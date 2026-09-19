@@ -760,6 +760,52 @@ as it serves Ollama.
   no key); hard-coding OpenCode's slot would have sent no key at all once a second agent
   had an endpoint.
 
+## Where the money meter lives
+
+`openrouter_usage.rs` + `usageRows::openRouterRow`. Every other meter measures a
+SUBSCRIPTION -- a rolling window with a cap, where the number is "what fraction have I
+burned". OpenRouter is prepaid credit, and that difference is structural, not cosmetic.
+
+- **`UWindow.money` exists because a fraction cannot express it.** `GET /api/v1/key` reports
+  `usage` plus a `limit`/`limit_remaining` that are **null for an uncapped key -- the normal
+  state on a funded account**. With no cap there is no denominator, so the row sets
+  `used: 0`, the panel draws NO bar, and the label reads "$12.40 spent". Never invent a
+  ceiling to get a percentage: the provider explicitly declined to give one.
+- **`quota` is `limit != null`.** An uncapped key gates nothing, so `rowHealth` reports
+  `remaining: null` (unknown) rather than a confident 100% -- the same rule agents with no
+  usage API already follow. Treating it as full would route work at an account with no
+  money in it; treating it as empty would stop routing at one that has.
+- **Keyed per AGENT** (`openrouter:<agent>`), not per account: two agents may hold two
+  different keys against the same provider, and one account key would collapse them.
+- Polled on the SLOW (5 min) tick with the other network reads. Prepaid credit only moves
+  when a turn completes; a per-minute poll would spend requests watching a static number.
+- **`visibleWindows` reads `show[kind] !== false`, not a truthy test.** Prefs persist per
+  machine, so a prefs object written before a window kind existed has `undefined` for it --
+  a truthy test hides a newly added meter from exactly the people already using the app,
+  who never learn there is a switch to turn on.
+
+## Where the agent profile panel lives
+
+`agent_profile.rs` + `AgentPanel.tsx` -- the Agent tab. The Model tab answers "what is this
+running on"; this answers "what does it know and what can it reach".
+
+- **Adaptive, and an empty section is OMITTED rather than drawn empty.** Agents expose very
+  different things, and a blank "Memory" heading reads as "this agent forgot everything"
+  rather than "this agent has no such concept". Rust returns only sections it could fill.
+- **Sections come from whoever holds the data.** Hermes' memory/skills/MCP are files, so
+  Rust reads them; Claude's MCP registry is localStorage, so the frontend composes that
+  section itself. The frontend skips its own MCP section when Rust already supplied one, so
+  an agent is never listed twice under two sources.
+- Hermes' three memory documents are listed SEPARATELY (`SOUL.md` = what you told it,
+  `USER.md` = what it inferred about you, `MEMORY.md` = what it remembered). Merging them
+  would hide the inferred one, which is the one worth checking.
+- **MCP is read from `config.yaml`, not `hermes mcp list`** -- the CLI costs a Python
+  process start (seconds) and this panel refreshes while open.
+- `serde_yaml` parses what OTHERS wrote (skill frontmatter, Hermes' config); `hermes.rs`
+  still hand-emits its overlay, because that file carries an explanatory header comment a
+  serializer would drop and its values are three known scalars.
+- Everything is READ-ONLY; an unreadable file costs that section, never the panel.
+
 ## Where agent routing lives
 
 Task-shaped preferences: a task kind (planning / implementation / review / research /

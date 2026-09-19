@@ -3,6 +3,7 @@ import {
   agyRow,
   claudeRow,
   commandCodeRow,
+  openRouterRow,
   meterView,
   rowHealth,
   summaryRemaining,
@@ -214,7 +215,24 @@ const ALL: Record<WinKind, boolean> = {
   weekly: true,
   weeklyOpus: true,
   context: true,
+  credit: true,
 };
+
+describe("a window kind the saved preferences predate", () => {
+  it("shows rather than hides", () => {
+    // Prefs persist per machine, so a prefs object written before `credit` existed has no
+    // key for it. A truthy test would hide the new meter from exactly the people already
+    // using the app, and they would never know there was a switch to turn on.
+    const older = { fiveHour: true, weekly: true, weeklyOpus: true, context: true };
+    const credit = win({ key: "c", kind: "credit", used: 0.25 });
+    expect(visibleWindows([credit], older)).toHaveLength(1);
+  });
+
+  it("still honours an explicit off", () => {
+    const credit = win({ key: "c", kind: "credit", used: 0.25 });
+    expect(visibleWindows([credit], { ...ALL, credit: false })).toHaveLength(0);
+  });
+});
 
 describe("what the panel reports vs what the router believes", () => {
   it("names the window its number came from", () => {
@@ -290,5 +308,59 @@ describe("stale reads", () => {
       },
     });
     expect(row.stale).toBe(false);
+  });
+});
+
+
+describe("OpenRouter is prepaid credit, not a subscription", () => {
+  const usage = (over: Partial<Parameters<typeof openRouterRow>[0]> = {}) =>
+    openRouterRow({
+      agent: "hermes",
+      label: "conduit key",
+      spent: 12.4,
+      limit: 50,
+      remaining: 37.6,
+      usageDaily: null,
+      usageWeekly: null,
+      usageMonthly: null,
+      isFreeTier: false,
+      source: "live",
+      ...over,
+    });
+
+  it("carries dollars, not just a fraction", () => {
+    const row = usage();
+    expect(row.windows).toHaveLength(1);
+    const w = row.windows[0];
+    expect(w.money).toEqual({ spent: 12.4, limit: 50, remaining: 37.6 });
+    // A capped key still has a meaningful bar.
+    expect(w.used).toBeCloseTo(12.4 / 50);
+    expect(w.quota).toBe(true);
+  });
+
+  it("an uncapped key gates nothing and reports unknown, not full", () => {
+    // The normal state on a funded account. Calling it 100% healthy would be a guess, and
+    // calling it spent would stop the router using an account with money in it.
+    const row = usage({ limit: null, remaining: null });
+    const w = row.windows[0];
+    expect(w.quota).toBe(false);
+    expect(w.money).toEqual({ spent: 12.4, limit: null, remaining: null });
+    expect(rowHealth([w]).remaining).toBeNull();
+  });
+
+  it("never invents a denominator", () => {
+    // `used` must stay 0 with no cap: any other value is a ratio against a number the API
+    // explicitly declined to give.
+    expect(usage({ limit: null, remaining: null }).windows[0].used).toBe(0);
+    expect(usage({ limit: 0, remaining: null }).windows[0].used).toBe(0);
+  });
+
+  it("keeps two agents on OpenRouter as two rows", () => {
+    // Both would otherwise collapse onto one account key and the second would vanish.
+    expect(usage({ agent: "hermes" }).key).not.toBe(usage({ agent: "opencode" }).key);
+  });
+
+  it("falls back to a name when the key is unlabelled", () => {
+    expect(usage({ label: "   " }).label).toBe("OpenRouter");
   });
 });

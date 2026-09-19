@@ -6034,3 +6034,167 @@ input[type="number"]:focus {
   background: color-mix(in srgb, var(--red) 18%, transparent);
   color: var(--red);
 }
+
+/* ---- Model tab: what is actually running ----------------------------------- */
+/* Read-only and first, because "which model am I paying for" is the question the tab is
+   opened to answer -- especially on an aggregator where 447 near-identical names differ by
+   two orders of magnitude in price. */
+.mp-running {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.mp-running-id {
+  font-family: var(--mono-font);
+  font-size: 12px;
+  color: var(--text-bright);
+  overflow-wrap: anywhere;
+}
+.mp-running-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-mid);
+}
+.mp-running-where {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.mp-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+}
+.mp-link:hover {
+  text-decoration: underline;
+}
+
+/* ---- Agent tab: memory, skills, MCP ---------------------------------------- */
+.agent-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+}
+.ap-section {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.ap-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 2px 0;
+  font-size: 11px;
+  color: var(--text-mid);
+  cursor: pointer;
+  text-align: left;
+}
+.ap-caret {
+  color: var(--text-dim);
+  font-size: 9px;
+}
+.ap-count {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.ap-items {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px 0 0 14px;
+}
+.ap-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 4px 6px;
+  border: none;
+  background: transparent;
+  border-radius: 4px;
+  color: var(--text-mid);
+}
+/* Only a row with something to read is interactive; a bare row must not invite a click
+   that does nothing. */
+.ap-item.readable {
+  cursor: pointer;
+}
+.ap-item.readable:hover {
+  background: var(--hover);
+}
+.ap-item-name {
+  font-size: 11px;
+  color: var(--text-bright);
+}
+.ap-item-detail {
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.ap-source {
+  font-size: 9px;
+  color: var(--text-dim);
+  opacity: 0.7;
+  padding: 4px 6px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ap-reader {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+}
+.ap-reader-box {
+  display: flex;
+  flex-direction: column;
+  max-width: 760px;
+  max-height: 100%;
+  width: 100%;
+  background: var(--sidebar-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.ap-reader-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-bright);
+}
+.ap-reader-body {
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  font-family: var(--mono-font);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-mid);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

@@ -2,6 +2,7 @@ import type {
   AgyUsage,
   ClaudeAccountUsage,
   CommandCodeAccountUsage,
+  OpenRouterUsage,
 } from "./store";
 import type { AgentId, AgentInfo } from "./agents";
 import type { AgentAvailability, AvailabilityMap } from "./routing";
@@ -28,7 +29,7 @@ export function accountKey(accountId: string | null | undefined): string {
 }
 
 /** A window's kind, used both for the prefs filter and for labeling. */
-export type WinKind = "fiveHour" | "weekly" | "weeklyOpus" | "context";
+export type WinKind = "fiveHour" | "weekly" | "weeklyOpus" | "context" | "credit";
 
 /**
  * One meter, normalized across agents.
@@ -55,6 +56,21 @@ export interface UWindow {
   quota: boolean;
   resetsAt: string | null;
   disabled: boolean;
+  /** Present ONLY for a prepaid-credit window. When set, the panel shows currency instead
+   *  of a percentage, because "you have spent $12.40" is the number that matters and
+   *  "25% used" is not -- and when `limit` is null there is no percentage to state at all. */
+  money?: Money;
+}
+
+/** A prepaid balance, in account currency (OpenRouter reports dollars).
+ *
+ *  `limit`/`remaining` are null for an UNCAPPED key, which is the normal state on a funded
+ *  account -- not an error and not zero. Nothing may invent a denominator for that case:
+ *  a bar drawn against a guessed cap is worse than no bar. */
+export interface Money {
+  spent: number;
+  limit: number | null;
+  remaining: number | null;
 }
 
 const clamp01 = (n: number) => Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0));
@@ -150,9 +166,13 @@ function healthOf(windows: UWindow[]): Health {
  *  so hiding a window can no longer leave the summary reporting one the user cannot see. */
 export function visibleWindows(
   windows: UWindow[],
-  show: Record<WinKind, boolean>,
+  show: Partial<Record<WinKind, boolean>>,
 ): UWindow[] {
-  return windows.filter((w) => show[w.kind]);
+  // `!== false`, not a truthy test: a prefs object persisted before a window KIND existed
+  // has `undefined` for it, and hiding a meter the user has never had the chance to turn
+  // off would make a newly added one invisible to exactly the people already using the app.
+  // Only an explicit `false` hides a window.
+  return windows.filter((w) => show[w.kind] !== false);
 }
 
 /**
@@ -208,6 +228,7 @@ const KIND_LABEL: Record<WinKind, string> = {
   weekly: "Weekly",
   weeklyOpus: "Weekly · Opus",
   context: "Context",
+  credit: "Credit",
 };
 
 /** `pool` survives only for agy, whose windows genuinely belong to separate quotas and
@@ -281,6 +302,51 @@ export function commandCodeRow(entry: CommandCodeAccountUsage): URow {
     connectable: false,
     planSource: source,
     minRemaining: limited ? 0 : summaryRemaining(windows),
+  };
+}
+
+/**
+ * OpenRouter spend, as one row.
+ *
+ * Every other builder here turns a SUBSCRIPTION into fractions. This one cannot: OpenRouter
+ * is prepaid credit, so the real quantities are dollars, and a key may have no cap at all.
+ * Two consequences, both deliberate:
+ *
+ * - **`quota` is `limit != null`.** An uncapped key gates nothing, so it must not drive the
+ *   router's health number. `rowHealth` then reports `remaining: null` (unknown) rather
+ *   than a confident 100%, which is the same rule agents with no usage API already follow:
+ *   unknown quota is not exhausted quota.
+ * - **`used` is 0 when uncapped**, and the panel draws no bar because `money.limit` is
+ *   null. The alternative -- scaling spend against some invented ceiling -- would put a
+ *   number on screen that OpenRouter explicitly declined to give.
+ */
+export function openRouterRow(u: OpenRouterUsage): URow {
+  const capped = u.limit != null && u.limit > 0;
+  const windows: UWindow[] = [
+    {
+      key: "credit",
+      label: windowLabel("credit"),
+      kind: "credit",
+      group: "credit",
+      used: capped ? clamp01(u.spent / (u.limit as number)) : 0,
+      quota: capped,
+      resetsAt: null,
+      disabled: false,
+      money: { spent: u.spent, limit: u.limit, remaining: u.remaining },
+    },
+  ];
+  return {
+    agent: u.agent,
+    // One key per agent, so two agents on OpenRouter stay two rows rather than colliding.
+    key: `openrouter:${u.agent}`,
+    accountId: null,
+    label: u.label.trim() || "OpenRouter",
+    windows,
+    // Nothing for a button to authorize: a missing key is fixed in the endpoint editor,
+    // not by a prompt this panel could raise.
+    connectable: false,
+    planSource: u.source,
+    minRemaining: summaryRemaining(windows),
   };
 }
 

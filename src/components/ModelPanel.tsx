@@ -1,32 +1,42 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useStore, liveState } from "../store";
+import { useStore, liveState, providerReady, EMPTY_PROVIDER, type LocalModel } from "../store";
 import { agentMeta, type AgentId } from "../agents";
 import { AgentGlyph } from "./AgentGlyph";
 import { Dropdown } from "./Dropdown";
-import { EndpointEditor } from "./EndpointEditor";
+import { presetMeta } from "./EndpointEditor";
 
 /**
- * The Model tab — what THIS session is actually running on, and the controls to change it.
+ * The Model tab — what THIS session is running on, and the few things that change per
+ * session.
  *
- * Session-scoped by construction: everything it renders derives from `sessionId`, so
- * selecting a different tab in the centre re-renders it for that session's agent. It
- * renders only the controls the selected agent ACTUALLY supports (`AGENTS` metadata, which
- * mirrors the Rust adapter flags) rather than greying out rows for capabilities that do not
- * exist — a disabled "Reasoning" control on an agent with no effort flag is a promise the
- * spawn cannot keep.
+ * **It deliberately does NOT configure the endpoint.** Base URL, API key and provider are
+ * set-and-forget: you do them once and never again, and having them here made a panel you
+ * open constantly mostly full of things you never touch — while also implying they were
+ * per-session when they are per-agent. They live in Settings → Model endpoints now, and
+ * this tab links there.
+ *
+ * What stays is what genuinely varies per session (model, reasoning, account) plus the one
+ * read-only thing that was missing: WHICH model is running and what it costs. On OpenRouter
+ * that is the difference between a $0.075/M model and a $15/M one, chosen from 447 with
+ * near-identical names.
  *
  * With no session selected it renders a placeholder, NOT the global defaults. This tab
  * answers "what is this session running"; showing defaults would make the answer a guess.
- *
- * Two scopes are visible and the panel never blurs them: model / reasoning / account are
- * PER SESSION, the endpoint is PER AGENT. Each block is captioned with which it is.
  */
+
+const fmtCtx = (n?: number | null) => (n ? `${Math.round(n / 1024)}k context` : "");
+
 export function ModelPanel({ sessionId }: { sessionId: string | null }) {
   const projects = useStore((s) => s.projects);
   const accounts = useStore((s) => s.accounts);
+  const agentProviders = useStore((s) => s.agentProviders);
+  const endpointModels = useStore((s) => s.endpointModels);
+  const loadProviderSettings = useStore((s) => s.loadProviderSettings);
   const setSessionModel = useStore((s) => s.setSessionModel);
   const setSessionEffort = useStore((s) => s.setSessionEffort);
   const setSessionAccount = useStore((s) => s.setSessionAccount);
+  const setSettingsTab = useStore((s) => s.setSettingsTab);
+  const setShowSettings = useStore((s) => s.setShowSettings);
   const stopSession = useStore((s) => s.stopSession);
   const startSession = useStore((s) => s.startSession);
   const live = useStore((s) => s.live);
@@ -44,27 +54,22 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
   const [modelDraft, setModelDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
-  /** A change only a SPAWN can apply. Tracked apart from anything a running agent would
-   *  pick up, because conflating the two is how a "saved" confirmation ends up implying a
-   *  running session already moved when it has not. */
   const [needsRestart, setNeedsRestart] = useState(false);
 
-  // The model box is a draft so typing does not round-trip on every keystroke; re-seed it
-  // when the SESSION (or its stored model) changes, not on every render.
+  useEffect(() => {
+    void loadProviderSettings();
+  }, [loadProviderSettings]);
+
   useEffect(() => {
     setModelDraft(session?.model ?? "");
     setNeedsRestart(false);
     setDone(null);
   }, [sessionId, session?.model]);
 
-  // Agents read their model, endpoint and credentials ONCE, at process start: Hermes and
-  // OpenCode both resolve them before the first prompt, so there is no live channel to push
-  // a change down. "Apply without restarting" therefore has to mean Conduit does the
-  // restart FOR you, not that the running process changes its mind.
-  //
-  // It is gated on the session being idle. Restarting an agent mid-turn throws away the
-  // work in flight, which is a far worse surprise than a button — so a busy session keeps
-  // the explicit button and applies the moment it goes quiet.
+  // Agents read their model, endpoint and credentials ONCE, at process start, so "apply
+  // without restarting" can only mean Conduit restarts the session for you. Gated on the
+  // session being idle: restarting an agent mid-turn throws away the work in flight, which
+  // is a far worse surprise than a button.
   const status = liveState(live, sessionId ?? "").status;
   const busyAgent = status === "running" || status === "needsInput";
   const restartRef = useRef<() => Promise<void>>(async () => {});
@@ -85,6 +90,16 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
   const agent: AgentId = session.agent;
   const meta = agentMeta(agent);
   const eligibleAccounts = accounts.filter((a) => a.agents.includes(agent));
+  const endpoint = agentProviders[agent] ?? EMPTY_PROVIDER;
+  const routed = providerReady(endpoint);
+
+  // Which model is ACTUALLY in play. A session-pinned model wins over the agent endpoint's,
+  // which is the same precedence the spawn uses — so this row cannot claim one thing while
+  // the agent runs another.
+  const effectiveModel = session.model?.trim() || (routed ? endpoint.model : "");
+  const known: LocalModel | undefined = (endpointModels[agent] ?? []).find(
+    (m) => m.id === effectiveModel,
+  );
 
   const restart = async () => {
     const pid = found!.project.id;
@@ -98,8 +113,12 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
       setBusy(false);
     }
   };
-
   restartRef.current = restart;
+
+  const openEndpoints = () => {
+    setSettingsTab("endpoints");
+    setShowSettings(true);
+  };
 
   return (
     <div className="model-panel">
@@ -108,6 +127,36 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
         <div className="mp-head-text">
           <div className="mp-title">{session.name}</div>
           <div className="mp-sub">{meta.label}</div>
+        </div>
+      </div>
+
+      {/* ---- What is running, read-only ---------------------------------------- */}
+      <div className="mp-running">
+        <div className="mp-running-id">{effectiveModel || `${meta.label}'s default`}</div>
+        <div className="mp-running-meta">
+          {known?.tools === true ? <span className="ep-badge tools">tools</span> : null}
+          {/* An agent without tool calling can barely function, so this is a warning, not a
+              detail — it is the single most useful thing to know about a cheap model. */}
+          {known?.tools === false ? <span className="ep-badge no">no tools</span> : null}
+          {fmtCtx(known?.context)}
+          {known?.detail ? (fmtCtx(known?.context) ? ` · ${known.detail}` : known.detail) : ""}
+        </div>
+        <div className="mp-running-where">
+          {routed ? (
+            <>
+              via {presetMeta(endpoint.preset)?.label ?? endpoint.preset}
+              {" · "}
+              <button className="mp-link" onClick={openEndpoints}>
+                change endpoint
+              </button>
+            </>
+          ) : meta.supportsEndpoint ? (
+            <button className="mp-link" onClick={openEndpoints}>
+              Set up an endpoint…
+            </button>
+          ) : (
+            `on ${meta.label}'s own configuration`
+          )}
         </div>
       </div>
 
@@ -124,7 +173,7 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
             <input
               className="mp-input"
               value={modelDraft}
-              placeholder={`${meta.label}'s default`}
+              placeholder={routed ? endpoint.model || "endpoint default" : `${meta.label}'s default`}
               onChange={(e) => setModelDraft(e.target.value)}
               onBlur={() => {
                 const v = modelDraft.trim();
@@ -132,20 +181,23 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
                 void setSessionModel(session.id, v || null);
                 setNeedsRestart(true);
               }}
-              list={meta.models?.length ? `mp-models-${agent}` : undefined}
+              list={`mp-models-${agent}`}
             />
-            {meta.models?.length ? (
-              <datalist id={`mp-models-${agent}`}>
-                {meta.models.map((m) => (
-                  <option key={m} value={m} />
-                ))}
-              </datalist>
-            ) : null}
+            <datalist id={`mp-models-${agent}`}>
+              {(meta.models ?? []).map((m) => (
+                <option key={m} value={m} />
+              ))}
+              {(endpointModels[agent] ?? []).slice(0, 200).map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.detail}
+                </option>
+              ))}
+            </datalist>
           </label>
         ) : (
           <p className="mp-note">
-            {meta.label} takes no per-invocation model flag, so its model is chosen inside the
-            agent{meta.supportsEndpoint ? " or by the endpoint below" : ""}.
+            {meta.label} takes no per-invocation model flag, so its model comes from
+            {meta.supportsEndpoint ? " its endpoint" : " the agent itself"}.
           </p>
         )}
 
@@ -186,21 +238,6 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
         ) : null}
       </div>
 
-      {/* ---- Per-agent endpoint ------------------------------------------------ */}
-      {meta.supportsEndpoint ? (
-        <>
-          <div className="mp-section-head" style={{ paddingTop: 4 }}>
-            Endpoint
-            <span className="mp-scope">every {meta.label} session</span>
-          </div>
-          <EndpointEditor
-            agent={agent}
-            sessionLocalOnly={!!session.localOnly}
-            onChanged={() => setNeedsRestart(true)}
-          />
-        </>
-      ) : null}
-
       {done ? <p className="mp-note">{done}</p> : null}
 
       {needsRestart ? (
@@ -209,7 +246,7 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
             {busy
               ? "Applying…"
               : busyAgent
-                ? "This agent is mid-turn — these settings apply as soon as it finishes, or restart now to apply immediately."
+                ? "Mid-turn — applies as soon as it finishes, or restart now."
                 : "Applying…"}
           </span>
           <button className="mp-btn" onClick={() => void restart()} disabled={busy}>

@@ -104,6 +104,7 @@ export function EndpointEditor({
   const setProviderKey = useStore((s) => s.setProviderKey);
   const detectLocalProviders = useStore((s) => s.detectLocalProviders);
   const listLocalModels = useStore((s) => s.listLocalModels);
+  const setEndpointModels = useStore((s) => s.setEndpointModels);
 
   const meta = agentMeta(agent);
   const endpoint: ProviderSettings = agentProviders[agent] ?? EMPTY_PROVIDER;
@@ -158,6 +159,9 @@ export function EndpointEditor({
           setNote({ kind: "warn", text: res });
         } else {
           setModels(rank(res));
+          // Share it: the Model tab describes the SELECTED model (context, price, tools)
+          // from this same catalogue rather than re-fetching 447 rows to say one line.
+          setEndpointModels(agent, res);
           setNote({
             kind: "ok",
             text: `${res.length} model${res.length === 1 ? "" : "s"} available.`,
@@ -167,7 +171,7 @@ export function EndpointEditor({
         setBusy(false);
       }
     },
-    [agent, listLocalModels],
+    [agent, listLocalModels, setEndpointModels],
   );
 
   const def = presetMeta(endpoint.preset);

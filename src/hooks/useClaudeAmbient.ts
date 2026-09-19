@@ -25,6 +25,7 @@ export function useClaudeAmbient(): void {
   const refreshUsage = useStore((s) => s.refreshClaudeUsage);
   const refreshAgy = useStore((s) => s.refreshAgyUsage);
   const refreshCommandCode = useStore((s) => s.refreshCommandCodeUsage);
+  const refreshOpenRouter = useStore((s) => s.loadOpenRouterUsage);
   const connectPlan = useStore((s) => s.connectPlanUsage);
   const planConnected = useStore((s) => s.planConnected);
 
@@ -41,6 +42,12 @@ export function useClaudeAmbient(): void {
       // is no connect step to gate this on -- it either answers or reports why it cannot.
       // Grouped with Claude because it is the other one going over the network.
       void refreshCommandCode();
+      // OpenRouter spend. On the SLOW tick with the other network reads: it is prepaid
+      // credit measured in dollars, so it only moves when a turn completes -- polling it
+      // every minute would spend requests watching a number that cannot have changed.
+      // Answers an empty list when no agent is routed at OpenRouter, so it costs nothing
+      // for users who never touch it.
+      void refreshOpenRouter();
     };
 
     const tick = () => {

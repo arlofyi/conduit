@@ -3,6 +3,29 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.39.0 — 2026-09-19
+
+- **Added — OpenRouter spend in the usage bar.** Sessions routed at OpenRouter now report
+  what they have actually cost, beside the subscription meters. Unlike those, this is money
+  rather than an allowance: a key with a spending cap shows `$12.40 of $50.00 · $37.60
+  left`, and a key without one shows what you have spent and no bar — because there is no
+  cap to draw it against. Each agent gets its own row, so Hermes and OpenCode on separate
+  keys are counted separately.
+- **Added — An Agent tab.** Beside Model: what the session's agent knows and what it can
+  reach. For Hermes that is its memory — the persona you gave it, what it has worked out
+  about you, and what it has remembered, each openable — plus its loaded skills and MCP
+  servers. For Claude it lists the MCP servers that session will load. Sections an agent has
+  no concept of are left out rather than shown empty.
+- **Added — The Model tab says what it is running.** The model in use is shown with its
+  context window, its price per million tokens in and out, and whether it supports tool
+  calling. On a provider offering hundreds of near-identically-named models, that is the
+  difference between a few cents and a few dollars per session.
+- **Changed — Endpoint setup moved to Settings.** Base URL, API key and provider were
+  set-and-forget controls sitting in a panel you open constantly, and they apply to every
+  session on an agent rather than the one you are looking at. They now live in
+  Settings → Model endpoints; the Model tab links to them and keeps only what genuinely
+  varies per session.
+
 ## 0.38.1 — 2026-09-19
 
 - **Fixed — OpenRouter and local endpoints now actually connect.** A session pointed at an

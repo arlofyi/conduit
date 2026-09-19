@@ -148,6 +148,46 @@ import type { ProviderSettings } from "./providers";
 /** The old name, kept for OpenCode's own call sites. */
 export type OpenCodeSettings = ProviderSettings;
 
+/** One agent's OpenRouter spend (mirrors the Rust `OpenRouterUsage`). Dollars, not a
+ *  fraction: `limit`/`remaining` are null for an uncapped key, which is normal. */
+export interface OpenRouterUsage {
+  agent: AgentId;
+  label: string;
+  spent: number;
+  limit: number | null;
+  remaining: number | null;
+  usageDaily: number | null;
+  usageWeekly: number | null;
+  usageMonthly: number | null;
+  isFreeTier: boolean;
+  /** "live" | "disconnected" (no key held) | "unavailable" (key rejected / shape moved). */
+  source: string;
+}
+
+/** One entry in an agent profile section (mirrors the Rust `ProfileItem`). */
+export interface ProfileItem {
+  name: string;
+  detail: string;
+  /** Full text for items that have one (a memory document); null for a bare row. */
+  body?: string | null;
+}
+
+/** One section of what an agent knows/can reach. Sections the agent has no concept of are
+ *  absent, never present-and-empty — a blank "Memory" heading reads as amnesia. */
+export interface ProfileSection {
+  id: string;
+  title: string;
+  items: ProfileItem[];
+  /** Where these were read from, so the panel can point at the real file. */
+  source: string;
+}
+
+export interface AgentProfile {
+  sections: ProfileSection[];
+  /** This agent exposes nothing Conduit can read, so the panel says so plainly. */
+  unsupported: boolean;
+}
+
 /** One probed local inference server (detect_local_providers). */
 export interface LocalProviderStatus {
   preset: string;
@@ -350,7 +390,7 @@ export interface ContextMenuState {
 }
 
 export type TopTab = "files" | "changes" | "todos" | "subagents";
-export type BottomTab = "terminal" | "git" | "model" | "decisions" | "messages";
+export type BottomTab = "terminal" | "git" | "model" | "agent" | "decisions" | "messages";
 
 // ---- Claude ambient (status + usage) — mirror Rust serde camelCase ----
 export interface StatusComponent { name: string; status: string; }
@@ -463,7 +503,7 @@ export interface UsagePrefs {
   /** How the usage bar renders. "selected" reproduces the pre-multi-account single panel. */
   layout: "selected" | "stacked" | "summary" | "lowAlertOnly";
   /** Which windows to show. Off-by-one agents just skip the windows they don't have. */
-  windows: { fiveHour: boolean; weekly: boolean; weeklyOpus: boolean; context: boolean };
+  windows: { fiveHour: boolean; weekly: boolean; weeklyOpus: boolean; context: boolean; credit: boolean };
   /** Row order: most-critical (least remaining) first, or alphabetical by label. */
   sort: "critical" | "label";
   /** Which direction every meter reads. Defaults to "used" -- what each agent's own usage
@@ -474,7 +514,7 @@ export interface UsagePrefs {
 }
 export const DEFAULT_USAGE_PREFS: UsagePrefs = {
   layout: "selected",
-  windows: { fiveHour: true, weekly: true, weeklyOpus: true, context: true },
+  windows: { fiveHour: true, weekly: true, weeklyOpus: true, context: true, credit: true },
   sort: "critical",
   metric: "used",
   lowThresholdPct: 20,
@@ -1410,6 +1450,17 @@ interface AppState {
   // ---- Per-agent endpoints ----
   /** Every agent's endpoint settings. Absent = that agent has none configured. */
   agentProviders: Partial<Record<AgentId, ProviderSettings>>;
+  /** OpenRouter spend per agent routed at it. Empty when no agent is. */
+  openrouterUsage: OpenRouterUsage[];
+  loadOpenRouterUsage: () => Promise<void>;
+  /** Last model catalogue fetched per agent endpoint. Shared so the endpoint editor's
+   *  fetch also feeds the Model tab's "what am I actually running" card, instead of each
+   *  asking the provider for the same 447 rows. */
+  endpointModels: Partial<Record<AgentId, LocalModel[]>>;
+  setEndpointModels: (agent: AgentId, models: LocalModel[]) => void;
+  /** What the selected session's agent knows: memory, skills, MCP. Keyed by session. */
+  agentProfiles: Record<string, AgentProfile>;
+  loadAgentProfile: (sessionId: string) => Promise<void>;
   /** Which agents hold an endpoint API key this run. Membership only — never a key. */
   providerKeys: AgentId[];
   loadProviderSettings: () => Promise<void>;
@@ -1757,6 +1808,9 @@ export const useStore = create<AppState>((set, get) => {
     opencodeKeySet: false,
     agentProviders: {},
     providerKeys: [],
+    openrouterUsage: [],
+    endpointModels: {},
+    agentProfiles: {},
     agentSetupComplete: localStorage.getItem(SETUP_DONE_KEY) === "1",
     telemetryOptOut: readTelemetryOptOut(),
 
@@ -2067,6 +2121,20 @@ export const useStore = create<AppState>((set, get) => {
         await invoke("clear_opencode_key").catch(() => {});
         set({ opencodeKeySet: false });
       }
+    },
+
+    setEndpointModels: (agent, models) =>
+      set((st) => ({ endpointModels: { ...st.endpointModels, [agent]: models } })),
+    loadAgentProfile: async (sessionId) => {
+      try {
+        const profile = await invoke<AgentProfile>("agent_profile", { sessionId });
+        set((st) => ({ agentProfiles: { ...st.agentProfiles, [sessionId]: profile } }));
+      } catch { /* keep the last good read */ }
+    },
+    loadOpenRouterUsage: async () => {
+      try {
+        set({ openrouterUsage: await invoke<OpenRouterUsage[]>("openrouter_usage") });
+      } catch { /* keep the last good read rather than blanking the meter */ }
     },
 
     // ---- Per-agent endpoints ----

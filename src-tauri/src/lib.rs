@@ -5,6 +5,7 @@
 //! and exposes them to the React frontend as Tauri commands.
 
 mod agent;
+mod agent_profile;
 mod agy_usage;
 mod board;
 mod bridge;
@@ -35,6 +36,7 @@ mod hotexit;
 mod local_llm;
 mod menu;
 mod notify;
+mod openrouter_usage;
 mod plugins;
 mod project_new;
 mod proposals;
@@ -2500,6 +2502,8 @@ pub fn run() {
             set_provider_key,
             clear_provider_key,
             provider_keys_set,
+            openrouter_usage::openrouter_usage,
+            agent_profile::agent_profile,
             local_llm::detect_local_providers,
             local_llm::list_local_models,
             local_llm::probe_tool_call,
