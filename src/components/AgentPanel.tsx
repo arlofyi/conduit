@@ -22,9 +22,13 @@ import { AgentGlyph } from "./AgentGlyph";
 function Section({
   section,
   onOpen,
+  onManage,
 }: {
   section: ProfileSection;
   onOpen: (s: ProfileSection, i: number) => void;
+  /** Present only for a section Conduit already has an editor for. Sections without one
+   *  say nothing rather than offering a button that goes nowhere. */
+  onManage?: () => void;
 }) {
   const [open, setOpen] = useState(true);
   return (
@@ -34,6 +38,17 @@ function Section({
         {section.title}
         <span className="ap-count">{section.items.length}</span>
       </button>
+      {onManage ? (
+        <button
+          className="mp-link ap-manage"
+          onClick={(e) => {
+            e.stopPropagation();
+            onManage();
+          }}
+        >
+          Manage…
+        </button>
+      ) : null}
       {open ? (
         <div className="ap-items">
           {section.items.map((it, i) => {
@@ -64,7 +79,13 @@ export function AgentPanel({ sessionId }: { sessionId: string | null }) {
   const loadProfile = useStore((s) => s.loadAgentProfile);
   const mcpServers = useStore((s) => s.mcpServers);
   const mcpEnabled = useStore((s) => s.mcpEnabled);
+  const writeMemory = useStore((s) => s.writeAgentMemory);
+  const setSettingsTab = useStore((s) => s.setSettingsTab);
+  const setShowSettings = useStore((s) => s.setShowSettings);
   const [reading, setReading] = useState<{ title: string; body: string } | null>(null);
+  const [draft, setDraft] = useState("");
+  const [saveErr, setSaveErr] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   const session = useMemo(() => {
     for (const p of projects) {
@@ -146,9 +167,23 @@ export function AgentPanel({ sessionId }: { sessionId: string | null }) {
           <Section
             key={s.id}
             section={s}
-            onOpen={(sec, i) =>
-              setReading({ title: sec.items[i].name, body: sec.items[i].body ?? "" })
+            // MCP is the one section with a real editor already: the MCP matrix adds and
+            // removes servers through each agent's own CLI. Pointing at it beats a second
+            // editor that could disagree with the first.
+            onManage={
+              s.id === "mcp" || s.id === "mcp-registry"
+                ? () => {
+                    setSettingsTab("mcp");
+                    setShowSettings(true);
+                  }
+                : undefined
             }
+            onOpen={(sec, i) => {
+              const body = sec.items[i].body ?? "";
+              setReading({ title: sec.items[i].name, body });
+              setDraft(body);
+              setSaveErr(null);
+            }}
           />
         ))
       )}
@@ -158,11 +193,42 @@ export function AgentPanel({ sessionId }: { sessionId: string | null }) {
           <div className="ap-reader-box" onClick={(e) => e.stopPropagation()}>
             <div className="ap-reader-head">
               {reading.title}
-              <button className="mp-btn" onClick={() => setReading(null)}>
-                Close
-              </button>
+              <span className="ap-reader-actions">
+                {/* A truncated preview must never be written back — saving it would delete
+                    everything past the cap. The panel refuses rather than risking it. */}
+                {reading.body.endsWith("… truncated") ? (
+                  <span className="mp-warn">Too long to edit here — open the file.</span>
+                ) : (
+                  <button
+                    className="mp-btn"
+                    disabled={saving || draft === reading.body}
+                    onClick={async () => {
+                      setSaving(true);
+                      const err = await writeMemory(sessionId, reading.title, draft);
+                      setSaving(false);
+                      if (err) setSaveErr(err);
+                      else setReading({ ...reading, body: draft });
+                    }}
+                  >
+                    {saving ? "Saving…" : draft === reading.body ? "Saved" : "Save"}
+                  </button>
+                )}
+                <button className="mp-btn" onClick={() => setReading(null)}>
+                  Close
+                </button>
+              </span>
             </div>
-            <pre className="ap-reader-body">{reading.body}</pre>
+            {saveErr ? <p className="mp-warn" style={{ padding: "0 12px" }}>{saveErr}</p> : null}
+            {reading.body.endsWith("… truncated") ? (
+              <pre className="ap-reader-body">{reading.body}</pre>
+            ) : (
+              <textarea
+                className="ap-reader-body ap-reader-edit"
+                value={draft}
+                spellCheck={false}
+                onChange={(e) => setDraft(e.target.value)}
+              />
+            )}
           </div>
         </div>
       ) : null}

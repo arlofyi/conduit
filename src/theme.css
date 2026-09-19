@@ -6198,3 +6198,33 @@ input[type="number"]:focus {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* One-click model switching. A task-driven change should not require typing a
+   40-character id out of a 447-entry catalogue. */
+.mp-quick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-left: 82px;
+}
+
+.ap-reader-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* The editor and the read-only view share .ap-reader-body so switching between them does
+   not move the text. */
+.ap-reader-edit {
+  border: none;
+  outline: none;
+  background: transparent;
+  resize: none;
+  min-height: 320px;
+}
+
+.ap-manage {
+  align-self: flex-start;
+  margin-left: 14px;
+  font-size: 10px;
+}

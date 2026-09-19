@@ -13,7 +13,7 @@ import {
   type TodoStatus,
   type AgyUsage,
 } from "./store";
-import { type AgentId } from "./agents";
+import { AGENTS, type AgentId } from "./agents";
 import { matchProjectByPath } from "./cliOpen";
 import {
   isEditableTarget,
@@ -595,7 +595,13 @@ export default function App() {
   // The `conduit` CLI launcher. The Rust side has already focused the window; this
   // owns what the app then shows.
   useEffect(() => {
-    const un = listen<{ path: string; agent?: string | null }>("cli-open", ({ payload }) => {
+    const un = listen<{
+      path: string;
+      agent?: string | null;
+      provider?: string | null;
+      model?: string | null;
+      effort?: string | null;
+    }>("cli-open", ({ payload }) => {
       void (async () => {
         const st = useStore.getState();
         let projectId = matchProjectByPath(st.projects, payload.path);
@@ -610,7 +616,29 @@ export default function App() {
         // `--agent` creates a session unconditionally and never resumes an existing
         // one, so its effect never depends on `restoreSessionsOnOpen`.
         if (projectId && payload.agent) {
-          await useStore.getState().addSession(projectId, { agent: payload.agent as AgentId });
+          // An agent id invented by whatever called the CLI must never render as a
+          // promise: `AgentId`'s deserialize is deliberately lenient, so an unknown id
+          // would silently spawn Claude under it. Same check `decisionRoute` makes.
+          const known = AGENTS.some((a) => a.id === payload.agent);
+          if (!known) {
+            useStore.getState().pushToast(
+              `conduit: unknown agent "${payload.agent}"`,
+              "error",
+            );
+            return;
+          }
+          // `--model` / `--effort` pin the NEW session, which is what lets one agent launch
+          // another under conditions it chose — a Hermes session on a local model starting
+          // a worker on OpenRouter, say. The model rides in `addSession` so the session is
+          // created WITH it rather than being corrected after its terminal has spawned.
+          await useStore.getState().addSession(projectId, {
+            agent: payload.agent as AgentId,
+            model: payload.model ?? null,
+          });
+          if (payload.effort) {
+            const id = globalSelectedSessionId(useStore.getState());
+            if (id) await useStore.getState().setSessionEffort(id, payload.effort);
+          }
         }
       })();
     });

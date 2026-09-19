@@ -256,6 +256,32 @@ pub trait ProviderAdapter {
     fn effort_flag(&self) -> &'static str {
         "--effort"
     }
+    /// The agent's OWN in-session command to change model mid-conversation, or None when
+    /// it has none.
+    ///
+    /// This is what makes "switch model without losing context" possible at all. Model,
+    /// endpoint and credentials are read once at process start, so Conduit cannot push a
+    /// change into a running agent -- but every mature TUI here already solves that for
+    /// itself with a slash command, and using the agent's own mechanism preserves the
+    /// conversation by construction rather than by us trying to reproduce it.
+    ///
+    /// Restarting is the fallback, not the plan: it is correct but it throws the session's
+    /// context away, which is exactly what a task-driven "downgrade this to a cheap model"
+    /// must not do.
+    ///
+    /// `None` means this agent's picker cannot be driven from a command line (OpenCode's
+    /// `/models` opens an interactive picker and takes no argument), so the caller restarts
+    /// instead. Returning a guessed command would be worse than admitting it: an
+    /// unrecognized slash command is pasted into the composer as literal text and sits
+    /// there, which reads to the user as "nothing happened".
+    fn model_switch_command(
+        &self,
+        _model: &str,
+        _provider: Option<&str>,
+        _effort: Option<&str>,
+    ) -> Option<String> {
+        None
+    }
     /// Extra env vars to set on the child process for this agent.
     fn env_overrides(&self) -> Vec<(&'static str, &'static str)> {
         Vec::new()
@@ -399,6 +425,17 @@ impl ProviderAdapter for ClaudeAdapter {
     }
     fn hooks_profile(&self) -> Option<crate::hooks::HooksProfile> {
         Some(crate::hooks::claude_profile())
+    }
+    /// `/model <name>`. Claude has no provider concept and its effort is a launch flag,
+    /// so both are ignored here rather than being smuggled into the command as flags the
+    /// slash parser would reject.
+    fn model_switch_command(
+        &self,
+        model: &str,
+        _provider: Option<&str>,
+        _effort: Option<&str>,
+    ) -> Option<String> {
+        Some(format!("/model {model}"))
     }
     fn mcp_add_command(&self, s: &McpServer) -> Option<String> {
         let env: String = s
@@ -891,6 +928,15 @@ impl ProviderAdapter for CommandCodeAdapter {
     fn project_mcp_config_rel_path(&self) -> Option<&'static str> {
         Some(".mcp.json")
     }
+    /// Command Code implements Claude's slash surface, `/model` included.
+    fn model_switch_command(
+        &self,
+        model: &str,
+        _provider: Option<&str>,
+        _effort: Option<&str>,
+    ) -> Option<String> {
+        Some(format!("/model {model}"))
+    }
     /// Resume by the id Command Code chose for itself.
     ///
     /// There is no `--session-id` to PIN one the way Claude has, so Conduit cannot decide
@@ -1337,6 +1383,32 @@ impl ProviderAdapter for HermesAdapter {
     }
     fn effort_flag(&self) -> &'static str {
         "--reasoning"
+    }
+    /// Hermes' `/model` is the richest of the three: it takes the model, `--provider` to
+    /// switch backend, and `--reasoning` to set effort, all in ONE command and all
+    /// session-scoped by default (verified in its slash-command reference).
+    ///
+    /// Session-scoped is what we want: a task-driven switch should not rewrite the user's
+    /// `config.yaml` default, so `--global` is deliberately never sent.
+    ///
+    /// **`/model` can only switch between providers Hermes already has configured.** A
+    /// provider Conduit has not written into the session's overlay will be refused by
+    /// Hermes itself with its own message, which is the right place for that error -- far
+    /// better than Conduit pre-judging it and silently doing nothing.
+    fn model_switch_command(
+        &self,
+        model: &str,
+        provider: Option<&str>,
+        effort: Option<&str>,
+    ) -> Option<String> {
+        let mut cmd = format!("/model {model}");
+        if let Some(p) = provider.map(str::trim).filter(|p| !p.is_empty()) {
+            cmd.push_str(&format!(" --provider {p}"));
+        }
+        if let Some(e) = effort.map(str::trim).filter(|e| !e.is_empty()) {
+            cmd.push_str(&format!(" --reasoning {e}"));
+        }
+        Some(cmd)
     }
     fn account_env(&self, config_dir: &str) -> Vec<(String, String)> {
         hermes_profile_env(config_dir)
@@ -2437,6 +2509,77 @@ mod tests {
             info.install_command.as_deref(),
             Some("npm install -g opencode-ai@latest")
         );
+    }
+
+    #[test]
+    fn a_live_model_switch_uses_each_agents_own_slash_command() {
+        // Driving the agent's OWN command is what preserves the conversation; a restart
+        // would apply the same model and throw the context away.
+        assert_eq!(
+            ClaudeAdapter
+                .model_switch_command("opus", None, None)
+                .as_deref(),
+            Some("/model opus")
+        );
+        assert_eq!(
+            CommandCodeAdapter
+                .model_switch_command("claude-opus-5", None, None)
+                .as_deref(),
+            Some("/model claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn hermes_switches_model_provider_and_effort_in_one_command() {
+        assert_eq!(
+            HermesAdapter
+                .model_switch_command("x-ai/grok-4", Some("openrouter"), Some("high"))
+                .as_deref(),
+            Some("/model x-ai/grok-4 --provider openrouter --reasoning high")
+        );
+        // Absent parts are omitted, not sent empty -- `--provider ` with no value is a
+        // parse error, not a no-op.
+        assert_eq!(
+            HermesAdapter
+                .model_switch_command("qwen3:30b", None, None)
+                .as_deref(),
+            Some("/model qwen3:30b")
+        );
+        assert_eq!(
+            HermesAdapter
+                .model_switch_command("m", Some("  "), Some(""))
+                .as_deref(),
+            Some("/model m")
+        );
+    }
+
+    #[test]
+    fn claude_never_smuggles_a_provider_or_effort_into_its_slash_command() {
+        // Claude has no provider concept and its effort is a LAUNCH flag. Appending either
+        // would hand its slash parser flags it rejects, and a rejected slash command is
+        // pasted into the composer as literal text -- which reads as "nothing happened".
+        assert_eq!(
+            ClaudeAdapter
+                .model_switch_command("sonnet", Some("openrouter"), Some("high"))
+                .as_deref(),
+            Some("/model sonnet")
+        );
+    }
+
+    #[test]
+    fn an_agent_with_only_an_interactive_picker_reports_none() {
+        // OpenCode's `/models` opens a picker and takes no argument, so the caller must
+        // restart rather than paste a command that would sit in the composer as text.
+        assert!(OpenCodeAdapter
+            .model_switch_command("x", None, None)
+            .is_none());
+        assert!(AntigravityAdapter
+            .model_switch_command("x", None, None)
+            .is_none());
+        assert!(CodexAdapter.model_switch_command("x", None, None).is_none());
+        assert!(GeminiAdapter
+            .model_switch_command("x", None, None)
+            .is_none());
     }
 
     #[test]

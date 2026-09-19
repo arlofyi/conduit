@@ -164,6 +164,15 @@ export interface OpenRouterUsage {
   source: string;
 }
 
+/** What a live model switch actually did (mirrors the Rust `ModelSwitch`). */
+export interface ModelSwitch {
+  /** True when the agent's own command was sent, so the conversation continues. */
+  live: boolean;
+  command: string;
+  /** Why it was not live. Empty when it was. */
+  reason: string;
+}
+
 /** One entry in an agent profile section (mirrors the Rust `ProfileItem`). */
 export interface ProfileItem {
   name: string;
@@ -1413,6 +1422,15 @@ interface AppState {
   setSessionModel: (sessionId: string, model: string | null) => Promise<void>;
   /** Pin (or clear, with null) this session's reasoning effort. Applies at the next spawn. */
   setSessionEffort: (sessionId: string, effort: string | null) => Promise<void>;
+  /** Change a RUNNING session's model without losing its conversation, by driving the
+   *  agent's own in-session command. Falls back to "applies at next start" for agents that
+   *  have none — reported in the result rather than silently restarting. */
+  switchSessionModel: (
+    sessionId: string,
+    model: string,
+    provider?: string | null,
+    effort?: string | null,
+  ) => Promise<ModelSwitch>;
 
   // ---- Trust boundaries (Feature 4) ----
   /** Master switch for the trust-boundary regime. When false the whole thing is inert. */
@@ -1461,6 +1479,8 @@ interface AppState {
   /** What the selected session's agent knows: memory, skills, MCP. Keyed by session. */
   agentProfiles: Record<string, AgentProfile>;
   loadAgentProfile: (sessionId: string) => Promise<void>;
+  /** Rewrite one of the agent's memory documents. Returns an error string, or null. */
+  writeAgentMemory: (sessionId: string, file: string, body: string) => Promise<string | null>;
   /** Which agents hold an endpoint API key this run. Membership only — never a key. */
   providerKeys: AgentId[];
   loadProviderSettings: () => Promise<void>;
@@ -2047,6 +2067,27 @@ export const useStore = create<AppState>((set, get) => {
         })),
       }));
     },
+    switchSessionModel: async (sessionId, model, provider, effort) => {
+      try {
+        const res = await invoke<ModelSwitch>("switch_session_model", {
+          sessionId,
+          model,
+          provider: provider ?? null,
+          effort: effort ?? null,
+        });
+        set((s) => ({
+          projects: s.projects.map((p) => ({
+            ...p,
+            sessions: p.sessions.map((sess) =>
+              sess.id === sessionId ? { ...sess, model: model || null } : sess,
+            ),
+          })),
+        }));
+        return res;
+      } catch (e) {
+        return { live: false, command: "", reason: String(e) };
+      }
+    },
     setSessionEffort: async (sessionId, effort) => {
       await invoke("set_session_effort", { sessionId, effort }).catch(() => {});
       set((s) => ({
@@ -2130,6 +2171,15 @@ export const useStore = create<AppState>((set, get) => {
         const profile = await invoke<AgentProfile>("agent_profile", { sessionId });
         set((st) => ({ agentProfiles: { ...st.agentProfiles, [sessionId]: profile } }));
       } catch { /* keep the last good read */ }
+    },
+    writeAgentMemory: async (sessionId, file, body) => {
+      try {
+        await invoke("write_agent_memory", { sessionId, file, body });
+        await get().loadAgentProfile(sessionId);
+        return null;
+      } catch (e) {
+        return String(e);
+      }
     },
     loadOpenRouterUsage: async () => {
       try {

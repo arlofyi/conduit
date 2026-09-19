@@ -268,6 +268,45 @@ pub fn hermes_default_home() -> Option<PathBuf> {
     base.filter(|p| p.is_dir())
 }
 
+/// Rewrite one of an agent's memory documents.
+///
+/// **The filename is checked against `MEMORY_DOCS`, not sanitized.** An allowlist is the
+/// only safe shape here: the name arrives from the frontend, and any "clean the path"
+/// approach is a guess about what the OS will do with `..`, a symlink, an alternate data
+/// stream or a UNC prefix. Three known names, compared exactly, cannot be talked into
+/// writing somewhere else.
+///
+/// This is the one place Conduit WRITES a file the agent owns, and it is deliberate: the
+/// panel shows what the agent has inferred about you, and a wrong inference you cannot
+/// correct is worse than one you cannot see. A truncated preview is never written back --
+/// the caller must have loaded the whole document, which is why `MEMORY_PREVIEW_BYTES` is
+/// generous enough that truncation is rare and the UI refuses to save when it happened.
+#[tauri::command]
+pub async fn write_agent_memory(
+    session_id: String,
+    file: String,
+    body: String,
+    store: tauri::State<'_, std::sync::Arc<crate::store::Store>>,
+) -> Result<(), String> {
+    if !MEMORY_DOCS.iter().any(|(name, _)| *name == file) {
+        return Err(format!("{file} is not an editable memory document"));
+    }
+    if store.session_agent(&session_id) != AgentId::Hermes {
+        return Err("this agent has no editable memory".into());
+    }
+    let account_dir = store.session_account_config_dir(&session_id);
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = account_dir
+            .as_deref()
+            .and_then(crate::agent::hermes_home_dir)
+            .or_else(hermes_default_home)
+            .ok_or("no Hermes home to write to")?;
+        std::fs::write(home.join(&file), body).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("write task failed: {e}"))?
+}
+
 /// Everything Conduit can read about what one session's agent knows.
 #[tauri::command]
 pub async fn agent_profile(

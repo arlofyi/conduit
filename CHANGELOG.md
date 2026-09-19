@@ -3,6 +3,29 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.40.0 — 2026-09-19
+
+- **Added — Change a session's model without losing the conversation.** Switching model is
+  a decision you make *during* a task — this part is mechanical, drop to something cheap;
+  this part is hard, go back up — so it no longer restarts the session. Conduit sends the
+  agent's own in-session command, which keeps the context by definition. Claude, Hermes and
+  Command Code switch live; OpenCode's model picker cannot be driven from a command, so it
+  still needs a restart and now says so instead of pretending.
+- **Added — One-click model switching.** The Model tab offers the endpoint's best
+  tool-capable models as buttons, so a mid-task change is a click rather than typing a
+  40-character id out of several hundred.
+- **Added — Start sessions with chosen conditions from the command line.**
+  `conduit . --agent hermes --provider openrouter --model x-ai/grok-4 --effort high` — so an
+  agent can launch other sessions under conditions it picked. A Hermes session running on a
+  local model can start workers on OpenRouter, or on Claude, without you configuring
+  anything in between. An unknown agent name is refused rather than quietly starting Claude.
+- **Added — Edit what the agent remembers.** The Agent tab's memory documents are now
+  editable, not just readable — including what the agent has worked out about you, which is
+  the one you actually want to correct. A document too large to show in full refuses to save
+  rather than risk truncating it.
+- **Added — Manage links.** The Agent tab points at the editor that already owns each thing
+  (MCP servers → Settings), rather than growing a second editor that could disagree with it.
+
 ## 0.39.0 — 2026-09-19
 
 - **Added — OpenRouter spend in the usage bar.** Sessions routed at OpenRouter now report

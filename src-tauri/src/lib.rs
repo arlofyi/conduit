@@ -1424,6 +1424,91 @@ fn set_session_effort(session_id: String, effort: Option<String>, store: State<A
     store.set_session_effort(&session_id, effort);
 }
 
+/// What `switch_session_model` did, so the UI can say so honestly rather than claiming a
+/// live switch it did not perform.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSwitch {
+    /// True when the agent's own in-session command was sent, so the conversation continues.
+    pub live: bool,
+    /// The command sent, for the UI to echo. Empty when nothing was sent.
+    pub command: String,
+    /// Why it could not be live. Empty when it was.
+    pub reason: String,
+}
+
+/// Change a running session's model WITHOUT losing its conversation.
+///
+/// The model, endpoint and credentials are read once at process start, so Conduit cannot
+/// push a change into a live agent. But every mature TUI here already solves that for
+/// itself -- `/model` -- and driving the agent's own command preserves context by
+/// construction instead of by us trying to reproduce it. Restarting is the FALLBACK, and a
+/// poor one for this purpose: it is exactly the thing a mid-task "drop to a cheap model"
+/// must not do.
+///
+/// The choice is persisted either way, so a later restart (or a reap) comes back on the
+/// model the user picked rather than reverting to the one it launched with.
+///
+/// `live: false` is returned rather than silently restarting: tearing down a running agent
+/// is the caller's decision to make, not a side effect of asking to change model.
+#[tauri::command]
+fn switch_session_model(
+    session_id: String,
+    model: String,
+    provider: Option<String>,
+    effort: Option<String>,
+    store: State<Arc<Store>>,
+    pty: State<Arc<PtyManager>>,
+) -> ModelSwitch {
+    let model = model.trim().to_string();
+    // Persist first: whatever happens to the live process, the next spawn must agree with
+    // what the user just chose.
+    store.set_session_model(&session_id, (!model.is_empty()).then(|| model.clone()));
+    if let Some(e) = effort.as_deref() {
+        store.set_session_effort(&session_id, (!e.trim().is_empty()).then(|| e.to_string()));
+    }
+    if model.is_empty() {
+        return ModelSwitch {
+            live: false,
+            command: String::new(),
+            reason: "Cleared — the agent's default applies at the next start.".into(),
+        };
+    }
+    let agent = store.session_agent(&session_id);
+    let Some(cmd) = crate::agent::adapter_for(agent).model_switch_command(
+        &model,
+        provider.as_deref(),
+        effort.as_deref(),
+    ) else {
+        return ModelSwitch {
+            live: false,
+            command: String::new(),
+            reason: "This agent has no in-session model command; restart to apply.".into(),
+        };
+    };
+    // A session with no live PTY has nothing to send to -- and that is not an error: the
+    // stored pin is all a stopped session needs.
+    if !pty.has(&session_id) {
+        return ModelSwitch {
+            live: false,
+            command: cmd,
+            reason: "Not running — applies when the session starts.".into(),
+        };
+    }
+    match pty.write(&session_id, &crate::pty::paste_and_submit(&cmd)) {
+        Ok(()) => ModelSwitch {
+            live: true,
+            command: cmd,
+            reason: String::new(),
+        },
+        Err(e) => ModelSwitch {
+            live: false,
+            command: cmd,
+            reason: e,
+        },
+    }
+}
+
 // ---- Trust boundaries (Feature 4: multi-agent silo / controlled sharing) ------
 
 #[tauri::command]
@@ -2487,6 +2572,7 @@ pub fn run() {
             set_session_account,
             set_session_model,
             set_session_effort,
+            switch_session_model,
             get_trust_settings,
             set_trust_settings,
             set_session_trust,
@@ -2504,6 +2590,7 @@ pub fn run() {
             provider_keys_set,
             openrouter_usage::openrouter_usage,
             agent_profile::agent_profile,
+            agent_profile::write_agent_memory,
             local_llm::detect_local_providers,
             local_llm::list_local_models,
             local_llm::probe_tool_call,

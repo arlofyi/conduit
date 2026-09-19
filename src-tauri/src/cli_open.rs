@@ -28,12 +28,35 @@ pub const TOKEN_HEADER: &str = "x-conduit-token";
 /// the hook loop's 1 MB cap, tighter because an open request is a path and a word.
 const MAX_BODY: u64 = 64 * 1024;
 
-/// One `conduit <path> [--agent <id>]` invocation.
+/// One `conduit <path> [--agent <id>] [--provider <p>] [--model <m>] [--effort <e>]`
+/// invocation.
+///
+/// The three extra fields are what let ONE agent start another under conditions it chose:
+/// a Hermes session running on a local model can launch a worker on OpenRouter, or on
+/// Claude, without the human configuring anything first. They are all
+/// `#[serde(default)]` so a shim from an older install -- which sends only `path` and
+/// `agent` -- still parses; that back-compat is why they are optional rather than a new
+/// required shape.
+///
+/// They are NOT validated here. `parse_open` is the security boundary (token, origin,
+/// body size) and stays exactly that; whether "gpt-9" is a real model is a question only
+/// the agent can answer, and the frontend re-checks the agent id against `AGENTS` before
+/// spawning anything -- the same rule `dispatch_work` follows, for the same reason: a
+/// model-invented id must never render as a promise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenRequest {
     pub path: String,
     #[serde(default)]
     pub agent: Option<String>,
+    /// Endpoint preset for the new session's agent ("openrouter", "ollama", ...).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Exact model id, in the agent's own spelling.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Reasoning effort, for agents that take one.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,9 +201,39 @@ mod tests {
             got,
             OpenRequest {
                 path: "/tmp/p".into(),
-                agent: Some("claude".into())
+                agent: Some("claude".into()),
+                provider: None,
+                model: None,
+                effort: None,
             }
         );
+    }
+
+    #[test]
+    fn spawn_conditions_ride_along_so_one_agent_can_launch_another() {
+        // The point of these three: a Hermes session on a local model launching a worker
+        // on OpenRouter, without a human configuring anything in between.
+        let h = hdrs(&[("X-Conduit-Token", TOK)]);
+        let got = parse_open(
+            &h,
+            r#"{"path":"/tmp/p","agent":"hermes","provider":"openrouter","model":"x-ai/grok-4","effort":"high"}"#,
+            TOK,
+        )
+        .unwrap();
+        assert_eq!(got.provider.as_deref(), Some("openrouter"));
+        assert_eq!(got.model.as_deref(), Some("x-ai/grok-4"));
+        assert_eq!(got.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_shim_that_predates_the_new_fields_still_parses() {
+        // The installed shim is generated, and an older one sends only path+agent. If that
+        // stopped parsing, every `conduit .` from a stale shim would 400.
+        let h = hdrs(&[("X-Conduit-Token", TOK)]);
+        let got = parse_open(&h, r#"{"path":"/tmp/p","agent":"claude"}"#, TOK).unwrap();
+        assert_eq!(got.provider, None);
+        assert_eq!(got.model, None);
+        assert_eq!(got.effort, None);
     }
 
     #[test]

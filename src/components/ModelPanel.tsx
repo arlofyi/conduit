@@ -32,7 +32,7 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
   const agentProviders = useStore((s) => s.agentProviders);
   const endpointModels = useStore((s) => s.endpointModels);
   const loadProviderSettings = useStore((s) => s.loadProviderSettings);
-  const setSessionModel = useStore((s) => s.setSessionModel);
+  const switchSessionModel = useStore((s) => s.switchSessionModel);
   const setSessionEffort = useStore((s) => s.setSessionEffort);
   const setSessionAccount = useStore((s) => s.setSessionAccount);
   const setSettingsTab = useStore((s) => s.setSettingsTab);
@@ -115,6 +115,35 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
   };
   restartRef.current = restart;
 
+  /**
+   * Change the model on a RUNNING session without losing its conversation.
+   *
+   * Sends the agent's own `/model` command rather than restarting, which is the whole
+   * point: switching model is a TASK decision ("this bit is mechanical, drop to something
+   * cheap"), and a restart would throw away the very context that made the decision.
+   * Agents with no such command report it and fall back to the next start — said out loud
+   * rather than silently restarting behind the user's back.
+   */
+  const applyModel = async (raw: string) => {
+    const v = raw.trim();
+    if (v === (session.model ?? "")) return;
+    setDone(null);
+    const res = await switchSessionModel(
+      session.id,
+      v,
+      routed ? endpoint.preset : null,
+      session.effort ?? null,
+    );
+    if (res.live) {
+      setDone(`Switched to ${v} — conversation kept.`);
+      setNeedsRestart(false);
+    } else {
+      setDone(res.reason);
+      // Only an agent that CANNOT switch live needs the restart path.
+      setNeedsRestart(!!v && !res.command);
+    }
+  };
+
   const openEndpoints = () => {
     setSettingsTab("endpoints");
     setShowSettings(true);
@@ -175,12 +204,10 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
               value={modelDraft}
               placeholder={routed ? endpoint.model || "endpoint default" : `${meta.label}'s default`}
               onChange={(e) => setModelDraft(e.target.value)}
-              onBlur={() => {
-                const v = modelDraft.trim();
-                if (v === (session.model ?? "")) return;
-                void setSessionModel(session.id, v || null);
-                setNeedsRestart(true);
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void applyModel(modelDraft);
               }}
+              onBlur={() => void applyModel(modelDraft)}
               list={`mp-models-${agent}`}
             />
             <datalist id={`mp-models-${agent}`}>
@@ -200,6 +227,29 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
             {meta.supportsEndpoint ? " its endpoint" : " the agent itself"}.
           </p>
         )}
+
+        {/* One-click switching. A task-driven change ("this part is mechanical") should
+            not require typing a 40-character model id from a 447-entry catalogue. */}
+        {meta.supportsModelFlags && (endpointModels[agent] ?? []).length > 0 ? (
+          <div className="mp-quick">
+            {(endpointModels[agent] ?? [])
+              .filter((m) => m.tools !== false)
+              .slice(0, 6)
+              .map((m) => (
+                <button
+                  key={m.id}
+                  className={`mp-chip${m.id === effectiveModel ? " active" : ""}`}
+                  title={`${m.detail}${m.context ? ` · ${fmtCtx(m.context)}` : ""}`}
+                  onClick={() => {
+                    setModelDraft(m.id);
+                    void applyModel(m.id);
+                  }}
+                >
+                  {m.id.split("/").pop()}
+                </button>
+              ))}
+          </div>
+        ) : null}
 
         {meta.effortLevels?.length ? (
           <label className="mp-row">

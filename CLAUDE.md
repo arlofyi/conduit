@@ -784,6 +784,49 @@ burned". OpenRouter is prepaid credit, and that difference is structural, not co
   a truthy test hides a newly added meter from exactly the people already using the app,
   who never learn there is a switch to turn on.
 
+## Where live model switching lives
+
+`ProviderAdapter::model_switch_command` + `lib.rs`'s `switch_session_model`.
+
+- **A restart is the FALLBACK, not the mechanism.** Model, endpoint and credentials are read
+  once at process start, so Conduit cannot push a change into a running agent -- but every
+  mature TUI here already solves that for itself with a slash command, and driving the
+  agent's OWN command preserves the conversation by construction. Restarting applies the
+  same model and throws away the context that motivated the change, which is exactly wrong
+  for a task-driven "drop to a cheap model".
+- **Returning `None` is a real answer.** OpenCode's `/models` opens an interactive picker
+  and takes no argument, so its adapter reports None and the caller restarts. Do NOT invent
+  a command: an unrecognized slash command is pasted into the composer as literal text and
+  sits there, which reads to the user as "nothing happened".
+- Claude gets `/model <name>` ONLY -- no provider (it has none) and no effort (a launch
+  flag). Appending either hands its slash parser flags it rejects. Hermes takes all three in
+  one command (`/model <m> --provider <p> --reasoning <e>`), session-scoped by default;
+  `--global` is deliberately never sent, because a task-driven switch must not rewrite the
+  user's `config.yaml` default.
+- The choice is PERSISTED before it is sent, so a later restart or a `session_budget` reap
+  comes back on the model the user picked rather than the one the session launched with.
+- Known gap: Hermes' `/model --provider` only reaches providers already in its config, and
+  Conduit writes ONE endpoint per agent into the overlay. Switching local<->OpenRouter
+  mid-session needs every configured endpoint written there, which needs a multi-endpoint
+  `ProviderSettings`.
+
+## Where spawn conditions live
+
+`OpenRequest` gained `provider`/`model`/`effort` (`cli_open.rs`), carried by both shims, so
+ONE agent can launch another under conditions it chose -- a Hermes session on a local model
+starting a worker on OpenRouter.
+
+- All three are `#[serde(default)]`: the shim is GENERATED and an older installed one sends
+  only `path`+`agent`. Without that, every `conduit .` from a stale shim would 400. A test
+  pins it.
+- `parse_open` stays purely the security boundary (token, origin, body size) and does NOT
+  validate them -- whether "gpt-9" is a real model is a question only the agent can answer.
+  The FRONTEND re-checks the agent id against `AGENTS` before spawning, the same rule
+  `decisionRoute` follows: `AgentId`'s lenient deserialize would otherwise spawn Claude
+  under an invented name.
+- The model rides in `addSession` rather than being set afterwards, so the session is
+  created WITH it instead of being corrected after its terminal has already spawned.
+
 ## Where the agent profile panel lives
 
 `agent_profile.rs` + `AgentPanel.tsx` -- the Agent tab. The Model tab answers "what is this
