@@ -21,6 +21,7 @@ mod context_window;
 mod continuity;
 mod continuity_feed;
 mod continuity_read;
+mod conversation_repair;
 mod fleet;
 mod fleet_mcp;
 mod format;
@@ -34,6 +35,7 @@ mod local_llm;
 mod menu;
 mod notify;
 mod plugins;
+mod project_new;
 mod proposals;
 mod pty;
 mod root_chat;
@@ -478,9 +480,9 @@ fn pty_spawn(
     };
 
     // Resume token: the agent's own captured conversation id. agy resumes via
-    // `--conversation=<id>` and Command Code via `--session <id>`; Claude ignores it (it
-    // keys off session_id, which Conduit gets to pin itself). None for shell-only
-    // companions and for a session we haven't captured an id for yet.
+    // `--conversation=<id>` and Command Code via `--session <id>`; Claude resumes it in
+    // place of its pinned session id once a `/clear` (or similar) has moved it on. None for
+    // shell-only companions and for a session we haven't captured an id for yet.
     let resume_token = (!shell_only)
         .then(|| store.session_agent_conversation_id(&session_id))
         .flatten();
@@ -615,11 +617,8 @@ fn session_context(
     session_id: String,
     store: State<Arc<store::Store>>,
 ) -> Option<context_window::ContextUsage> {
-    let projects = match store.session_account_config_dir(&session_id) {
-        Some(cfg) if !cfg.is_empty() => std::path::PathBuf::from(cfg).join("projects"),
-        _ => pty::claude_projects_dir()?,
-    };
-    let path = pty::transcript_path(&session_id, &projects)?;
+    let projects = pty::session_projects_dir(&store, &session_id)?;
+    let path = pty::transcript_path(&store.claude_conversation_id(&session_id), &projects)?;
     context_window::for_transcript(&path)
 }
 
@@ -632,14 +631,10 @@ fn session_subagents(
     session_id: String,
     store: State<Arc<store::Store>>,
 ) -> Vec<subagents::Subagent> {
-    let projects = match store.session_account_config_dir(&session_id) {
-        Some(cfg) if !cfg.is_empty() => std::path::PathBuf::from(cfg).join("projects"),
-        _ => match pty::claude_projects_dir() {
-            Some(d) => d,
-            None => return Vec::new(),
-        },
+    let Some(projects) = pty::session_projects_dir(&store, &session_id) else {
+        return Vec::new();
     };
-    subagents::for_session(&projects, &session_id)
+    subagents::for_session(&projects, &store.claude_conversation_id(&session_id))
 }
 
 /// Search past conversations for a phrase.
@@ -666,7 +661,13 @@ fn search_transcripts(
     let mut seen = std::collections::HashSet::new();
     let mut hits = Vec::new();
     for root in roots {
-        for hit in transcript_index::search(&root, &query, limit) {
+        for mut hit in transcript_index::search(&root, &query, limit) {
+            // A hit is keyed by its transcript's filename, which is the CONVERSATION id. For
+            // a session that moved past a `/clear` that is not the session's own id, so map
+            // it back -- otherwise the palette cannot tie its latest conversation to its row.
+            if let Some(owner) = store.session_for_conversation(&hit.session_id) {
+                hit.session_id = owner;
+            }
             if seen.insert(hit.session_id.clone()) {
                 hits.push(hit);
             }
@@ -675,6 +676,48 @@ fn search_transcripts(
     hits.sort_by_key(|h| std::cmp::Reverse(h.updated_at));
     hits.truncate(limit);
     hits
+}
+
+/// Claude sessions whose tracked conversation has a newer successor on disk -- conversations
+/// a `/clear` moved them to before Conduit captured that. Read-only; `async` because it reads
+/// Claude's prompt history and the head of every transcript in the affected folders.
+#[tauri::command(async)]
+fn claude_conversation_drift(
+    store: State<Arc<store::Store>>,
+) -> Vec<conversation_repair::DriftCandidate> {
+    conversation_repair::scan(&store)
+}
+
+/// Point a Claude session at `conversation_id`, so its next launch resumes that conversation.
+///
+/// Validated here rather than trusted from the UI: the conversation must be on disk in the
+/// session's own transcript store, and no other session may already own it. The running
+/// agent is not touched; the caller restarts the session to pick the change up.
+#[tauri::command]
+fn adopt_claude_conversation(
+    session_id: String,
+    conversation_id: String,
+    store: State<Arc<store::Store>>,
+) -> Result<(), String> {
+    if !store.has_session(&session_id)
+        || store.session_agent(&session_id) != crate::agent::AgentId::Claude
+    {
+        return Err("not a Claude session".into());
+    }
+    let projects = pty::session_projects_dir(&store, &session_id)
+        .ok_or("no Claude transcript store for this session")?;
+    if !pty::transcript_exists(&conversation_id, &projects) {
+        return Err("that conversation is no longer on disk".into());
+    }
+    if store.claude_conversation_claimed_elsewhere(&conversation_id, &session_id) {
+        return Err("another session already owns that conversation".into());
+    }
+    if conversation_id == session_id {
+        store.clear_session_agent_conversation_id(&session_id);
+    } else {
+        store.set_session_agent_conversation_id(&session_id, &conversation_id);
+    }
+    Ok(())
 }
 
 /// Whether any session with a LIVE PTY is currently marked running. Cross-checks the fleet
@@ -1678,6 +1721,33 @@ fn git_discard_file(dir: String, path: String) -> Result<String, String> {
     git_mut::discard_file(&dir, &path)
 }
 
+// ---- New Project / Clone Repository --------------------------------------------
+
+#[tauri::command(async)]
+fn create_project_dir(parent: String, name: String, git_init: bool) -> Result<String, String> {
+    project_new::create_project(&parent, &name, git_init)
+}
+
+/// Long-running; `(async)` puts it on the blocking pool so the read loop never
+/// touches the main thread. Progress reaches the dialog as `clone-progress` events,
+/// throttled so a fast transfer doesn't flood the event bus.
+#[tauri::command(async)]
+fn clone_project_repo(
+    app: tauri::AppHandle,
+    url: String,
+    parent: String,
+    name: String,
+) -> Result<String, String> {
+    let mut last = None::<std::time::Instant>;
+    project_new::run_clone(&url, &parent, &name, &mut |line| {
+        let due = last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100));
+        if due {
+            last = Some(std::time::Instant::now());
+            let _ = app.emit("clone-progress", serde_json::json!({ "line": line }));
+        }
+    })
+}
+
 // ---- Format Document -----------------------------------------------------------
 
 #[tauri::command(async)]
@@ -2253,6 +2323,8 @@ pub fn run() {
             session_context,
             session_subagents,
             search_transcripts,
+            claude_conversation_drift,
+            adopt_claude_conversation,
             set_session_persistence,
             any_agent_running,
             load_projects,
@@ -2324,6 +2396,8 @@ pub fn run() {
             git_show_head,
             git_diff_hunks,
             git_discard_file,
+            create_project_dir,
+            clone_project_repo,
             list_project_files,
             search_content,
             format_content,

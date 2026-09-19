@@ -3,18 +3,30 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.37.0 — 2026-09-18
+
+- **Added — Create a project without leaving Conduit.** File → New Project… (⌘⇧N, also
+  in the command palette) prompts for a name and a location, creates the folder — git
+  repository initialized by default — and opens it as a project. The location field
+  remembers where you last created one.
+- **Added — Clone a repository.** File → Clone Repository… takes a URL (the folder name
+  fills in from it, editable), clones into your chosen location with live progress, and
+  adds the clone as a project. A failing clone shows git's own error in the dialog.
+
 ## 0.36.1 — 2026-09-15
 
-- **Fixed — Numeric tab switching works on Windows and Linux.** Jumping to a tab by
-  position was bound to Cmd+1..9 only, so off macOS there was no way to do it at all:
-  Ctrl+digit has to reach the terminal untouched (Ctrl+3 is ESC, which interrupts a
-  running agent) and the Windows key is reserved by the OS. Windows and Linux now use
-  Alt+1..9, matching VS Code. 9 still jumps to the last tab.
-- **Fixed — Save All and Toggle Word Wrap have keyboard shortcuts off macOS.** Both menu
-  items were mac-only, leaving them mouse-only everywhere else. Save All is now
-  Ctrl+Shift+S and Toggle Word Wrap is Alt+Z on Windows and Linux. Find and Replace stays
-  deliberately unbound there: its usual Ctrl+H is backspace in a terminal, and Monaco's
-  own editor-scoped Ctrl+H still works.
+- **Fixed — Messages sent to a session now submit themselves.** A message handed to a
+  running agent — by the Conductor's `fleet_send`, or by typing into the conversation
+  pane — arrived in the agent's prompt box but sat there unsent, waiting for someone to
+  press Enter. Short messages went through; anything long or multi-line did not.
+- **Fixed — No more notifications from agents Conduit didn't start.** A `claude` launched
+  from a terminal or another editor could reach Conduit's hook port and raise a Conduit
+  notification for its own turns, labelled with the generic name "Session". Conduit now
+  ignores events from sessions it doesn't own. Related: opening your home folder as a
+  project used to install Conduit's hooks into Claude Code's machine-wide settings, which
+  is how every agent on the machine ended up reporting in; Conduit refuses to install
+  there now. If you hit this, clear the leftover hooks from
+  `~/.claude/settings.local.json`.
 
 ## 0.36.0 — 2026-09-09
 
