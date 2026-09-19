@@ -5922,3 +5922,115 @@ input[type="number"]:focus {
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
 }
+
+/* ---- Endpoint editor: local vs cloud, and the model picker ------------------ */
+/* The group split is load-bearing, not decoration: a flat chip row gave no way to see
+   that OpenRouter sends every prompt off the machine while Ollama does not — and that
+   distinction is what `allowedForLocalOnly` enforces for a private-mode session. */
+.ep-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.ep-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+.ep-group-sub {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+.ep-scope {
+  font-size: 11px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+}
+.ep-scope.local {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 35%, transparent);
+  background: color-mix(in srgb, var(--green) 8%, transparent);
+}
+.ep-scope.cloud {
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 35%, transparent);
+  background: color-mix(in srgb, var(--amber) 8%, transparent);
+}
+.ep-keyhint {
+  margin-left: 82px;
+}
+.ep-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ep-filter {
+  flex: 1 1 auto;
+}
+.ep-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 210px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.ep-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-mid);
+  cursor: pointer;
+}
+.ep-item:last-child {
+  border-bottom: none;
+}
+.ep-item:hover {
+  background: var(--hover);
+}
+.ep-item.active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text-bright);
+}
+.ep-item-id {
+  font-family: var(--mono-font);
+  font-size: 11px;
+  color: var(--text-bright);
+}
+.ep-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.ep-badge {
+  padding: 1px 5px;
+  border-radius: 999px;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ep-badge.tools {
+  background: var(--tag-chip-bg);
+  color: var(--tag-chip-text);
+}
+/* An agent without tool calling is near-useless, so say so rather than just ranking it low. */
+.ep-badge.no {
+  background: color-mix(in srgb, var(--red) 18%, transparent);
+  color: var(--red);
+}

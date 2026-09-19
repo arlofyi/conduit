@@ -170,6 +170,59 @@ fn parse_ollama_tags(body: &str) -> Vec<LocalModel> {
 }
 
 /// OpenAI-compatible GET <base>/models → data[].id (vLLM/LM Studio/llama.cpp/OpenWebUI).
+/// Price per MILLION tokens, from OpenRouter's per-token decimal STRINGS ("0.000000075").
+///
+/// Strings, not numbers, because the values are far below what a JSON float round-trips
+/// exactly -- and they are what the catalogue actually sends. A free model reports "0",
+/// which must render as "free" rather than "$0.00/M"; an unparseable or absent price
+/// yields None and simply prints nothing, since a wrong price is worse than no price.
+fn price_per_million(v: Option<&serde_json::Value>) -> Option<f64> {
+    let raw = v?.as_str()?;
+    let per_token: f64 = raw.parse().ok()?;
+    (per_token.is_finite() && per_token >= 0.0).then_some(per_token * 1_000_000.0)
+}
+
+/// Human hint for one catalogue entry: the vendor's display name, then its price.
+fn openai_model_detail(m: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+        parts.push(name.to_string());
+    }
+    let pricing = m.get("pricing");
+    let inp = price_per_million(pricing.and_then(|p| p.get("prompt")));
+    let out = price_per_million(pricing.and_then(|p| p.get("completion")));
+    match (inp, out) {
+        (Some(i), Some(o)) if i == 0.0 && o == 0.0 => parts.push("free".into()),
+        (Some(i), Some(o)) => parts.push(format!("{}/M in · {}/M out", fmt_price(i), fmt_price(o))),
+        _ => {}
+    }
+    parts.join(" · ")
+}
+
+/// Format a per-million price. Three decimals below a dollar, two above.
+///
+/// Two decimals everywhere collapses the cheap end of the catalogue: $0.075 and $0.070
+/// both render "$0.07", and a large share of OpenRouter's models live under ten cents per
+/// million tokens -- which is exactly the range someone picking a bulk model is comparing.
+fn fmt_price(per_million: f64) -> String {
+    if per_million < 1.0 {
+        format!("${per_million:.3}")
+    } else {
+        format!("${per_million:.2}")
+    }
+}
+
+/// Parse an OpenAI-compatible `GET <base>/models` list.
+///
+/// One shape, three dialects. vLLM reports the window as `max_model_len`; OpenRouter (and
+/// other aggregators) call it `context_length`; a plain llama.cpp reports neither. Reading
+/// only vLLM's spelling made every one of OpenRouter's 400+ models show no context and no
+/// tool support, which is exactly the information the picker ranks on.
+///
+/// `tools` is derived from `supported_parameters`, OpenRouter's per-model capability list.
+/// Its ABSENCE stays `None` ("unknown"), never `Some(false)`: a server that does not publish
+/// the field has not said its models lack tools, and `pickable` treats an explicit false as
+/// disqualifying.
 fn parse_openai_models(body: &str) -> Vec<LocalModel> {
     let v: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -183,9 +236,15 @@ fn parse_openai_models(body: &str) -> Vec<LocalModel> {
         .filter_map(|m| {
             Some(LocalModel {
                 id: m.get("id")?.as_str()?.to_string(),
-                context: m.get("max_model_len").and_then(|c| c.as_u64()), // vLLM reports this
-                detail: String::new(),
-                tools: None, // the OpenAI list shape doesn't carry capabilities
+                context: m
+                    .get("max_model_len") // vLLM
+                    .or_else(|| m.get("context_length")) // OpenRouter & friends
+                    .and_then(|c| c.as_u64()),
+                detail: openai_model_detail(m),
+                tools: m
+                    .get("supported_parameters")
+                    .and_then(|p| p.as_array())
+                    .map(|p| p.iter().any(|x| x.as_str() == Some("tools"))),
             })
         })
         .collect()
@@ -373,19 +432,36 @@ pub async fn detect_local_providers() -> Vec<LocalProviderStatus> {
 /// other URL a (potentially compromised) frontend might pass, or these commands become
 /// an oracle that exfiltrates the key to an arbitrary host.
 ///
-/// Now that endpoints are per agent, this searches every configured one and answers with
-/// the key belonging to the agent whose endpoint MATCHES. The anti-oracle property is
-/// unchanged — an unrecognized URL still gets nothing — but the match is no longer
-/// hard-coded to OpenCode's slot, which would have silently sent no key at all once a
-/// second agent had an endpoint of its own.
-fn key_for_endpoint(store: &crate::store::Store, requested_base_url: &str) -> Option<String> {
+/// `agent` names whose endpoint the caller means. It is checked FIRST and is not an
+/// optimization: two agents may legitimately sit behind the SAME base URL (OpenRouter on
+/// both OpenCode and Hermes) with different keys, and a URL-only match would then return
+/// whichever entry the hash map happened to yield — nondeterministically the wrong key,
+/// which reads as an invalid-credentials error the user cannot explain.
+///
+/// The URL scan remains as a fallback for a caller that names no agent. In both paths the
+/// anti-oracle property is the same: a URL matching no CONFIGURED endpoint gets nothing.
+fn key_for_endpoint(
+    store: &crate::store::Store,
+    agent: Option<crate::agent::AgentId>,
+    requested_base_url: &str,
+) -> Option<String> {
     let norm = |s: &str| s.trim().trim_end_matches('/').to_ascii_lowercase();
     let want = norm(requested_base_url);
+    let matches = |s: &crate::store::ProviderSettings| {
+        !s.base_url.trim().is_empty() && norm(&s.base_url) == want
+    };
+    if let Some(a) = agent {
+        // Only when THAT agent's own endpoint is the one being asked about.
+        if matches(&store.provider_settings(a)) {
+            return store.provider_key(a);
+        }
+        return None;
+    }
     store
         .all_provider_settings()
         .into_iter()
-        .find(|(_, s)| !s.base_url.trim().is_empty() && norm(&s.base_url) == want)
-        .and_then(|(agent, _)| store.provider_key(agent))
+        .find(|(_, s)| matches(s))
+        .and_then(|(a, _)| store.provider_key(a))
 }
 
 /// List the models a local server offers, for the Settings model picker. Ollama is asked
@@ -395,9 +471,12 @@ fn key_for_endpoint(store: &crate::store::Store, requested_base_url: &str) -> Op
 pub async fn list_local_models(
     base_url: String,
     preset: String,
+    // Whose endpoint this is. Decides which agent's key is attached; see
+    // `key_for_endpoint` for why a URL alone is not enough.
+    agent: Option<crate::agent::AgentId>,
     store: tauri::State<'_, std::sync::Arc<crate::store::Store>>,
 ) -> Result<Vec<LocalModel>, String> {
-    let api_key = key_for_endpoint(&store, &base_url);
+    let api_key = key_for_endpoint(&store, agent, &base_url);
     tauri::async_runtime::spawn_blocking(move || {
         let base = base_url.trim().trim_end_matches('/').to_string();
         if !base.starts_with("http://") && !base.starts_with("https://") {
@@ -429,9 +508,12 @@ pub async fn list_local_models(
 pub async fn probe_tool_call(
     base_url: String,
     model: String,
+    // Whose endpoint this is; see `key_for_endpoint`. `None` keeps the pre-existing
+    // URL-match behaviour for callers that do not name one.
+    agent: Option<crate::agent::AgentId>,
     store: tauri::State<'_, std::sync::Arc<crate::store::Store>>,
 ) -> Result<ToolProbeResult, String> {
-    let api_key = key_for_endpoint(&store, &base_url);
+    let api_key = key_for_endpoint(&store, agent, &base_url);
     tauri::async_runtime::spawn_blocking(move || {
         let base = base_url.trim().trim_end_matches('/');
         if !base.starts_with("http://") && !base.starts_with("https://") {
@@ -451,6 +533,79 @@ pub async fn probe_tool_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verbatim shape of one OpenRouter catalogue entry (fields this parser reads), taken
+    /// from a real `GET https://openrouter.ai/api/v1/models` response.
+    const OPENROUTER_ENTRY: &str = r#"{"data":[{
+        "id":"prism-ml/ternary-bonsai-2-27b",
+        "name":"PrismML: Ternary Bonsai 2 27B",
+        "context_length":262144,
+        "supported_parameters":["temperature","tool_choice","tools","top_p"],
+        "pricing":{"prompt":"0.000000075","completion":"0.0000005"}
+    }]}"#;
+
+    #[test]
+    fn openrouter_context_and_tools_are_read_not_dropped() {
+        // Reading only vLLM's `max_model_len` left all 400+ OpenRouter models with no
+        // context and no tool flag -- exactly what the picker ranks on.
+        let ms = parse_openai_models(OPENROUTER_ENTRY);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].id, "prism-ml/ternary-bonsai-2-27b");
+        assert_eq!(ms[0].context, Some(262144));
+        assert_eq!(ms[0].tools, Some(true));
+        assert!(ms[0].detail.contains("PrismML"), "{}", ms[0].detail);
+        // Per-token strings become per-million dollars.
+        assert!(ms[0].detail.contains("$0.075/M in"), "{}", ms[0].detail);
+        assert!(ms[0].detail.contains("$0.500/M out"), "{}", ms[0].detail);
+    }
+
+    #[test]
+    fn vllms_own_spelling_still_works() {
+        let ms = parse_openai_models(r#"{"data":[{"id":"q","max_model_len":32768}]}"#);
+        assert_eq!(ms[0].context, Some(32768));
+    }
+
+    #[test]
+    fn an_unpublished_capability_list_stays_unknown_not_false() {
+        // `pickable` treats an explicit false as disqualifying, so a server that simply
+        // does not publish the field must not have its models ruled out.
+        let ms = parse_openai_models(r#"{"data":[{"id":"q"}]}"#);
+        assert_eq!(ms[0].tools, None);
+        assert_eq!(ms[0].context, None);
+        assert!(ms[0].detail.is_empty());
+    }
+
+    #[test]
+    fn a_model_without_tools_is_marked_false() {
+        let ms =
+            parse_openai_models(r#"{"data":[{"id":"q","supported_parameters":["temperature"]}]}"#);
+        assert_eq!(ms[0].tools, Some(false));
+    }
+
+    #[test]
+    fn cheap_models_keep_three_decimals_so_they_stay_distinguishable() {
+        // At two decimals a large share of the catalogue collapses to "$0.07".
+        assert_eq!(fmt_price(0.075), "$0.075");
+        assert_eq!(fmt_price(0.07), "$0.070");
+        assert_eq!(fmt_price(3.0), "$3.00");
+        assert_eq!(fmt_price(15.5), "$15.50");
+    }
+
+    #[test]
+    fn a_free_model_says_free_rather_than_zero_dollars() {
+        let ms = parse_openai_models(
+            r#"{"data":[{"id":"q","pricing":{"prompt":"0","completion":"0"}}]}"#,
+        );
+        assert_eq!(ms[0].detail, "free");
+    }
+
+    #[test]
+    fn an_unparseable_price_prints_nothing_rather_than_a_wrong_one() {
+        let ms = parse_openai_models(
+            r#"{"data":[{"id":"q","name":"Q","pricing":{"prompt":"n/a","completion":"n/a"}}]}"#,
+        );
+        assert_eq!(ms[0].detail, "Q");
+    }
 
     #[test]
     fn parses_ollama_tags_with_context_and_details() {

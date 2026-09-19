@@ -1394,9 +1394,18 @@ interface AppState {
   setOpenCodeKey: (key: string) => Promise<void>;
   detectLocalProviders: () => Promise<LocalProviderStatus[]>;
   /** Models the server at baseUrl offers; a string is the error message. */
-  listLocalModels: (baseUrl: string, preset: string) => Promise<LocalModel[] | string>;
+  listLocalModels: (
+    baseUrl: string,
+    preset: string,
+    /** Whose endpoint this is — decides which agent's key is attached. */
+    agent?: AgentId,
+  ) => Promise<LocalModel[] | string>;
   /** Live-test native tool calling on the served model; a string is the error message. */
-  probeToolCall: (baseUrl: string, model: string) => Promise<ToolProbeResult | string>;
+  probeToolCall: (
+    baseUrl: string,
+    model: string,
+    agent?: AgentId,
+  ) => Promise<ToolProbeResult | string>;
 
   // ---- Per-agent endpoints ----
   /** Every agent's endpoint settings. Absent = that agent has none configured. */
@@ -2102,16 +2111,16 @@ export const useStore = create<AppState>((set, get) => {
         return [];
       }
     },
-    listLocalModels: async (baseUrl, preset) => {
+    listLocalModels: async (baseUrl, preset, agent) => {
       try {
-        return await invoke<LocalModel[]>("list_local_models", { baseUrl, preset });
+        return await invoke<LocalModel[]>("list_local_models", { baseUrl, preset, agent: agent ?? null });
       } catch (e) {
         return String(e);
       }
     },
-    probeToolCall: async (baseUrl, model) => {
+    probeToolCall: async (baseUrl, model, agent) => {
       try {
-        return await invoke<ToolProbeResult>("probe_tool_call", { baseUrl, model });
+        return await invoke<ToolProbeResult>("probe_tool_call", { baseUrl, model, agent: agent ?? null });
       } catch (e) {
         return String(e);
       }

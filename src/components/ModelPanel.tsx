@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { useStore } from "../store";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useStore, liveState } from "../store";
 import { agentMeta, type AgentId } from "../agents";
 import { AgentGlyph } from "./AgentGlyph";
 import { Dropdown } from "./Dropdown";
@@ -29,6 +29,7 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
   const setSessionAccount = useStore((s) => s.setSessionAccount);
   const stopSession = useStore((s) => s.stopSession);
   const startSession = useStore((s) => s.startSession);
+  const live = useStore((s) => s.live);
 
   const found = useMemo(() => {
     for (const p of projects) {
@@ -56,6 +57,23 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
     setDone(null);
   }, [sessionId, session?.model]);
 
+  // Agents read their model, endpoint and credentials ONCE, at process start: Hermes and
+  // OpenCode both resolve them before the first prompt, so there is no live channel to push
+  // a change down. "Apply without restarting" therefore has to mean Conduit does the
+  // restart FOR you, not that the running process changes its mind.
+  //
+  // It is gated on the session being idle. Restarting an agent mid-turn throws away the
+  // work in flight, which is a far worse surprise than a button — so a busy session keeps
+  // the explicit button and applies the moment it goes quiet.
+  const status = liveState(live, sessionId ?? "").status;
+  const busyAgent = status === "running" || status === "needsInput";
+  const restartRef = useRef<() => Promise<void>>(async () => {});
+  useEffect(() => {
+    if (!needsRestart || busyAgent || busy) return;
+    const t = setTimeout(() => void restartRef.current(), 400);
+    return () => clearTimeout(t);
+  }, [needsRestart, busyAgent, busy]);
+
   if (!sessionId || !session) {
     return (
       <p className="placeholder" style={{ padding: 12 }}>
@@ -75,11 +93,13 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
       await stopSession(pid, session.id);
       await startSession(pid, session.id);
       setNeedsRestart(false);
-      setDone("Restarted on the new settings.");
+      setDone("Applied.");
     } finally {
       setBusy(false);
     }
   };
+
+  restartRef.current = restart;
 
   return (
     <div className="model-panel">
@@ -95,7 +115,7 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
       <div className="mp-section">
         <div className="mp-section-head">
           This session
-          <span className="mp-scope">applies at next start</span>
+          <span className="mp-scope">applied automatically</span>
         </div>
 
         {meta.supportsModelFlags ? (
@@ -185,9 +205,15 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
 
       {needsRestart ? (
         <div className="mp-restart">
-          <span>These settings apply when the session next starts.</span>
+          <span>
+            {busy
+              ? "Applying…"
+              : busyAgent
+                ? "This agent is mid-turn — these settings apply as soon as it finishes, or restart now to apply immediately."
+                : "Applying…"}
+          </span>
           <button className="mp-btn" onClick={() => void restart()} disabled={busy}>
-            {busy ? "Restarting…" : "Restart now"}
+            {busy ? "Applying…" : "Restart now"}
           </button>
         </div>
       ) : null}

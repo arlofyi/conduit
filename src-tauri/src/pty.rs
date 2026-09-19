@@ -503,8 +503,10 @@ impl PtyManager {
             // variable and never in the file.
             if let Some(h) = &hermes {
                 cmd.env(crate::hermes::MANAGED_DIR_ENV, &h.managed_dir);
-                if let Some(key) = &h.api_key {
-                    cmd.env(crate::hermes::API_KEY_ENV, key);
+                // The PROVIDER's own variable name, not a Conduit-private one -- Hermes'
+                // credential resolver only reads the canonical names. See `hermes::key_env_var`.
+                if let Some((var, key)) = &h.api_key {
+                    cmd.env(var, key);
                 }
             }
             // Select the pinned account (Feature 1/2) without disturbing the user's default

@@ -3,6 +3,30 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.38.1 — 2026-09-19
+
+- **Fixed — OpenRouter and local endpoints now actually connect.** A session pointed at an
+  endpoint still opened its agent's "no inference provider is configured" wizard: the API
+  key was passed in a way the agent's credential resolver never reads, so it saw no key at
+  all. The key is now handed over in the variable each provider actually expects.
+- **Fixed — Hermes sessions failed to start** with "uv trampoline failed to spawn Python
+  child process" on machines where Windows stops following directory junctions.
+- **Added — Pick a model instead of typing one.** Entering an endpoint's API key now loads
+  its catalogue straight away and offers a filterable list showing each model's context
+  window, price per million tokens, and whether it supports tool calling — sorted so
+  tool-capable models come first. Previously all of OpenRouter's 400+ models showed none of
+  that, because only one server's spelling of "context window" was understood.
+- **Added — Settings changes apply themselves.** Changing a session's model, reasoning,
+  account or endpoint no longer needs a manual restart: an idle session restarts itself on
+  the new settings, and a session that is mid-turn waits until it finishes rather than
+  throwing away work in flight.
+- **Changed — Local and cloud endpoints are told apart.** The endpoint picker now groups
+  servers running on your machine separately from cloud providers, names which kind the
+  selected one is, and says where to get an API key. "Use only this endpoint" now spells out
+  that it does not keep a cloud provider's traffic local.
+- **Fixed — The right API key is used when two agents share an endpoint.** Keys were matched
+  by URL alone, so putting OpenRouter on two agents could attach the wrong one.
+
 ## 0.38.0 — 2026-09-19
 
 - **Added — Hermes Agent.** Nous Research's Hermes joins Claude, Codex, Gemini, OpenCode,

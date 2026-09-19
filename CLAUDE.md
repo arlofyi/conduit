@@ -680,6 +680,20 @@ installed CLI (`hermes --help`, `hermes chat --help`) and its own source, not fr
   forms are both wrong here -- no `${VAR}`, no redirection, no `|| true`. It is bare argv,
   and the session id is BAKED IN rather than read from the env. Consequence: no equivalent
   of Claude's endpoint-file layer that re-reads the live port at hook time.
+- **The API key MUST ride the provider's OWN env var**, never a Conduit-private one.
+  `hermes::key_env_var` maps preset -> `OPENROUTER_API_KEY` / `LM_API_KEY` /
+  `OPENAI_API_KEY`. The first cut wrote `api_key: "${CONDUIT_HERMES_APIKEY}"` into the
+  overlay, trusting its documented `${VAR}` expansion. The overlay IS applied (provider and
+  base URL resolve from it), but Hermes' credential resolver never reads `model.api_key`
+  from process env, so `resolve_runtime_provider` returned `api_key: ''` and the interactive
+  startup gate offered its "no inference provider is configured" wizard over a fully
+  configured endpoint. Measured: `CONDUIT_HERMES_APIKEY` -> `READY: False`,
+  `OPENROUTER_API_KEY` -> `READY: True`. Do NOT set `OPENAI_BASE_URL` alongside it --
+  `hermes_cli/main.py` reclassifies a resolved `openrouter` as `custom` when it is present.
+- **A key is handed over ONLY when an endpoint is configured.** Hermes INGESTS an env key
+  into its credential pool (`auth.json`), so a key passed to a session with no endpoint
+  would register a credential for a provider the user never picked. It stores a
+  `secret_fingerprint` + `source: env:<VAR>`, never the secret itself.
 - **`pre_approval_request` is what buys the `needsInput` badge** Command Code never got:
   its payload carries no `notification_type`, and `status_rules::notification_status` reads
   an absent type as the legacy `needsInput`. `post_approval_response` -> `pretool` clears it.
@@ -722,6 +736,19 @@ as it serves Ollama.
 - The same rules exist in TypeScript in `src/providers.ts` -- standalone because `store.ts`
   cannot be imported under the node-env vitest, re-exported from the store so call sites
   keep one import path. `providers.test.ts` pins them. They must not fork from Rust's.
+- **An agent reads its endpoint ONCE, at process start**, so "apply without restarting"
+  can only mean Conduit restarts the session for you. `ModelPanel` does that when the
+  session is IDLE and waits when it is mid-turn -- restarting a running agent throws away
+  the work in flight, which is a worse surprise than a button.
+- **`key_for_endpoint` is scoped by AGENT first, then URL.** Two agents may legitimately sit
+  behind the same base URL (OpenRouter on both OpenCode and Hermes) with different keys; a
+  URL-only match returned whichever the hash map yielded, which surfaces as an
+  unexplainable invalid-credentials error.
+- **`parse_openai_models` speaks three dialects**: vLLM's `max_model_len`, OpenRouter's
+  `context_length`, and neither. Reading only vLLM's left all 400+ OpenRouter models with no
+  context, price or tool flag -- exactly what the picker ranks on. `tools` comes from
+  `supported_parameters`; its ABSENCE stays `None` ("unknown"), never `Some(false)`, because
+  `pickable` treats an explicit false as disqualifying.
 - **UI: one editor, two scopes.** `EndpointEditor.tsx` is the per-AGENT form, used by both
   Settings -> Model endpoints (`EndpointsPanel.tsx`) and the per-SESSION Model tab
   (`ModelPanel.tsx`), so the two cannot drift. The Model tab is session-scoped by

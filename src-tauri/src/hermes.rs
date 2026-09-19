@@ -24,10 +24,36 @@ use crate::store::ProviderSettings;
 /// The env var that names one session's overlay directory.
 pub const MANAGED_DIR_ENV: &str = "HERMES_MANAGED_DIR";
 
-/// The env var carrying the endpoint API key, referenced from the generated config as
-/// `${CONDUIT_HERMES_APIKEY}`. One variable, so it is trivially redactable and never
-/// duplicated into the config blob.
-pub const API_KEY_ENV: &str = "CONDUIT_HERMES_APIKEY";
+/// The env var Hermes reads this preset's API key from.
+///
+/// **This must be the provider's OWN canonical variable, not a Conduit-private one.** The
+/// first cut wrote `api_key: "${CONDUIT_HERMES_APIKEY}"` into the managed overlay on the
+/// strength of `apply_managed_overlay`'s documented `${VAR}` expansion. The overlay *is*
+/// applied -- provider and base URL resolve from it correctly -- but Hermes' credential
+/// resolver never reads `model.api_key` from the process environment that way, so
+/// `resolve_runtime_provider` came back with `api_key: ''` and the interactive startup gate
+/// (`_probe_runtime_credentials`) decided nothing was configured and opened its provider
+/// wizard. Measured both ways against the installed CLI:
+///
+/// ```text
+/// CONDUIT_HERMES_APIKEY=… -> api_key: ''            READY: False   (wizard)
+/// OPENROUTER_API_KEY=…    -> api_key: 'sk-or-…'     READY: True
+/// ```
+///
+/// The names come from Hermes' own provider registry (`hermes_cli/providers.py`): OpenRouter
+/// and LM Studio each name their variable, and the `custom` family (ollama / vLLM /
+/// llama.cpp / OpenWebUI / a typed URL) goes through the OpenAI-compatible one.
+///
+/// `OPENAI_BASE_URL` is deliberately NOT set alongside it: `hermes_cli/main.py` reclassifies
+/// a resolved `openrouter` as `custom` the moment that variable is present, which would
+/// silently move the session off the provider the user picked.
+pub fn key_env_var(preset: &str) -> &'static str {
+    match preset {
+        "openrouter" => "OPENROUTER_API_KEY",
+        "lmstudio" => "LM_API_KEY",
+        _ => "OPENAI_API_KEY",
+    }
+}
 
 /// One Hermes lifecycle event mapped to the Conduit verb its `/hook` listener already
 /// understands.
@@ -222,9 +248,9 @@ pub fn managed_config_yaml(
             yaml_str(hermes_provider_id(&p.preset))
         ));
         out.push_str(&format!("  base_url: {}\n", yaml_str(p.base_url.trim())));
-        // The literal placeholder, never the key: `${VAR}` in a managed file expands
-        // against the PROCESS env, so the secret lives in exactly one env var.
-        out.push_str(&format!("  api_key: \"${{{API_KEY_ENV}}}\"\n"));
+        // No `api_key` line. It would be inert (see `key_env_var`) and actively misleading:
+        // a reader of this file would conclude the key travels here when it does not. The
+        // key reaches Hermes through its provider's own env var, set at spawn.
         if let Some(c) = p.context_limit {
             // Hermes auto-detects the window from the provider and only needs telling when
             // that detection is wrong -- a local server with a custom num_ctx, or a proxy
@@ -263,7 +289,9 @@ pub fn write_managed_config(
 #[derive(Clone, Debug, PartialEq)]
 pub struct HermesSpawnConfig {
     pub managed_dir: PathBuf,
-    pub api_key: Option<String>,
+    /// `(env var, key)` -- the var is the PROVIDER's own name, so Hermes' credential
+    /// resolver actually finds it. See `key_env_var`.
+    pub api_key: Option<(String, String)>,
 }
 
 /// Write this session's overlay and describe its spawn env.
@@ -283,10 +311,16 @@ pub fn build_spawn_config(
     api_key: Option<&str>,
 ) -> Option<HermesSpawnConfig> {
     let managed_dir = write_managed_config(session_id, port, provider)?;
-    let routed = provider.is_some_and(|p| p.is_ready());
+    // Only when there is actually an endpoint to use it on: handing a session a provider
+    // key while its config pins no endpoint would put a secret in a child's environment
+    // for nothing -- and, because Hermes ingests an env key into its credential pool,
+    // would register a credential for a provider the user never selected.
+    let key = provider
+        .filter(|p| p.is_ready())
+        .and_then(|p| api_key.map(|k| (key_env_var(&p.preset).to_string(), k.to_string())));
     Some(HermesSpawnConfig {
         managed_dir,
-        api_key: routed.then(|| api_key.map(str::to_string)).flatten(),
+        api_key: key,
     })
 }
 
@@ -384,8 +418,53 @@ mod tests {
         assert!(y.contains("provider: \"openrouter\""));
         assert!(y.contains("default: \"anthropic/claude-sonnet-5\""));
         assert!(y.contains("base_url: \"https://openrouter.ai/api/v1\""));
-        // The placeholder, never the key itself.
-        assert!(y.contains("api_key: \"${CONDUIT_HERMES_APIKEY}\""));
+        // No api_key line at all: it was inert, and a reader would wrongly conclude the
+        // key travels in this file. It reaches Hermes via the provider's own env var.
+        assert!(
+            !y.contains("api_key"),
+            "the overlay must not imply the key travels here: {y}"
+        );
+    }
+
+    #[test]
+    fn the_key_rides_the_providers_own_env_var() {
+        // Hermes' credential resolver only reads the canonical names. A Conduit-private
+        // variable resolved to an EMPTY api_key, and the startup gate then offered its
+        // "no provider configured" wizard over a fully configured endpoint.
+        assert_eq!(key_env_var("openrouter"), "OPENROUTER_API_KEY");
+        assert_eq!(key_env_var("lmstudio"), "LM_API_KEY");
+        // The `custom` family (ollama / vLLM / llama.cpp / OpenWebUI / a typed URL) all
+        // go through the OpenAI-compatible variable.
+        for p in ["ollama", "vllm", "llamacpp", "openwebui", "custom"] {
+            assert_eq!(key_env_var(p), "OPENAI_API_KEY", "{p}");
+        }
+    }
+
+    #[test]
+    fn a_key_is_only_carried_when_an_endpoint_will_use_it() {
+        // Hermes INGESTS an env key into its credential pool, so handing one to a session
+        // with no configured endpoint would register a credential for a provider the user
+        // never chose.
+        let ready = settings("openrouter", "https://openrouter.ai/api/v1", "x/y");
+        let cfg = build_spawn_config("s-ready", 8423, Some(&ready), Some("sk-or-secret"));
+        assert_eq!(
+            cfg.unwrap().api_key,
+            Some(("OPENROUTER_API_KEY".to_string(), "sk-or-secret".to_string()))
+        );
+
+        let half = ProviderSettings {
+            model: String::new(),
+            ..ready
+        };
+        let cfg = build_spawn_config("s-half", 8423, Some(&half), Some("sk-or-secret"));
+        assert_eq!(cfg.unwrap().api_key, None, "no endpoint, no credential");
+
+        let cfg = build_spawn_config("s-none", 8423, None, Some("sk-or-secret"));
+        assert_eq!(cfg.unwrap().api_key, None, "routing off, no credential");
+
+        for id in ["s-ready", "s-half", "s-none"] {
+            remove_managed_config(id);
+        }
     }
 
     #[test]
