@@ -805,10 +805,67 @@ burned". OpenRouter is prepaid credit, and that difference is structural, not co
   user's `config.yaml` default.
 - The choice is PERSISTED before it is sent, so a later restart or a `session_budget` reap
   comes back on the model the user picked rather than the one the session launched with.
-- Known gap: Hermes' `/model --provider` only reaches providers already in its config, and
-  Conduit writes ONE endpoint per agent into the overlay. Switching local<->OpenRouter
-  mid-session needs every configured endpoint written there, which needs a multi-endpoint
-  `ProviderSettings`.
+- **Every configured endpoint is written into the agent's config, not just the active one.**
+  `/model --provider` can only reach providers ALREADY in the config, so one endpoint per
+  agent left the provider half of a live switch unreachable. See "Where the endpoint pool
+  lives" below.
+
+## Where the endpoint pool lives
+
+An agent has a LIST of endpoints (`PersistState.agent_endpoints`) and one of them is ACTIVE
+(`agent_providers`, unchanged). The pool exists for one reason: an agent's own
+`/model --provider` only reaches providers already present in its config, so a session that
+launched against Ollama could never be moved to OpenRouter without a restart -- which throws
+away the context live switching exists to preserve.
+
+- **`#[serde(default)]` and seeded on load** (`seed_endpoint_pool`, pure/tested). A
+  `state.json` written before the pool has an active endpoint and no pool; without the seed
+  the list renders empty beside a session demonstrably talking to something, and the first
+  write drops the endpoint in use. An agent that already HAS a pool is left alone -- newer
+  state wins, the same rule `adopt_legacy_opencode` beside it follows.
+- **`set_provider_settings` rewrites the pool entry that WAS active** rather than appending.
+  Appending forks the endpoint: the pool keeps the old values and `endpoint_pool` adds the new
+  ones beside them, so one endpoint appears twice and the stale copy is still offered as
+  somewhere to switch to. Matching on the NEW url instead leaves a renamed endpoint as a ghost.
+- **Keys are per (agent, BASE URL)**, not per agent (`key_slot`). A pool routinely holds a
+  keyed cloud endpoint beside a keyless local one, and may hold two cloud endpoints with two
+  keys; collapsing them onto the agent hands one endpoint's key to another, which surfaces as
+  an unexplainable 401. The one exception is `promote_unbound_key`: a key typed BEFORE any URL
+  exists lands in the agent's empty slot and is moved onto the first endpoint it gets. That is
+  deliberately NOT a general "follow the active endpoint" rule -- that would carry a cloud key
+  onto a local server the moment the user switched preset.
+- **Hermes reaches them through a `providers:` MAP in the managed overlay**, one entry per
+  pooled endpoint keyed `conduit-<preset>`, each naming its own `key_env`. Verified against the
+  installed CLI, not docs: `providers:` merges per leaf, `get_compatible_custom_providers`
+  normalizes the entries, and `custom_provider_slug` derives a stable `custom:<key>` slug from
+  the entry KEY -- which is what `/model --provider` takes. A Conduit-private variable is
+  CORRECT here and does NOT contradict `key_env_var`'s warning: that failure was
+  `model.api_key: "${VAR}"`, a mechanism the credential resolver never consults, whereas a
+  `providers:` entry NAMES its variable and is read with `get_secret_str`. A test pins the slug
+  and env-var format, because a drift makes `/model --provider` silently reach nothing -- the
+  switch is accepted and the endpoint does not change.
+- **The silo filters the POOL, not just the launch endpoint.** A local-only session under
+  private mode gets only local endpoints written into its config; otherwise the launch-time
+  `is_local()` check is decoration, because the agent is one slash command away from routing
+  siloed work through OpenRouter.
+- **A live switch persists `Session.provider`.** `/model --provider` moves the running
+  process, but the next start reads the AGENT's active endpoint -- so without the pin a
+  restart silently moves the session back, with a model pinned that the original endpoint may
+  not serve. `session_endpoint` resolves it, falling back to the active endpoint when the
+  pinned slug names nothing (a deleted endpoint must degrade to "the normal one", never to
+  "no endpoint at all").
+- **`add_session` takes `provider`, resolved by `resolve_provider_slug`.** A caller types what
+  it knows (`openrouter`); the stored pin must be the slug `pooled_provider_slugs` produces or
+  `session_endpoint` never matches it. Both spellings resolve, and an unknown name passes
+  through rather than being dropped. It rides the CREATE call for the same reason `model` does
+  -- set afterwards, the terminal has already spawned.
+- **`ProviderAdapter::pooled_provider_slugs` is the seam**, and all-`None` is a real answer:
+  OpenCode's `/models` takes no argument, and every other agent reads its endpoint once at
+  process start. An invented slug would render an enabled chip that silently does nothing.
+- UI: the pool list in `EndpointsPanel.tsx` (clicking a row makes it active, which is also
+  what points the editor below at it -- two ways to edit one endpoint is how the two end up
+  disagreeing), and the endpoint chip row in `ModelPanel.tsx`, which carries the endpoint's
+  OWN pinned model across: a model id served by Ollama is not one OpenRouter serves.
 
 ## Where spawn conditions live
 

@@ -498,14 +498,22 @@ impl PtyManager {
             // deep-merges that file's leaves on top of the user's config.yaml and leaves
             // every sibling key theirs, so this installs Conduit's status hooks (and, when
             // routing is on, the endpoint) without writing a byte to the user's Hermes
-            // home. The key is referenced from that file as `${CONDUIT_HERMES_APIKEY}`,
-            // which expands against THIS process env -- so the secret lives in exactly one
-            // variable and never in the file.
+            // home. Keys are never written into that file -- every one of them rides in an
+            // environment variable the file merely NAMES, so the secret lives in this
+            // process env and nowhere on disk.
             if let Some(h) = &hermes {
                 cmd.env(crate::hermes::MANAGED_DIR_ENV, &h.managed_dir);
-                // The PROVIDER's own variable name, not a Conduit-private one -- Hermes'
-                // credential resolver only reads the canonical names. See `hermes::key_env_var`.
+                // The ACTIVE endpoint's key goes in the PROVIDER's own variable name, not a
+                // Conduit-private one: Hermes' startup credential gate only reads the
+                // canonical names. See `hermes::key_env_var`.
                 if let Some((var, key)) = &h.api_key {
+                    cmd.env(var, key);
+                }
+                // One variable per POOLED endpoint, each named by that entry's own
+                // `key_env`. This is the mechanism `key_env_var` documents as the one that
+                // works for a named provider entry, and it is what lets a mid-session
+                // `/model --provider` reach a second endpoint with a different key.
+                for (var, key) in &h.pool_keys {
                     cmd.env(var, key);
                 }
             }

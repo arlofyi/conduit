@@ -6228,3 +6228,122 @@ input[type="number"]:focus {
   margin-left: 14px;
   font-size: 10px;
 }
+
+/* ---- Settings -> Model endpoints: the pool ---------------------------------- */
+/* An agent has a LIST of endpoints and one of them is active. The list is above the
+   editor because the editor always edits the active one -- reading top to bottom you pick
+   which endpoint, then configure it. */
+.ep-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ep-pool {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ep-pool-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-mid);
+}
+.ep-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ep-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-bg);
+}
+.ep-row.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel-bg));
+}
+.ep-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+}
+.ep-row-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-bright);
+}
+.ep-row-detail,
+.ep-row-slug {
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ep-row-slug {
+  font-family: var(--mono-font);
+  color: var(--text-mid);
+}
+.ep-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* The key field spans both columns so a long hint wraps under the row rather than
+   squeezing the actions off the end. */
+.ep-row-key {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.ep-row-key input {
+  flex: 1;
+  min-width: 140px;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-bright);
+  font-family: var(--mono-font);
+  outline: none;
+}
+.ep-row-key input:focus {
+  border-color: var(--accent);
+}
+.ep-badge.key {
+  background: var(--tag-chip-bg);
+  color: var(--tag-chip-text);
+}
+.mp-link.danger {
+  color: var(--red);
+}
+/* A label over its control rather than beside it: a chip row of endpoint names does not
+   fit in the 74px gutter the single-line rows use. */
+.mp-row-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+}

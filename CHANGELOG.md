@@ -3,6 +3,28 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.41.0 — 2026-09-19
+
+- **Added — Several endpoints per agent, and switching between them mid-conversation.**
+  An agent is no longer pinned to one endpoint. Configure a local model *and* OpenRouter in
+  Settings → Model endpoints, and the Model tab gets a row of buttons to move a running
+  session between them — without restarting it, so the work in progress survives. That is
+  the decision you actually make mid-task: is a local model enough for this bit, or is this
+  one worth sending to a frontier model? Hermes switches live; agents that read their
+  endpoint once at startup say so instead of offering a button that does nothing.
+- **Added — A key per endpoint.** Each endpoint holds its own API key, so a keyed cloud
+  endpoint and a keyless local one sit side by side without one being handed the other's
+  credential. Keys are still held in memory for the session only and never written to disk.
+- **Changed — A switched session stays switched.** The endpoint you move a session to is
+  remembered, so restarting or resuming it comes back where you left it rather than quietly
+  reverting to the agent's default with a model that endpoint may not serve.
+- **Changed — `conduit --provider` now picks the endpoint.** It was accepted and ignored;
+  it now starts the new session on the endpoint you named, which is what makes one agent
+  able to launch another under conditions it chose.
+- **Fixed — A private session cannot be routed out of its silo.** A local-only session
+  under private mode is given only local endpoints, so its agent cannot switch itself to a
+  cloud provider mid-conversation.
+
 ## 0.40.0 — 2026-09-19
 
 - **Added — Change a session's model without losing the conversation.** Switching model is

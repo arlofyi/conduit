@@ -85,6 +85,9 @@ export interface Session {
   modelTier?: string | null;
   seedMemory?: string | null;
   effort?: string | null;
+  /** The endpoint this session was switched to, as the agent's own provider slug. Absent =
+   *  follow the agent's active endpoint, which is every session never switched. */
+  provider?: string | null;
   /** The agent's own captured conversation id (agy), for resume. Set by the backend. */
   agentConversationId?: string | null;
   /** User stopped this session's processes without deleting it (persisted). Its terminal
@@ -142,8 +145,8 @@ export {
   allowedForLocalOnly,
   EMPTY_PROVIDER,
 } from "./providers";
-export type { ProviderSettings } from "./providers";
-import type { ProviderSettings } from "./providers";
+export type { ProviderSettings, EndpointView } from "./providers";
+import type { ProviderSettings, EndpointView } from "./providers";
 
 /** The old name, kept for OpenCode's own call sites. */
 export type OpenCodeSettings = ProviderSettings;
@@ -1488,6 +1491,19 @@ interface AppState {
   /** Non-empty = hold/replace this agent's key for this run; empty = clear. Never persisted. */
   setProviderKey: (agent: AgentId, key: string) => Promise<void>;
 
+  /**
+   * Every endpoint configured per agent, with the slug each one can be switched to LIVE.
+   *
+   * Separate from `agentProviders`, which holds only the ACTIVE endpoint — the one a new
+   * session spawns on. The pool is what the agent's own `/model --provider` can reach
+   * mid-conversation, and a pool of one is why switching provider used to need a restart.
+   */
+  endpointPools: Partial<Record<AgentId, EndpointView[]>>;
+  loadEndpointPools: () => Promise<void>;
+  setEndpointPool: (agent: AgentId, endpoints: ProviderSettings[]) => Promise<void>;
+  /** Hold/replace (non-empty) or clear (empty) the key for ONE endpoint. Never persisted. */
+  setEndpointKey: (agent: AgentId, baseUrl: string, key: string) => Promise<void>;
+
   // ---- MCP server registry ----
   mcpServers: McpServer[];
   mcpEnabled: Record<string, AgentId[]>;
@@ -1510,7 +1526,7 @@ interface AppState {
 
   addProject: (path: string) => Promise<void>;
   removeProject: (id: string) => Promise<void>;
-  addSession: (projectId: string, opts?: { name?: string; useWorktree?: boolean; agent?: AgentId; role?: SessionRole; account?: string | null; mcpServers?: string[] | null; model?: string | null }) => Promise<void>;
+  addSession: (projectId: string, opts?: { name?: string; useWorktree?: boolean; agent?: AgentId; role?: SessionRole; account?: string | null; mcpServers?: string[] | null; model?: string | null; provider?: string | null }) => Promise<void>;
   renameSession: (projectId: string, sessionId: string, name: string) => Promise<void>;
   /** Rename a project's display label only (not the directory on disk). */
   renameProject: (projectId: string, name: string) => Promise<void>;
@@ -1828,6 +1844,7 @@ export const useStore = create<AppState>((set, get) => {
     opencodeKeySet: false,
     agentProviders: {},
     providerKeys: [],
+    endpointPools: {},
     openrouterUsage: [],
     endpointModels: {},
     agentProfiles: {},
@@ -2222,6 +2239,28 @@ export const useStore = create<AppState>((set, get) => {
         ...(agent === "opencode" ? { opencodeKeySet: held } : {}),
       }));
     },
+    setEndpointKey: async (agent, baseUrl, key) => {
+      const held = key.trim().length > 0;
+      await invoke(held ? "set_endpoint_key" : "clear_endpoint_key", {
+        agent,
+        baseUrl,
+        ...(held ? { key } : {}),
+      }).catch(() => {});
+      // Re-read rather than patching in place: `hasKey` is the server's answer, and the
+      // active endpoint's key also feeds the agent-scoped `providerKeys` set.
+      await get().loadEndpointPools();
+      await get().loadProviderSettings();
+    },
+    loadEndpointPools: async () => {
+      try {
+        const pools = await invoke<Partial<Record<AgentId, EndpointView[]>>>("all_endpoint_pools");
+        set({ endpointPools: pools ?? {} });
+      } catch { /* keep current */ }
+    },
+    setEndpointPool: async (agent, endpoints) => {
+      await invoke("set_endpoint_pool", { agent, endpoints }).catch(() => {});
+      await get().loadEndpointPools();
+    },
     detectLocalProviders: async () => {
       try {
         return await invoke<LocalProviderStatus[]>("detect_local_providers");
@@ -2397,7 +2436,10 @@ export const useStore = create<AppState>((set, get) => {
       // `model` is the concrete id a route picked. Both ride the CREATE call rather than a
       // follow-up so the session is never persisted, however briefly, without them.
       const model = opts?.model ?? null;
-      const session = await invoke<Session | null>("add_session", { projectId, name, useWorktree, agent, role, mcpServers, model });
+      // `provider` names the endpoint the new session runs on. It rides the CREATE call for
+      // the same reason `model` does: set afterwards, the terminal has already spawned.
+      const provider = opts?.provider ?? null;
+      const session = await invoke<Session | null>("add_session", { projectId, name, useWorktree, agent, role, mcpServers, model, provider });
       if (!session) return;
       // Pin an explicitly-chosen account (blank = inherit the project/global default).
       if (opts?.account) {

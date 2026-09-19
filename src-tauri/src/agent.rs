@@ -282,6 +282,21 @@ pub trait ProviderAdapter {
     ) -> Option<String> {
         None
     }
+    /// Which of this agent's POOLED endpoints its own model command can switch to, and
+    /// under what name. One `Option<String>` per entry, in order; `None` for an endpoint
+    /// this agent cannot be moved to without a restart.
+    ///
+    /// Default: every entry `None`. That is the honest answer for every agent but Hermes --
+    /// OpenCode's `/models` takes no argument, and the rest read their endpoint once at
+    /// process start with no way to be told otherwise. Returning an invented slug would put
+    /// an enabled button in front of the user that silently does nothing, which is the
+    /// failure `model_switch_command`'s `None` case exists to avoid.
+    fn pooled_provider_slugs(
+        &self,
+        pool: &[crate::store::ProviderSettings],
+    ) -> Vec<Option<String>> {
+        vec![None; pool.len()]
+    }
     /// Extra env vars to set on the child process for this agent.
     fn env_overrides(&self) -> Vec<(&'static str, &'static str)> {
         Vec::new()
@@ -1013,8 +1028,9 @@ pub struct OpenCodeSpawnConfig {
     pub api_key: Option<String>,
 }
 
-/// Human label for an endpoint preset id, shown as the provider name inside OpenCode.
-fn preset_label(preset: &str) -> &'static str {
+/// Human label for an endpoint preset id, shown as the provider name inside OpenCode,
+/// and as a pooled endpoint's display name in Hermes' overlay. One spelling, one place.
+pub(crate) fn preset_label(preset: &str) -> &'static str {
     match preset {
         "ollama" => "Ollama",
         "lmstudio" => "LM Studio",
@@ -1381,6 +1397,37 @@ impl ProviderAdapter for HermesAdapter {
     fn supports_model_flags(&self) -> bool {
         true
     }
+    /// Hermes is the one agent that can be moved between endpoints mid-conversation. Each
+    /// pooled endpoint is written into the managed overlay as a `providers:` entry, and
+    /// Hermes derives a stable `custom:<key>` slug from that entry's KEY -- which is what
+    /// `/model <model> --provider <slug>` takes. Measured against the installed CLI; see
+    /// `hermes::pool_key_env`.
+    fn pooled_provider_slugs(
+        &self,
+        pool: &[crate::store::ProviderSettings],
+    ) -> Vec<Option<String>> {
+        let pairs: Vec<(crate::store::ProviderSettings, Option<String>)> =
+            pool.iter().map(|e| (e.clone(), None)).collect();
+        let entries = crate::hermes::pool_entries(&pairs);
+        // `pool_entries` SKIPS an endpoint with no URL, so the two lists are not index-
+        // aligned. Walk them together rather than zipping, or every entry after a blank one
+        // would be handed its neighbour's slug.
+        let mut it = entries.into_iter();
+        let mut next = it.next();
+        pool.iter()
+            .map(|e| {
+                if e.base_url.trim().is_empty() {
+                    return None;
+                }
+                let slug = next
+                    .as_ref()
+                    .map(|n| crate::hermes::pool_provider_slug(&n.config_key));
+                next = it.next();
+                slug
+            })
+            .collect()
+    }
+
     fn effort_flag(&self) -> &'static str {
         "--reasoning"
     }

@@ -148,6 +148,17 @@ pub struct Session {
     /// Seeded / "prefixed" memory injected at spawn as an appended system prompt. Phase 5.
     #[serde(default)]
     pub seed_memory: Option<String>,
+    /// The ENDPOINT this session is on, as the agent's own provider slug
+    /// (`custom:conduit-openrouter`, or a first-class name like `openrouter`).
+    ///
+    /// Set when the user moves a running session to another endpoint. Without it the live
+    /// switch would be a half-truth: `/model --provider` moves the running process, but the
+    /// next start reads the AGENT's active endpoint and would silently put the session back
+    /// where it came from -- with a model pinned that the original endpoint may not even
+    /// serve. `None` = follow the agent's active endpoint, which is every session that has
+    /// never been switched.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Effort level: "low" | "medium" | "high" | "xhigh" | "max" (SPEC-B, §7.2). Only
     /// Claude has a per-invocation effort control today (verified: `claude --help` lists
     /// `--effort <level>` with exactly these five values) -- other adapters record this
@@ -541,9 +552,21 @@ pub struct PersistState {
     /// contract `default_account` has with `default_accounts[Claude]`.
     #[serde(default)]
     pub opencode: OpenCodeSettings,
-    /// Per-agent endpoint settings (agent -> settings). Source of truth going forward.
+    /// Per-agent ACTIVE endpoint (agent -> settings): what a new session spawns on.
     #[serde(default)]
     pub agent_providers: HashMap<AgentId, ProviderSettings>,
+    /// Every endpoint configured for an agent, the active one included.
+    ///
+    /// One active endpoint was not enough to switch PROVIDER mid-session: an agent's own
+    /// `/model --provider` can only reach providers already present in its config, so a
+    /// session that launched against Ollama could never be moved to OpenRouter without a
+    /// restart -- which is exactly the context loss live switching exists to avoid. The
+    /// pool is what Conduit writes into the agent's config so every one of them resolves.
+    ///
+    /// `#[serde(default)]`, and seeded from `agent_providers` on load, so a state.json
+    /// written before the pool existed keeps working and gains a one-entry pool.
+    #[serde(default)]
+    pub agent_endpoints: HashMap<AgentId, Vec<ProviderSettings>>,
     #[serde(default)]
     pub plugins: Vec<crate::plugins::PluginRecord>,
     #[serde(default)]
@@ -566,6 +589,7 @@ pub struct Store {
     default_accounts: Mutex<HashMap<AgentId, String>>,
     trust: Mutex<TrustSettings>,
     agent_providers: Mutex<HashMap<AgentId, ProviderSettings>>,
+    agent_endpoints: Mutex<HashMap<AgentId, Vec<ProviderSettings>>>,
     plugins: Mutex<Vec<crate::plugins::PluginRecord>>,
     root_chats: Mutex<Vec<RootChat>>,
     routes: Mutex<crate::routing::AgentRoutes>,
@@ -573,8 +597,12 @@ pub struct Store {
     active_profile_id: Mutex<Option<String>>,
     /// The local-endpoint API key, held in memory for the app's lifetime only. Never part
     /// of `PersistState`/`save()`, never logged; injected into the child's env at spawn.
-    /// Keyed per agent, because two agents may sit behind two different endpoints.
-    provider_keys: Mutex<HashMap<AgentId, String>>,
+    /// Keyed per (agent, BASE URL) via `key_slot`, not per agent. An agent's pool routinely
+    /// holds a keyed cloud endpoint beside a keyless local one, and may hold two cloud
+    /// endpoints with two different keys; collapsing them onto the agent would hand one
+    /// endpoint's key to another, which surfaces as an unexplainable 401. The URL is the
+    /// identity because an endpoint IS its URL -- the preset is only a label.
+    provider_keys: Mutex<HashMap<(AgentId, String), String>>,
     save_path: PathBuf,
 }
 
@@ -734,6 +762,41 @@ fn rotate_backup(save_path: &std::path::Path) {
     }
 }
 
+/// Give every agent that has an ACTIVE endpoint at least that one endpoint in its pool.
+///
+/// A `state.json` written before the pool existed carries a configured active endpoint and
+/// no pool at all. Without this the endpoints list would render empty beside a session that
+/// is demonstrably talking to something, and the first pool write would drop the endpoint
+/// the user is actually on.
+///
+/// An agent that already HAS a pool is left alone -- newer state wins, exactly as
+/// `adopt_legacy_opencode` below does and for the same reason: a migration that overwrites
+/// is a migration that silently unconfigures someone.
+///
+/// Pure so it can be tested; `Store::new` reads `data_dir()` and cannot be pointed at a
+/// fixture.
+fn seed_endpoint_pool(
+    mut pool: HashMap<AgentId, Vec<ProviderSettings>>,
+    active: &HashMap<AgentId, ProviderSettings>,
+) -> HashMap<AgentId, Vec<ProviderSettings>> {
+    for (agent, settings) in active {
+        // An unconfigured slot is not an endpoint. Seeding it would put a blank row in the
+        // list for every agent the user has never set up.
+        if settings.base_url.trim().is_empty() {
+            continue;
+        }
+        pool.entry(*agent).or_insert_with(|| vec![settings.clone()]);
+    }
+    pool
+}
+
+/// The `provider_keys` map key: an endpoint is identified by its agent AND its URL.
+/// See that field's own comment for why neither half alone will do. The URL is trimmed so
+/// a key stored from a padded paste and a later lookup agree.
+fn key_slot(agent: AgentId, base_url: &str) -> (AgentId, String) {
+    (agent, base_url.trim().to_string())
+}
+
 /// Fold the legacy single `opencode` slot into the per-agent endpoint map.
 ///
 /// A `state.json` written before per-agent endpoints carries only `opencode`. Dropping it
@@ -781,8 +844,12 @@ impl Store {
             default_accounts: Mutex::new(default_accounts),
             trust: Mutex::new(state.trust),
             agent_providers: Mutex::new(adopt_legacy_opencode(
-                state.agent_providers,
-                state.opencode,
+                state.agent_providers.clone(),
+                state.opencode.clone(),
+            )),
+            agent_endpoints: Mutex::new(seed_endpoint_pool(
+                state.agent_endpoints,
+                &adopt_legacy_opencode(state.agent_providers, state.opencode),
             )),
             plugins: Mutex::new(state.plugins),
             root_chats: Mutex::new(state.root_chats),
@@ -813,6 +880,13 @@ impl Store {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // Read into a local for the reason given just above: a `.lock()` inside the struct
+        // literal would still be held when the next one runs.
+        let agent_endpoints = self
+            .agent_endpoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let state = PersistState {
             projects: projects.to_vec(),
             accounts: self
@@ -838,6 +912,7 @@ impl Store {
                 .cloned()
                 .unwrap_or_default(),
             agent_providers,
+            agent_endpoints,
             plugins: self
                 .plugins
                 .lock()
@@ -1259,6 +1334,34 @@ impl Store {
         let snapshot = projects.clone();
         drop(projects);
         self.save(&snapshot);
+    }
+
+    /// Pin the endpoint a session is on. See `Session::provider` for why a live switch is
+    /// incomplete without this.
+    pub fn set_session_provider(&self, session_id: &str, provider: Option<String>) {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        for p in projects.iter_mut() {
+            if let Some(s) = p.sessions.iter_mut().find(|s| s.id == session_id) {
+                s.provider = provider
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                break;
+            }
+        }
+        let snapshot = projects.clone();
+        drop(projects);
+        self.save(&snapshot);
+    }
+
+    /// The endpoint slug pinned on a session, if any.
+    pub fn session_provider(&self, session_id: &str) -> Option<String> {
+        self.projects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|p| &p.sessions)
+            .find(|s| s.id == session_id)
+            .and_then(|s| s.provider.clone())
     }
 
     pub fn set_session_model(&self, session_id: &str, model: Option<String>) {
@@ -1984,12 +2087,117 @@ impl Store {
     }
 
     pub fn set_provider_settings(&self, agent: AgentId, settings: ProviderSettings) {
-        {
+        let url = settings.base_url.trim().to_string();
+        let previous = {
             let mut m = self
                 .agent_providers
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            m.insert(agent, settings);
+            m.insert(agent, settings.clone())
+        };
+        // Keep the pool in step with the edit. Without this, editing the active endpoint
+        // forks it: the pool keeps the OLD values and `endpoint_pool` appends the new ones
+        // beside them, so one endpoint appears twice and the stale copy is still offered as
+        // somewhere to switch to. The entry rewritten is the one that WAS active -- matching
+        // on the new URL instead would leave a renamed endpoint behind as a ghost.
+        let was = previous
+            .map(|p| p.base_url.trim().to_string())
+            .unwrap_or_default();
+        {
+            let mut pools = self
+                .agent_endpoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let pool = pools.entry(agent).or_default();
+            let slot = pool
+                .iter()
+                .position(|e| !was.is_empty() && e.base_url.trim() == was)
+                .or_else(|| pool.iter().position(|e| e.base_url.trim() == url));
+            match slot {
+                Some(i) if !url.is_empty() => pool[i] = settings,
+                // A cleared endpoint (no URL) drops out of the pool rather than sitting in
+                // the list as an unaddressable row.
+                Some(i) => {
+                    pool.remove(i);
+                }
+                None if !url.is_empty() => pool.push(settings),
+                None => {}
+            }
+            if pool.is_empty() {
+                pools.remove(&agent);
+            }
+        }
+        self.promote_unbound_key(agent, &url);
+        self.persist();
+    }
+
+    /// Move a key that was set while this agent had NO endpoint onto the endpoint it just
+    /// got. Keys are per (agent, URL), so a key typed before the URL lands in the agent's
+    /// empty slot and would otherwise belong to nothing -- and the form that asks for a key
+    /// before a URL is a perfectly reasonable one to fill in that order.
+    ///
+    /// Deliberately NOT a general "follow the active endpoint" rule. Moving a key whenever
+    /// the active endpoint changes would carry a cloud key onto a local server the moment
+    /// the user switched preset, which is the exact confusion per-endpoint keys exist to
+    /// prevent. Only the empty slot is promoted, and only when the target has no key of its
+    /// own, so this can fire at most once per agent.
+    fn promote_unbound_key(&self, agent: AgentId, base_url: &str) {
+        if base_url.is_empty() {
+            return;
+        }
+        let mut m = self.provider_keys.lock().unwrap_or_else(|e| e.into_inner());
+        let target = key_slot(agent, base_url);
+        if m.contains_key(&target) {
+            return;
+        }
+        if let Some(k) = m.remove(&key_slot(agent, "")) {
+            m.insert(target, k);
+        }
+    }
+
+    /// Every endpoint configured for this agent. Always contains the active one, so a caller
+    /// can write the whole pool into an agent's config and know the session's own endpoint
+    /// is among them.
+    pub fn endpoint_pool(&self, agent: AgentId) -> Vec<ProviderSettings> {
+        let mut pool = self
+            .agent_endpoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&agent)
+            .cloned()
+            .unwrap_or_default();
+        let active = self.provider_settings(agent);
+        let url = active.base_url.trim().to_string();
+        // The active endpoint is authoritative even if the pool has drifted. Including it
+        // anyway beats writing a config that omits the very endpoint the session runs on.
+        if !url.is_empty() && !pool.iter().any(|e| e.base_url.trim() == url) {
+            pool.push(active);
+        }
+        pool
+    }
+
+    /// Every agent's pool, for the settings UI.
+    pub fn all_endpoint_pools(&self) -> HashMap<AgentId, Vec<ProviderSettings>> {
+        self.agent_endpoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Replace this agent's pool wholesale. The UI edits a list, so a list is what it sends;
+    /// per-entry add/remove commands would need an entry identity that `ProviderSettings`
+    /// does not carry.
+    pub fn set_endpoint_pool(&self, agent: AgentId, endpoints: Vec<ProviderSettings>) {
+        {
+            let mut m = self
+                .agent_endpoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if endpoints.is_empty() {
+                m.remove(&agent);
+            } else {
+                m.insert(agent, endpoints);
+            }
         }
         self.persist();
     }
@@ -2002,28 +2210,55 @@ impl Store {
         self.set_provider_settings(AgentId::OpenCode, settings);
     }
 
-    /// Set (Some) or clear (None) an agent's in-memory endpoint API key. Never persisted.
+    /// Set (Some) or clear (None) the in-memory API key for ONE endpoint. Never persisted.
     /// Trimmed on the way in — a paste with padding would otherwise ride into the
     /// Authorization header verbatim and 401 with no way to inspect the held value.
-    pub fn set_provider_key(&self, agent: AgentId, key: Option<String>) {
+    pub fn set_provider_key_for(&self, agent: AgentId, base_url: &str, key: Option<String>) {
+        let slot = key_slot(agent, base_url);
         let mut m = self.provider_keys.lock().unwrap_or_else(|e| e.into_inner());
         match key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
             Some(k) => {
-                m.insert(agent, k);
+                m.insert(slot, k);
             }
             None => {
-                m.remove(&agent);
+                m.remove(&slot);
             }
         }
     }
 
-    /// An agent's in-memory endpoint API key, if one was set this run.
-    pub fn provider_key(&self, agent: AgentId) -> Option<String> {
+    /// The key held for ONE endpoint, if one was set this run.
+    pub fn provider_key_for(&self, agent: AgentId, base_url: &str) -> Option<String> {
         self.provider_keys
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&agent)
+            .get(&key_slot(agent, base_url))
             .cloned()
+    }
+
+    /// Set the key for this agent's ACTIVE endpoint. The agent-scoped form callers used
+    /// before the pool existed, kept so one that only knows the agent still lands on the
+    /// endpoint that agent is actually using.
+    pub fn set_provider_key(&self, agent: AgentId, key: Option<String>) {
+        let url = self.provider_settings(agent).base_url;
+        self.set_provider_key_for(agent, &url, key);
+    }
+
+    /// The key for this agent's ACTIVE endpoint, if one was set this run.
+    pub fn provider_key(&self, agent: AgentId) -> Option<String> {
+        self.provider_key_for(agent, &self.provider_settings(agent).base_url)
+    }
+
+    /// Every pooled endpoint of this agent that has a key held for it, as (base_url, key).
+    /// What the spawn path needs: the whole pool is written into the agent's config, so
+    /// every provider in it needs its own credential or switching to it 401s.
+    pub fn provider_keys_for_pool(&self, agent: AgentId) -> Vec<(String, String)> {
+        self.endpoint_pool(agent)
+            .into_iter()
+            .filter_map(|e| {
+                self.provider_key_for(agent, &e.base_url)
+                    .map(|k| (e.base_url, k))
+            })
+            .collect()
     }
 
     pub fn set_opencode_key(&self, key: Option<String>) {
@@ -2158,6 +2393,7 @@ mod tests {
                 default_accounts: Mutex::new(HashMap::new()),
                 trust: Mutex::new(TrustSettings::default()),
                 agent_providers: Mutex::new(HashMap::new()),
+                agent_endpoints: Mutex::new(HashMap::new()),
                 plugins: Mutex::new(Vec::new()),
                 root_chats: Mutex::new(Vec::new()),
                 routes: Mutex::new(Default::default()),
@@ -3001,6 +3237,215 @@ mod tests {
         assert!(store.is_session_siloed(&s.id));
         assert!(store.is_session_local_only(&s.id));
         assert!(!store.is_session_local_only("missing"));
+    }
+
+    #[test]
+    fn endpoint_pool_seeds_from_the_active_endpoint_and_never_overwrites_one() {
+        // A state.json written before the pool existed: an active endpoint, no pool.
+        let mut active = HashMap::new();
+        active.insert(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "anthropic/claude-sonnet-5".into(),
+                ..Default::default()
+            },
+        );
+        // An agent the user never configured must NOT gain a blank row.
+        active.insert(AgentId::OpenCode, ProviderSettings::default());
+
+        let seeded = seed_endpoint_pool(HashMap::new(), &active);
+        assert_eq!(seeded.len(), 1, "only the configured agent is seeded");
+        assert_eq!(seeded[&AgentId::Hermes].len(), 1);
+        assert_eq!(
+            seeded[&AgentId::Hermes][0].base_url,
+            "https://openrouter.ai/api/v1"
+        );
+
+        // Newer state wins: an agent that already has a pool is left exactly as it is,
+        // even though its active endpoint is not the first entry.
+        let mut existing = HashMap::new();
+        existing.insert(
+            AgentId::Hermes,
+            vec![ProviderSettings {
+                preset: "ollama".into(),
+                base_url: "http://localhost:11434/v1".into(),
+                ..Default::default()
+            }],
+        );
+        let kept = seed_endpoint_pool(existing, &active);
+        assert_eq!(kept[&AgentId::Hermes].len(), 1);
+        assert_eq!(kept[&AgentId::Hermes][0].preset, "ollama");
+    }
+
+    #[test]
+    fn endpoint_keys_are_per_endpoint_not_per_agent() {
+        let dir = temp_dir("ep_keys");
+        let store = Store::for_test(&dir);
+        let cloud = "https://openrouter.ai/api/v1";
+        let local = "http://localhost:11434/v1";
+
+        store.set_provider_key_for(AgentId::Hermes, cloud, Some("  sk-or-CLOUD \n".into()));
+        store.set_provider_key_for(AgentId::Hermes, local, Some("local-KEY".into()));
+
+        // Padding trimmed, and neither endpoint can see the other's key.
+        assert_eq!(
+            store.provider_key_for(AgentId::Hermes, cloud).as_deref(),
+            Some("sk-or-CLOUD")
+        );
+        assert_eq!(
+            store.provider_key_for(AgentId::Hermes, local).as_deref(),
+            Some("local-KEY")
+        );
+        // The same URL under a DIFFERENT agent is a different slot: two agents may sit
+        // behind one aggregator with two keys.
+        assert_eq!(store.provider_key_for(AgentId::OpenCode, cloud), None);
+
+        store.set_provider_key_for(AgentId::Hermes, cloud, None);
+        assert_eq!(store.provider_key_for(AgentId::Hermes, cloud), None);
+        assert_eq!(
+            store.provider_key_for(AgentId::Hermes, local).as_deref(),
+            Some("local-KEY"),
+            "clearing one endpoint must not clear another"
+        );
+    }
+
+    #[test]
+    fn a_key_set_before_the_url_is_promoted_onto_it_once() {
+        let dir = temp_dir("ep_promote");
+        let store = Store::for_test(&dir);
+        // The order a form is filled in: key first, endpoint second.
+        store.set_provider_key(AgentId::Hermes, Some("sk-or-FIRST".into()));
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "anthropic/claude-sonnet-5".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            store
+                .provider_key_for(AgentId::Hermes, "https://openrouter.ai/api/v1")
+                .as_deref(),
+            Some("sk-or-FIRST"),
+            "a key with no endpoint yet follows the endpoint the agent then gets"
+        );
+
+        // Once promoted the empty slot is gone, so a LATER endpoint change cannot pick the
+        // same key up again -- the promotion fires at most once per agent.
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "ollama".into(),
+                base_url: "http://localhost:11434/v1".into(),
+                model: "qwen3:30b-a3b".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            store.provider_key_for(AgentId::Hermes, "http://localhost:11434/v1"),
+            None
+        );
+    }
+
+    #[test]
+    fn switching_the_active_endpoint_never_carries_a_key_across() {
+        let dir = temp_dir("ep_noswap");
+        let store = Store::for_test(&dir);
+        let local = ProviderSettings {
+            enabled: true,
+            preset: "ollama".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "qwen3:30b-a3b".into(),
+            ..Default::default()
+        };
+        store.set_provider_settings(AgentId::Hermes, local.clone());
+        store.set_provider_key(AgentId::Hermes, Some("local-KEY".into()));
+
+        // Swap the active endpoint to a cloud aggregator. The local key must NOT follow --
+        // that is the confusion per-endpoint keys exist to prevent.
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "anthropic/claude-sonnet-5".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(store.provider_key(AgentId::Hermes), None, "no key carried");
+        // ...and the local endpoint kept its own.
+        assert_eq!(
+            store
+                .provider_key_for(AgentId::Hermes, "http://localhost:11434/v1")
+                .as_deref(),
+            Some("local-KEY")
+        );
+    }
+
+    #[test]
+    fn the_pool_always_contains_the_active_endpoint() {
+        let dir = temp_dir("ep_pool_active");
+        let store = Store::for_test(&dir);
+        store.set_endpoint_pool(
+            AgentId::Hermes,
+            vec![ProviderSettings {
+                preset: "ollama".into(),
+                base_url: "http://localhost:11434/v1".into(),
+                ..Default::default()
+            }],
+        );
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "anthropic/claude-sonnet-5".into(),
+                ..Default::default()
+            },
+        );
+        let pool = store.endpoint_pool(AgentId::Hermes);
+        assert_eq!(pool.len(), 2, "the new active endpoint joined the pool");
+        assert!(pool.iter().any(|e| e.preset == "openrouter"));
+        assert!(
+            pool.iter().any(|e| e.preset == "ollama"),
+            "and the old one stayed"
+        );
+
+        // Editing the ACTIVE endpoint rewrites its pool entry instead of forking it. A fork
+        // would offer the stale copy as somewhere to switch to.
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "openai/gpt-5".into(),
+                ..Default::default()
+            },
+        );
+        let pool = store.endpoint_pool(AgentId::Hermes);
+        assert_eq!(pool.len(), 2, "an edit is not a new endpoint");
+        assert_eq!(
+            pool.iter()
+                .find(|e| e.preset == "openrouter")
+                .unwrap()
+                .model,
+            "openai/gpt-5"
+        );
+
+        // And the pool survives a save/load round trip.
+        let raw = fs::read_to_string(dir.join("state.json")).unwrap();
+        let ps: PersistState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ps.agent_endpoints[&AgentId::Hermes].len(), 2);
     }
 
     #[test]

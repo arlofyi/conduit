@@ -215,3 +215,62 @@ edits the default every new session inherits).
   until then its capability card claims no `structuredResult`.
 - **No change to Claude, Codex, Gemini or agy spawn paths.** The Model tab reads them; it
   does not gain new powers over them.
+
+---
+
+## Addendum: the endpoint pool (0.41.0)
+
+The first cut of this design gave each agent ONE endpoint, and recorded the consequence as a
+known gap: Hermes' `/model --provider` only reaches providers already present in its config,
+so a session that launched against a local model could never be moved to OpenRouter without
+a restart. That makes the provider half of live switching unreachable, and a restart is
+precisely what live switching exists to avoid — it throws away the context that motivated
+the change.
+
+**The fix is a pool, not a bigger `ProviderSettings`.** `PersistState.agent_endpoints` maps
+an agent to a LIST of endpoints; `agent_providers` keeps its exact previous meaning as the
+ACTIVE one, so nothing about spawn behaviour or back-compat changes. The pool is what gets
+written into the agent's own config, and that is the entire mechanism.
+
+### What was verified rather than assumed
+
+Every claim below was measured against the installed Hermes CLI and its source, not read
+from documentation — the same discipline that caught the `on_session_end` naming trap and
+the credential-resolution failure earlier in this design.
+
+- `providers:` is a first-class config key (`config_providers.py`), deep-merged per leaf
+  like every other key, so Conduit's entries sit beside the user's own.
+- `custom_provider_slug` derives a stable identity from the entry's KEY, not its display
+  name, giving `custom:conduit-<preset>`. That is what `/model --provider <slug>` accepts.
+- Each entry names its own `key_env`, read at runtime with `get_secret_str`. Two pooled
+  entries with two private variables each resolved their own key:
+
+  ```text
+  custom:conduit-openrouter -> https://openrouter.ai/api/v1   key: sk-test-…
+  custom:conduit-ollama     -> http://127.0.0.1:11434/v1      key: local-xy…
+  ```
+
+This is why a Conduit-private variable is correct here and does **not** contradict
+`key_env_var`'s warning. That warning is about `model.api_key: "${VAR}"` — overlay expansion
+the credential resolver never consults. A `providers:` entry naming its variable is a
+different, working mechanism. The distinction is subtle enough that a test pins the format:
+a drift makes `/model --provider` silently reach nothing, and the switch is *accepted*, so
+the failure is invisible.
+
+### The decisions worth keeping
+
+- **Keys are per (agent, base URL).** A pool holds a keyed cloud endpoint beside a keyless
+  local one; one key per agent hands one endpoint's credential to another. The single
+  exception, `promote_unbound_key`, moves a key typed before any URL existed onto the first
+  endpoint the agent gets — not a general "follow the active endpoint" rule, which would
+  carry a cloud key onto a local server on a preset change.
+- **The silo filters the pool.** Writing a cloud endpoint into a local-only session's config
+  would leave its agent one slash command from routing siloed work off the machine, making
+  the launch-time `is_local()` check decoration.
+- **A switch persists `Session.provider`.** Otherwise the next start reads the agent's active
+  endpoint and silently moves the session back — with a model pinned that endpoint may not
+  serve. A pinned slug that no longer names anything degrades to the active endpoint, never
+  to none.
+- **`pooled_provider_slugs` returning all-`None` is an answer.** OpenCode's `/models` takes
+  no argument and every other agent reads its endpoint once at start; an invented slug would
+  put an enabled button in front of the user that does nothing.

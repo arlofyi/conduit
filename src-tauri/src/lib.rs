@@ -370,7 +370,11 @@ fn pty_spawn(
     // aggregator: `is_local()` is the check, not `enabled`, because OpenRouter is a
     // perfectly valid endpoint that happens not to be local.
     let hermes_cfg = if !shell_only && agent == crate::agent::AgentId::Hermes {
-        let settings = store.provider_settings(crate::agent::AgentId::Hermes);
+        // A session that was switched to another endpoint comes back on THAT endpoint, not
+        // on the agent's current default. Falls back to the default when the pinned slug no
+        // longer names anything -- an endpoint the user has since deleted must degrade to
+        // "the normal one", never to "no endpoint at all".
+        let settings = session_endpoint(&store, crate::agent::AgentId::Hermes, &session_id);
         let must_be_local = store.is_private_mode() && store.is_session_local_only(&session_id);
         let usable = settings.is_ready() && (!must_be_local || settings.is_local());
         if settings.is_ready() && !usable {
@@ -379,11 +383,29 @@ fn pty_spawn(
                  endpoint is not local -- routing skipped, the session runs on its own config."
             );
         }
+        // The pool is what `/model --provider` can reach mid-session, so the silo has to
+        // filter it too. Writing a cloud endpoint into a local-only session's config would
+        // leave the agent one slash command away from routing siloed work through
+        // OpenRouter -- the launch-time `usable` check above would have been decoration.
+        let keys = store.provider_keys_for_pool(crate::agent::AgentId::Hermes);
+        let pool: Vec<(crate::store::ProviderSettings, Option<String>)> = store
+            .endpoint_pool(crate::agent::AgentId::Hermes)
+            .into_iter()
+            .filter(|e| !must_be_local || e.is_local())
+            .map(|e| {
+                let key = keys
+                    .iter()
+                    .find(|(url, _)| url.trim() == e.base_url.trim())
+                    .map(|(_, k)| k.clone());
+                (e, key)
+            })
+            .collect();
         crate::hermes::build_spawn_config(
             &session_id,
             port,
             usable.then_some(&settings),
             store.provider_key(crate::agent::AgentId::Hermes).as_deref(),
+            &pool,
         )
     } else {
         None
@@ -1261,6 +1283,9 @@ fn add_session(
     // (today's behavior). See `Session::mcp_servers` for why None != Some(<everything>).
     mcp_servers: Option<Vec<String>>,
     model: Option<String>,
+    // The endpoint the new session should run on, as a provider slug or a preset name.
+    // Resolved to a slug here so what is stored is the same spelling a live switch writes.
+    provider: Option<String>,
     store: State<Arc<Store>>,
 ) -> Option<Session> {
     let mut session = store.add_session(
@@ -1283,7 +1308,40 @@ fn add_session(
         store.set_session_model(&session.id, model.clone());
         session.model = model;
     }
+    // Same reason as the model: this is what lets ONE agent start another under conditions
+    // it chose -- a Hermes session on a local model launching a worker on OpenRouter -- and
+    // a session persisted even briefly without it would spawn on the wrong endpoint first.
+    if let Some(p) = provider.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        let slug = resolve_provider_slug(&store, agent, p);
+        store.set_session_provider(&session.id, Some(slug.clone()));
+        session.provider = Some(slug);
+    }
     Some(session)
+}
+
+/// Turn what a caller NAMED into the slug this agent's switcher speaks.
+///
+/// A caller types what they know -- `openrouter`, `ollama`, a preset. The pinned value has
+/// to be what `pooled_provider_slugs` produces, or `session_endpoint` will never match it
+/// and the session silently spawns on the agent's default instead. Matching on the preset
+/// first and the slug second means both spellings work; an unrecognized name is passed
+/// through rather than dropped, so a first-class provider the agent knows but Conduit does
+/// not still reaches it.
+fn resolve_provider_slug(store: &Arc<Store>, agent: crate::agent::AgentId, named: &str) -> String {
+    let pool = store.endpoint_pool(agent);
+    let slugs = crate::agent::adapter_for(agent).pooled_provider_slugs(&pool);
+    for (e, slug) in pool.iter().zip(slugs.iter()) {
+        let hit = e.preset.eq_ignore_ascii_case(named)
+            || slug
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(named));
+        if hit {
+            if let Some(s) = slug {
+                return s.clone();
+            }
+        }
+    }
+    named.to_string()
 }
 
 #[tauri::command]
@@ -1464,6 +1522,11 @@ fn switch_session_model(
     // Persist first: whatever happens to the live process, the next spawn must agree with
     // what the user just chose.
     store.set_session_model(&session_id, (!model.is_empty()).then(|| model.clone()));
+    // The endpoint is persisted too, or the next start would quietly move the session back
+    // to the agent's active endpoint with a model that endpoint may not serve.
+    if let Some(p) = provider.as_deref() {
+        store.set_session_provider(&session_id, (!p.trim().is_empty()).then(|| p.to_string()));
+    }
     if let Some(e) = effort.as_deref() {
         store.set_session_effort(&session_id, (!e.trim().is_empty()).then(|| e.to_string()));
     }
@@ -1621,6 +1684,113 @@ fn provider_keys_set(store: State<Arc<Store>>) -> Vec<crate::agent::AgentId> {
         .map(|a| a.id())
         .filter(|id| store.provider_key(*id).is_some())
         .collect()
+}
+
+/// The endpoint one session should spawn on: the one it was switched to, else the agent's
+/// active default.
+///
+/// The pin is stored as the agent's own provider SLUG, because that is what the live switch
+/// sends and storing two different spellings of the same choice is how they drift.
+fn session_endpoint(
+    store: &Arc<Store>,
+    agent: crate::agent::AgentId,
+    session_id: &str,
+) -> crate::store::ProviderSettings {
+    let active = store.provider_settings(agent);
+    let Some(pinned) = store.session_provider(session_id) else {
+        return active;
+    };
+    let pool = store.endpoint_pool(agent);
+    let slugs = crate::agent::adapter_for(agent).pooled_provider_slugs(&pool);
+    pool.into_iter()
+        .zip(slugs)
+        .find(|(_, slug)| slug.as_deref() == Some(pinned.as_str()))
+        .map(|(e, _)| e)
+        .unwrap_or(active)
+}
+
+/// One pooled endpoint as the UI renders it. Never carries a key -- only whether one is
+/// held, which is all a form needs to decide between "Add key" and "Replace key".
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointView {
+    /// The whole endpoint, not a projection of it. The UI activates a pooled endpoint by
+    /// sending this back as the agent's settings, so anything dropped here (`enabled`,
+    /// `pinLocal`, `outputLimit`) would be silently reset the moment a row was clicked.
+    pub settings: crate::store::ProviderSettings,
+    /// True for the endpoint a new session of this agent spawns on.
+    pub active: bool,
+    pub has_key: bool,
+    /// What `/model --provider <slug>` accepts for this endpoint, or None when this agent
+    /// cannot be moved to it without a restart. The UI renders a chip for Some and a
+    /// "restart to apply" row for None -- see `ProviderAdapter::pooled_provider_slugs`.
+    pub provider_slug: Option<String>,
+}
+
+/// Every endpoint configured for one agent, with the slug each can be switched to live.
+#[tauri::command]
+fn endpoint_pool(agent: crate::agent::AgentId, store: State<Arc<Store>>) -> Vec<EndpointView> {
+    endpoint_pool_for(&store, agent)
+}
+
+fn endpoint_pool_for(store: &Arc<Store>, agent: crate::agent::AgentId) -> Vec<EndpointView> {
+    let pool = store.endpoint_pool(agent);
+    let active = store.provider_settings(agent).base_url.trim().to_string();
+    let slugs = crate::agent::adapter_for(agent).pooled_provider_slugs(&pool);
+    pool.into_iter()
+        .enumerate()
+        .map(|(i, e)| EndpointView {
+            active: !active.is_empty() && e.base_url.trim() == active,
+            has_key: store.provider_key_for(agent, &e.base_url).is_some(),
+            provider_slug: slugs.get(i).cloned().flatten(),
+            settings: e,
+        })
+        .collect()
+}
+
+/// Every agent's pool at once, so the settings tab renders from ONE read rather than one
+/// round trip per agent -- the same shape `get_all_provider_settings` has.
+#[tauri::command]
+fn all_endpoint_pools(
+    store: State<Arc<Store>>,
+) -> std::collections::HashMap<crate::agent::AgentId, Vec<EndpointView>> {
+    store
+        .all_endpoint_pools()
+        .into_keys()
+        .map(|agent| {
+            let views = endpoint_pool_for(&store, agent);
+            (agent, views)
+        })
+        .collect()
+}
+
+/// Replace one agent's endpoint pool. The UI edits a list and sends the list back; see
+/// `Store::set_endpoint_pool` for why there is no per-entry add/remove.
+#[tauri::command]
+fn set_endpoint_pool(
+    agent: crate::agent::AgentId,
+    endpoints: Vec<crate::store::ProviderSettings>,
+    store: State<Arc<Store>>,
+) {
+    store.set_endpoint_pool(agent, endpoints);
+}
+
+/// Hold the key for ONE endpoint in memory for this app run. A blank key clears it.
+/// Per endpoint rather than per agent because a pool routinely holds a keyed cloud endpoint
+/// beside a keyless local one. Never persisted; reaches a child only via its process env.
+#[tauri::command]
+fn set_endpoint_key(
+    agent: crate::agent::AgentId,
+    base_url: String,
+    key: String,
+    store: State<Arc<Store>>,
+) {
+    store.set_provider_key_for(agent, &base_url, Some(key));
+}
+
+#[tauri::command]
+fn clear_endpoint_key(agent: crate::agent::AgentId, base_url: String, store: State<Arc<Store>>) {
+    store.set_provider_key_for(agent, &base_url, None);
 }
 
 // `(async)` on a sync fn: run it on the thread pool instead of inline on the IPC (main)
@@ -2588,6 +2758,11 @@ pub fn run() {
             set_provider_key,
             clear_provider_key,
             provider_keys_set,
+            endpoint_pool,
+            all_endpoint_pools,
+            set_endpoint_pool,
+            set_endpoint_key,
+            clear_endpoint_key,
             openrouter_usage::openrouter_usage,
             agent_profile::agent_profile,
             agent_profile::write_agent_memory,
@@ -2663,6 +2838,120 @@ pub fn run() {
                 app_handle.state::<Arc<PtyManager>>().kill_all();
             }
         });
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use crate::agent::AgentId;
+    use crate::store::ProviderSettings;
+
+    fn ep(preset: &str, url: &str, model: &str) -> ProviderSettings {
+        ProviderSettings {
+            enabled: true,
+            preset: preset.into(),
+            base_url: url.into(),
+            model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A real `Store` on a throwaway directory. Mirrors `store::tests::temp_dir` rather
+    /// than sharing it: that helper lives inside store.rs's own `mod tests`.
+    fn store_with_pool() -> Arc<Store> {
+        let dir = std::env::temp_dir().join(format!(
+            "conduit_ep_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::for_test(&dir));
+        store.set_endpoint_pool(
+            AgentId::Hermes,
+            vec![
+                ep("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-5"),
+                ep("ollama", "http://127.0.0.1:11434/v1", "qwen3:30b-a3b"),
+            ],
+        );
+        store
+    }
+
+    /// A caller types what it knows. Both the preset name a human would write on the CLI
+    /// and the slug a live switch produces must land on the SAME stored value -- otherwise
+    /// `session_endpoint` never matches it and the session quietly spawns on the default.
+    #[test]
+    fn a_named_provider_resolves_to_the_agents_own_slug() {
+        let store = store_with_pool();
+        assert_eq!(
+            resolve_provider_slug(&store, AgentId::Hermes, "openrouter"),
+            "custom:conduit-openrouter"
+        );
+        assert_eq!(
+            resolve_provider_slug(&store, AgentId::Hermes, "custom:conduit-ollama"),
+            "custom:conduit-ollama"
+        );
+        // Unknown names pass through rather than being dropped: a first-class provider the
+        // agent knows and Conduit does not should still reach it.
+        assert_eq!(
+            resolve_provider_slug(&store, AgentId::Hermes, "anthropic"),
+            "anthropic"
+        );
+        // An agent that cannot be switched has no slugs, so nothing is rewritten.
+        assert_eq!(
+            resolve_provider_slug(&store, AgentId::OpenCode, "openrouter"),
+            "openrouter"
+        );
+    }
+
+    /// The other half of the live switch: a session that was moved comes back on the
+    /// endpoint it was moved TO, not on the agent's current default.
+    #[test]
+    fn a_switched_session_respawns_on_its_own_endpoint() {
+        let store = store_with_pool();
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ep("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-5"),
+        );
+        let p = store.add_project("/tmp/proj".to_string());
+        let sess = store
+            .add_session(
+                &p.id,
+                "s".into(),
+                false,
+                AgentId::Hermes,
+                Default::default(),
+            )
+            .expect("session");
+
+        // Never switched -> the agent's active endpoint.
+        assert_eq!(
+            session_endpoint(&store, AgentId::Hermes, &sess.id).preset,
+            "openrouter"
+        );
+
+        store.set_session_provider(&sess.id, Some("custom:conduit-ollama".into()));
+        assert_eq!(
+            session_endpoint(&store, AgentId::Hermes, &sess.id).preset,
+            "ollama",
+            "a switched session keeps its endpoint across a restart"
+        );
+
+        // An endpoint deleted since the switch degrades to the default, never to nothing:
+        // a session with no endpoint at all would silently lose its routing.
+        store.set_endpoint_pool(
+            AgentId::Hermes,
+            vec![ep(
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "openai/gpt-5",
+            )],
+        );
+        assert_eq!(
+            session_endpoint(&store, AgentId::Hermes, &sess.id).preset,
+            "openrouter"
+        );
+    }
 }
 
 #[cfg(test)]

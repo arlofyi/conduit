@@ -627,13 +627,16 @@ export default function App() {
             );
             return;
           }
-          // `--model` / `--effort` pin the NEW session, which is what lets one agent launch
-          // another under conditions it chose — a Hermes session on a local model starting
-          // a worker on OpenRouter, say. The model rides in `addSession` so the session is
-          // created WITH it rather than being corrected after its terminal has spawned.
+          // `--provider` / `--model` / `--effort` pin the NEW session, which is what lets
+          // one agent launch another under conditions it chose — a Hermes session on a
+          // local model starting a worker on OpenRouter, say. Both ride in `addSession` so
+          // the session is created WITH them rather than corrected after its terminal has
+          // spawned. The provider is resolved to the agent's own slug on the Rust side,
+          // where the endpoint pool lives.
           await useStore.getState().addSession(projectId, {
             agent: payload.agent as AgentId,
             model: payload.model ?? null,
+            provider: payload.provider ?? null,
           });
           if (payload.effort) {
             const id = globalSelectedSessionId(useStore.getState());

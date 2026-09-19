@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useStore, liveState, providerReady, EMPTY_PROVIDER, type LocalModel } from "../store";
+import {
+  useStore,
+  liveState,
+  providerReady,
+  EMPTY_PROVIDER,
+  type LocalModel,
+  type EndpointView,
+} from "../store";
 import { agentMeta, type AgentId } from "../agents";
 import { AgentGlyph } from "./AgentGlyph";
 import { Dropdown } from "./Dropdown";
@@ -31,6 +38,8 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
   const accounts = useStore((s) => s.accounts);
   const agentProviders = useStore((s) => s.agentProviders);
   const endpointModels = useStore((s) => s.endpointModels);
+  const endpointPools = useStore((s) => s.endpointPools);
+  const loadEndpointPools = useStore((s) => s.loadEndpointPools);
   const loadProviderSettings = useStore((s) => s.loadProviderSettings);
   const switchSessionModel = useStore((s) => s.switchSessionModel);
   const setSessionEffort = useStore((s) => s.setSessionEffort);
@@ -58,7 +67,8 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
 
   useEffect(() => {
     void loadProviderSettings();
-  }, [loadProviderSettings]);
+    void loadEndpointPools();
+  }, [loadProviderSettings, loadEndpointPools]);
 
   useEffect(() => {
     setModelDraft(session?.model ?? "");
@@ -97,6 +107,18 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
   // which is the same precedence the spawn uses — so this row cannot claim one thing while
   // the agent runs another.
   const effectiveModel = session.model?.trim() || (routed ? endpoint.model : "");
+
+  // Which endpoint this SESSION is on. `session.provider` is set once the user has moved it
+  // somewhere; until then it follows the agent's active endpoint, which is what an
+  // un-switched session actually spawns on.
+  const pool: EndpointView[] = endpointPools[agent] ?? [];
+  const switchable = pool.filter((r) => r.providerSlug);
+  const currentSlug =
+    session.provider ?? switchable.find((r) => r.active)?.providerSlug ?? null;
+  const currentEndpoint =
+    switchable.find((r) => r.providerSlug === currentSlug) ??
+    pool.find((r) => r.active) ??
+    null;
   const known: LocalModel | undefined = (endpointModels[agent] ?? []).find(
     (m) => m.id === effectiveModel,
   );
@@ -124,14 +146,16 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
    * Agents with no such command report it and fall back to the next start — said out loud
    * rather than silently restarting behind the user's back.
    */
-  const applyModel = async (raw: string) => {
+  const applyModel = async (raw: string, slug?: string | null) => {
     const v = raw.trim();
-    if (v === (session.model ?? "")) return;
+    // A provider change with the same model is still a change — it is the whole point of
+    // "is a local model enough, or do I need OpenRouter for this bit".
+    if (v === (session.model ?? "") && (slug ?? null) === (currentSlug ?? null)) return;
     setDone(null);
     const res = await switchSessionModel(
       session.id,
       v,
-      routed ? endpoint.preset : null,
+      slug ?? currentSlug ?? (routed ? endpoint.preset : null),
       session.effort ?? null,
     );
     if (res.live) {
@@ -173,7 +197,10 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
         <div className="mp-running-where">
           {routed ? (
             <>
-              via {presetMeta(endpoint.preset)?.label ?? endpoint.preset}
+              via{" "}
+              {presetMeta(currentEndpoint?.settings.preset ?? endpoint.preset)?.label ??
+                currentEndpoint?.settings.preset ??
+                endpoint.preset}
               {" · "}
               <button className="mp-link" onClick={openEndpoints}>
                 change endpoint
@@ -195,6 +222,35 @@ export function ModelPanel({ sessionId }: { sessionId: string | null }) {
           This session
           <span className="mp-scope">applied automatically</span>
         </div>
+
+        {/* ---- Endpoint, switchable mid-conversation -------------------------- */}
+        {switchable.length > 1 ? (
+          <div className="mp-row mp-row-stack">
+            <span className="mp-label">Endpoint</span>
+            <div className="mp-chips">
+              {switchable.map((r) => {
+                const on = r.providerSlug === currentSlug;
+                const def = presetMeta(r.settings.preset);
+                return (
+                  <button
+                    key={r.providerSlug}
+                    className={`mp-chip${on ? " active" : ""}`}
+                    disabled={busy}
+                    title={`${r.settings.baseUrl}${r.hasKey ? "" : " · no key held"}`}
+                    onClick={() =>
+                      // The endpoint's own pinned model comes with it: a model id served by
+                      // Ollama is not one OpenRouter serves, so carrying the current id
+                      // across would switch to a model the new endpoint cannot answer for.
+                      void applyModel(r.settings.model || modelDraft, r.providerSlug)
+                    }
+                  >
+                    {def?.label ?? r.settings.preset}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
 
         {meta.supportsModelFlags ? (
           <label className="mp-row">

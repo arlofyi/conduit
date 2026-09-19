@@ -14,6 +14,29 @@
  */
 
 /** Non-secret endpoint settings for ONE agent. Mirrors the Rust `ProviderSettings`. */
+/**
+ * One pooled endpoint as the backend reports it. Never carries a key — only `hasKey`,
+ * which is all a form needs to choose between "Add key" and "Replace key".
+ */
+export interface EndpointView {
+  /** The whole endpoint, not a projection — a row is activated by sending this back, so a
+   *  dropped field would be silently reset the moment the row was clicked. */
+  settings: ProviderSettings;
+  /** The endpoint a NEW session of this agent spawns on. */
+  active: boolean;
+  hasKey: boolean;
+  /**
+   * What this agent's own `/model --provider <slug>` accepts for this endpoint, or null
+   * when the agent cannot be moved to it without a restart.
+   *
+   * Null is a real answer, not a missing one: OpenCode's `/models` takes no argument, and
+   * every other agent reads its endpoint once at process start. The UI must render the
+   * difference — an enabled chip that silently does nothing is worse than a disabled one
+   * that says why.
+   */
+  providerSlug: string | null;
+}
+
 export interface ProviderSettings {
   enabled: boolean;
   /** "ollama" | "lmstudio" | "vllm" | "llamacpp" | "openwebui" | "openrouter" | "custom"
