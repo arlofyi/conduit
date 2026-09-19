@@ -1,9 +1,9 @@
 //! Agent provider adapters: how to launch and detect each terminal coding agent.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Which coding-agent CLI a session runs. Persisted on each Session; serializes as a
-/// lowercase string ("claude"/"codex"/"gemini"/"opencode"/"antigravity"/"commandcode").
+/// lowercase string ("claude"/"codex"/"gemini"/"opencode"/"antigravity"/"commandcode"/"hermes").
 /// Unknown/absent → Claude, and that back-compat promise is now KEPT rather than merely
 /// documented: see `store::PersistedEnum` for what one unreadable value used to cost.
 /// `Hash`/`Eq` let it key the per-agent default-account maps (serde emits it as a JSON string
@@ -18,6 +18,7 @@ pub enum AgentId {
     OpenCode,
     Antigravity,
     CommandCode,
+    Hermes,
 }
 
 impl crate::store::PersistedEnum for AgentId {
@@ -29,6 +30,7 @@ impl crate::store::PersistedEnum for AgentId {
             "opencode" => Some(AgentId::OpenCode),
             "antigravity" => Some(AgentId::Antigravity),
             "commandcode" => Some(AgentId::CommandCode),
+            "hermes" => Some(AgentId::Hermes),
             _ => None,
         }
     }
@@ -218,6 +220,7 @@ pub fn default_profile_dir(agent: AgentId) -> Option<&'static str> {
     match agent {
         AgentId::Claude | AgentId::Antigravity => Some(".claude"),
         AgentId::CommandCode => Some(".commandcode"),
+        AgentId::Hermes => Some(".hermes"),
         AgentId::Codex | AgentId::Gemini | AgentId::OpenCode => None,
     }
 }
@@ -241,6 +244,17 @@ pub trait ProviderAdapter {
     /// until someone checks rather than shipping half a pair.
     fn supports_model_flags(&self) -> bool {
         false
+    }
+    /// How THIS CLI spells the reasoning-effort flag.
+    ///
+    /// Claude, Command Code and the shared flag builder in `pty.rs` all assumed `--effort`,
+    /// which is fine while every agent that takes one spells it that way. Hermes spells it
+    /// `--reasoning` (verified in `hermes chat --help`), and an unknown flag is not a
+    /// degradation -- argparse exits non-zero, so every Hermes session would fall through
+    /// to its bare `||` fallback and silently lose the effort the user asked for. Only
+    /// consulted when `supports_model_flags()` is true.
+    fn effort_flag(&self) -> &'static str {
+        "--effort"
     }
     /// Extra env vars to set on the child process for this agent.
     fn env_overrides(&self) -> Vec<(&'static str, &'static str)> {
@@ -953,7 +967,7 @@ pub struct OpenCodeSpawnConfig {
     pub api_key: Option<String>,
 }
 
-/// Human label for a local-provider preset id, shown as the provider name inside OpenCode.
+/// Human label for an endpoint preset id, shown as the provider name inside OpenCode.
 fn preset_label(preset: &str) -> &'static str {
     match preset {
         "ollama" => "Ollama",
@@ -961,7 +975,8 @@ fn preset_label(preset: &str) -> &'static str {
         "vllm" => "vLLM",
         "llamacpp" => "llama.cpp",
         "openwebui" => "OpenWebUI",
-        _ => "Local endpoint",
+        "openrouter" => "OpenRouter",
+        _ => "Custom endpoint",
     }
 }
 
@@ -973,10 +988,16 @@ fn preset_label(preset: &str) -> &'static str {
 ///
 /// The provider id is a fixed "conduit" (not the preset name) so the merge can never
 /// collide with a provider the user defined themselves. `small_model` is pinned too so
-/// title-generation etc. can't silently route to a cloud model. `pin_local` emits
+/// title-generation etc. can't silently route to a different model. `pin_local` emits
 /// `enabled_providers: ["conduit"]` — an allowlist that keeps OpenCode from loading ANY
-/// other provider even when cloud credentials exist in its auth store; the spawner sets
-/// it for siloed/local-only sessions under private mode (trust boundaries) or by choice.
+/// other provider even when other credentials exist in its auth store.
+///
+/// The endpoint no longer has to be local: the same `@ai-sdk/openai-compatible` provider
+/// serves OpenRouter (`https://openrouter.ai/api/v1`) exactly as it serves Ollama. That
+/// widens what `pin_local` MEANS — "use only this endpoint", which under a local preset
+/// also means "nothing leaves the machine" and under OpenRouter does not. So it is no
+/// longer sufficient on its own for a trust-boundary silo: the caller checks
+/// `ProviderSettings::is_local()` for that, and this flag keeps its narrow job.
 pub fn build_opencode_config(
     s: &crate::store::OpenCodeSettings,
     api_key: Option<&str>,
@@ -1118,6 +1139,13 @@ pub fn model_for_tier(agent: AgentId, tier: &str) -> Option<&'static str> {
         (AgentId::CommandCode, "cheap") => Some("deepseek/deepseek-v4-flash"),
         (AgentId::CommandCode, "standard") => Some("claude-sonnet-5"),
         (AgentId::CommandCode, "hard") => Some("claude-opus-5"),
+        // Hermes' tiers are deliberately UNPINNED. Its model id is meaningless without
+        // the provider beside it -- `qwen3:30b` on a local Ollama and
+        // `anthropic/claude-sonnet-5` on OpenRouter are both valid `model.default` values
+        // for the same install, and which one is right depends on an endpoint Conduit
+        // stores per agent (`ProviderSettings`), not on a tier. Naming a fixed id here
+        // would route a local-only session at a cloud model the moment a tier was set.
+        // Same call OpenCode's "cheap" makes, for the same reason.
         _ => None,
     }
 }
@@ -1205,6 +1233,20 @@ pub fn capability_card(agent: AgentId) -> serde_json::Value {
             "whenToUse": "Spreading load across ~58 models from one subscription -- Anthropic, OpenAI, Google, xAI and a large open-source set -- when the point is to NOT spend a Claude or Codex quota. Per-session model and reasoning effort are selectable (`--model`, `--effort`): pass `model` to fleet_spawn to pin any one of them exactly (`claude-opus-5`, `google/gemini-3.7-flash`, `deepseek/deepseek-v4-flash`), or `modelTier` for the coarse cheap/standard/hard mapping. A cheap open model can take mechanical work while the expensive quotas stay for work that needs them.",
             "whenNotToUse": "Conducting: the Conductor persona and its orchestration tools are Claude-only. Work that must run on one specific vendor's own subscription rather than through Command Code's."
         }),
+        AgentId::Hermes => serde_json::json!({
+            "agent": "hermes",
+            // Tier 2, not 1, and the distinction is the design doc's invariant 9: Hermes
+            // HAS `hermes mcp add`, so the MCP matrix manages it, but nothing has yet
+            // verified that a Hermes worker can serve Conduit's session-scoped fleet MCP
+            // server end to end the way OpenCode's spike verified OpenCode's. Claiming
+            // `structuredResult` before that spike would be exactly the lie the invariant
+            // forbids. Promote to 1 when, and only when, the spike is run.
+            "tier": 2,
+            "structuredResult": false,
+            "mailbox": false,
+            "whenToUse": "Work that should run on a model Conduit's other agents cannot reach: any OpenRouter model, or a local GPU, chosen per session. Hermes has the richest lifecycle surface of any adapter here (per-turn status AND a real needs-you badge from its approval prompts), so a long unattended run is more legible than on agy or Command Code.",
+            "whenNotToUse": "Anything needing a fleet_result or the mailbox -- Hermes has no verified result channel yet, so treat it like Codex: give it self-contained work and read the outcome yourself."
+        }),
     }
 }
 
@@ -1216,6 +1258,156 @@ pub fn capability_cards() -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Which Hermes home a registered account resolves to.
+///
+/// A Conduit account's `config_dir` is `.claude`-rooted (see `default_profile_dir`), so a
+/// Hermes-tagged account hands this adapter a path Hermes cannot use directly. This is the
+/// ONE place that decides what it becomes, exactly as `command_code_profile_dir` is for
+/// Command Code -- the two disagreed once there (the session ran ambient while the meter
+/// looked elsewhere) and it silently emptied the usage bar.
+///
+/// `<root>/.hermes` when it exists, else None (inherit the ambient home). Unlike Claude and
+/// Command Code this does NOT redirect HOME: Hermes documents `HERMES_HOME` as its own
+/// config-root override, so the blast radius stays one variable instead of the whole
+/// home directory.
+pub fn hermes_home_dir(config_dir: &str) -> Option<PathBuf> {
+    let p = Path::new(config_dir);
+    if !p.exists() {
+        return None;
+    }
+    // Already a `.hermes` profile: take it as given.
+    if p.file_name().and_then(|f| f.to_str()) == Some(".hermes") {
+        return Some(p.to_path_buf());
+    }
+    // A `.claude`-rooted account: its sibling `.hermes`, when the user made one.
+    let root = if p.file_name().and_then(|f| f.to_str()) == Some(".claude") {
+        p.parent()?
+    } else {
+        p
+    };
+    let candidate = root.join(".hermes");
+    candidate.is_dir().then_some(candidate)
+}
+
+/// The `HERMES_HOME` redirect for an account profile. Empty = inherit the ambient home.
+pub fn hermes_profile_env(config_dir: &str) -> Vec<(String, String)> {
+    match hermes_home_dir(config_dir) {
+        Some(dir) => vec![(
+            "HERMES_HOME".to_string(),
+            dir.to_string_lossy().into_owned(),
+        )],
+        None => Vec::new(),
+    }
+}
+
+pub struct HermesAdapter;
+
+impl ProviderAdapter for HermesAdapter {
+    fn id(&self) -> AgentId {
+        AgentId::Hermes
+    }
+    fn binary(&self) -> &'static str {
+        "hermes"
+    }
+    // Nous Research's own installer. Run on explicit user action only (Conduit surfaces the
+    // exact command). Post-install, `hermes setup` still has to be run inside the PTY to
+    // choose a provider -- install is not ready, same as every other agent here.
+    fn install_command(&self) -> Option<String> {
+        #[cfg(windows)]
+        {
+            Some("iex (irm https://hermes-agent.nousresearch.com/install.ps1)".into())
+        }
+        #[cfg(not(windows))]
+        {
+            Some("curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash".into())
+        }
+    }
+    // Hermes manages its own worktrees (`-w/--worktree`). Same call as Command Code: two
+    // worktree managers over one directory is a decision to make deliberately, not by
+    // default.
+    fn supports_worktree(&self) -> bool {
+        false
+    }
+    // Verified against the installed CLI, not the docs: `hermes chat --help` lists
+    // `-m MODEL, --model MODEL` and `--reasoning LEVEL` (none/minimal/low/medium/high/
+    // xhigh/max/ultra -- a superset of Conduit's five, so no effort value needs clamping
+    // for this adapter).
+    fn supports_model_flags(&self) -> bool {
+        true
+    }
+    fn effort_flag(&self) -> &'static str {
+        "--reasoning"
+    }
+    fn account_env(&self, config_dir: &str) -> Vec<(String, String)> {
+        hermes_profile_env(config_dir)
+    }
+    /// Resume is PINNED, not captured.
+    ///
+    /// agy and Command Code both need their chosen id scraped back after the fact (agy from
+    /// a filesystem baseline, Command Code from a `SessionStart` body) because neither lets
+    /// a caller name the session up front. Hermes does:
+    /// `-c <name> --create-if-missing` means "resume the session titled `<name>`, creating
+    /// it if absent" (`hermes chat --help`: "if no session matches the name, create a new
+    /// session with that title and proceed"). Passing Conduit's own session id as the title
+    /// makes the first spawn and every later one the SAME command -- idempotent, with
+    /// nothing to capture and no `Session.agent_conversation_id` involvement at all.
+    ///
+    /// Do not "unify" this with the resume_token path later for consistency: having nothing
+    /// to capture is the feature.
+    ///
+    /// `chat` is explicit rather than relying on the bare `hermes` default, because the
+    /// bare form's flag set is the top-level parser's and `--create-if-missing` lives on
+    /// `chat`. `|| hermes chat` keeps the house guarantee that a rejected flag still opens
+    /// a usable terminal instead of a dead pane.
+    fn build_invocation(
+        &self,
+        session_id: &str,
+        _projects_dir: Option<&Path>,
+        flags: &str,
+        initial_prompt: Option<&str>,
+        _resume_token: Option<&str>,
+    ) -> String {
+        let id = crate::pty::quote_arg(session_id);
+        // `-q` seeds the prompt as the first turn and STAYS interactive on a TTY -- the
+        // same property OpenCode's `--prompt` has, and the reason neither uses the
+        // one-shot form (`--oneshot`/`-z`), which would answer and exit.
+        let prompt = initial_prompt
+            .map(|p| format!(" -q {}", crate::pty::quote_arg(p)))
+            .unwrap_or_default();
+        format!("hermes chat -c {id} --create-if-missing{flags}{prompt} || hermes chat")
+    }
+    /// `hermes mcp add/remove` (verified: `hermes mcp --help`). Named-server management
+    /// only -- the per-session allowlist Claude gets from `--mcp-config` has no Hermes
+    /// equivalent, so `session_mcp_config_json` still does not apply here.
+    fn mcp_add_command(&self, s: &McpServer) -> Option<String> {
+        let env: String = s
+            .env
+            .iter()
+            .map(|(k, v)| format!(" -e {}={}", sh_quote(k), sh_quote(v)))
+            .collect();
+        match s.transport.as_str() {
+            "stdio" => {
+                let args: String = s.args.iter().map(|a| format!(" {}", sh_quote(a))).collect();
+                Some(format!(
+                    "hermes mcp add{env} {} -- {}{}",
+                    sh_quote(&s.name),
+                    sh_quote(&s.command),
+                    args
+                ))
+            }
+            "http" => Some(format!(
+                "hermes mcp add --transport http{env} {} {}",
+                sh_quote(&s.name),
+                sh_quote(&s.url)
+            )),
+            _ => None,
+        }
+    }
+    fn mcp_remove_command(&self, name: &str) -> Option<String> {
+        Some(format!("hermes mcp remove {}", sh_quote(name)))
+    }
+}
+
 /// Resolve the adapter for an agent id.
 pub fn adapter_for(agent: AgentId) -> Box<dyn ProviderAdapter> {
     match agent {
@@ -1225,6 +1417,7 @@ pub fn adapter_for(agent: AgentId) -> Box<dyn ProviderAdapter> {
         AgentId::OpenCode => Box::new(OpenCodeAdapter),
         AgentId::Antigravity => Box::new(AntigravityAdapter),
         AgentId::CommandCode => Box::new(CommandCodeAdapter),
+        AgentId::Hermes => Box::new(HermesAdapter),
     }
 }
 
@@ -1271,6 +1464,7 @@ pub fn all_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(OpenCodeAdapter),
         Box::new(AntigravityAdapter),
         Box::new(CommandCodeAdapter),
+        Box::new(HermesAdapter),
     ]
 }
 
@@ -1282,6 +1476,7 @@ fn label_for(id: AgentId) -> &'static str {
         AgentId::OpenCode => "OpenCode",
         AgentId::Antigravity => "Antigravity (agy)",
         AgentId::CommandCode => "Command Code",
+        AgentId::Hermes => "Hermes Agent",
     }
 }
 
@@ -2244,6 +2439,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_effort_flag_is_each_clis_own_spelling() {
+        // An unknown flag does not degrade: argparse exits non-zero and the whole session
+        // falls through to its bare `||` fallback with the effort silently lost.
+        assert_eq!(HermesAdapter.effort_flag(), "--reasoning");
+        assert_eq!(ClaudeAdapter.effort_flag(), "--effort");
+        assert_eq!(CommandCodeAdapter.effort_flag(), "--effort");
+    }
+
+    #[test]
+    fn hermes_pins_its_own_resume_title_and_never_captures_an_id() {
+        // `-c <title> --create-if-missing` makes the first spawn and every later one the
+        // same command, so there is nothing to capture. The resume_token argument is
+        // deliberately ignored.
+        let fresh = HermesAdapter.build_invocation("sess-1", None, "", None, None);
+        let resumed =
+            HermesAdapter.build_invocation("sess-1", None, "", None, Some("some-other-id"));
+        assert_eq!(fresh, resumed, "a captured id must not change the command");
+        assert!(fresh.contains("-c sess-1"), "{fresh}");
+        assert!(fresh.contains("--create-if-missing"), "{fresh}");
+        // The house guarantee: a rejected flag still opens a usable terminal.
+        assert!(fresh.ends_with("|| hermes chat"), "{fresh}");
+    }
+
+    #[test]
+    fn hermes_seeds_a_prompt_interactively_not_as_a_one_shot() {
+        // `-z/--oneshot` would answer and exit, which kills a fleet worker's terminal.
+        let cmd = HermesAdapter.build_invocation("s", None, "", Some("do the thing"), None);
+        assert!(cmd.contains("-q "), "{cmd}");
+        assert!(!cmd.contains("--oneshot") && !cmd.contains(" -z "), "{cmd}");
+    }
+
+    #[test]
+    fn hermes_carries_model_flags_through() {
+        let cmd = HermesAdapter.build_invocation("s", None, " --model x-ai/grok-4", None, None);
+        assert!(cmd.contains("--model x-ai/grok-4"), "{cmd}");
+    }
+
+    #[test]
+    fn hermes_manages_its_own_worktrees_so_conduit_does_not() {
+        // Two worktree managers over one directory is a decision not yet made -- same call
+        // as Command Code.
+        assert!(!HermesAdapter.supports_worktree());
+        assert!(HermesAdapter.supports_model_flags());
+    }
+
+    #[test]
+    fn hermes_account_redirects_only_its_own_home() {
+        // Unlike Claude/agy/Command Code this must NOT touch HOME/USERPROFILE: Hermes
+        // documents HERMES_HOME, so the blast radius stays one variable.
+        let dir = std::env::temp_dir().join(format!("conduit_hermes_acct_{}", std::process::id()));
+        let hermes_home = dir.join(".hermes");
+        std::fs::create_dir_all(&hermes_home).unwrap();
+        let env = HermesAdapter.account_env(dir.to_str().unwrap());
+        assert_eq!(env.len(), 1, "exactly one variable: {env:?}");
+        assert_eq!(env[0].0, "HERMES_HOME");
+        assert!(env[0].1.ends_with(".hermes"), "{:?}", env[0].1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hermes_account_with_no_hermes_home_inherits_the_ambient_one() {
+        // Better to inherit than to point the session at a directory that does not exist.
+        let dir = std::env::temp_dir().join(format!("conduit_hermes_bare_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(HermesAdapter.account_env(dir.to_str().unwrap()).is_empty());
+        assert!(HermesAdapter.account_env("/definitely/not/here").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hermes_tiers_stay_unpinned_because_a_model_id_needs_its_endpoint() {
+        // `qwen3:30b` on a local Ollama and `anthropic/claude-sonnet-5` on OpenRouter are
+        // both valid for the same install. Pinning one here would route a local-only
+        // session at a cloud model the moment a tier was set.
+        for tier in ["cheap", "standard", "hard"] {
+            assert_eq!(model_for_tier(AgentId::Hermes, tier), None, "{tier}");
+        }
+    }
+
     fn oc_settings() -> crate::store::OpenCodeSettings {
         crate::store::OpenCodeSettings {
             enabled: true,
@@ -2576,6 +2851,7 @@ mod tests {
             (AgentId::Gemini, 2),
             (AgentId::CommandCode, 1),
             (AgentId::Antigravity, 3),
+            (AgentId::Hermes, 2),
         ];
         assert_eq!(
             expected_tiers.len(),

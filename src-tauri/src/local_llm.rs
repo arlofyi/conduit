@@ -369,17 +369,23 @@ pub async fn detect_local_providers() -> Vec<LocalProviderStatus> {
     .unwrap_or_default()
 }
 
-/// The held key is credentials FOR the configured endpoint — never attach it to any
+/// The held key is credentials FOR a configured endpoint — never attach it to any
 /// other URL a (potentially compromised) frontend might pass, or these commands become
 /// an oracle that exfiltrates the key to an arbitrary host.
+///
+/// Now that endpoints are per agent, this searches every configured one and answers with
+/// the key belonging to the agent whose endpoint MATCHES. The anti-oracle property is
+/// unchanged — an unrecognized URL still gets nothing — but the match is no longer
+/// hard-coded to OpenCode's slot, which would have silently sent no key at all once a
+/// second agent had an endpoint of its own.
 fn key_for_endpoint(store: &crate::store::Store, requested_base_url: &str) -> Option<String> {
-    let configured = store.opencode_settings().base_url;
     let norm = |s: &str| s.trim().trim_end_matches('/').to_ascii_lowercase();
-    if norm(requested_base_url) == norm(&configured) {
-        store.opencode_key()
-    } else {
-        None
-    }
+    let want = norm(requested_base_url);
+    store
+        .all_provider_settings()
+        .into_iter()
+        .find(|(_, s)| !s.base_url.trim().is_empty() && norm(&s.base_url) == want)
+        .and_then(|(agent, _)| store.provider_key(agent))
 }
 
 /// List the models a local server offers, for the Settings model picker. Ollama is asked

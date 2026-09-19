@@ -78,6 +78,10 @@ export interface Session {
   /** Must run against a local model and receive no cloud MCP (siloed sensitive-data agent). */
   localOnly?: boolean;
   channels?: string[];
+  /** A CONCRETE model id pinned for this session, as chosen by a route or by hand. Takes
+   *  precedence over `modelTier`. Only acted on for agents whose `supportsModelFlags` is
+   *  true, and only at the next spawn. */
+  model?: string | null;
   modelTier?: string | null;
   seedMemory?: string | null;
   effort?: string | null;
@@ -128,21 +132,21 @@ export interface SensitivityHit {
 
 // ---- OpenCode local provider — mirror the Rust serde structs (camelCase) ----
 
-/** Non-secret local-provider settings. The endpoint API key is never part of this (or of
- * any persisted state) — it is held in backend memory and reaches OpenCode via child env. */
-export interface OpenCodeSettings {
-  enabled: boolean;
-  /** "ollama" | "lmstudio" | "vllm" | "llamacpp" | "openwebui" | "custom" ("" = unset). */
-  preset: string;
-  /** Full OpenAI-compatible base URL (e.g. http://127.0.0.1:11434/v1). */
-  baseUrl: string;
-  /** Model id exactly as the server reports it. */
-  model: string;
-  contextLimit?: number | null;
-  outputLimit?: number | null;
-  /** Allowlist the injected provider so OpenCode can't fall back to cloud providers. */
-  pinLocal: boolean;
-}
+/** Endpoint-provider types and rules live in their own module -- `store.ts` cannot be
+ *  imported under the node-env vitest, and these need to be testable. Re-exported here so
+ *  call sites keep one import path (same arrangement as `accountKey` / `usageRows.ts`). */
+export {
+  LOCAL_PRESETS,
+  isLocalPreset,
+  providerReady,
+  allowedForLocalOnly,
+  EMPTY_PROVIDER,
+} from "./providers";
+export type { ProviderSettings } from "./providers";
+import type { ProviderSettings } from "./providers";
+
+/** The old name, kept for OpenCode's own call sites. */
+export type OpenCodeSettings = ProviderSettings;
 
 /** One probed local inference server (detect_local_providers). */
 export interface LocalProviderStatus {
@@ -346,7 +350,7 @@ export interface ContextMenuState {
 }
 
 export type TopTab = "files" | "changes" | "todos" | "subagents";
-export type BottomTab = "terminal" | "git" | "decisions" | "messages";
+export type BottomTab = "terminal" | "git" | "model" | "decisions" | "messages";
 
 // ---- Claude ambient (status + usage) — mirror Rust serde camelCase ----
 export interface StatusComponent { name: string; status: string; }
@@ -1365,6 +1369,10 @@ interface AppState {
   setAccountAgents: (accountId: string, agents: AgentId[]) => Promise<void>;
   /** Pin (id) or clear (null) a single session's account. */
   setSessionAccount: (sessionId: string, id: string | null) => Promise<void>;
+  /** Pin (or clear, with null) this session's model. Applies at the next spawn. */
+  setSessionModel: (sessionId: string, model: string | null) => Promise<void>;
+  /** Pin (or clear, with null) this session's reasoning effort. Applies at the next spawn. */
+  setSessionEffort: (sessionId: string, effort: string | null) => Promise<void>;
 
   // ---- Trust boundaries (Feature 4) ----
   /** Master switch for the trust-boundary regime. When false the whole thing is inert. */
@@ -1389,6 +1397,16 @@ interface AppState {
   listLocalModels: (baseUrl: string, preset: string) => Promise<LocalModel[] | string>;
   /** Live-test native tool calling on the served model; a string is the error message. */
   probeToolCall: (baseUrl: string, model: string) => Promise<ToolProbeResult | string>;
+
+  // ---- Per-agent endpoints ----
+  /** Every agent's endpoint settings. Absent = that agent has none configured. */
+  agentProviders: Partial<Record<AgentId, ProviderSettings>>;
+  /** Which agents hold an endpoint API key this run. Membership only — never a key. */
+  providerKeys: AgentId[];
+  loadProviderSettings: () => Promise<void>;
+  setProviderSettings: (agent: AgentId, settings: ProviderSettings) => Promise<void>;
+  /** Non-empty = hold/replace this agent's key for this run; empty = clear. Never persisted. */
+  setProviderKey: (agent: AgentId, key: string) => Promise<void>;
 
   // ---- MCP server registry ----
   mcpServers: McpServer[];
@@ -1728,6 +1746,8 @@ export const useStore = create<AppState>((set, get) => {
       pinLocal: false,
     },
     opencodeKeySet: false,
+    agentProviders: {},
+    providerKeys: [],
     agentSetupComplete: localStorage.getItem(SETUP_DONE_KEY) === "1",
     telemetryOptOut: readTelemetryOptOut(),
 
@@ -1953,6 +1973,28 @@ export const useStore = create<AppState>((set, get) => {
         })),
       }));
     },
+    setSessionModel: async (sessionId, model) => {
+      await invoke("set_session_model", { sessionId, model }).catch(() => {});
+      set((s) => ({
+        projects: s.projects.map((p) => ({
+          ...p,
+          sessions: p.sessions.map((sess) =>
+            sess.id === sessionId ? { ...sess, model } : sess,
+          ),
+        })),
+      }));
+    },
+    setSessionEffort: async (sessionId, effort) => {
+      await invoke("set_session_effort", { sessionId, effort }).catch(() => {});
+      set((s) => ({
+        projects: s.projects.map((p) => ({
+          ...p,
+          sessions: p.sessions.map((sess) =>
+            sess.id === sessionId ? { ...sess, effort } : sess,
+          ),
+        })),
+      }));
+    },
 
     // ---- Trust boundaries (Feature 4) ----
     loadTrustSettings: async () => {
@@ -2016,6 +2058,42 @@ export const useStore = create<AppState>((set, get) => {
         await invoke("clear_opencode_key").catch(() => {});
         set({ opencodeKeySet: false });
       }
+    },
+
+    // ---- Per-agent endpoints ----
+    loadProviderSettings: async () => {
+      try {
+        const [agentProviders, providerKeys] = await Promise.all([
+          invoke<Partial<Record<AgentId, ProviderSettings>>>("get_all_provider_settings"),
+          invoke<AgentId[]>("provider_keys_set"),
+        ]);
+        // OpenCode's own slice is the same row; keep the two in step so a panel reading
+        // either one never shows a stale endpoint after the other wrote.
+        const opencode = agentProviders.opencode;
+        set({
+          agentProviders,
+          providerKeys,
+          ...(opencode ? { opencode, opencodeKeySet: providerKeys.includes("opencode") } : {}),
+        });
+      } catch { /* keep current */ }
+    },
+    setProviderSettings: async (agent, settings) => {
+      await invoke("set_provider_settings", { agent, settings }).catch(() => {});
+      set((st) => ({
+        agentProviders: { ...st.agentProviders, [agent]: settings },
+        ...(agent === "opencode" ? { opencode: settings } : {}),
+      }));
+    },
+    setProviderKey: async (agent, key) => {
+      const held = key.trim().length > 0;
+      await invoke(held ? "set_provider_key" : "clear_provider_key",
+        held ? { agent, key } : { agent }).catch(() => {});
+      set((st) => ({
+        providerKeys: held
+          ? Array.from(new Set([...st.providerKeys, agent]))
+          : st.providerKeys.filter((a) => a !== agent),
+        ...(agent === "opencode" ? { opencodeKeySet: held } : {}),
+      }));
     },
     detectLocalProviders: async () => {
       try {

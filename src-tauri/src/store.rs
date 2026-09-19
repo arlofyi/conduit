@@ -450,19 +450,24 @@ pub struct TrustSettings {
     pub private_mode: bool,
 }
 
-/// OpenCode local-provider settings: route `opencode` sessions to a
-/// local/self-hosted OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, llama.cpp,
-/// OpenWebUI, or a custom URL). Non-secret and persisted in state.json; the API key is
-/// deliberately NOT here — it lives only in `Store::opencode_key` (in memory) and reaches
-/// the child solely through its process env at spawn.
+/// Endpoint settings for ONE agent: route its sessions at a chosen OpenAI-compatible
+/// endpoint — a local/self-hosted server (Ollama, LM Studio, vLLM, llama.cpp, OpenWebUI),
+/// a cloud aggregator (OpenRouter), or a custom URL. Non-secret and persisted in
+/// state.json; the API key is deliberately NOT here — it lives only in
+/// `Store::provider_key` and reaches the child solely through its process env at spawn.
+///
+/// This was `OpenCodeSettings`, one global slot for one agent. The shape is byte-identical
+/// on the wire so existing `state.json` files keep parsing (see `PersistState::opencode`),
+/// and the alias below keeps the old name working for OpenCode's own call sites.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct OpenCodeSettings {
-    /// Master switch. Off = OpenCode spawns untouched (its own config applies).
+pub struct ProviderSettings {
+    /// Master switch. Off = the agent spawns untouched (its own config applies).
     #[serde(default)]
     pub enabled: bool,
-    /// Preset id: "ollama" | "lmstudio" | "vllm" | "llamacpp" | "openwebui" | "custom".
-    /// Only affects labels and how models are listed; the spawn config is uniform.
+    /// Preset id: "ollama" | "lmstudio" | "vllm" | "llamacpp" | "openwebui" |
+    /// "openrouter" | "custom". Only affects labels and how models are listed; the spawn
+    /// config is uniform.
     #[serde(default)]
     pub preset: String,
     /// Full OpenAI-compatible base URL (e.g. http://localhost:11434/v1).
@@ -476,10 +481,39 @@ pub struct OpenCodeSettings {
     pub context_limit: Option<u32>,
     #[serde(default)]
     pub output_limit: Option<u32>,
-    /// Allowlist the injected provider (`enabled_providers: ["conduit"]`) so OpenCode
-    /// cannot fall back to cloud providers even if the user has credentials for them.
+    /// Allowlist the injected provider (`enabled_providers: ["conduit"]`) so the agent
+    /// cannot fall back to other providers even if it has credentials for them.
+    ///
+    /// The wire name stays `pinLocal` although the meaning widened to "use only this
+    /// endpoint" (under OpenRouter it pins a cloud aggregator, not a local server).
+    /// Renaming the key would silently reset the setting for everyone who had it on.
     #[serde(default)]
     pub pin_local: bool,
+}
+
+/// The old name, kept so OpenCode's own call sites read as they did.
+pub type OpenCodeSettings = ProviderSettings;
+
+/// Presets that are genuinely LOCAL inference, i.e. no request leaves the machine.
+/// `openrouter` and `custom` are deliberately absent: a custom URL may point anywhere,
+/// and treating "the user typed a URL" as local is how a siloed session would get
+/// quietly routed through a cloud aggregator.
+pub const LOCAL_PRESETS: &[&str] = &["ollama", "lmstudio", "vllm", "llamacpp", "openwebui"];
+
+impl ProviderSettings {
+    /// Whether this endpoint keeps inference on the machine. This is what a `local_only`
+    /// session under private mode checks — NOT `enabled`, and NOT `pin_local`, which only
+    /// says "don't fall back elsewhere" and is equally true of a cloud aggregator.
+    pub fn is_local(&self) -> bool {
+        LOCAL_PRESETS.contains(&self.preset.as_str())
+    }
+
+    /// Enough to build a spawn config from: a switch that is on, and both halves of the
+    /// route present. An `enabled` block with no model is not a half-configured route to
+    /// guess at — the agent spawns untouched instead.
+    pub fn is_ready(&self) -> bool {
+        self.enabled && !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
+    }
 }
 
 /// Root of state.json. Was a bare `Vec<Project>`; promoted to an object so the account
@@ -501,8 +535,15 @@ pub struct PersistState {
     pub default_accounts: HashMap<AgentId, String>,
     #[serde(default)]
     pub trust: TrustSettings,
+    /// Legacy single slot (pre-multi-agent providers). Kept so an older Conduit still
+    /// finds OpenCode's endpoint where it left it, and so new state migrates it into
+    /// `agent_providers[OpenCode]` on load. On save it mirrors that entry -- the same
+    /// contract `default_account` has with `default_accounts[Claude]`.
     #[serde(default)]
     pub opencode: OpenCodeSettings,
+    /// Per-agent endpoint settings (agent -> settings). Source of truth going forward.
+    #[serde(default)]
+    pub agent_providers: HashMap<AgentId, ProviderSettings>,
     #[serde(default)]
     pub plugins: Vec<crate::plugins::PluginRecord>,
     #[serde(default)]
@@ -524,15 +565,16 @@ pub struct Store {
     /// field is migrated in on load and mirrored out (as the Claude slot) on save.
     default_accounts: Mutex<HashMap<AgentId, String>>,
     trust: Mutex<TrustSettings>,
-    opencode: Mutex<OpenCodeSettings>,
+    agent_providers: Mutex<HashMap<AgentId, ProviderSettings>>,
     plugins: Mutex<Vec<crate::plugins::PluginRecord>>,
     root_chats: Mutex<Vec<RootChat>>,
     routes: Mutex<crate::routing::AgentRoutes>,
     profiles: Mutex<Vec<Profile>>,
     active_profile_id: Mutex<Option<String>>,
     /// The local-endpoint API key, held in memory for the app's lifetime only. Never part
-    /// of `PersistState`/`save()`, never logged; injected into an `opencode` child's env.
-    opencode_key: Mutex<Option<String>>,
+    /// of `PersistState`/`save()`, never logged; injected into the child's env at spawn.
+    /// Keyed per agent, because two agents may sit behind two different endpoints.
+    provider_keys: Mutex<HashMap<AgentId, String>>,
     save_path: PathBuf,
 }
 
@@ -692,6 +734,24 @@ fn rotate_backup(save_path: &std::path::Path) {
     }
 }
 
+/// Fold the legacy single `opencode` slot into the per-agent endpoint map.
+///
+/// A `state.json` written before per-agent endpoints carries only `opencode`. Dropping it
+/// would silently unconfigure the user's endpoint on upgrade -- their OpenCode sessions
+/// would quietly go back to whatever the cloud default is, with no message. Newer state
+/// wins: an `agent_providers` that already names OpenCode is left alone, exactly as the
+/// `default_account` -> `default_accounts[Claude]` migration beside it does.
+///
+/// Pure so it can be tested; `Store::new` reads `data_dir()` and cannot be pointed at a
+/// fixture.
+fn adopt_legacy_opencode(
+    mut per_agent: HashMap<AgentId, ProviderSettings>,
+    legacy: ProviderSettings,
+) -> HashMap<AgentId, ProviderSettings> {
+    per_agent.entry(AgentId::OpenCode).or_insert(legacy);
+    per_agent
+}
+
 impl Store {
     pub fn new() -> Self {
         let save_path = data_dir().join("state.json");
@@ -720,13 +780,16 @@ impl Store {
             accounts: Mutex::new(accounts),
             default_accounts: Mutex::new(default_accounts),
             trust: Mutex::new(state.trust),
-            opencode: Mutex::new(state.opencode),
+            agent_providers: Mutex::new(adopt_legacy_opencode(
+                state.agent_providers,
+                state.opencode,
+            )),
             plugins: Mutex::new(state.plugins),
             root_chats: Mutex::new(state.root_chats),
             routes: Mutex::new(state.routes),
             profiles: Mutex::new(state.profiles),
             active_profile_id: Mutex::new(state.active_profile_id),
-            opencode_key: Mutex::new(None),
+            provider_keys: Mutex::new(HashMap::new()),
             save_path,
         }
     }
@@ -738,6 +801,15 @@ impl Store {
         // already holds the projects lock, so lock only the other two mutexes here.
         let default_accounts = self
             .default_accounts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // ONE lock, read once. Locking `agent_providers` twice inside the struct literal
+        // below would SELF-DEADLOCK: a `MutexGuard` temporary lives until the end of the
+        // enclosing statement, so the first guard is still held when the second `.lock()`
+        // runs, and `std::sync::Mutex` is not reentrant. That hung every test that saves.
+        let agent_providers = self
+            .agent_providers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
@@ -758,11 +830,14 @@ impl Store {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            opencode: self
-                .opencode
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
+            // Mirror OpenCode's entry into the legacy slot so an older Conduit still
+            // finds its endpoint; `agent_providers` is the source of truth. Written first
+            // so the borrow ends before the move on the next line.
+            opencode: agent_providers
+                .get(&AgentId::OpenCode)
+                .cloned()
+                .unwrap_or_default(),
+            agent_providers,
             plugins: self
                 .plugins
                 .lock()
@@ -1168,6 +1243,24 @@ impl Store {
     ///
     /// `None` clears the pin and the session falls back to its tier, then to the agent's own
     /// configured model.
+    /// Pin (Some) or clear (None) this session's reasoning effort. Only acted on at
+    /// spawn, and only for an adapter whose `supports_model_flags()` is true -- the flag's
+    /// spelling is the adapter's (`ProviderAdapter::effort_flag`).
+    pub fn set_session_effort(&self, session_id: &str, effort: Option<String>) {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        for p in projects.iter_mut() {
+            if let Some(s) = p.sessions.iter_mut().find(|s| s.id == session_id) {
+                s.effort = effort
+                    .map(|e| e.trim().to_string())
+                    .filter(|e| !e.is_empty());
+                break;
+            }
+        }
+        let snapshot = projects.clone();
+        drop(projects);
+        self.save(&snapshot);
+    }
+
     pub fn set_session_model(&self, session_id: &str, model: Option<String>) {
         {
             let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
@@ -1870,37 +1963,75 @@ impl Store {
             .unwrap_or(false)
     }
 
-    // ---- OpenCode local provider ---------------------------------------------------
+    // ---- Per-agent endpoint providers ------------------------------------------------
 
-    pub fn opencode_settings(&self) -> OpenCodeSettings {
-        self.opencode
+    /// This agent's endpoint settings, or the default (disabled) when it has none.
+    pub fn provider_settings(&self, agent: AgentId) -> ProviderSettings {
+        self.agent_providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&agent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Every configured agent endpoint, for the settings UI.
+    pub fn all_provider_settings(&self) -> HashMap<AgentId, ProviderSettings> {
+        self.agent_providers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
-    pub fn set_opencode_settings(&self, settings: OpenCodeSettings) {
+    pub fn set_provider_settings(&self, agent: AgentId, settings: ProviderSettings) {
         {
-            let mut s = self.opencode.lock().unwrap_or_else(|e| e.into_inner());
-            *s = settings;
+            let mut m = self
+                .agent_providers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            m.insert(agent, settings);
         }
         self.persist();
     }
 
-    /// Set (Some) or clear (None) the in-memory endpoint API key. Never persisted.
-    /// Trimmed on the way in — a paste with padding would otherwise ride into the
-    /// Authorization header verbatim and 401 with no way to inspect the held value.
-    pub fn set_opencode_key(&self, key: Option<String>) {
-        let mut k = self.opencode_key.lock().unwrap_or_else(|e| e.into_inner());
-        *k = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    pub fn opencode_settings(&self) -> OpenCodeSettings {
+        self.provider_settings(AgentId::OpenCode)
     }
 
-    /// The in-memory endpoint API key, if one was set this run.
-    pub fn opencode_key(&self) -> Option<String> {
-        self.opencode_key
+    pub fn set_opencode_settings(&self, settings: OpenCodeSettings) {
+        self.set_provider_settings(AgentId::OpenCode, settings);
+    }
+
+    /// Set (Some) or clear (None) an agent's in-memory endpoint API key. Never persisted.
+    /// Trimmed on the way in — a paste with padding would otherwise ride into the
+    /// Authorization header verbatim and 401 with no way to inspect the held value.
+    pub fn set_provider_key(&self, agent: AgentId, key: Option<String>) {
+        let mut m = self.provider_keys.lock().unwrap_or_else(|e| e.into_inner());
+        match key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
+            Some(k) => {
+                m.insert(agent, k);
+            }
+            None => {
+                m.remove(&agent);
+            }
+        }
+    }
+
+    /// An agent's in-memory endpoint API key, if one was set this run.
+    pub fn provider_key(&self, agent: AgentId) -> Option<String> {
+        self.provider_keys
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .get(&agent)
+            .cloned()
+    }
+
+    pub fn set_opencode_key(&self, key: Option<String>) {
+        self.set_provider_key(AgentId::OpenCode, key);
+    }
+
+    pub fn opencode_key(&self) -> Option<String> {
+        self.provider_key(AgentId::OpenCode)
     }
 
     /// Auto-detect candidate Claude account dirs to prefill the accounts manager (does not
@@ -2026,13 +2157,13 @@ mod tests {
                 accounts: Mutex::new(Vec::new()),
                 default_accounts: Mutex::new(HashMap::new()),
                 trust: Mutex::new(TrustSettings::default()),
-                opencode: Mutex::new(OpenCodeSettings::default()),
+                agent_providers: Mutex::new(HashMap::new()),
                 plugins: Mutex::new(Vec::new()),
                 root_chats: Mutex::new(Vec::new()),
                 routes: Mutex::new(Default::default()),
                 profiles: Mutex::new(Vec::new()),
                 active_profile_id: Mutex::new(None),
-                opencode_key: Mutex::new(None),
+                provider_keys: Mutex::new(HashMap::new()),
                 save_path: dir.join("state.json"),
             }
         }
@@ -2906,6 +3037,147 @@ mod tests {
         // Clearing (or setting a blank) key empties the holder.
         store.set_opencode_key(Some("   ".into()));
         assert!(store.opencode_key().is_none());
+    }
+
+    #[test]
+    fn a_legacy_opencode_block_migrates_into_the_per_agent_map() {
+        // A state.json written before per-agent endpoints has only the legacy slot. It
+        // must be ADOPTED, not dropped -- otherwise upgrading silently unconfigures the
+        // user's endpoint and their OpenCode sessions quietly go back to the cloud.
+        let raw = r#"{"projects":[],"opencode":{"enabled":true,"preset":"ollama",
+            "baseUrl":"http://localhost:11434/v1","model":"qwen3:30b","pinLocal":true}}"#;
+        let ps: PersistState = serde_json::from_str(raw).unwrap();
+        assert!(
+            ps.agent_providers.is_empty(),
+            "the legacy file has no per-agent map at all"
+        );
+
+        let adopted = adopt_legacy_opencode(ps.agent_providers, ps.opencode);
+        let oc = adopted
+            .get(&AgentId::OpenCode)
+            .expect("legacy block adopted");
+        assert!(oc.enabled);
+        assert_eq!(oc.model, "qwen3:30b");
+        assert!(oc.pin_local);
+    }
+
+    #[test]
+    fn newer_per_agent_state_wins_over_the_legacy_slot() {
+        // Both present means the file was written by a version that knows both. The new
+        // map is the source of truth; adopting the legacy block over it would resurrect a
+        // stale endpoint the user has already replaced.
+        let mut per_agent = HashMap::new();
+        per_agent.insert(
+            AgentId::OpenCode,
+            ProviderSettings {
+                model: "current".into(),
+                ..Default::default()
+            },
+        );
+        let adopted = adopt_legacy_opencode(
+            per_agent,
+            ProviderSettings {
+                model: "stale".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(adopted[&AgentId::OpenCode].model, "current");
+    }
+
+    #[test]
+    fn opencode_is_mirrored_back_into_the_legacy_slot_on_save() {
+        // An older Conduit reads `opencode`, not `agent_providers`. A downgrade must still
+        // find the endpoint where it left it.
+        let dir = temp_dir("provider_mirror");
+        let store = Store::for_test(&dir);
+        store.set_provider_settings(
+            AgentId::OpenCode,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "anthropic/claude-sonnet-5".into(),
+                ..Default::default()
+            },
+        );
+        let ps: PersistState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(ps.opencode.model, "anthropic/claude-sonnet-5");
+        assert_eq!(
+            ps.agent_providers.get(&AgentId::OpenCode).unwrap().model,
+            "anthropic/claude-sonnet-5",
+            "and the per-agent map is the source of truth"
+        );
+    }
+
+    #[test]
+    fn a_second_agents_endpoint_does_not_disturb_opencodes() {
+        let dir = temp_dir("provider_two");
+        let store = Store::for_test(&dir);
+        store.set_provider_settings(
+            AgentId::OpenCode,
+            ProviderSettings {
+                enabled: true,
+                preset: "ollama".into(),
+                base_url: "http://127.0.0.1:11434/v1".into(),
+                model: "qwen3:30b".into(),
+                ..Default::default()
+            },
+        );
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "x-ai/grok-4".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            store.provider_settings(AgentId::OpenCode).model,
+            "qwen3:30b"
+        );
+        assert_eq!(
+            store.provider_settings(AgentId::Hermes).model,
+            "x-ai/grok-4"
+        );
+        // Keys are per agent too -- two agents behind two endpoints need two credentials.
+        store.set_provider_key(AgentId::Hermes, Some("sk-or-hermes".into()));
+        assert_eq!(
+            store.provider_key(AgentId::Hermes).as_deref(),
+            Some("sk-or-hermes")
+        );
+        assert!(store.provider_key(AgentId::OpenCode).is_none());
+    }
+
+    #[test]
+    fn is_local_is_the_silo_test_and_pin_local_is_not() {
+        // `pin_local` means "don't fall back elsewhere", which a cloud aggregator satisfies
+        // completely. Reading it as containment is the bug this distinction prevents.
+        let cloud = ProviderSettings {
+            enabled: true,
+            preset: "openrouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "anthropic/claude-sonnet-5".into(),
+            pin_local: true,
+            ..Default::default()
+        };
+        assert!(cloud.is_ready());
+        assert!(!cloud.is_local(), "pinned, but not local");
+
+        let local = ProviderSettings {
+            preset: "ollama".into(),
+            ..cloud.clone()
+        };
+        assert!(local.is_local());
+
+        // Enabled but half-configured is not a route to guess at.
+        let half = ProviderSettings {
+            model: String::new(),
+            ..cloud
+        };
+        assert!(!half.is_ready());
     }
 
     #[test]

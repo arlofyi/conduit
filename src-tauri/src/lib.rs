@@ -28,6 +28,7 @@ mod format;
 mod fsops;
 mod git;
 mod git_mut;
+mod hermes;
 mod hookbus;
 mod hooks;
 mod hotexit;
@@ -360,15 +361,52 @@ fn pty_spawn(
     let suppress_remote =
         !shell_only && store.is_private_mode() && store.is_session_siloed(&session_id);
 
+    // Hermes: always write the per-session overlay for a real Hermes session -- the
+    // status hooks are not optional, and the endpoint block rides along only when the
+    // user enabled routing for Hermes. A local-only session under private mode refuses a
+    // non-local endpoint outright rather than silently routing sensitive work at a cloud
+    // aggregator: `is_local()` is the check, not `enabled`, because OpenRouter is a
+    // perfectly valid endpoint that happens not to be local.
+    let hermes_cfg = if !shell_only && agent == crate::agent::AgentId::Hermes {
+        let settings = store.provider_settings(crate::agent::AgentId::Hermes);
+        let must_be_local = store.is_private_mode() && store.is_session_local_only(&session_id);
+        let usable = settings.is_ready() && (!must_be_local || settings.is_local());
+        if settings.is_ready() && !usable {
+            eprintln!(
+                "conduit: hermes session {session_id} is local-only, but its configured \
+                 endpoint is not local -- routing skipped, the session runs on its own config."
+            );
+        }
+        crate::hermes::build_spawn_config(
+            &session_id,
+            port,
+            usable.then_some(&settings),
+            store.provider_key(crate::agent::AgentId::Hermes).as_deref(),
+        )
+    } else {
+        None
+    };
+
     // OpenCode local provider: route the session to the configured local/self-hosted
     // endpoint. None (feature off / not an OpenCode session / settings incomplete) spawns
     // untouched. Pinning (`enabled_providers: ["conduit"]`) applies globally by user
     // choice, or is forced for a local-only (siloed) session under private mode — the
     // "guaranteed local model" half of the trust-boundary silo.
     let opencode = if !shell_only && agent == crate::agent::AgentId::OpenCode {
-        let settings = store.opencode_settings();
-        let pin = settings.pin_local
-            || (store.is_private_mode() && store.is_session_local_only(&session_id));
+        let mut settings = store.opencode_settings();
+        // A local-only session under private mode must reach a LOCAL endpoint or none.
+        // `pin_local` is not the test: it only says "don't fall back elsewhere", which is
+        // equally true of OpenRouter, so pinning a cloud aggregator would satisfy the flag
+        // while defeating the silo. Drop the routing instead of honouring it.
+        let must_be_local = store.is_private_mode() && store.is_session_local_only(&session_id);
+        if must_be_local && settings.is_ready() && !settings.is_local() {
+            eprintln!(
+                "conduit: opencode session {session_id} is local-only, but its configured \
+                 endpoint is not local -- routing skipped, the session runs on its own config."
+            );
+            settings.enabled = false;
+        }
+        let pin = settings.pin_local || must_be_local;
         let base =
             crate::agent::build_opencode_config(&settings, store.opencode_key().as_deref(), pin);
         if gets_fleet_mcp {
@@ -503,6 +541,7 @@ fn pty_spawn(
         agent,
         suppress_remote,
         opencode,
+        hermes_cfg,
         is_conductor,
         agent_model,
         agent_effort.map(str::to_string),
@@ -1368,6 +1407,21 @@ fn set_session_account(session_id: String, account_id: Option<String>, store: St
     store.set_session_account(&session_id, account_id);
 }
 
+/// Pin or clear one session's model. `None` clears it, which is how a session goes back to
+/// whatever its agent would pick on its own -- distinct from pinning an empty string.
+/// Takes effect at the session's NEXT spawn: the model rides on the command line, so a
+/// running agent keeps the one it launched with.
+#[tauri::command]
+fn set_session_model(session_id: String, model: Option<String>, store: State<Arc<Store>>) {
+    store.set_session_model(&session_id, model);
+}
+
+/// Pin or clear one session's reasoning effort. Same next-spawn semantics as the model.
+#[tauri::command]
+fn set_session_effort(session_id: String, effort: Option<String>, store: State<Arc<Store>>) {
+    store.set_session_effort(&session_id, effort);
+}
+
 // ---- Trust boundaries (Feature 4: multi-agent silo / controlled sharing) ------
 
 #[tauri::command]
@@ -1432,6 +1486,56 @@ fn opencode_key_set(store: State<Arc<Store>>) -> bool {
     store.opencode_key().is_some()
 }
 
+// ---- Per-agent endpoints (the generalization of the four commands above) ----------
+
+#[tauri::command]
+fn get_provider_settings(
+    agent: crate::agent::AgentId,
+    store: State<Arc<Store>>,
+) -> crate::store::ProviderSettings {
+    store.provider_settings(agent)
+}
+
+/// Every agent's endpoint settings at once, so the settings UI and the per-session Model
+/// tab render from ONE read rather than one round trip per agent.
+#[tauri::command]
+fn get_all_provider_settings(
+    store: State<Arc<Store>>,
+) -> std::collections::HashMap<crate::agent::AgentId, crate::store::ProviderSettings> {
+    store.all_provider_settings()
+}
+
+#[tauri::command]
+fn set_provider_settings(
+    agent: crate::agent::AgentId,
+    settings: crate::store::ProviderSettings,
+    store: State<Arc<Store>>,
+) {
+    store.set_provider_settings(agent, settings);
+}
+
+/// Hold one agent's endpoint API key in memory for this app run. A blank key clears it.
+/// Deliberately NOT persisted anywhere; it reaches a child only via its process env.
+#[tauri::command]
+fn set_provider_key(agent: crate::agent::AgentId, key: String, store: State<Arc<Store>>) {
+    store.set_provider_key(agent, Some(key));
+}
+
+#[tauri::command]
+fn clear_provider_key(agent: crate::agent::AgentId, store: State<Arc<Store>>) {
+    store.set_provider_key(agent, None);
+}
+
+/// Which agents currently hold a key. Set membership only -- never a key itself.
+#[tauri::command]
+fn provider_keys_set(store: State<Arc<Store>>) -> Vec<crate::agent::AgentId> {
+    crate::agent::all_adapters()
+        .iter()
+        .map(|a| a.id())
+        .filter(|id| store.provider_key(*id).is_some())
+        .collect()
+}
+
 // `(async)` on a sync fn: run it on the thread pool instead of inline on the IPC (main)
 // thread. Destroying a session SIGKILLs a child, reaps it, tears down its tmux session and
 // rewrites state.json -- seconds of work in the worst case, and every one of them a frozen
@@ -1446,6 +1550,10 @@ fn remove_session(
 ) {
     pty.kill(&session_id);
     pty.kill(&format!("{session_id}::term"));
+    // A Hermes session owns a generated overlay directory under the data dir. Deleting the
+    // session without it would leave one directory per session ever created. Unconditional
+    // (and ignoring failure) because it is a cheap no-op for every other agent.
+    crate::hermes::remove_managed_config(&session_id);
     store.remove_session(&project_id, &session_id);
 }
 
@@ -2375,6 +2483,8 @@ pub fn run() {
             set_project_default_account,
             set_account_agents,
             set_session_account,
+            set_session_model,
+            set_session_effort,
             get_trust_settings,
             set_trust_settings,
             set_session_trust,
@@ -2384,6 +2494,12 @@ pub fn run() {
             set_opencode_key,
             clear_opencode_key,
             opencode_key_set,
+            get_provider_settings,
+            get_all_provider_settings,
+            set_provider_settings,
+            set_provider_key,
+            clear_provider_key,
+            provider_keys_set,
             local_llm::detect_local_providers,
             local_llm::list_local_models,
             local_llm::probe_tool_call,

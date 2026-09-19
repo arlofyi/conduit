@@ -5762,3 +5762,163 @@ input[type="number"]:focus {
 .decision-actions button { padding: 5px 12px; border-radius: 7px; font-size: 12px; }
 .decision-actions .primary { background: var(--accent); color: var(--panel-bg); }
 .decision-actions .primary:disabled { opacity: 0.45; }
+
+/* ---- Model tab (right column, bottom panel) -------------------------------- */
+/* Absolutely positioned like `.git-host`: the bottom panel's content box holds the
+   keep-alive terminal stack, so a new sibling must sit over it rather than in flow. */
+.model-host {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  z-index: 2;
+}
+.model-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 10px 12px;
+}
+.mp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mp-head-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.mp-title {
+  font-size: 12px;
+  color: var(--text-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mp-sub {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.mp-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.mp-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-mid);
+}
+/* The scope caption is what stops "I changed the model" being confused with "I changed
+   it for every session on this agent". It must stay visible, not a tooltip. */
+.mp-scope {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.mp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mp-label {
+  flex: 0 0 74px;
+  font-size: 11px;
+  color: var(--text-mid);
+}
+.mp-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  color: var(--text-bright);
+  font-family: var(--mono-font);
+  outline: none;
+  caret-color: var(--accent);
+}
+.mp-input:focus {
+  border-color: var(--accent);
+}
+.mp-toggle {
+  font-size: 11px;
+  color: var(--text-mid);
+}
+.mp-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.mp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-mid);
+  cursor: pointer;
+}
+.mp-chip.active {
+  border-color: var(--accent);
+  color: var(--text-bright);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.mp-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+}
+.mp-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mp-btn {
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-mid);
+  cursor: pointer;
+}
+.mp-btn:hover:not(:disabled) {
+  color: var(--text-bright);
+  border-color: var(--accent);
+}
+.mp-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.mp-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin: 0;
+}
+.mp-warn {
+  font-size: 11px;
+  color: var(--amber);
+  margin: 0;
+}
+.mp-restart {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-mid);
+  padding: 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}

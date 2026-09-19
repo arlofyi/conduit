@@ -32,6 +32,7 @@ const SETTINGS_PAGES: Array<[SettingsTab, string]> = [
   ["formatting", "Formatting"],
   ["mcp", "MCP"],
   ["localmodels", "Local models"],
+  ["endpoints", "Model endpoints"],
   ["security", "Security"],
 ];
 

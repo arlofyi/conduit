@@ -10,6 +10,7 @@ import { GeneralSettings } from "./GeneralSettings";
 import { TerminalSettings } from "./TerminalSettings";
 import { TrustPanel } from "./TrustPanel";
 import { OpenCodePanel } from "./OpenCodePanel";
+import { EndpointsPanel } from "./EndpointsPanel";
 import { CommandCodePanel } from "./CommandCodePanel";
 import { RoutingPanel } from "./RoutingPanel";
 import { PluginsPanel } from "./PluginsPanel";
@@ -23,6 +24,7 @@ export type SettingsTab =
   | "usage"
   | "mcp"
   | "localmodels"
+  | "endpoints"
   | "commandcode"
   | "routing"
   | "formatting"
@@ -45,6 +47,7 @@ const NAV: Array<{ group: string; items: Array<{ id: SettingsTab; label: string 
     items: [
       { id: "agents", label: "Agents" },
       { id: "localmodels", label: "Local models" },
+      { id: "endpoints", label: "Model endpoints" },
       { id: "commandcode", label: "Command Code" },
       { id: "routing", label: "Routing" },
       { id: "mcp", label: "MCP servers" },
@@ -154,6 +157,19 @@ export function Settings({
                     it for you.
                   </p>
                   <OpenCodePanel />
+                </>
+              )}
+              {tab === "endpoints" && (
+                <>
+                  <p className="settings-intro">
+                    Point an agent at the endpoint of your choice — a local server (Ollama, LM
+                    Studio, vLLM, llama.cpp, OpenWebUI), OpenRouter, or any other
+                    OpenAI-compatible URL. This is the default every new session on that agent
+                    inherits; a single session's model and reasoning are set from the Model tab
+                    beside Git. API keys are held in memory for this run only and never written
+                    to disk.
+                  </p>
+                  <EndpointsPanel />
                 </>
               )}
               {tab === "commandcode" && <CommandCodePanel />}

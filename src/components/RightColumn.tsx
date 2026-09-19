@@ -13,6 +13,7 @@ import {
 } from "../store";
 import { joinPath } from "../paths";
 import { GitGraph, type GraphCommit } from "./GitGraph";
+import { ModelPanel } from "./ModelPanel";
 import { FileTree } from "./FileTree";
 import { SubagentsView } from "./SubagentsView";
 import { TerminalView } from "./Terminal";
@@ -289,6 +290,7 @@ export function RightColumn({
         <div className="panel-tabs">
           <PanelTab label="Terminal" active={bottomTab === "terminal"} onClick={() => setBottomTab("terminal")} />
           <PanelTab label="Git" active={bottomTab === "git"} onClick={() => setBottomTab("git")} />
+          <PanelTab label="Model" active={bottomTab === "model"} onClick={() => setBottomTab("model")} />
           {feedAvailable && (
             <>
               <PanelTab
@@ -320,6 +322,11 @@ export function RightColumn({
           {bottomTab === "git" && (
             <div className="git-host">
               <GitGraph commits={graph} />
+            </div>
+          )}
+          {bottomTab === "model" && (
+            <div className="model-host">
+              <ModelPanel sessionId={activeSessionId} />
             </div>
           )}
           {bottomTab === "decisions" && projectId && (

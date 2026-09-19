@@ -68,13 +68,13 @@ pub fn tool_specs() -> Vec<Value> {
                 "properties": {
                     "task": { "type": "string" },
                     "name": { "type": "string" },
-                    "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "opencode", "antigravity", "commandcode"], "description": "Defaults to \"claude\". See fleet_capabilities for what each agent is good at and its tier (structured-result support)." },
+                    "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "opencode", "antigravity", "commandcode", "hermes"], "description": "Defaults to \"claude\". See fleet_capabilities for what each agent is good at and its tier (structured-result support)." },
                     "objective": { "type": "string", "description": "The mandate, if different/more precise than `task`." },
                     "outputShape": { "type": "string", "description": "What a done result should look like." },
                     "boundaries": { "type": "string", "description": "What the worker must NOT do." },
                     "modelTier": { "type": "string", "enum": ["cheap", "standard", "hard"], "description": "Cost/capability tier, mapped to a concrete model per agent. Omit to use the agent's own default." },
-                    "model": { "type": "string", "description": "Pin one exact model id, in the agent's own spelling (\"opus\" for claude; \"claude-opus-5\", \"google/gemini-3.7-flash\", \"deepseek/deepseek-v4-flash\" for commandcode). Wins over modelTier, which is only a coarse per-agent lookup. Acted on by the agents whose CLI takes --model (claude, commandcode); recorded but inert for the rest." },
-                    "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "Claude only today. xhigh is Opus-only -- silently clamped to high on any other modelTier." },
+                    "model": { "type": "string", "description": "Pin one exact model id, in the agent's own spelling (\"opus\" for claude; \"claude-opus-5\", \"google/gemini-3.7-flash\", \"deepseek/deepseek-v4-flash\" for commandcode). Wins over modelTier, which is only a coarse per-agent lookup. Acted on by the agents whose CLI takes --model (claude, commandcode, hermes); recorded but inert for the rest." },
+                    "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "Claude, Command Code and Hermes. Hermes spells the flag --reasoning and accepts a wider set of its own; these five are the values every one of them takes. xhigh is Opus-only on Claude -- silently clamped to high on any other modelTier." },
                     "accountId": { "type": "string", "description": "Pin this worker to a specific registered Claude account (Settings -> Accounts), instead of the global default." }
                 },
                 "required": ["task"] }

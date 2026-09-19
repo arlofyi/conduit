@@ -650,6 +650,89 @@ A sixth agent (`npm i -g command-code`), fronting ~58 models from one subscripti
   installer).
 - Design: `docs/superpowers/specs/2026-08-23-command-code-agent-design.md`.
 
+## Where Hermes Agent lives
+
+A seventh adapter (Nous Research, `hermes`), and the first one that arrived with a SUPERSET
+of what Conduit needs rather than a subset. Every flag below was verified against the
+installed CLI (`hermes --help`, `hermes chat --help`) and its own source, not from docs.
+
+- **Resume is PINNED, not captured.** `hermes chat -c <session-id> --create-if-missing`
+  means "resume the session titled `<id>`, creating it if absent", so the first spawn and
+  every later one are the SAME command. agy and Command Code both need their chosen id
+  scraped back after the fact; Hermes needs nothing, so **`Session.agent_conversation_id`
+  is deliberately unused by this adapter**. Do not wire it in later "for consistency" --
+  having nothing to capture is the feature.
+- **Its config arrives as a MANAGED-SCOPE OVERLAY, never by editing the user's files.**
+  Hermes has no project-scoped config; `hooks:` is read only from the profile's
+  `config.yaml`, which is machine-wide -- writing there is the exact failure
+  `hook_target_is_user_level` prevents for Claude. `HERMES_MANAGED_DIR` names a directory
+  whose `config.yaml` is deep-merged PER LEAF on top of the user's, is read from the
+  PROCESS env (so it is per-spawn), and is fail-open. `hermes.rs` writes
+  `<dataDir>/hermes/<session_id>/config.yaml`; `remove_managed_config` reaps it with the
+  session.
+- **`on_session_end` is NOT the end of the session.** It is fired by
+  `agent/turn_finalizer.py` ("run_conversation() runs once per message") and is the analogue
+  of Claude's `Stop` -> verb `stop`. The real session boundary is `on_session_finalize`
+  (`cli_session_mixin.py`) -> verb `sessionend`. Hermes' own telemetry agrees
+  (`finish_task` vs `close_session`). Swapping them leaves every session reading `running`
+  until the 20-minute stale watchdog, and fires `sessionend` after every turn.
+- **Hooks run with `shell=False`** (`shlex.split`), so the POSIX and cmd.exe hook command
+  forms are both wrong here -- no `${VAR}`, no redirection, no `|| true`. It is bare argv,
+  and the session id is BAKED IN rather than read from the env. Consequence: no equivalent
+  of Claude's endpoint-file layer that re-reads the live port at hook time.
+- **`pre_approval_request` is what buys the `needsInput` badge** Command Code never got:
+  its payload carries no `notification_type`, and `status_rules::notification_status` reads
+  an absent type as the legacy `needsInput`. `post_approval_response` -> `pretool` clears it.
+- **`hooks_auto_accept: true` lives in the overlay, not in a flag.** Hermes prompts for
+  consent per `(event, command)` and a spawn has no TTY to answer. `--accept-hooks` /
+  `HERMES_ACCEPT_HOOKS=1` would auto-approve every hook in the MERGED config, including the
+  user's own; scoping it to the overlay keeps the widening in a file Conduit owns.
+- **Effort is spelled `--reasoning`.** That is why `ProviderAdapter::effort_flag` exists --
+  an unknown flag does not degrade, it makes argparse exit and the session fall through to
+  its bare `|| hermes chat` with the effort silently lost.
+- **Accounts redirect `HERMES_HOME` only**, not `HOME` -- Hermes documents a config-root
+  override, so the blast radius is one variable instead of the whole home. `hermes_home_dir`
+  is the ONE place a `.claude`-rooted account resolves to a Hermes home (the Command Code
+  trap: spawn and meter disagreed once and silently emptied the usage bar).
+- Tier 2 on arrival, and the card says so: `hermes mcp add` works, but nothing has verified
+  a Hermes worker against Conduit's fleet MCP server the way OpenCode's spike did, so
+  `structuredResult`/`mailbox` stay false rather than lying to the router.
+- Design: `docs/superpowers/specs/2026-09-19-hermes-agent-and-provider-routing-design.md`.
+
+## Where per-agent model endpoints live
+
+One agent, one endpoint: `ProviderSettings` (`store.rs`), stored as
+`agent_providers: HashMap<AgentId, ProviderSettings>`. This generalizes the single
+`OpenCodeSettings` slot, and OpenRouter joins the local servers as just another preset --
+the same `@ai-sdk/openai-compatible` provider serves `https://openrouter.ai/api/v1` exactly
+as it serves Ollama.
+
+- **`PersistState.opencode` is KEPT and mirrors `agent_providers[OpenCode]`**, the same
+  contract `default_account` has with `default_accounts[Claude]`. On load an
+  `agent_providers` with no OpenCode entry adopts the legacy block. This is not tidiness:
+  an unreadable `state.json` costs every running session (see the orphan sweep), so a
+  downgrade must still find OpenCode's endpoint where it left it.
+- **`pin_local` kept its wire name and lost its guarantee.** It emits
+  `enabled_providers: ["conduit"]` -- "use only this endpoint", which under a local preset
+  also means "nothing leaves the machine" and under OpenRouter does not. So it is NO LONGER
+  the trust-boundary test: `ProviderSettings::is_local()` is, and a private-mode
+  `local_only` session with a non-local endpoint has its routing DROPPED rather than
+  honoured (both the Hermes and OpenCode spawn branches in `lib.rs`). Renaming the key
+  would have silently reset the setting for everyone who had it on.
+- The same rules exist in TypeScript in `src/providers.ts` -- standalone because `store.ts`
+  cannot be imported under the node-env vitest, re-exported from the store so call sites
+  keep one import path. `providers.test.ts` pins them. They must not fork from Rust's.
+- **UI: one editor, two scopes.** `EndpointEditor.tsx` is the per-AGENT form, used by both
+  Settings -> Model endpoints (`EndpointsPanel.tsx`) and the per-SESSION Model tab
+  (`ModelPanel.tsx`), so the two cannot drift. The Model tab is session-scoped by
+  construction and renders only controls the selected agent actually supports; with no
+  session selected it shows a placeholder, never the global defaults -- it answers "what is
+  THIS session running", and defaults there would make the answer a guess.
+- `key_for_endpoint` (`local_llm.rs`) now searches every configured agent endpoint instead
+  of only OpenCode's. The anti-oracle property is unchanged (an unrecognized URL still gets
+  no key); hard-coding OpenCode's slot would have sent no key at all once a second agent
+  had an endpoint.
+
 ## Where agent routing lives
 
 Task-shaped preferences: a task kind (planning / implementation / review / research /

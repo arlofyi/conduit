@@ -293,6 +293,9 @@ impl PtyManager {
         agent: crate::agent::AgentId,
         suppress_remote: bool,
         opencode: Option<crate::agent::OpenCodeSpawnConfig>,
+        // Hermes: the per-session managed-config overlay (status hooks, and the endpoint
+        // block when provider routing is on). None = spawn untouched.
+        hermes: Option<crate::hermes::HermesSpawnConfig>,
         is_conductor: bool,
         model: Option<String>,
         effort: Option<String>,
@@ -489,6 +492,19 @@ impl PtyManager {
                 cmd.env("OPENCODE_CONFIG_CONTENT", &oc.config_json);
                 if let Some(key) = &oc.api_key {
                     cmd.env("CONDUIT_OC_APIKEY", key);
+                }
+            }
+            // Hermes: point this session at its own managed-scope overlay. Hermes
+            // deep-merges that file's leaves on top of the user's config.yaml and leaves
+            // every sibling key theirs, so this installs Conduit's status hooks (and, when
+            // routing is on, the endpoint) without writing a byte to the user's Hermes
+            // home. The key is referenced from that file as `${CONDUIT_HERMES_APIKEY}`,
+            // which expands against THIS process env -- so the secret lives in exactly one
+            // variable and never in the file.
+            if let Some(h) = &hermes {
+                cmd.env(crate::hermes::MANAGED_DIR_ENV, &h.managed_dir);
+                if let Some(key) = &h.api_key {
+                    cmd.env(crate::hermes::API_KEY_ENV, key);
                 }
             }
             // Select the pinned account (Feature 1/2) without disturbing the user's default
@@ -1113,14 +1129,17 @@ fn build_script(
             shell_quote(path)
         ));
     }
-    // SPEC-B: only ever populated for Claude (the caller in lib.rs gates on
-    // agent == AgentId::Claude before resolving these) -- verified real flags, not a guess
-    // (`claude --help` lists both `--model <model>` and `--effort <level>`).
+    // SPEC-B: populated for any adapter whose `supports_model_flags()` is true (the
+    // caller in lib.rs gates on exactly that) -- verified real flags per CLI, not a guess.
+    // `--model` is spelled the same by every agent that takes one; the effort flag is NOT
+    // (Hermes spells it `--reasoning`), so its spelling comes from the adapter. An unknown
+    // flag does not degrade -- the CLI exits non-zero and the whole session falls through
+    // to its bare `||` fallback with the effort silently lost.
     if let Some(m) = model {
         flags.push_str(&format!(" --model {}", shell_quote(m)));
     }
     if let Some(e) = effort {
-        flags.push_str(&format!(" --effort {}", shell_quote(e)));
+        flags.push_str(&format!(" {} {}", adapter.effort_flag(), shell_quote(e)));
     }
     let invocation = adapter.build_invocation(
         session_id,
@@ -1187,12 +1206,13 @@ fn build_script_win(
     if let Some(path) = system_prompt_file {
         flags.push_str(&format!(" --append-system-prompt-file {}", quote_arg(path)));
     }
-    // SPEC-B: only ever populated for Claude -- see build_script's matching comment.
+    // SPEC-B: see build_script's matching comment -- the effort flag's spelling is the
+    // adapter's, because Hermes spells it `--reasoning`.
     if let Some(m) = model {
         flags.push_str(&format!(" --model {}", quote_arg(m)));
     }
     if let Some(e) = effort {
-        flags.push_str(&format!(" --effort {}", quote_arg(e)));
+        flags.push_str(&format!(" {} {}", adapter.effort_flag(), quote_arg(e)));
     }
     adapter.build_invocation(
         session_id,
