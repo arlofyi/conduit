@@ -3,6 +3,32 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.38.0 — 2026-09-19
+
+- **Added — Hermes Agent.** Nous Research's Hermes joins Claude, Codex, Gemini, OpenCode,
+  Antigravity and Command Code as a seventh agent you can start sessions with. It reports
+  live status the way Claude does — busy, finished, and a real "needs you" badge when it
+  asks to run a command — and reopens the same conversation when you restart a session.
+  Install it in one click from Settings → Agents.
+- **Added — Run any agent on OpenRouter.** OpenRouter joins the endpoint list beside
+  Ollama, LM Studio, vLLM, llama.cpp and OpenWebUI, so an OpenCode or Hermes session can
+  run on hundreds of hosted models behind one API key. Keys are held in memory for the
+  session only and are never written to disk.
+- **Added — Local models for Hermes.** Point Hermes at your own GPU the same way OpenCode
+  already could. Conduit configures the session without touching your own Hermes settings.
+- **Added — A Model tab.** A new tab beside Git shows what the selected session is actually
+  running — its agent, model, reasoning level, account and endpoint — and lets you change
+  any of them. It follows whichever session you select, offers only the controls that
+  agent genuinely supports, and says plainly which changes need a restart (with a button
+  to do it).
+- **Added — Settings → Model endpoints.** One place to set the default endpoint each agent
+  inherits, separate from the per-session Model tab.
+- **Changed — Endpoint settings are now per agent.** Each agent keeps its own endpoint
+  instead of sharing one slot. Existing OpenCode settings carry over untouched.
+- **Fixed — A local-only session can no longer be routed to the cloud.** Marking a session
+  local-only under private mode now refuses a non-local endpoint outright instead of
+  accepting one that merely had "use only this endpoint" ticked.
+
 ## 0.37.1 — 2026-09-19
 
 - **Fixed — Numeric tab switching works on Windows and Linux.** Jumping to a tab by
