@@ -90,31 +90,58 @@ grep -E '"?version"?\s*[:=]\s*"[0-9]' package.json src-tauri/tauri.conf.json; se
 
 ### When to bump (SemVer, pre-1.0)
 
-Conduit is `0.MINOR.PATCH` until its first stable public release. Bump **once per release
-that reaches a user** (one bump covers every change in that release), not per commit:
+**A version marks an INSTALLABLE ARTIFACT, never a commit.** The trigger is building an
+installer someone will actually run — not finishing a feature, not passing the gate, not
+landing a branch. Work that is merged but never built is not a release and must not consume
+a number.
 
-- **MINOR** (`0.X.0`) — a shipped, user-facing **feature or feature set** (e.g. multi-account
-  accounts, the usage bar). Reset PATCH to `0`.
+This is the rule most easily broken while working fast. On 2026-09-19 six versions
+(`0.37.1` → `0.41.0`) were cut in one day, one per feature batch, and at least two of them
+were never installed by anyone — numbers spent on artifacts that never existed. The fix is
+mechanical and lives below: **features accumulate under `## Unreleased`, and the number is
+stamped at build time.**
+
+Conduit is `0.MINOR.PATCH` until its first stable public release. Size is decided by the
+*largest* change in the release:
+
+- **MINOR** (`0.X.0`) — the release contains any user-facing **new capability**. Reset PATCH
+  to `0`. One MINOR covers every change in that release, however many features it carries.
 - **PATCH** (`0.x.Y`) — bug fixes, polish, perf, refactors, docs: **no** new user-facing
-  capability.
+  capability anywhere in the release.
 - **MAJOR** stays `0` until the first stable public release, which is `1.0.0`; after that,
   breaking changes bump MAJOR.
 
+**Never number a feature as a PATCH to keep the minor number small.** Pre-1.0 the
+MINOR-vs-PATCH split is the only signal the scheme carries, and a feature filed as a patch
+is invisible to anyone scanning for what is new. There is no such thing as too many minors;
+a high minor number costs nothing, a dishonest one costs the reader. (The `0.x.y` =
+"x breaking / y everything else" convention some pre-1.0 *libraries* use does not apply
+here: it exists to warn downstream code about API breakage, and Conduit has no API
+consumers — only users asking "what can I do now that I couldn't before".)
+
 A `-N` build suffix (e.g. `0.5.0-3`) is only for iterating installers of the *same* target
-during testing — a real feature release gets a clean `0.x.0`. Don't bump as a side effect of
-an unrelated change; do bump when the release adds or fixes something a user would notice.
+during testing — a real feature release gets a clean `0.x.0`.
 
-### Keeping the changelog (do this every version bump)
+### Keeping the changelog
 
-`CHANGELOG.md` is the source of truth for what shipped when, and **every version bump must
-add a matching entry in the same change** — never bump the three version files without one.
-The top entry's version must equal the version in the three files above; a bump that leaves
-the changelog behind is incomplete work.
+`CHANGELOG.md` is the source of truth for what shipped when. It is written in TWO steps, and
+separating them is what stops a version being spent on an artifact nobody installs.
 
-- **One entry per increment, granular.** Each user-facing feature or feature set gets its own
-  **MINOR** entry; each fix/polish batch gets its own **PATCH** entry. Do **not** bucket
-  several people's unrelated features under one version — split them into separate increments
-  so the log reads as a logical timeline.
+**1. Every change lands under `## Unreleased`, immediately.** A feature is not done until its
+bullets are there. No version number is chosen, and the three version files are NOT touched.
+
+**2. At installer build time, stamp it.** Rename `## Unreleased` to `## X.Y.Z — YYYY-MM-DD`,
+bump the three version files to match, run `cargo build` so `Cargo.lock` follows, and build.
+That single commit is the release. Then add a fresh empty `## Unreleased` above it.
+
+A version bump with no matching changelog entry — or a stamped entry whose version disagrees
+with the three files — is incomplete work.
+
+- **Bullets stay granular; the RELEASE does not.** Each user-facing feature gets its own
+  bullet, and unrelated features are never merged into one vague line. But many bullets
+  belong under one version — that is what a release *is*. (This used to read "one entry per
+  increment", which was about keeping bullets distinct and was misread as "one version per
+  feature". That misreading is what produced six versions in a day.)
 - **Header format:** `## X.Y.Z — YYYY-MM-DD`, newest first. **No contributor names**, no
   author attribution — describe the change, not who made it.
 - **Bullets:** `- **Added|Changed|Fixed — short title.** user-facing description.` Write for

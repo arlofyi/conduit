@@ -3,6 +3,11 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+_Nothing yet. Features land here as they are built; the version is
+stamped when an installer is cut._
+
 ## 0.41.0 — 2026-09-19
 
 - **Added — Several endpoints per agent, and switching between them mid-conversation.**
