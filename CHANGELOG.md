@@ -5,8 +5,15 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
-_Nothing yet. Features land here as they are built; the version is
-stamped when an installer is cut._
+- **Added — Edit a skill, not just read it.** The Agent tab's skills open like its memory
+  documents do, and their `SKILL.md` can be edited in place. An edit takes effect on its own
+  — Hermes rebuilds its prompt when the file changes — so tightening a skill's instructions
+  no longer means leaving the app to find the file.
+- **Added — Skills that are switched off now look switched off.** A skill disabled in
+  Hermes' own config is dimmed and marked, read from the same file the agent reads. A skill
+  the agent is quietly ignoring is exactly what you go looking for when it will not do
+  something you expect. Turning one on or off is still done with `hermes skills config`;
+  Conduit shows the state rather than owning it.
 
 ## 0.41.0 — 2026-09-19
 

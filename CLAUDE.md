@@ -931,7 +931,35 @@ running on"; this answers "what does it know and what can it reach".
 - `serde_yaml` parses what OTHERS wrote (skill frontmatter, Hermes' config); `hermes.rs`
   still hand-emits its overlay, because that file carries an explanatory header comment a
   serializer would drop and its values are three known scalars.
-- Everything is READ-ONLY; an unreadable file costs that section, never the panel.
+- **Memory documents and SKILL.md files are EDITABLE; everything else is read-only.** An
+  unreadable file costs that section, never the panel. A truncated preview is never written
+  back -- the UI refuses to save one, which is why the caps (`MEMORY_PREVIEW_BYTES`,
+  `SKILL_PREVIEW_BYTES`) are generous enough that truncation is rare.
+- **A skill is located by ENUMERATION, never by joining its key onto a path.**
+  `hermes_skill_dirs` walks the tree and the frontend's key is compared against the directory
+  names it found; a key matching nothing is refused. Same shape as `MEMORY_DOCS`, and for the
+  same reason: "sanitize the path" is a guess about what the OS does with `..`, a symlink, an
+  ADS or a UNC prefix, whereas a path Conduit produced has nothing to sanitize. The key is
+  the DIRECTORY name because Hermes' own predicate (`prompt_builder.hides`) accepts either it
+  or the frontmatter name, and only the directory name always exists -- a skill with
+  unparseable frontmatter still lists.
+- Editing a SKILL.md takes effect on its own: Hermes' snapshot manifest
+  (`_build_skills_manifest`) is a file signature of every SKILL.md, so a write invalidates the
+  cached prompt rather than being masked by it.
+- **Skill enable/disable is SHOWN but not editable, and that is a measured limit rather than
+  a gap in the UI.** `skills.disabled` is read by the agent side straight out of
+  `HERMES_HOME/config.yaml` (`agent/skill_utils.py::_load_raw_config`, whose docstring says
+  "no hermes_cli.config import"), so the managed-scope overlay -- a `hermes_cli.config`
+  feature -- never reaches it. Measured: an overlay carrying `skills.disabled: [findmy]`
+  leaves `get_disabled_skill_names()` empty, while `hermes_cli`'s own
+  `get_disabled_skills(cfg)` sees it. `get_config_path()` is strictly
+  `HERMES_HOME/config.yaml` with no override, so the only ways to change what the AGENT sees
+  are writing the user's own config (machine-wide) or redirecting `HERMES_HOME` (moves
+  memory, skills, sessions and auth too). Both are the user's call, not a side effect of
+  opening a panel -- so the panel dims a disabled skill and says where it was turned off.
+  `ESSENTIAL_SKILLS` is kept for whatever surface eventually does offer the switch:
+  `save_disabled_skills` drops those SILENTLY, so a control offered for one would flip, save,
+  and come back on with no error anywhere.
 
 ## Where agent routing lives
 

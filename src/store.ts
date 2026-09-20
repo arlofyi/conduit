@@ -180,8 +180,15 @@ export interface ModelSwitch {
 export interface ProfileItem {
   name: string;
   detail: string;
-  /** Full text for items that have one (a memory document); null for a bare row. */
+  /** Full text for items that have one (a memory document, a SKILL.md); null for a bare row. */
   body?: string | null;
+  /** What this item is addressed by when written back — a skill's DIRECTORY name.
+   *  Null for rows that cannot be acted on. */
+  key?: string | null;
+  /** Whether the item is active, for things that can be inactive. Null = not applicable.
+   *  READ-ONLY: Hermes' agent side reads `skills.disabled` from its own config.yaml and
+   *  never sees Conduit's overlay, so this is state to show, not a control. */
+  enabled?: boolean | null;
 }
 
 /** One section of what an agent knows/can reach. Sections the agent has no concept of are
@@ -1484,6 +1491,8 @@ interface AppState {
   loadAgentProfile: (sessionId: string) => Promise<void>;
   /** Rewrite one of the agent's memory documents. Returns an error string, or null. */
   writeAgentMemory: (sessionId: string, file: string, body: string) => Promise<string | null>;
+  /** Rewrite one skill's SKILL.md. Returns an error string, or null. */
+  writeAgentSkill: (sessionId: string, key: string, body: string) => Promise<string | null>;
   /** Which agents hold an endpoint API key this run. Membership only — never a key. */
   providerKeys: AgentId[];
   loadProviderSettings: () => Promise<void>;
@@ -2192,6 +2201,15 @@ export const useStore = create<AppState>((set, get) => {
     writeAgentMemory: async (sessionId, file, body) => {
       try {
         await invoke("write_agent_memory", { sessionId, file, body });
+        await get().loadAgentProfile(sessionId);
+        return null;
+      } catch (e) {
+        return String(e);
+      }
+    },
+    writeAgentSkill: async (sessionId, key, body) => {
+      try {
+        await invoke("write_agent_skill", { sessionId, key, body });
         await get().loadAgentProfile(sessionId);
         return null;
       } catch (e) {

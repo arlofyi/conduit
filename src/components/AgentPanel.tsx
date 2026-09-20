@@ -54,18 +54,39 @@ function Section({
           {section.items.map((it, i) => {
             // Only a row with a body is interactive; a bare row must not look clickable.
             const readable = !!it.body;
-            return readable ? (
-              <button key={`${it.name}-${i}`} className="ap-item readable" onClick={() => onOpen(section, i)}>
+            const body = (
+              <>
                 <span className="ap-item-name">{it.name}</span>
                 <span className="ap-item-detail">{it.detail}</span>
-              </button>
-            ) : (
-              <div key={`${it.name}-${i}`} className="ap-item">
-                <span className="ap-item-name">{it.name}</span>
-                <span className="ap-item-detail">{it.detail}</span>
+              </>
+            );
+            return (
+              <div
+                key={`${it.name}-${i}`}
+                className={`ap-row${it.enabled === false ? " off" : ""}`}
+              >
+                {readable ? (
+                  <button className="ap-item readable" onClick={() => onOpen(section, i)}>
+                    {body}
+                  </button>
+                ) : (
+                  <div className="ap-item">{body}</div>
+                )}
+                {/* State, not a control. Conduit cannot change this — see `ProfileItem.enabled`
+                    in agent_profile.rs for the measurement. Showing it is still worth it: a
+                    skill the agent is ignoring is exactly the thing you go looking for when it
+                    will not do something you expect. */}
+                {it.enabled === false ? <span className="ap-locked">off</span> : null}
               </div>
             );
           })}
+          {/* Said once per section, not once per row, and only where something is actually
+              switched off -- otherwise it is a standing note about a state that never occurs. */}
+          {section.items.some((it) => it.enabled === false) ? (
+            <div className="ap-apply-note">
+              Dimmed skills are switched off in Hermes' own config (<code>hermes skills config</code>).
+            </div>
+          ) : null}
           {section.source ? <div className="ap-source" title={section.source}>{section.source}</div> : null}
         </div>
       ) : null}
@@ -80,9 +101,16 @@ export function AgentPanel({ sessionId }: { sessionId: string | null }) {
   const mcpServers = useStore((s) => s.mcpServers);
   const mcpEnabled = useStore((s) => s.mcpEnabled);
   const writeMemory = useStore((s) => s.writeAgentMemory);
+  const writeSkill = useStore((s) => s.writeAgentSkill);
   const setSettingsTab = useStore((s) => s.setSettingsTab);
   const setShowSettings = useStore((s) => s.setShowSettings);
-  const [reading, setReading] = useState<{ title: string; body: string } | null>(null);
+  // What the open reader is editing: a memory document (by file name) or a skill (by key).
+  // Kept on the reader itself rather than inferred from the title, because a skill's DISPLAY
+  // name comes from its frontmatter and is not what the writer addresses it by.
+  const [reading, setReading] = useState<
+    { title: string; body: string; kind: "memory" | "skill"; key: string } | null
+  >(null);
+
   const [draft, setDraft] = useState("");
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -179,8 +207,16 @@ export function AgentPanel({ sessionId }: { sessionId: string | null }) {
                 : undefined
             }
             onOpen={(sec, i) => {
-              const body = sec.items[i].body ?? "";
-              setReading({ title: sec.items[i].name, body });
+              const it = sec.items[i];
+              const body = it.body ?? "";
+              setReading({
+                title: it.name,
+                body,
+                kind: sec.id === "skills" ? "skill" : "memory",
+                // A memory document is addressed by its file name, a skill by its directory
+                // name; `key` carries the latter and is absent for the former.
+                key: it.key ?? it.name,
+              });
               setDraft(body);
               setSaveErr(null);
             }}
@@ -204,7 +240,10 @@ export function AgentPanel({ sessionId }: { sessionId: string | null }) {
                     disabled={saving || draft === reading.body}
                     onClick={async () => {
                       setSaving(true);
-                      const err = await writeMemory(sessionId, reading.title, draft);
+                      const err =
+                        reading.kind === "skill"
+                          ? await writeSkill(sessionId, reading.key, draft)
+                          : await writeMemory(sessionId, reading.key, draft);
                       setSaving(false);
                       if (err) setSaveErr(err);
                       else setReading({ ...reading, body: draft });

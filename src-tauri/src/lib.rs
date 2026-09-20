@@ -2766,6 +2766,7 @@ pub fn run() {
             openrouter_usage::openrouter_usage,
             agent_profile::agent_profile,
             agent_profile::write_agent_memory,
+            agent_profile::write_agent_skill,
             local_llm::detect_local_providers,
             local_llm::list_local_models,
             local_llm::probe_tool_call,

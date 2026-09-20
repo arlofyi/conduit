@@ -29,6 +29,19 @@ use crate::agent::AgentId;
 /// bounds the IPC payload; the file is named so the user can open the real thing.
 const MEMORY_PREVIEW_BYTES: usize = 16 * 1024;
 
+/// Skills Hermes refuses to disable from any surface (`agent.skill_utils.ESSENTIAL_SKILLS`).
+///
+/// Kept for the day Conduit offers a skill switch: `save_disabled_skills` drops these
+/// SILENTLY, so a control offered for one would flip, save, and come back on with no error
+/// anywhere. Whatever surface eventually turns skills off must refuse these rather than
+/// accept-and-ignore them.
+#[cfg_attr(not(test), allow(dead_code))]
+const ESSENTIAL_SKILLS: &[&str] = &["hermes-agent"];
+
+/// How much of a SKILL.md to hand the UI. Same reasoning as `MEMORY_PREVIEW_BYTES`: a
+/// truncated body must never be written back, and the UI refuses to save one.
+const SKILL_PREVIEW_BYTES: usize = 64 * 1024;
+
 /// The most skills to enumerate. Hermes ships ~52 and a hub install can add many more;
 /// past this the list stops being a list.
 const MAX_SKILLS: usize = 200;
@@ -39,8 +52,41 @@ pub struct ProfileItem {
     pub name: String,
     /// One line under the name -- a description, a transport, a size.
     pub detail: String,
-    /// Full(ish) text, for items that have one (a memory document). None = nothing to open.
+    /// Full(ish) text, for items that have one (a memory document, a SKILL.md).
+    /// None = nothing to open.
     pub body: Option<String>,
+    /// The identifier this item is addressed by when written back -- a skill's DIRECTORY
+    /// name. None for items that cannot be acted on.
+    ///
+    /// The directory name rather than the frontmatter one because Hermes' own visibility
+    /// predicate (`prompt_builder.hides`) accepts EITHER, and only the directory name is
+    /// guaranteed to exist: a skill whose frontmatter will not parse still lists, and a
+    /// toggle keyed on a name that parsed to nothing would silently do nothing.
+    pub key: Option<String>,
+    /// Whether this item is currently active, for things that can be inactive. None = the
+    /// question does not apply.
+    ///
+    /// **Read-only, and it has to be.** Hermes' agent side reads `skills.disabled` straight
+    /// out of `HERMES_HOME/config.yaml` (`agent/skill_utils.py::_load_raw_config`, whose own
+    /// docstring says "no hermes_cli.config import"), so the managed-scope overlay -- which
+    /// is a `hermes_cli.config.load_config` feature -- never reaches it. Measured: an overlay
+    /// `skills.disabled: [findmy]` leaves `get_disabled_skill_names()` empty. Changing it
+    /// would therefore mean writing the user's own config.yaml, which is machine-wide and
+    /// their call, not a side effect of opening a panel.
+    pub enabled: Option<bool>,
+}
+
+impl ProfileItem {
+    /// An item that is only shown, never acted on (a memory document, an MCP server).
+    fn inert(name: String, detail: String, body: Option<String>) -> Self {
+        ProfileItem {
+            name,
+            detail,
+            body,
+            key: None,
+            enabled: None,
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -69,14 +115,20 @@ pub struct AgentProfile {
 /// Empty counts as absent on purpose: Hermes creates `MEMORY.md` before it has learned
 /// anything, and an item titled "MEMORY.md — 0 bytes" is noise.
 fn read_capped(path: &Path) -> Option<String> {
+    read_capped_to(path, MEMORY_PREVIEW_BYTES)
+}
+
+/// `read_capped` with an explicit cap. A SKILL.md is a document the user may want to edit
+/// whole, so it gets a larger one than a memory preview.
+fn read_capped_to(path: &Path, cap: usize) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
-    Some(if text.len() > MEMORY_PREVIEW_BYTES {
+    Some(if text.len() > cap {
         // Cut on a char boundary -- a byte slice through UTF-8 panics.
-        let mut end = MEMORY_PREVIEW_BYTES;
+        let mut end = cap;
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -103,11 +155,11 @@ fn hermes_memory(home: &Path) -> Option<ProfileSection> {
         .iter()
         .filter_map(|(file, what)| {
             let body = read_capped(&home.join(file))?;
-            Some(ProfileItem {
-                name: (*file).to_string(),
-                detail: format!("{what} · {}", human_bytes(body.len())),
-                body: Some(body),
-            })
+            Some(ProfileItem::inert(
+                (*file).to_string(),
+                format!("{what} · {}", human_bytes(body.len())),
+                Some(body),
+            ))
         })
         .collect();
     (!items.is_empty()).then(|| ProfileSection {
@@ -154,12 +206,20 @@ pub fn parse_skill_frontmatter(text: &str) -> (Option<String>, Option<String>) {
     (get("name"), get("description"))
 }
 
-/// Hermes lays skills out as `skills/<category>/<name>/SKILL.md`.
-fn hermes_skills(home: &Path) -> Option<ProfileSection> {
+/// Every skill on disk, as `(directory name, path to its SKILL.md)`.
+///
+/// **The one place a skill directory is located.** Both the reader and the writer walk this,
+/// so a skill is only ever addressed by a path CONDUIT produced -- the frontend's string is
+/// compared against these names, never joined onto a path. Same reasoning as `MEMORY_DOCS`:
+/// an allowlist cannot be talked into writing elsewhere, and "sanitize the path" is a guess
+/// about what the OS does with `..`, a symlink, an ADS or a UNC prefix.
+fn hermes_skill_dirs(home: &Path) -> Vec<(String, String, PathBuf)> {
     let root = home.join("skills");
-    let mut items: Vec<ProfileItem> = Vec::new();
-    let mut categories = std::fs::read_dir(&root)
-        .ok()?
+    let mut out: Vec<(String, String, PathBuf)> = Vec::new();
+    let Ok(cats) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    let mut categories = cats
         .filter_map(Result::ok)
         .filter(|e| e.path().is_dir())
         .collect::<Vec<_>>();
@@ -175,29 +235,97 @@ fn hermes_skills(home: &Path) -> Option<ProfileSection> {
             .collect::<Vec<_>>();
         skills.sort_by_key(|e| e.file_name());
         for sk in skills {
-            if items.len() >= MAX_SKILLS {
-                break;
+            if out.len() >= MAX_SKILLS {
+                return out;
             }
-            let dir_name = sk.file_name().to_string_lossy().into_owned();
-            let (name, desc) = std::fs::read_to_string(sk.path().join("SKILL.md"))
-                .map(|t| parse_skill_frontmatter(&t))
-                .unwrap_or((None, None));
-            items.push(ProfileItem {
-                name: name.unwrap_or(dir_name),
-                detail: match desc {
-                    Some(d) => format!("{category} · {d}"),
-                    None => category.clone(),
-                },
-                body: None,
-            });
+            out.push((
+                sk.file_name().to_string_lossy().into_owned(),
+                category.clone(),
+                sk.path().join("SKILL.md"),
+            ));
         }
     }
+    out
+}
+
+/// Hermes lays skills out as `skills/<category>/<name>/SKILL.md`.
+///
+/// `disabled` is the EFFECTIVE set for this session -- the user's own global list unioned
+/// with anything this session has switched off. Both halves matter: showing only the
+/// session's would draw a globally disabled skill as active.
+fn hermes_skills(
+    home: &Path,
+    disabled: &std::collections::HashSet<String>,
+) -> Option<ProfileSection> {
+    let root = home.join("skills");
+    let items: Vec<ProfileItem> = hermes_skill_dirs(home)
+        .into_iter()
+        .map(|(dir_name, category, skill_md)| {
+            let text = read_capped_to(&skill_md, SKILL_PREVIEW_BYTES);
+            let (name, desc) = text
+                .as_deref()
+                .map(parse_skill_frontmatter)
+                .unwrap_or((None, None));
+            ProfileItem {
+                name: name.unwrap_or_else(|| dir_name.clone()),
+                detail: match desc {
+                    Some(d) => format!("{category} · {d}"),
+                    None => category,
+                },
+                body: text,
+                enabled: Some(!disabled.contains(&dir_name)),
+                key: Some(dir_name),
+            }
+        })
+        .collect();
     (!items.is_empty()).then(|| ProfileSection {
         id: "skills".into(),
         title: "Skills".into(),
         items,
         source: root.to_string_lossy().into_owned(),
     })
+}
+
+/// The user's OWN globally disabled skills, out of their `config.yaml`.
+///
+/// Conduit never writes this key in the user's file -- a session switching a skill off is
+/// session-scoped, and lives in the managed overlay. But it must READ it, because the
+/// overlay replaces the list rather than unioning it (measured: a list is a leaf, so an
+/// overlay `skills.disabled` silently RE-ENABLES everything the user turned off globally).
+/// `hermes::managed_config_yaml` is handed the union for exactly that reason.
+pub fn hermes_disabled_skills(home: &Path) -> std::collections::HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(home.join("config.yaml")) else {
+        return Default::default();
+    };
+    parse_disabled_skills(&text)
+}
+
+/// `skills.disabled` out of a Hermes config.yaml.
+///
+/// Mirrors `skills_config._normalize_skill_names`: YAML null is empty, and a bare scalar is
+/// ONE name rather than its characters -- a subtlety their own code carries a bug reference
+/// for (#13026). An unparseable file yields nothing rather than erroring: a bad config must
+/// cost the toggle state, never the panel.
+pub fn parse_disabled_skills(config_yaml: &str) -> std::collections::HashSet<String> {
+    let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(config_yaml) else {
+        return Default::default();
+    };
+    let Some(d) = v.get("skills").and_then(|s| s.get("disabled")) else {
+        return Default::default();
+    };
+    match d {
+        serde_yaml::Value::String(one) => [one.trim().to_string()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect(),
+        serde_yaml::Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|x| x.as_str())
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        _ => Default::default(),
+    }
 }
 
 /// `mcp_servers:` out of Hermes' own config.yaml.
@@ -227,11 +355,7 @@ pub fn parse_mcp_servers(config_yaml: &str) -> Vec<ProfileItem> {
                         .map(|c| c.to_string())
                 })
                 .unwrap_or_default();
-            Some(ProfileItem {
-                name,
-                detail,
-                body: None,
-            })
+            Some(ProfileItem::inert(name, detail, None))
         })
         .collect();
     items.sort_by(|a, b| a.name.cmp(&b.name));
@@ -307,6 +431,46 @@ pub async fn write_agent_memory(
     .map_err(|e| format!("write task failed: {e}"))?
 }
 
+/// Rewrite one skill's `SKILL.md`.
+///
+/// **The skill is located by ENUMERATION, never by joining `key` onto a path.**
+/// `hermes_skill_dirs` walks the skills tree and the requested key is compared against the
+/// directory names it found; a key that matches nothing is refused. That is the same shape
+/// as `MEMORY_DOCS` above and for the same reason -- the name arrives from the frontend, and
+/// "sanitize the path" is a guess about what the OS will do with `..`, a symlink, an
+/// alternate data stream or a UNC prefix. Here the path is one Conduit produced, so there is
+/// nothing to sanitize.
+///
+/// A truncated preview is never written back: the UI refuses to save one, and
+/// `SKILL_PREVIEW_BYTES` is generous enough that truncation is rare.
+#[tauri::command]
+pub async fn write_agent_skill(
+    session_id: String,
+    key: String,
+    body: String,
+    store: tauri::State<'_, std::sync::Arc<crate::store::Store>>,
+) -> Result<(), String> {
+    if store.session_agent(&session_id) != AgentId::Hermes {
+        return Err("this agent has no editable skills".into());
+    }
+    let account_dir = store.session_account_config_dir(&session_id);
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = account_dir
+            .as_deref()
+            .and_then(crate::agent::hermes_home_dir)
+            .or_else(hermes_default_home)
+            .ok_or("no Hermes home to write to")?;
+        let target = hermes_skill_dirs(&home)
+            .into_iter()
+            .find(|(dir_name, _, _)| *dir_name == key)
+            .map(|(_, _, skill_md)| skill_md)
+            .ok_or_else(|| format!("no skill named {key}"))?;
+        std::fs::write(target, body).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("write task failed: {e}"))?
+}
+
 /// Everything Conduit can read about what one session's agent knows.
 #[tauri::command]
 pub async fn agent_profile(
@@ -329,7 +493,7 @@ pub async fn agent_profile(
                 Some(home) => AgentProfile {
                     sections: [
                         hermes_memory(&home),
-                        hermes_skills(&home),
+                        hermes_skills(&home, &hermes_disabled_skills(&home)),
                         hermes_mcp(&home),
                     ]
                     .into_iter()
@@ -359,6 +523,41 @@ pub async fn agent_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_users_globally_disabled_skills() {
+        // The ordinary shape.
+        let d = parse_disabled_skills("skills:\n  disabled:\n    - alpha\n    - beta\n");
+        assert_eq!(d.len(), 2);
+        assert!(d.contains("alpha") && d.contains("beta"));
+
+        // A BARE SCALAR is one name, not its characters. Hermes' own normalizer carries a
+        // bug reference for exactly this (#13026); splitting it would disable nothing and
+        // silently report a dozen single-letter skills as off.
+        let one = parse_disabled_skills("skills:\n  disabled: alpha\n");
+        assert_eq!(one.len(), 1);
+        assert!(one.contains("alpha"));
+
+        // YAML null, a missing key, a missing section, and an unparseable file are all
+        // "nothing disabled" -- a bad config must cost the toggle state, never the panel.
+        for src in [
+            "skills:\n  disabled:\n",
+            "skills: {}\n",
+            "other: 1\n",
+            "::: not yaml :::\n",
+            "",
+        ] {
+            assert!(parse_disabled_skills(src).is_empty(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn hermes_requires_its_own_skill() {
+        // Mirrors `agent.skill_utils.ESSENTIAL_SKILLS`. `save_disabled_skills` drops these
+        // SILENTLY, so a switch offered for one would flip, save, and come back on with no
+        // error anywhere -- the panel locks them instead.
+        assert!(ESSENTIAL_SKILLS.contains(&"hermes-agent"));
+    }
 
     #[test]
     fn reads_a_skills_frontmatter_block() {

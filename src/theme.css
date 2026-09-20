@@ -6347,3 +6347,36 @@ input[type="number"]:focus {
   align-items: stretch;
   gap: 5px;
 }
+
+/* ---- Agent tab: skill rows that can be switched off ------------------------- */
+/* The row is a grid so the switch keeps its column while the label wraps; the label itself
+   stays the full-width button it was, so the whole name is still a click target for the
+   reader. */
+.ap-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 6px;
+}
+.ap-row > .ap-item {
+  min-width: 0;
+  width: 100%;
+}
+/* A disabled skill is dimmed rather than hidden: "it is here and it is off" is the state
+   worth showing, and hiding it would make the list disagree with the agent's own. */
+.ap-row.off > .ap-item {
+  opacity: 0.45;
+}
+/* Said once per section rather than per row: every dimmed row in it means the same. */
+.ap-apply-note,
+.ap-locked {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+.ap-locked {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ap-apply-note {
+  padding: 4px 6px 0 14px;
+}
