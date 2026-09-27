@@ -126,6 +126,17 @@ fn opts_into_mailbox(has_mission: bool, channels: &[String]) -> bool {
 
 // ---- Terminal / PTY commands -------------------------------------------------
 
+/// One `pty_spawn` at a time.
+///
+/// `pty_spawn` runs on the thread pool (`(async)`) so launching an agent -- a process spawn,
+/// plus the hook, MCP and account files it writes first -- never stalls the UI thread that
+/// also delivers keystrokes. As a plain sync command it was serialized for free, and its
+/// preparation still depends on that: several steps read-modify-write files that sessions
+/// SHARE (a project's hook settings, an account's agy home, an agent's config), and opening a
+/// project fires one spawn per session at once. Two of those interleaving would lose one
+/// write. This keeps the old one-at-a-time order, just off the UI thread.
+static SPAWN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn pty_spawn(
@@ -155,6 +166,7 @@ fn pty_spawn(
     store: State<Arc<Store>>,
     agy_resume: State<Arc<crate::agy_usage::AgyResumeState>>,
 ) -> Result<(), String> {
+    let _gate = SPAWN_GATE.lock().unwrap_or_else(|e| e.into_inner());
     let port = hook_state.port.load(Ordering::SeqCst);
     let agent = if shell_only {
         crate::agent::AgentId::Claude // shell companion: agent is irrelevant

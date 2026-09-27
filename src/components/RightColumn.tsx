@@ -116,7 +116,7 @@ export function RightColumn({
   // and the file tree reloaded once — without remounting it on every poll tick.
   const lastBranch = useRef<string | null | undefined>(undefined);
   // The dir whose git reads are still in flight. One read is four `git` processes, and in a
-  // large or cloud-synced repo that takes longer than GIT_POLL_MS (measured 2.6 s on
+  // large or cloud-synced repo that can take longer than GIT_POLL_MS (2.6 s measured on
   // Windows), so without this ticks stack up behind each other and spawn git forever.
   const gitInFlight = useRef<string | null>(null);
   const currentDir = useRef(workingDirectory);

@@ -5,6 +5,13 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.42.1 — 2026-09-27
+
+- **Fixed — Opening several sessions at once can no longer corrupt shared settings.** Sessions
+  now start in the background, one at a time, so two launches never rewrite the same hook or
+  account file at once; keys typed while a session is still starting are delivered once it
+  is up instead of being lost.
+
 ## 0.42.0 — 2026-09-27
 
 - **Added — Edit a skill, not just read it.** The Agent tab's skills open like its memory
