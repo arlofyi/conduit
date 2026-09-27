@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.42.0 — 2026-09-27
+
 - **Added — Edit a skill, not just read it.** The Agent tab's skills open like its memory
   documents do, and their `SKILL.md` can be edited in place. An edit takes effect on its own
   — Hermes rebuilds its prompt when the file changes — so tightening a skill's instructions
