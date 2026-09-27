@@ -181,6 +181,13 @@ with the three files — is incomplete work.
   login shell and `claude` falls off `PATH`. Both spawn sites — `pty.rs` and the
   `claude -p` titler in `lib.rs` — call `env_remove("npm_config_prefix")`. Keep that when
   editing spawn code.
+- **A command that spawns a process or reads more than a small file must be
+  `#[tauri::command(async)]`.** A plain sync command runs on the UI thread, which on Windows
+  is also the thread that delivers `pty_write` — so a polled `git` call (~100 ms per process
+  spawn on Windows, seconds in a large or OneDrive repo) made typed text appear seconds late.
+  `(async)` on a sync fn runs it on the thread pool with no signature change. Keep `pty_write`
+  / `pty_resize` sync: they are cheap and their ORDER is the keystroke order. `pty_spawn` is
+  off-thread, which is why `PtyManager` serializes spawn and teardown on `lifecycle`.
 - **Secrets.** The plan-usage path reads Claude Code's OAuth token from the macOS Keychain
   (`security find-generic-password`) only on explicit user action, holds it in memory, and
   never writes it to disk. Don't log the token or persist it.

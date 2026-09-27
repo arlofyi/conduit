@@ -14,6 +14,13 @@ All notable changes to Conduit are documented here. This project uses
   the agent is quietly ignoring is exactly what you go looking for when it will not do
   something you expect. Turning one on or off is still done with `hermes skills config`;
   Conduit shows the state rather than owning it.
+- **Fixed — Typing and tab switching no longer lag on Windows.** The Git panel's
+  background refresh, file reads, session launches and similar work used to run on the same
+  thread that delivers your keystrokes, so each refresh (four `git` processes, often half a
+  second or more, several seconds in a large or cloud-synced repo) held typed text back
+  until it finished. That work now runs in the background, a slow repo can no longer stack
+  up refreshes behind each other, and busy terminals send their output in fewer, larger
+  pieces — which matters most with many sessions open across several profiles.
 
 ## 0.41.0 — 2026-09-19
 

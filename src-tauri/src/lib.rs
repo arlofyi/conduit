@@ -109,7 +109,7 @@ fn opts_into_mailbox(has_mission: bool, channels: &[String]) -> bool {
 
 // ---- Terminal / PTY commands -------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn pty_spawn(
     app: tauri::AppHandle,
@@ -623,7 +623,7 @@ struct TmuxInfo {
     install: Option<tmux::InstallHint>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn tmux_available(pty: State<Arc<PtyManager>>) -> TmuxInfo {
     #[cfg(not(windows))]
     {
@@ -675,7 +675,7 @@ fn set_session_persistence(enabled: bool, pty: State<Arc<PtyManager>>) {
 /// The transcript store is resolved per session rather than from the app's own environment,
 /// since a session assigned to a non-default account writes under that account's
 /// `CLAUDE_CONFIG_DIR` and its transcript is simply not in the default tree.
-#[tauri::command]
+#[tauri::command(async)]
 fn session_context(
     session_id: String,
     store: State<Arc<store::Store>>,
@@ -689,7 +689,7 @@ fn session_context(
 ///
 /// Empty for the overwhelmingly common case of a session that has not fanned out. Resolved
 /// against the session's own account config dir for the same reason `session_context` is.
-#[tauri::command]
+#[tauri::command(async)]
 fn session_subagents(
     session_id: String,
     store: State<Arc<store::Store>>,
@@ -705,7 +705,7 @@ fn session_subagents(
 /// Searches the DEFAULT transcript store plus every registered account's, deduplicated by
 /// session id — a session's transcript lives under whichever account ran it, and someone
 /// searching their own history does not think in accounts.
-#[tauri::command]
+#[tauri::command(async)]
 fn search_transcripts(
     query: String,
     limit: usize,
@@ -820,17 +820,17 @@ fn add_project(path: String, store: State<Arc<Store>>) -> Project {
 
 // ---- CLI launcher --------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn cli_shim_status() -> cli_shim::ShimStatus {
     cli_shim::status()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn install_cli_shim() -> Result<cli_shim::ShimStatus, String> {
     cli_shim::install()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_cli_shim() -> Result<cli_shim::ShimStatus, String> {
     cli_shim::remove()
 }
@@ -1212,7 +1212,7 @@ fn board_resolve_gate(
 /// Read-only continuity view for a project's board: which of its sessions are present
 /// (per continuity, matched by agent_label == Conduit session id) and pending handoffs
 /// scoped to any of its cards. Best-effort -- see `continuity_read::view_for_project`.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_continuity(
     store: State<Arc<Store>>,
     project_id: String,
@@ -1230,7 +1230,7 @@ fn list_continuity(
 /// sessions that belong to it. Scoped by Conduit session id (exact) plus the git toplevel
 /// of the project and each of its worktrees (for sessions started outside Conduit).
 /// Best-effort -- see `continuity_feed::feed_for_project`.
-#[tauri::command]
+#[tauri::command(async)]
 fn continuity_feed(
     store: State<Arc<Store>>,
     project_id: String,
@@ -1407,7 +1407,7 @@ fn get_default_accounts(
 }
 
 /// Auto-detected candidate accounts (not yet registered), for the "Detect" button.
-#[tauri::command]
+#[tauri::command(async)]
 fn discover_accounts(store: State<Arc<Store>>) -> Vec<crate::store::Account> {
     store.discover_accounts()
 }
@@ -2032,22 +2032,22 @@ fn sanitize_title(raw: &str) -> String {
 
 // ---- Git (read-only) ---------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_branch(dir: String) -> Option<String> {
     git::current_branch(&dir)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_changes(dir: String) -> Vec<git::Change> {
     git::changes(&dir)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_commits(dir: String) -> Vec<git::Commit> {
     git::commits(&dir, 8)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_graph(dir: String) -> Vec<git::GraphCommit> {
     git::graph(&dir, 80)
 }
@@ -2124,7 +2124,7 @@ fn format_content(
     format::format_content(&dir, &path, &content)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resolve_prettier_options(path: String) -> Option<format::PrettierConfig> {
     format::resolve_prettier_config(std::path::Path::new(&path))
 }
@@ -2136,7 +2136,7 @@ fn hotexit_save(entries: Vec<hotexit::HotExitEntry>) -> Result<(), String> {
     hotexit::save(&entries)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn hotexit_load() -> Vec<hotexit::HotExitEntry> {
     hotexit::load()
 }
@@ -2157,17 +2157,17 @@ fn worktree_remove(repo_path: String, worktree_path: String, force: bool) -> Res
 
 // ---- Read-only filesystem (Files tab + viewer) ------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_dir(dir: String) -> Vec<fsops::DirEntry> {
     fsops::list_dir(&dir)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn dir_exists(path: String) -> bool {
     fsops::dir_exists(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_file(path: String) -> fsops::FileContent {
     fsops::read_file(&path)
 }
@@ -2177,7 +2177,7 @@ fn write_file(path: String, content: String) -> Result<fsops::FileStat, String> 
     fsops::write_file(&path, &content)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn stat_file(path: String) -> fsops::FileStat {
     fsops::stat_file(&path)
 }
@@ -2202,12 +2202,12 @@ fn delete_path(path: String) -> Result<(), String> {
     fsops::delete_path(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_file_base64(path: String) -> Result<fsops::FileBase64, String> {
     fsops::read_file_base64(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resolve_terminal_path(base: String, token: String) -> Option<fsops::ResolvedPath> {
     fsops::resolve_terminal_path(&base, &token)
 }
@@ -2346,7 +2346,7 @@ fn install_agent(agent: crate::agent::AgentId) -> Result<String, String> {
 /// Open a directory in VS Code. Tries the `code` CLI first (cross-platform), then
 /// falls back to launching by macOS bundle id / app name so it still works when the
 /// `code` shell command isn't installed.
-#[tauri::command]
+#[tauri::command(async)]
 fn open_in_vscode(dir: String) -> Result<(), String> {
     use std::process::Command;
 
@@ -2401,7 +2401,7 @@ fn open_in_vscode(dir: String) -> Result<(), String> {
 /// shell-out approach (no `tauri-plugin-opener`/`shell` dependency): Windows via cmd's
 /// `start`, macOS via `open`, Linux via `xdg-open`. Only http(s) URLs are ever passed
 /// to the shell.
-#[tauri::command]
+#[tauri::command(async)]
 fn open_external(url: String) -> Result<(), String> {
     use std::process::Command;
 
@@ -2435,7 +2435,7 @@ fn open_external(url: String) -> Result<(), String> {
 /// platform supports selection (Finder `open -R`, Explorer `/select,`). Same
 /// shell-out doctrine as `open_external`: args passed positionally, never through
 /// a shell.
-#[tauri::command]
+#[tauri::command(async)]
 fn reveal_path(path: String) -> Result<(), String> {
     use std::process::Command;
 
