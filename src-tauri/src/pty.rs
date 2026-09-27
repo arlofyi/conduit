@@ -27,8 +27,32 @@ use dashmap::DashMap;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tauri::ipc::Channel;
 
-type Sink = Arc<Mutex<Channel<String>>>;
+type Sink = Arc<Mutex<Option<Channel<String>>>>;
 type Subscribers = Arc<Mutex<Vec<(u64, SyncSender<String>)>>>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum SinkSend {
+    Ok,
+    Failed,
+    Detached,
+}
+
+/// One reader-loop send. Detached is NOT a failure — it's the window being closed.
+fn send_to_sink(sink: &Sink, encoded: String) -> SinkSend {
+    match sink.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(ch) => {
+                if ch.send(encoded).is_ok() {
+                    SinkSend::Ok
+                } else {
+                    SinkSend::Failed
+                }
+            }
+            None => SinkSend::Detached,
+        },
+        Err(_) => SinkSend::Failed,
+    }
+}
 
 /// Bounded buffer (frames) per remote subscriber before frames start dropping.
 const SUBSCRIBER_BUFFER: usize = 1024;
@@ -205,6 +229,11 @@ pub struct PtyManager {
     /// would both miss and start two agents, and a kill landing mid-spawn would find
     /// nothing and orphan the process the spawn then inserts. Held for the whole of both.
     lifecycle: Mutex<()>,
+    /// The IDE-announce host, set once at startup (`set_ide_host`). Lives here so
+    /// `tear_down` can stop a DESTROYED session's IDE server and drop its lock file;
+    /// a RETIRE keeps both — the persisted port makes the resume spawn reuse them
+    /// (`IdeHost::start_for_session` is idempotent).
+    ide_host: std::sync::OnceLock<Arc<crate::ide_host::IdeHost>>,
 }
 
 /// Why a session's processes are being ended. The two verbs kill the same things; they
@@ -241,7 +270,14 @@ impl PtyManager {
             tmux: std::sync::OnceLock::new(),
             warm_spawns: DashMap::new(),
             lifecycle: Mutex::new(()),
+            ide_host: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Wire the IDE-announce host in at startup. A second call is a no-op (OnceLock),
+    /// which is exactly right — there is one host for the app's lifetime.
+    pub fn set_ide_host(&self, host: Arc<crate::ide_host::IdeHost>) {
+        let _ = self.ide_host.set(host);
     }
 
     /// Absolute tmux path, or None when tmux is unavailable. Resolved on first use.
@@ -311,6 +347,10 @@ impl PtyManager {
         // exactly that file's servers. Set only when the session has its own MCP allowlist
         // (Feature C); false keeps the pre-allowlist inheritance behavior.
         strict_mcp: bool,
+        // IDE announce: this session's own WS/MCP server port (None = not announcing).
+        // POSIX rides build_script's export line (the tmux boundary); Windows rides
+        // cmd.env (no tmux there).
+        ide_port: Option<u16>,
         on_event: Channel<String>,
     ) -> Result<(), String> {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
@@ -320,7 +360,7 @@ impl PtyManager {
         if let Some(existing) = self.sessions.get(&session_id) {
             if let Ok(s) = existing.lock() {
                 if let Ok(mut sink) = s.sink.lock() {
-                    *sink = on_event;
+                    *sink = Some(on_event);
                 }
             }
             drop(existing); // release the shard guard before resize re-locks it
@@ -420,6 +460,7 @@ impl PtyManager {
                     effort.as_deref(),
                     resume_token.as_deref(),
                     strict_mcp,
+                    ide_port,
                 )
             };
             // Persistence: run `inner` inside a tmux session named after this session id,
@@ -473,6 +514,14 @@ impl PtyManager {
         if !shell_only {
             cmd.env("CONDUIT_SESSION_ID", &session_id);
             cmd.env("CONDUIT_HOOK_PORT", hook_port.to_string());
+            // IDE announce. On Windows this is the real delivery path (no tmux). On
+            // POSIX it only reaches the tmux CLIENT — the copy that matters rides
+            // build_script's export line — but setting it here too keeps the direct
+            // (persistence-off) spawn correct with zero extra branching.
+            if let Some(p) = ide_port {
+                cmd.env("CLAUDE_CODE_SSE_PORT", p.to_string());
+                cmd.env("ENABLE_IDE_INTEGRATION", "true");
+            }
             // The port ABOVE is fixed for this session's lifetime; the path below is how
             // it stays correct anyway. Hook commands source this file before posting, so a
             // session that outlives an app restart onto a different port finds the live
@@ -558,7 +607,7 @@ impl PtyManager {
 
         let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
         let subs_for_reader = subscribers.clone();
-        let sink: Sink = Arc::new(Mutex::new(on_event));
+        let sink: Sink = Arc::new(Mutex::new(Some(on_event)));
         let output = Arc::new(RingBuffer::new(OUTPUT_RING_BYTES));
         let output_for_reader = output.clone();
         let suppress_flag = Arc::new(AtomicBool::new(suppress_remote));
@@ -588,7 +637,11 @@ impl PtyManager {
         // replay on top of that would show the same screen twice.
         if let Some(snapshot) = self.take_cold_scrollback(&session_id) {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&snapshot);
-            let _ = sink.lock().map(|s| s.send(encoded));
+            let _ = sink.lock().map(|s| {
+                if let Some(ch) = s.as_ref() {
+                    let _ = ch.send(encoded);
+                }
+            });
         }
 
         // The reader self-reaps its map entry when the child exits on its own (below), so
@@ -599,17 +652,19 @@ impl PtyManager {
         #[cfg(windows)]
         let sid_for_reader = session_id.clone();
 
-        // Two threads per session. The READER does blocking reads and hands the raw bytes
-        // over; the FLUSHER coalesces them (see `OUTPUT_FRAME`) and sends each batch to the
-        // current sink. Send errors are ignored (the channel may be briefly absent during a
-        // reload); only a read EOF/error ends the reader, and the flusher follows it.
+        // Two threads per session. The READER does blocking reads into the ring buffer and
+        // hands the raw bytes over; the FLUSHER coalesces them (see `OUTPUT_FRAME`) and
+        // sends each batch to the current sink. Sink state never ends either loop: only a
+        // read EOF/error ends the reader, and the flusher drains what is left and follows.
         let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
             let engine = base64::engine::general_purpose::STANDARD;
-            // Exit if the sink stays dead for a long run of batches (orphaned, never
-            // re-attached, never killed) — a safety net against a forever-looping
-            // thread. Resets on any successful send, so reload gaps don't trip it. Exiting
-            // drops the receiver, which is what makes the reader stop too.
+            // Detach the sink after a long run of failed sends (dead channel that was
+            // never re-attached, never detached via a clean window close, never killed)
+            // — a safety net so a stuck Channel doesn't retry forever. This never ends
+            // the loop: the child may still be alive, so send failure only clears the
+            // sink (see `send_to_sink`'s `Failed` arm below). Resets on any successful
+            // send, so reload gaps don't trip it.
             let mut consecutive_fails: u32 = 0;
             let mut last_flush: Option<std::time::Instant> = None;
             while let Some(batch) = next_output_batch(&out_rx, last_flush, OUTPUT_FRAME) {
@@ -623,16 +678,20 @@ impl PtyManager {
                         broadcast(&mut subs, &encoded);
                     }
                 }
-                let ok = sink
-                    .lock()
-                    .map(|s| s.send(encoded).is_ok())
-                    .unwrap_or(false);
-                if ok {
-                    consecutive_fails = 0;
-                } else {
-                    consecutive_fails += 1;
-                    if consecutive_fails > 2000 {
-                        return;
+                match send_to_sink(&sink, encoded) {
+                    SinkSend::Ok => consecutive_fails = 0,
+                    SinkSend::Detached => {} // window closed; ring buffer + scrollback keep running
+                    SinkSend::Failed => {
+                        consecutive_fails += 1;
+                        if consecutive_fails > 2000 {
+                            // The channel is dead but the child is alive: detach instead of the
+                            // old `break` that left a zombie entry whose next spawn re-attached
+                            // to silence.
+                            if let Ok(mut s) = sink.lock() {
+                                *s = None;
+                            }
+                            consecutive_fails = 0;
+                        }
                     }
                 }
             }
@@ -644,16 +703,17 @@ impl PtyManager {
                 }
             }
             if let Ok(s) = sink.lock() {
-                let _ = s.send(enc_notice);
+                if let Some(ch) = s.as_ref() {
+                    let _ = ch.send(enc_notice);
+                }
             }
         });
 
         thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
-            // Whether the loop ended because the child actually exited (EOF/error) vs the
-            // flusher giving up on an orphaned sink (process may still be alive — must NOT
-            // reap then).
-            let mut child_exited = false;
+            // Only a real read EOF/error sets this — sink/channel state never ends the
+            // loop, and neither does the flusher (it only stops after this thread does).
+            let child_exited;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
@@ -662,9 +722,7 @@ impl PtyManager {
                     }
                     Ok(n) => {
                         output_for_reader.push(&buf[..n]);
-                        if out_tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
+                        let _ = out_tx.send(buf[..n].to_vec());
                     }
                 }
             }
@@ -672,8 +730,7 @@ impl PtyManager {
             // exit notice after it -- never before the agent's last output.
             drop(out_tx);
             // Free the dead session's handles/buffers and let a re-spawn of this id
-            // cold-start instead of re-attaching a dead PTY. Only on a real child exit
-            // (not the orphaned-sink safety break, where the process may still be alive).
+            // cold-start instead of re-attaching a dead PTY. Only on a real child exit.
             // Windows-only so macOS behavior is untouched (see the clones above).
             #[cfg(windows)]
             if child_exited {
@@ -825,6 +882,20 @@ impl PtyManager {
         Some(snapshot)
     }
 
+    /// Detach a session's desktop consumer (its window closed). The PTY, tmux session and
+    /// reader thread all keep running; the next `pty_spawn` re-attaches warm. Called from
+    /// `lib.rs`'s `on_window_event` `Destroyed` arm for every session belonging to the
+    /// window's profile.
+    pub fn detach(&self, session_id: &str) {
+        if let Some(entry) = self.sessions.get(session_id) {
+            if let Ok(s) = entry.lock() {
+                if let Ok(mut sink) = s.sink.lock() {
+                    *sink = None;
+                }
+            }
+        }
+    }
+
     pub fn kill(&self, session_id: &str) {
         self.tear_down(session_id, Teardown::Destroy);
     }
@@ -884,6 +955,15 @@ impl PtyManager {
         self.warm_spawns.remove(session_id);
         if !how.keeps_snapshot() {
             crate::scrollback::remove(session_id);
+            // DESTROY also ends the session's IDE server and removes its lock file —
+            // pending diff reviews are answered DIFF_REJECTED first so claude's blocked
+            // openDiff resolves instead of dangling. RETIRE deliberately keeps both:
+            // the listener costs kilobytes, and the persisted port lets the resume
+            // spawn hand the SAME env to a claude that may still be running under tmux.
+            if let Some(h) = self.ide_host.get() {
+                h.reject_all(session_id);
+                h.stop_for_session(session_id);
+            }
         }
     }
 
@@ -914,6 +994,13 @@ impl PtyManager {
         // it is here for the launch AFTER a reboot, when there is no tmux left to reattach
         // to and the snapshot is the only record of the screen.
         self.save_scrollback();
+        // IDE lock files die with the process's listeners: leaving them would show dead
+        // "Conduit" entries in other terminals' /ide menus until the next boot's sweep.
+        // The agents themselves keep running under tmux; the next launch re-binds each
+        // session's persisted port and rewrites its lock.
+        if let Some(h) = self.ide_host.get() {
+            h.remove_all_locks();
+        }
         let ids: Vec<String> = self.sessions.iter().map(|e| e.key().clone()).collect();
         for id in ids {
             if let Some((_, m)) = self.sessions.remove(&id) {
@@ -1174,6 +1261,11 @@ fn build_script(
     effort: Option<&str>,
     resume_token: Option<&str>,
     strict_mcp: bool,
+    // IDE announce (2026-09-23 spec): the session's own WS/MCP server port. Rides the
+    // export line because that is the ONLY per-session env channel that crosses the
+    // tmux server boundary — `cmd.env` reaches the tmux CLIENT, and the server keeps
+    // its own environment for every session after the one that started it.
+    ide_port: Option<u16>,
 ) -> String {
     let mut flags = String::new();
     if let Some(name) = worktree {
@@ -1227,9 +1319,14 @@ fn build_script(
         resume_token,
     );
     format!(
-        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}; cd {dir} && {invocation}; exec {shell} -i -l",
+        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}{ide}; cd {dir} && {invocation}; exec {shell} -i -l",
         sid = shell_quote(session_id),
         port = port,
+        // CLAUDE_CODE_SSE_PORT is the 2.1.267 auto-connect trigger;
+        // ENABLE_IDE_INTEGRATION covers older CLIs (harmless on new ones).
+        ide = ide_port
+            .map(|p| format!(" CLAUDE_CODE_SSE_PORT={p} ENABLE_IDE_INTEGRATION=true"))
+            .unwrap_or_default(),
         dir = shell_quote(working_directory),
         invocation = invocation,
         shell = shell,
@@ -1363,6 +1460,24 @@ mod tests {
     const ID: &str = "11111111-2222-3333-4444-555555555555";
 
     #[test]
+    fn detached_sink_send_never_counts_a_failure() {
+        // Pure helper the reader loop uses; None = detached, must not tick the fail counter.
+        let sink: Sink = Arc::new(Mutex::new(None));
+        assert_eq!(send_to_sink(&sink, "x".into()), SinkSend::Detached);
+        let live: Sink = Arc::new(Mutex::new(Some(tauri::ipc::Channel::new(|_| Ok(())))));
+        assert_eq!(send_to_sink(&live, "x".into()), SinkSend::Ok);
+    }
+
+    #[test]
+    fn detach_flips_sink_and_reattach_restores() {
+        let sink: Sink = Arc::new(Mutex::new(Some(tauri::ipc::Channel::new(|_| Ok(())))));
+        *sink.lock().unwrap() = None; // what detach() does
+        assert_eq!(send_to_sink(&sink, "x".into()), SinkSend::Detached);
+        *sink.lock().unwrap() = Some(tauri::ipc::Channel::new(|_| Ok(())));
+        assert_eq!(send_to_sink(&sink, "x".into()), SinkSend::Ok);
+    }
+
+    #[test]
     fn destroying_a_session_drops_its_scrollback_but_retiring_keeps_it() {
         // The whole difference between hibernating a session and deleting one. A retired
         // session has to come back looking like it survived a reboot, and it cannot do that
@@ -1493,10 +1608,46 @@ mod tests {
             None,
             None,
             false, // strict_mcp
+            None,  // ide_port
         );
         assert!(script.contains("export CONDUIT_SESSION_ID='sid-1' CONDUIT_HOOK_PORT=7777"));
         assert!(script.contains("claude --session-id 'sid-1' || claude"));
         assert!(script.contains("cd '/repo' &&"));
+        // No IDE announce → neither env var appears anywhere.
+        assert!(!script.contains("CLAUDE_CODE_SSE_PORT"));
+        assert!(!script.contains("ENABLE_IDE_INTEGRATION"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn build_script_exports_ide_port_when_present() {
+        // The IDE vars MUST ride the export line: `cmd.env` dies at the tmux server
+        // boundary for every session after the first (the server keeps its own env),
+        // and the export inside `sh -c` is the mechanism that already carries
+        // CONDUIT_SESSION_ID per session.
+        let script = build_script(
+            &crate::agent::ClaudeAdapter,
+            "sid-1",
+            7777,
+            "/repo",
+            "/bin/zsh",
+            None,
+            None,
+            None,
+            None, // plugin_dir
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false, // strict_mcp
+            Some(61234),
+        );
+        assert!(script.contains(
+            "export CONDUIT_SESSION_ID='sid-1' CONDUIT_HOOK_PORT=7777 \
+             CLAUDE_CODE_SSE_PORT=61234 ENABLE_IDE_INTEGRATION=true;"
+        ));
     }
 
     #[cfg(not(windows))]
@@ -1519,6 +1670,7 @@ mod tests {
             None,
             None,
             true, // strict_mcp
+            None, // ide_port
         );
         assert!(script.contains("--mcp-config '/cfg/mcp.json'"));
         assert!(script.contains("--strict-mcp-config"));
@@ -1546,6 +1698,7 @@ mod tests {
             None,
             None,
             false, // strict_mcp
+            None,  // ide_port
         );
         assert!(script.contains("--mcp-config '/cfg/mcp.json'"));
         assert!(!script.contains("--strict-mcp-config"));
@@ -1572,6 +1725,7 @@ mod tests {
             None,                     // effort
             None,
             false, // strict_mcp
+            None,  // ide_port
         );
         assert!(script.contains("--settings '/cfg/hooks.json'"), "{script}");
         assert!(script.contains("--mcp-config '/cfg/mcp.json'"), "{script}");
@@ -1671,6 +1825,7 @@ mod tests {
             None,
             None,
             false, // strict_mcp
+            None,  // ide_port
         );
         assert!(
             script.contains("'implement the parser'"),
@@ -1877,6 +2032,7 @@ mod tests {
             Some("high"),
             None,
             false, // strict_mcp
+            None,  // ide_port
         );
         assert!(script.contains("--model 'claude-opus-4-8'"), "{script}");
         assert!(script.contains("--effort 'high'"), "{script}");
@@ -1925,6 +2081,7 @@ mod tests {
             None,
             None,
             false, // strict_mcp
+            None,  // ide_port
         );
         assert!(
             with_plugin.contains("--plugin-dir '/opt/continuity-plugin'"),
@@ -1934,7 +2091,7 @@ mod tests {
         // None (continuity off) must add nothing -- purely additive.
         let without_plugin = build_script(
             &*adapter, "sid-1", 8423, "/repo", "/bin/zsh", None, None, None, None, None, None,
-            None, None, None, None, false,
+            None, None, None, None, false, None,
         );
         assert!(!without_plugin.contains("--plugin-dir"), "{without_plugin}");
     }

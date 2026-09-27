@@ -33,6 +33,7 @@ mod hermes;
 mod hookbus;
 mod hooks;
 mod hotexit;
+pub mod ide_host;
 mod local_llm;
 mod menu;
 mod notify;
@@ -59,9 +60,10 @@ mod transcript;
 mod transcript_index;
 mod updates;
 mod usage_tally;
+mod window_registry;
 mod worktree;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -92,12 +94,27 @@ impl NoWindow for std::process::Command {
     }
 }
 
-/// Unsaved-buffer count pushed from the frontend (`set_dirty_count`). Rust has no
-/// other view of editor dirtiness; the quit paths (menu.rs `quit` arm and the
+/// Unsaved-buffer count pushed from the frontend (`set_dirty_count`), PER WINDOW LABEL.
+/// Rust has no other view of editor dirtiness; the quit paths (menu.rs `quit` arm and the
 /// `CloseRequested` handler below) consult it so a clean quit stays instant and
 /// webview-independent, while a dirty quit round-trips for a confirm dialog.
+///
+/// Keyed by label because closing a SECONDARY window must only gate on that window's own
+/// dirty buffers — a dirty main window must never block a profile window from closing, and
+/// vice versa. The last-window quit path sums every label (`total()`): at that point every
+/// open editor in the app is about to go away together.
 #[derive(Default)]
-pub(crate) struct DirtyGuard(pub std::sync::atomic::AtomicUsize);
+pub(crate) struct DirtyGuard(pub dashmap::DashMap<String, usize>);
+
+impl DirtyGuard {
+    pub fn total(&self) -> usize {
+        self.0.iter().map(|e| *e.value()).sum()
+    }
+
+    pub fn for_label(&self, label: &str) -> usize {
+        self.0.get(label).map(|e| *e.value()).unwrap_or(0)
+    }
+}
 
 /// SPEC-F: does a WORKER session qualify for fleet MCP via mailbox opt-in (as opposed to
 /// a fleet mission)? True iff it has no mission AND has explicitly joined at least one
@@ -126,6 +143,10 @@ fn pty_spawn(
     // sends the definitions it already holds, looked up fresh at every spawn. None =
     // inherit (no MCP flags), which is the pre-allowlist behavior.
     mcp_allowlist: Option<Vec<crate::agent::McpServer>>,
+    // IDE announce (2026-09-23 spec): whether this spawn starts a per-session IDE
+    // server and points claude at it. None = true (the pref's default), so older
+    // frontends keep announcing without resending the arg.
+    announce_ide: Option<bool>,
     on_event: Channel<String>,
     pty: State<Arc<PtyManager>>,
     hook_state: State<Arc<HookState>>,
@@ -548,6 +569,39 @@ fn pty_spawn(
     let resume_token = (!shell_only)
         .then(|| store.session_agent_conversation_id(&session_id))
         .flatten();
+
+    // IDE announce (2026-09-23 spec): bind this session's own WS/MCP server, write its
+    // lock file where THIS session's claude will look (the account redirect moves the
+    // whole config home), and carry the port into the spawn env. Claude-only — the
+    // protocol is Claude's — and never for the companion shell. A failure to bind
+    // degrades to a plain terminal; it must never fail the spawn.
+    let ide_port =
+        if !shell_only && agent == crate::agent::AgentId::Claude && announce_ide.unwrap_or(true) {
+            let ide_state: State<Arc<crate::ide_host::IdeHost>> = app.state();
+            // Ambient CLAUDE_CONFIG_DIR moves the lock dir the same way it moves the
+            // transcript store (see `pty::claude_projects_dir`).
+            let ambient_cfg = std::env::var("CLAUDE_CONFIG_DIR")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let lock_base = account_config_dir.clone().or(ambient_cfg);
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+            let lock_dir = crate::ide_host::lock_dir(lock_base.as_deref(), &home);
+            let events: Arc<dyn crate::ide_host::IdeEvents> =
+                Arc::new(TauriIdeEvents { app: app.clone() });
+            let port = ide_state.start_for_session(
+                &session_id,
+                &cwd,
+                &lock_dir,
+                store.session_ide_port(&session_id),
+                events,
+            );
+            if let Some(p) = port {
+                store.set_session_ide_port(&session_id, p);
+            }
+            port
+        } else {
+            None
+        };
     pty.spawn(
         session_id,
         cwd,
@@ -571,8 +625,86 @@ fn pty_spawn(
         agent_effort.map(str::to_string),
         resume_token,
         strict_mcp,
+        ide_port,
         on_event,
     )
+}
+
+/// `IdeEvents` over Tauri's event bus: the connection loop's side effects become
+/// frontend events. Payload keys are camelCase to match every other Conduit event.
+struct TauriIdeEvents {
+    app: tauri::AppHandle,
+}
+
+impl crate::ide_host::IdeEvents for TauriIdeEvents {
+    fn open_diff(&self, session_id: &str, diff_id: &str, args: &serde_json::Value) {
+        let _ = self.app.emit(
+            "ide-open-diff",
+            serde_json::json!({
+                "sessionId": session_id,
+                "diffId": diff_id,
+                "oldFilePath": args["old_file_path"],
+                "newFilePath": args["new_file_path"],
+                "newFileContents": args["new_file_contents"],
+                "tabName": args["tab_name"],
+            }),
+        );
+    }
+    fn open_file(&self, session_id: &str, path: &str) {
+        let _ = self.app.emit(
+            "ide-open-file",
+            serde_json::json!({"sessionId": session_id, "filePath": path}),
+        );
+    }
+    fn diff_closed(&self, session_id: &str, tab_name: Option<&str>) {
+        let _ = self.app.emit(
+            "ide-diff-closed",
+            serde_json::json!({"sessionId": session_id, "tabName": tab_name}),
+        );
+    }
+}
+
+/// The human's verdict on a parked openDiff. Keep ⇒ claude receives
+/// `[FILE_SAVED, contents]` and writes the file itself; reject ⇒ `[DIFF_REJECTED]`.
+#[tauri::command]
+fn ide_diff_verdict(
+    session_id: String,
+    diff_id: String,
+    keep: bool,
+    contents: Option<String>,
+    ide: State<Arc<crate::ide_host::IdeHost>>,
+) -> Result<bool, String> {
+    Ok(ide.resolve_diff(&session_id, &diff_id, keep, contents.as_deref()))
+}
+
+/// Editor context push (project-scoped): the frontend sends the active file,
+/// selection, open tabs and markers whenever they change; the IDE host caches them
+/// per session and answers claude's read tools from that cache.
+#[tauri::command]
+fn ide_editor_context(
+    project_id: String,
+    context: crate::ide_host::EditorContext,
+    selection_changed: bool,
+    ide: State<Arc<crate::ide_host::IdeHost>>,
+    store: State<Arc<Store>>,
+) -> Result<(), String> {
+    let session_ids = store.project_session_ids(&project_id);
+    ide.update_context(&session_ids, &context, selection_changed);
+    Ok(())
+}
+
+/// Explicit "send this selection to claude" — an at_mentioned notification into one
+/// session's prompt.
+#[tauri::command]
+fn ide_at_mention(
+    session_id: String,
+    file_path: String,
+    line_start: u64,
+    line_end: u64,
+    ide: State<Arc<crate::ide_host::IdeHost>>,
+) -> Result<(), String> {
+    ide.at_mention(&session_id, &file_path, line_start, line_end);
+    Ok(())
 }
 
 #[tauri::command]
@@ -783,6 +915,17 @@ fn adopt_claude_conversation(
     Ok(())
 }
 
+/// The window currently holding OS focus, if any. Lets an event that used to be a
+/// broadcast (menu clicks, cli-open) target the one window the user is actually looking
+/// at instead of hard-coding "main" -- multiple profile windows can be open at once
+/// (window_registry design). Generic over `R` because `menu.rs`'s `on_event` is.
+pub(crate) fn focused_label<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<String> {
+    app.webview_windows()
+        .iter()
+        .find(|(_, w)| w.is_focused().unwrap_or(false))
+        .map(|(label, _)| label.clone())
+}
+
 /// Whether any session with a LIVE PTY is currently marked running. Cross-checks the fleet
 /// status against a real process so a stale "running" (an agent killed mid-turn, or a deleted
 /// session whose status was never cleared) can't trigger a spurious quit prompt. Fed for agy by
@@ -814,8 +957,8 @@ fn load_projects(store: State<Arc<Store>>) -> Vec<Project> {
 }
 
 #[tauri::command]
-fn add_project(path: String, store: State<Arc<Store>>) -> Project {
-    store.add_project(path)
+fn add_project(path: String, profile_id: Option<String>, store: State<Arc<Store>>) -> Project {
+    store.add_project(path, profile_id)
 }
 
 // ---- CLI launcher --------------------------------------------------------------
@@ -854,8 +997,8 @@ fn list_root_chats(store: State<Arc<Store>>) -> Vec<store::RootChat> {
 }
 
 #[tauri::command]
-fn add_root_chat(store: State<Arc<Store>>) -> store::RootChat {
-    store.add_root_chat()
+fn add_root_chat(profile_id: Option<String>, store: State<Arc<Store>>) -> store::RootChat {
+    store.add_root_chat(profile_id)
 }
 
 #[tauri::command]
@@ -1029,7 +1172,42 @@ fn add_profile(name: String, store: State<Arc<Store>>) -> store::Profile {
 }
 
 #[tauri::command]
-fn remove_profile(id: String, store: State<Arc<Store>>) -> bool {
+fn remove_profile(
+    id: String,
+    app: tauri::AppHandle,
+    store: State<Arc<Store>>,
+    reg: State<Arc<window_registry::WindowRegistry>>,
+    pty: State<Arc<PtyManager>>,
+) -> bool {
+    // If a secondary window is showing this profile, detach its sessions and tear it down
+    // ourselves, BEFORE the store mutation below. The window's `Destroyed` handler fires
+    // asynchronously and could otherwise land AFTER `store.remove_profile` -- at which
+    // point this dangling id would normalize to Default (`sessions_for_profile`) and its
+    // `profile_of` lookup would mis-detach DEFAULT's sessions instead of this profile's.
+    //
+    // "main" is exempt from all of this: it is never destroyed here (it stays open,
+    // showing the removed profile's projects/chats now fallen back to Default), so no
+    // Destroyed event will ever fire for this call and there is nothing to preempt --
+    // detaching its sessions here would kill their PTYs while they're still on screen,
+    // which is exactly the keep-alive-terminal bug this module's doc comment warns about.
+    if let Some(label) = reg.label_for(&Some(id.clone())) {
+        if label != "main" {
+            // Detach while `id` still names a real profile and normalizes to itself
+            // rather than Default.
+            for sid in store.sessions_for_profile(&Some(id.clone())) {
+                pty.detach(&sid);
+            }
+            // Remove the registry entry synchronously, so that by the time the async
+            // Destroyed handler runs, `profile_of(&label)` misses (the label is gone)
+            // and its own detach loop is skipped rather than mis-firing on Default.
+            reg.remove(&label);
+            if let Some(w) = app.get_webview_window(&label) {
+                let _ = w.destroy();
+            }
+        }
+    }
+    // Only now the store mutation: profile removed, its projects/chats fall back to
+    // Default.
     store.remove_profile(&id)
 }
 
@@ -1039,8 +1217,215 @@ fn get_active_profile(store: State<Arc<Store>>) -> Option<String> {
 }
 
 #[tauri::command]
-fn set_active_profile(id: Option<String>, store: State<Arc<Store>>) -> bool {
-    store.set_active_profile(id)
+fn set_active_profile(
+    id: Option<String>,
+    window: tauri::Window,
+    store: State<Arc<Store>>,
+    reg: State<Arc<window_registry::WindowRegistry>>,
+) -> bool {
+    // Only "main" may change the global active profile -- a secondary profile window's
+    // identity is fixed to the profile it was opened for (the registry entry), and letting
+    // it rewrite the global would make every other window's Default view jump underneath it.
+    if window.label() != "main" {
+        return false;
+    }
+    let ok = store.set_active_profile(id.clone());
+    if ok {
+        // Keep the registry's "main" entry in lock-step with the store. This command is
+        // the ONLY place `active_profile_id` changes at runtime, and only in switch mode
+        // -- window mode never calls it (the ProfileBar routes every pick through
+        // `open_profile_window` instead; see Sidebar.tsx/store.ts's `WINDOWED` gates), so
+        // `main`'s registry entry (set once at boot) never needs refreshing there. In
+        // switch mode it does: without this, switching profiles mid-session leaves
+        // "main" registered under its BOOT-time profile forever, and `label_for` would
+        // keep reporting a miss for the newly active profile even though "main" is
+        // showing it -- e.g. the cli-open sink's normal (non-pending-open) fallthrough
+        // would needlessly fall to `focused_label`/`"main"` instead of finding "main"
+        // directly. NOT load-bearing for the pending-open path itself, which is gated on
+        // `WindowModeFlag` (window mode only) rather than trusting `label_for` misses in
+        // switch mode -- see that flag's own doc comment for why a stale-or-not registry
+        // entry is unreliable there regardless.
+        reg.register("main", id);
+    }
+    ok
+}
+
+// ---- Profile window commands --------------------------------------------------
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WindowProfileInfo {
+    label: String,
+    profile_id: Option<String>,
+    is_main: bool,
+}
+
+/// Reported once, early, by every window's frontend on boot with the `WINDOWED` constant
+/// (`profileWindowMode` localStorage pref) — see `WindowModeFlag`'s doc comment for why
+/// the cli-open sink needs this signal from the ONE place that actually knows the mode.
+#[tauri::command]
+fn set_profile_window_mode(windowed: bool, flag: State<Arc<window_registry::WindowModeFlag>>) {
+    flag.set(windowed);
+}
+
+#[tauri::command]
+fn window_profile(
+    window: tauri::Window,
+    reg: State<Arc<window_registry::WindowRegistry>>,
+) -> WindowProfileInfo {
+    let label = window.label().to_string();
+    let profile_id = reg.profile_of(&label).flatten();
+    WindowProfileInfo {
+        is_main: label == "main",
+        label,
+        profile_id,
+    }
+}
+
+/// Normalize an `open_profile_window` request into the profile it should show: `None`
+/// passes through as Default, `Some(id)` must match a known profile or the window would
+/// open with no way to tell which (now nonexistent) profile it was meant to filter to.
+/// Pure so it's unit-testable without a `Store`.
+fn resolve_open_target(
+    profiles: &[store::Profile],
+    id: &Option<String>,
+) -> Result<Option<String>, String> {
+    match id {
+        None => Ok(None),
+        Some(id) => {
+            if profiles.iter().any(|p| &p.id == id) {
+                Ok(Some(id.clone()))
+            } else {
+                Err(format!("unknown profile: {id}"))
+            }
+        }
+    }
+}
+
+/// Title for a secondary profile window: "Conduit (<profile name>)", so the OS window
+/// switcher can tell two Conduits apart. `None` is the implicit Default profile.
+fn profile_window_title(name: Option<&str>) -> String {
+    format!("Conduit ({})", name.unwrap_or("Default"))
+}
+
+/// Create or focus the window for `target` (a resolved profile, `None` = Default),
+/// returning the label it ended up at. Shared by the `open_profile_window` command and
+/// the cli-open sink's pending-open path (`hooks.rs`) so both go through the exact same
+/// claim-or-build logic and a race between them resolves the same way `claim` already
+/// guarantees for two concurrent `open_profile_window` calls.
+pub(crate) fn open_or_focus_profile_window(
+    app: &tauri::AppHandle,
+    reg: &Arc<window_registry::WindowRegistry>,
+    target: &Option<String>,
+) -> Result<String, String> {
+    let label = window_registry::profile_window_label(target);
+    // `claim` is check-then-insert under ONE lock: two concurrent calls for the same
+    // profile can't both see "nothing registered" and both try to build a window under
+    // the same label (the old label_for-then-register split had exactly that race).
+    match reg.claim(&label, target) {
+        window_registry::Claim::Existing(label) => {
+            if let Some(w) = app.get_webview_window(&label) {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+            // Else: another call is still building this label, or the entry is stale.
+            // Do nothing rather than remove/rebuild here -- Task 4's Destroyed handler
+            // is what reaps a truly-dead entry, so a stale claim is transient.
+            Ok(label)
+        }
+        window_registry::Claim::Claimed(label) => {
+            // `claim` already inserted `label -> target` before returning; that insert
+            // landing before `build()` is load-bearing -- the new webview's first
+            // `window_profile` IPC call must find its own registry entry, or it reports
+            // isMain: false / profileId: null on first paint.
+            // Titled per profile so the window switcher / Mission Control can tell two
+            // Conduits apart; only main keeps the bare "Conduit" (tauri.conf.json).
+            let name = target.as_ref().and_then(|id| {
+                app.state::<Arc<Store>>()
+                    .list_profiles()
+                    .into_iter()
+                    .find(|p| &p.id == id)
+                    .map(|p| p.name)
+            });
+            let builder =
+                tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::default())
+                    .title(profile_window_title(name.as_deref()))
+                    .inner_size(1100.0, 720.0)
+                    .min_inner_size(980.0, 600.0)
+                    .theme(Some(tauri::Theme::Dark))
+                    .disable_drag_drop_handler();
+            #[cfg(target_os = "macos")]
+            let builder = builder.title_bar_style(tauri::TitleBarStyle::Overlay);
+            builder.build().map_err(|e| {
+                reg.remove(&label);
+                format!("open window: {e}")
+            })?;
+            Ok(label)
+        }
+    }
+}
+
+// `(async)` is required, not a speed-up: `WebviewWindowBuilder::build` deadlocks on Windows
+// when called from a synchronous command (WebView2 creation waits on the UI thread the
+// command is blocking) -- documented on the builder itself. `claim` already makes two
+// concurrent opens of one profile safe, which is what running off-thread needs.
+#[tauri::command(async)]
+fn open_profile_window(
+    app: tauri::AppHandle,
+    profile_id: Option<String>,
+    reg: State<Arc<window_registry::WindowRegistry>>,
+    store: State<Arc<Store>>,
+) -> Result<(), String> {
+    let target = resolve_open_target(&store.list_profiles(), &profile_id)?;
+    open_or_focus_profile_window(&app, reg.inner(), &target)?;
+    Ok(())
+}
+
+/// One window's drain of every `conduit <path> [--agent <id>]` invocation the cli-open
+/// sink queued for it while it had no live window yet (Finding 1's pending-open path).
+/// Called once per window right after `load()` resolves, alongside the live `cli-open`
+/// listener that handles the same payload shape for a window that was already open.
+#[tauri::command]
+fn take_pending_opens(
+    window: tauri::Window,
+    pending: State<Arc<window_registry::PendingOpens>>,
+) -> Vec<cli_open::OpenRequest> {
+    pending.take(window.label())
+}
+
+#[tauri::command]
+fn close_window(app: tauri::AppHandle, label: String) {
+    // Destroying the LAST window is a quit, and a quit must go through the quit-confirm
+    // path (`CloseRequested`'s single-window branch: running-agent check, then dirty-buffer
+    // confirm) -- never a bare programmatic destroy that bypasses both. That hazard is what
+    // this guard exists to close, and it is a property of "is this the last window", not of
+    // the label: refusing only `label == "main"` let a dirty `main` with a secondary window
+    // still open hit `CloseRequested`'s multi-window branch (which emits `close-window` at
+    // `main`'s own label, same as any other window), run the frontend's confirm, and then
+    // have THIS command silently refuse the destroy anyway -- the user confirms a dialog and
+    // main just stays open with no feedback. With another window alive, closing this one
+    // (main or a secondary) is not a quit: `Destroyed` (`on_window_event`) still reaps its
+    // registry entry and per-label dirty guard, and nothing downstream requires "main"
+    // specifically to keep existing -- the hook server's cli-open target-window fallback
+    // already tries any live window when its preferred target (main included) is gone.
+    //
+    // The `len()` check and the `destroy()` below are NOT atomic with each other -- there
+    // is no lock spanning them. Correctness today rests entirely on this command being a
+    // plain (non-`async`) `#[tauri::command]`: Tauri v2 dispatches those synchronously on
+    // the same windowing event loop thread that also creates and destroys webview windows,
+    // so nothing can create or destroy another window between this check and this destroy
+    // call. DO NOT mark this command `async` (or move the destroy off this thread) without
+    // first adding a lock/mutex spanning the check-then-act pair -- doing so would silently
+    // reopen a real race where two closing windows could each see `len() > 1` and both
+    // proceed to destroy, leaving zero windows open with neither call having gone through
+    // the quit-confirm path this guard exists to protect.
+    if app.webview_windows().len() <= 1 {
+        return;
+    }
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.destroy();
+    }
 }
 
 // ---- Project task board commands ---------------------------------------------
@@ -2093,6 +2478,18 @@ fn create_project_dir(parent: String, name: String, git_init: bool) -> Result<St
     project_new::create_project(&parent, &name, git_init)
 }
 
+/// `clone-progress` is a plain broadcast (`app.emit`, not `emit_to`), and the dialog is
+/// the only listener today -- but a second dialog in another window (or a second clone
+/// run in the same one, opened/cancelled/reopened while the first is still streaming)
+/// would otherwise see the wrong run's lines with no way to tell them apart. `requestId`
+/// is round-tripped from the invoke so the dialog can filter its own listener by it.
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CloneProgress {
+    line: String,
+    request_id: String,
+}
+
 /// Long-running; `(async)` puts it on the blocking pool so the read loop never
 /// touches the main thread. Progress reaches the dialog as `clone-progress` events,
 /// throttled so a fast transfer doesn't flood the event bus.
@@ -2102,13 +2499,20 @@ fn clone_project_repo(
     url: String,
     parent: String,
     name: String,
+    request_id: String,
 ) -> Result<String, String> {
     let mut last = None::<std::time::Instant>;
     project_new::run_clone(&url, &parent, &name, &mut |line| {
         let due = last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100));
         if due {
             last = Some(std::time::Instant::now());
-            let _ = app.emit("clone-progress", serde_json::json!({ "line": line }));
+            let _ = app.emit(
+                "clone-progress",
+                CloneProgress {
+                    line,
+                    request_id: request_id.clone(),
+                },
+            );
         }
     })
 }
@@ -2132,8 +2536,12 @@ fn resolve_prettier_options(path: String) -> Option<format::PrettierConfig> {
 // ---- Hot exit -------------------------------------------------------------------
 
 #[tauri::command]
-fn hotexit_save(entries: Vec<hotexit::HotExitEntry>) -> Result<(), String> {
-    hotexit::save(&entries)
+fn hotexit_save(
+    window: tauri::Window,
+    entries: Vec<hotexit::HotExitEntry>,
+    state: State<hotexit::HotExitState>,
+) -> Result<(), String> {
+    state.save_for(window.label(), &entries)
 }
 
 #[tauri::command(async)]
@@ -2215,8 +2623,8 @@ fn resolve_terminal_path(base: String, token: String) -> Option<fsops::ResolvedP
 // ---- Quit guard ----------------------------------------------------------------
 
 #[tauri::command]
-fn set_dirty_count(count: usize, dirty: State<DirtyGuard>) {
-    dirty.0.store(count, Ordering::SeqCst);
+fn set_dirty_count(window: tauri::Window, count: usize, dirty: State<DirtyGuard>) {
+    dirty.0.insert(window.label().to_string(), count);
 }
 
 /// Actually quit, invoked by the frontend after the dirty-buffer confirm. Preserves
@@ -2504,6 +2912,7 @@ pub fn run() {
 
     builder
         .manage(Arc::new(PtyManager::new()))
+        .manage(crate::ide_host::IdeHost::new())
         .manage(Arc::new(Store::new()))
         .manage(Arc::new(HookState::default()))
         .manage(Arc::new(crate::fleet::FleetState::default()))
@@ -2517,20 +2926,61 @@ pub fn run() {
         .manage(Arc::new(broker::Broker::default()))
         .manage(Arc::new(broker::Presence::default()))
         .manage(Arc::new(proposals::Proposals::default()))
+        .manage(Arc::new(window_registry::WindowRegistry::default()))
+        .manage(Arc::new(window_registry::PendingOpens::default()))
+        .manage(Arc::new(window_registry::WindowModeFlag::default()))
         .manage(DirtyGuard::default())
+        .manage(hotexit::HotExitState::default())
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Closing the (only) window quits the app; give dirty buffers AND any actively
-                // running agent the same confirm round-trip as Cmd+Q. Clean+idle windows close
-                // instantly. The frontend decides the exact prompt (unsaved files vs running
-                // agents) from the "quit" event.
-                let app = window.app_handle();
-                let dirty = app.state::<DirtyGuard>().0.load(Ordering::SeqCst);
-                let running = live_running_agent(app);
-                if dirty > 0 || running {
-                    api.prevent_close();
-                    let _ = app.emit("menu", "quit");
+            let app = window.app_handle();
+            let label = window.label().to_string();
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if app.webview_windows().len() > 1 {
+                        // Not the last window: closing detaches, never quits. Only this
+                        // window's OWN dirty buffers gate it -- a dirty main window must
+                        // never block a profile window from closing, or vice versa;
+                        // running agents in EITHER window keep running regardless.
+                        if app.state::<DirtyGuard>().for_label(&label) > 0 {
+                            api.prevent_close();
+                            let _ = app.emit_to(&label, "menu", "close-window");
+                        }
+                    } else {
+                        // Last window = the app quit path, exactly as before (summed
+                        // dirty across every window, since they're all going away
+                        // together) plus any actively running agent. Clean+idle closes
+                        // instantly; the frontend decides the exact prompt from "quit".
+                        let dirty = app.state::<DirtyGuard>().total();
+                        let running = live_running_agent(app);
+                        if dirty > 0 || running {
+                            api.prevent_close();
+                            let _ = app.emit_to(&label, "menu", "quit");
+                        }
+                    }
                 }
+                tauri::WindowEvent::Destroyed => {
+                    // The one place a registry entry is reaped and a profile's sessions
+                    // are detached from this window's PTYs -- runs for EVERY window,
+                    // main included, since Task 3's `claim` logic depends on a dead
+                    // window's profile becoming reopenable. Read `profile_of` BEFORE
+                    // `remove`: once removed it would answer "unknown label" and the
+                    // detach loop below would silently detach nothing.
+                    let reg = app.state::<Arc<window_registry::WindowRegistry>>();
+                    if let Some(profile) = reg.profile_of(&label) {
+                        let store = app.state::<Arc<Store>>();
+                        let pty = app.state::<Arc<PtyManager>>();
+                        // `sessions_for_profile` returns an owned Vec after its internal
+                        // lock is dropped, so nothing here holds the registry or store
+                        // lock across `detach` -- which itself locks per-session state
+                        // its reader thread also touches.
+                        for sid in store.sessions_for_profile(&profile) {
+                            pty.detach(&sid);
+                        }
+                    }
+                    reg.remove(&label);
+                    app.state::<DirtyGuard>().0.remove(&label);
+                }
+                _ => {}
             }
         })
         .setup(|app| {
@@ -2543,12 +2993,35 @@ pub fn run() {
             let pty = app.state::<Arc<PtyManager>>().inner().clone();
             let store = app.state::<Arc<Store>>().inner().clone();
             let tasks = app.state::<Arc<TaskBoard>>().inner().clone();
+
+            // Wire the store-saved broadcast. Fires after every persisted store write.
+            let gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let handle = app.handle().clone();
+            store.set_on_save(Box::new(move || {
+                let _ = handle.emit(
+                    "store-saved",
+                    gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                );
+            }));
             let agy_usage = app
                 .state::<Arc<crate::agy_usage::AgyUsageState>>()
                 .inner()
                 .clone();
             let agy_resume = app
                 .state::<Arc<crate::agy_usage::AgyResumeState>>()
+                .inner()
+                .clone();
+            let reg = app
+                .state::<Arc<window_registry::WindowRegistry>>()
+                .inner()
+                .clone();
+            reg.register("main", store.active_profile());
+            let pending_opens = app
+                .state::<Arc<window_registry::PendingOpens>>()
+                .inner()
+                .clone();
+            let window_mode = app
+                .state::<Arc<window_registry::WindowModeFlag>>()
                 .inner()
                 .clone();
             hooks::start(
@@ -2563,8 +3036,42 @@ pub fn run() {
                 board.clone(),
                 agy_usage,
                 agy_resume,
+                reg,
+                pending_opens,
+                window_mode,
             );
             bridge::start(app.handle().clone());
+
+            // IDE announce: hand the host to the PTY manager (teardown needs it) and
+            // sweep OUR stale lock files — every lock dir Conduit could have written
+            // (ambient + each registered account), a Conduit-named lock whose port no
+            // longer answers. Off the main thread; each probe is a 300 ms TCP connect.
+            {
+                let ide = app.state::<Arc<crate::ide_host::IdeHost>>().inner().clone();
+                pty.set_ide_host(ide);
+                let mut lock_dirs: Vec<std::path::PathBuf> = Vec::new();
+                let ambient_cfg = std::env::var("CLAUDE_CONFIG_DIR")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                if let Some(home) = dirs::home_dir() {
+                    lock_dirs.push(crate::ide_host::lock_dir(ambient_cfg.as_deref(), &home));
+                    for account in store.list_accounts() {
+                        lock_dirs.push(crate::ide_host::lock_dir(Some(&account.config_dir), &home));
+                    }
+                }
+                std::thread::spawn(move || {
+                    let probe = |port: u16| {
+                        std::net::TcpStream::connect_timeout(
+                            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                            std::time::Duration::from_millis(300),
+                        )
+                        .is_ok()
+                    };
+                    for dir in lock_dirs {
+                        crate::ide_host::sweep_lock_dir(&dir, &probe);
+                    }
+                });
+            }
 
             // Sweep tmux sessions whose Conduit session no longer exists. Persistence
             // means a tmux session outlives the app, so one whose owner was deleted while
@@ -2683,6 +3190,9 @@ pub fn run() {
             stop_session,
             start_session,
             stop_idle_sessions,
+            ide_diff_verdict,
+            ide_editor_context,
+            ide_at_mention,
             pty_is_running,
             tmux_available,
             session_context,
@@ -2707,6 +3217,11 @@ pub fn run() {
             remove_profile,
             get_active_profile,
             set_active_profile,
+            window_profile,
+            set_profile_window_mode,
+            open_profile_window,
+            take_pending_opens,
+            close_window,
             set_project_color,
             root_chat::root_chat_send,
             root_chat::root_chat_stop,
@@ -2914,7 +3429,7 @@ mod endpoint_tests {
             AgentId::Hermes,
             ep("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-5"),
         );
-        let p = store.add_project("/tmp/proj".to_string());
+        let p = store.add_project("/tmp/proj".to_string(), None);
         let sess = store
             .add_session(
                 &p.id,
@@ -3001,6 +3516,43 @@ mod tests {
         assert!(idle_stop_targets(&[], &id_set(&[]), &id_set(&[])).is_empty());
     }
 
+    fn test_profile(id: &str) -> store::Profile {
+        store::Profile {
+            id: id.to_string(),
+            name: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_open_target_none_is_default() {
+        let profiles = [test_profile("a")];
+        assert_eq!(resolve_open_target(&profiles, &None), Ok(None));
+    }
+
+    #[test]
+    fn profile_window_title_names_the_profile() {
+        assert_eq!(
+            profile_window_title(Some("Streaming")),
+            "Conduit (Streaming)"
+        );
+        assert_eq!(profile_window_title(None), "Conduit (Default)");
+    }
+
+    #[test]
+    fn resolve_open_target_known_id_passes_through() {
+        let profiles = [test_profile("a"), test_profile("b")];
+        assert_eq!(
+            resolve_open_target(&profiles, &Some("b".to_string())),
+            Ok(Some("b".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_open_target_unknown_id_is_refused() {
+        let profiles = [test_profile("a")];
+        assert!(resolve_open_target(&profiles, &Some("ghost".to_string())).is_err());
+    }
+
     /// The invariant that keeps root chat from escalating: a dispatched session is a
     /// WORKER. A Conductor would hold fleet's whole orchestration surface, which root
     /// chat is deliberately not given.
@@ -3021,7 +3573,7 @@ mod tests {
     fn approving_a_pending_proposal_creates_a_worker_session_and_resolves_it() {
         let dir = approve_test_dir("happy");
         let store = Store::for_test(&dir);
-        let project = store.add_project("/repo".into());
+        let project = store.add_project("/repo".into(), store.active_profile());
         let proposals = proposals::Proposals::default();
         let p = proposals
             .register(
@@ -3066,7 +3618,7 @@ mod tests {
     fn approving_with_an_agent_this_build_cannot_spawn_is_refused_not_defaulted_to_claude() {
         let dir = approve_test_dir("bogus_agent");
         let store = Store::for_test(&dir);
-        let project = store.add_project("/repo".into());
+        let project = store.add_project("/repo".into(), store.active_profile());
         let proposals = proposals::Proposals::default();
         let p = proposals
             .register(
@@ -3130,7 +3682,7 @@ mod tests {
     fn approving_an_expired_proposal_is_refused_and_creates_no_session() {
         let dir = approve_test_dir("expired");
         let store = Store::for_test(&dir);
-        let project = store.add_project("/repo".into());
+        let project = store.add_project("/repo".into(), store.active_profile());
         let proposals = proposals::Proposals::default();
         let p = proposals
             .register(
@@ -3167,7 +3719,7 @@ mod tests {
     fn approve_refuses_a_proposal_already_resolved_by_someone_else() {
         let dir = approve_test_dir("race");
         let store = Store::for_test(&dir);
-        let project = store.add_project("/repo".into());
+        let project = store.add_project("/repo".into(), store.active_profile());
         let proposals = proposals::Proposals::default();
         let p = proposals
             .register(
@@ -3208,7 +3760,7 @@ mod tests {
     fn only_one_concurrent_approval_wins_and_no_orphan_session_survives() {
         let dir = approve_test_dir("concurrent");
         let store = Arc::new(Store::for_test(&dir));
-        let project = store.add_project("/repo".into());
+        let project = store.add_project("/repo".into(), store.active_profile());
         let proposals = Arc::new(proposals::Proposals::default());
         let p = proposals
             .register(
@@ -3266,7 +3818,7 @@ mod tests {
     fn list_pending_decisions_reports_the_project_name() {
         let dir = approve_test_dir("pending_list");
         let store = Store::for_test(&dir);
-        let project = store.add_project("/repo".into());
+        let project = store.add_project("/repo".into(), store.active_profile());
         let proposals = proposals::Proposals::default();
         proposals
             .register(
@@ -3289,5 +3841,18 @@ mod tests {
         assert_eq!(rows[0]["projectId"], project.id);
         assert_eq!(rows[0]["projectName"], project.name);
         assert_eq!(rows[0]["kind"], "implementation");
+    }
+
+    #[test]
+    fn dirty_guard_sums_across_labels_and_reads_one_label() {
+        let guard = DirtyGuard::default();
+        guard.0.insert("main".to_string(), 2);
+        guard.0.insert("profile-a".to_string(), 3);
+
+        assert_eq!(guard.total(), 5);
+        assert_eq!(guard.for_label("main"), 2);
+        assert_eq!(guard.for_label("profile-a"), 3);
+        // A label never written reads as clean, not missing-and-panicking.
+        assert_eq!(guard.for_label("profile-b"), 0);
     }
 }

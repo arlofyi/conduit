@@ -13,6 +13,8 @@ import {
 import type { TerminalRenderer } from "./terminalRenderer";
 import { initialProjectSelection, type OpenBehavior } from "./startup";
 import { insertTabAt, repairLayout } from "./layout";
+import { pushDiff, popDiff, closeDiffs, type PendingDiff } from "./ideBridge";
+import { mergeSlices } from "./storeSync";
 import { accountKey, type UsageMetric } from "./usageRows";
 import type { Chain, RoutesView, TaskKind, TaskKindInfo } from "./routing";
 import { AGENTS, type AgentId, type AgentInfo, DEFAULT_AGENT, type McpServer } from "./agents";
@@ -35,7 +37,7 @@ import {
   type PendingDecision,
 } from "./rootProposals";
 import { projectsNeedingRoutes, type RoutesByProject } from "./pendingDecisionRouting";
-import { inProfile, type Profile } from "./profiles";
+import { inProfile, mountedInWindow, type Profile, type WindowProfile } from "./profiles";
 import { type CanvasState, emptyCanvas, migrateNotes } from "./canvas";
 import type { ContinuityFeed } from "./continuityFeed";
 import type * as Monaco from "monaco-editor";
@@ -386,6 +388,12 @@ export interface LiveState {
   todos: TodoItem[];
   /** Short "what it's doing now" label while running (from PreToolUse). */
   activity?: string;
+  /**
+   * Claude's permission mode as the hook stream last reported it ("default",
+   * "acceptEdits", "plan", "bypassPermissions"). Hook-carried, so it lags a Shift+Tab
+   * until the next hook fires; absent entirely on CLIs too old to send it.
+   */
+  permissionMode?: string;
   /** True between a PreCompact event and the next activity, for a "compacting" hint. */
   compacting?: boolean;
   /**
@@ -640,6 +648,24 @@ function writeRestoreSessionsOnOpen(v: boolean): void {
   }
 }
 
+// IDE announce: Claude sessions connect back to Conduit as their IDE (diff review,
+// selection context). Default ON. Same persisted-pref pattern as restore-on-open.
+const ANNOUNCE_IDE_KEY = "conduit.announceAsIde";
+function readAnnounceAsIde(): boolean {
+  try {
+    return localStorage.getItem(ANNOUNCE_IDE_KEY) !== "0"; // default on (absent => true)
+  } catch {
+    return true;
+  }
+}
+function writeAnnounceAsIde(v: boolean): void {
+  try {
+    localStorage.setItem(ANNOUNCE_IDE_KEY, v ? "1" : "0");
+  } catch {
+    /* quota — non-fatal */
+  }
+}
+
 // Root chat workspace root: the directory the HQ chats read from (their spawn cwd).
 // Empty = the Rust side falls back to the home directory. Same persisted-pref pattern.
 const WORKSPACE_ROOT_KEY = "conduit.workspaceRoot";
@@ -707,6 +733,31 @@ function writeLastProject(id: string | null): void {
     /* quota — non-fatal */
   }
 }
+
+// Multi-window profiles: "window" = picking a profile opens (or focuses) a separate OS
+// window permanently pinned to it, like Obsidian vaults, instead of re-filtering this
+// one. Read ONCE at module init into `WINDOWED` below — restart-gated, so a mid-session
+// flip cannot leave an already-open window straddling both models. Same persisted-pref
+// pattern as the toggles above.
+const PROFILE_WINDOW_MODE_KEY = "conduit.profileWindowMode";
+function readProfileWindowMode(): "switch" | "window" {
+  try {
+    return localStorage.getItem(PROFILE_WINDOW_MODE_KEY) === "window" ? "window" : "switch";
+  } catch {
+    return "switch";
+  }
+}
+function writeProfileWindowMode(v: "switch" | "window"): void {
+  try {
+    localStorage.setItem(PROFILE_WINDOW_MODE_KEY, v);
+  } catch {
+    /* quota — non-fatal */
+  }
+}
+/** Boot-frozen: whether THIS launch runs in multi-window profiles mode. A change to the
+ *  `profileWindowMode` preference takes effect only after restarting Conduit — read this,
+ *  never `profileWindowMode` (state), to decide behavior. */
+export const WINDOWED = readProfileWindowMode() === "window";
 
 // Terminal renderer: which xterm rasterizer new panes ask for, and which live panes swap to
 // when it changes. Default WebGL (VS Code's default) — one GPU draw per viewport instead of
@@ -994,15 +1045,25 @@ function validateLayout(
  * layout, so removing it needed one repair. A borrowed session lives in someone else's
  * panes, so a targeted repair would leave a tab pointing at a session that no longer
  * exists. Only changed layouts are persisted -- this runs on every removal.
+ *
+ * In window mode a project this window doesn't MOUNT is skipped entirely — `layouts`
+ * still carries a (stale, boot-time-or-last-sync) copy of it (see `mergeSlices`'
+ * `mountedIds` in storeSync.ts), and repairing + persisting that copy here would
+ * overwrite the OWNING window's current layout with this window's outdated one. This
+ * window has no business writing a layout for a project it never renders. In switch
+ * mode `mountedInWindow` always returns true, so nothing here changes.
  */
 function revalidateAllLayouts(
   layouts: Record<string, ProjectLayout>,
   maximized: Record<string, string>,
   projects: Project[],
+  windowProfileId: string | null,
+  knownProfileIds: ReadonlySet<string>,
 ): { layouts: Record<string, ProjectLayout>; maximized: Record<string, string> } {
   const nextLayouts = { ...layouts };
   const nextMax = { ...maximized };
   for (const p of projects) {
+    if (!mountedInWindow(p, WINDOWED, windowProfileId, knownProfileIds)) continue;
     const cur = layouts[p.id];
     if (!cur) continue;
     const next = validateLayout(cur, p, projects);
@@ -1281,6 +1342,18 @@ interface AppState {
    *  shows a project the sidebar hides. */
   setActiveProfile: (id: string | null) => Promise<void>;
 
+  // ---- multi-window profiles: this window's identity + the pref that enables it ----
+  /** This OS window's own profile identity, from the Rust `window_profile` command.
+   *  Default (main, Default profile) until `load()` resolves it. In window mode this is
+   *  what a secondary window stamps new items with and restores its own selection from —
+   *  never `activeProfileId`, which in window mode is main's boot-time value and only
+   *  main may change. */
+  windowProfile: WindowProfile;
+  /** Persisted (per-machine) preference. Behavior itself is boot-frozen — see the
+   *  exported `WINDOWED` const — so this state exists only for the Settings checkbox. */
+  profileWindowMode: "switch" | "window";
+  setProfileWindowMode: (v: "switch" | "window") => void;
+
   // ---- root chat (HQ): read-only claude -p conversations above all projects ----
   rootChats: RootChat[];
   /** Non-null while the chat view overlays the (still-mounted) terminal workspace. */
@@ -1310,7 +1383,12 @@ interface AppState {
 
   /** Work root chat proposed, waiting on your approval. Runtime-only; Rust owns it. */
   pendingDecisions: PendingDecision[];
-  loadPendingDecisions: () => Promise<void>;
+  /** `accept` mirrors the live `pending-decision` listener's own per-window guard
+   *  (App.tsx's `inThisWindow`) — omit only for a caller that wants every card
+   *  regardless of window (there is none today; App.tsx's mount-time catch-up always
+   *  passes one). Without it, this catch-up fetch showed every OTHER window's cards too,
+   *  since (unlike the live event) it never went through that guard. */
+  loadPendingDecisions: (accept?: (projectId: string) => boolean) => Promise<void>;
   decisionArrived: (d: PendingDecision) => void;
   approveDecision: (id: string, agent: string, model?: string) => Promise<void>;
   denyDecision: (id: string) => Promise<void>;
@@ -1326,6 +1404,17 @@ interface AppState {
    *  resumes all its sessions instead of waiting for a click. */
   restoreSessionsOnOpen: boolean;
   setRestoreSessionsOnOpen: (v: boolean) => void;
+  /** Persisted. When true (default), Claude sessions announce Conduit as their IDE:
+   *  diff review lands in a Monaco overlay, editor selections reach the session. */
+  announceAsIde: boolean;
+  setAnnounceAsIde: (v: boolean) => void;
+  /** Runtime-only: parked openDiff reviews from IDE-connected sessions (FIFO per
+   *  session, rendered by DiffReviewOverlay). Never persisted — a diff request dies
+   *  with the claude that asked it. */
+  pendingDiffs: PendingDiff[];
+  ideDiffArrived: (d: PendingDiff) => void;
+  ideDiffResolved: (sessionId: string, diffId: string) => void;
+  ideDiffsClosed: (sessionId: string, tabName: string | null) => void;
   /** Persisted. Whether a launch reopens the project you were last on ("last", the
    *  default) or opens nothing ("none"). Neither one reopens the topmost project as
    *  such — see `initialProjectSelection`. */
@@ -1395,6 +1484,11 @@ interface AppState {
   dismissUpdate: () => void;
 
   load: () => Promise<void>;
+  /** Cross-window convergence: debounced off the `store-saved` broadcast (useStoreSync.ts).
+   *  Refetches the read slices another window's write may have changed and merges them via
+   *  `mergeSlices` (storeSync.ts) — never touches `windowProfile`, `selectedProjectId`, or
+   *  any localStorage-backed pref. */
+  mergeSyncedSlices: () => Promise<void>;
   agents: AgentInfo[] | null;
   defaultAgent: AgentId;
   agentSetupComplete: boolean;
@@ -1696,6 +1790,7 @@ interface AppState {
   markStale: (ids: string[]) => void;
   setTodos: (id: string, todos: TodoItem[]) => void;
   setActivity: (id: string, activity: string | undefined) => void;
+  setPermissionMode: (id: string, permissionMode: string | undefined) => void;
   setCompacting: (id: string, compacting: boolean) => void;
   setThemePref: (pref: ThemePref) => void;
   applySystemDark: (dark: boolean) => void;
@@ -1770,6 +1865,14 @@ export const useStore = create<AppState>((set, get) => {
     });
   };
 
+  // Which profile a newly created project/root-chat gets stamped with. In switch mode
+  // this is just the active profile; in window mode it MUST be this window's own pinned
+  // identity, never `activeProfileId` — that field is global, only "main" may write it
+  // (lib.rs), and a secondary window's copy of it is frozen at main's boot-time value.
+  // Stamping with it there would silently mis-file a project under main's profile.
+  const stampProfileId = (): string | null =>
+    WINDOWED ? get().windowProfile.profileId : get().activeProfileId;
+
   // Clear a session's "needs you" once you attend to it.
   const clearNeeds = (sessionId: string) => {
     set((s) => {
@@ -1810,6 +1913,8 @@ export const useStore = create<AppState>((set, get) => {
     sessionDirs: {},
     profiles: [],
     activeProfileId: null,
+    windowProfile: { label: "main", profileId: null, isMain: true },
+    profileWindowMode: readProfileWindowMode(),
     rootChats: [],
     selectedRootChatId: null,
     rootChatItems: {},
@@ -1819,6 +1924,8 @@ export const useStore = create<AppState>((set, get) => {
     pendingDecisions: [],
     decisionRoutes: {},
     restoreSessionsOnOpen: readRestoreSessionsOnOpen(),
+    announceAsIde: readAnnounceAsIde(),
+    pendingDiffs: [],
     openBehavior: readOpenBehavior(),
     terminalRenderer: readTerminalRenderer(),
     persistSessions: readPersistSessions(),
@@ -1894,6 +2001,7 @@ export const useStore = create<AppState>((set, get) => {
         hotExitEntries,
         profiles,
         activeProfileId,
+        wp,
       ] = await Promise.all([
         invoke<Project[]>("load_projects"),
         getHomeDir().catch(() => null),
@@ -1906,6 +2014,9 @@ export const useStore = create<AppState>((set, get) => {
         invoke<HotExitEntry[]>("hotexit_load").catch(() => [] as HotExitEntry[]),
         invoke<Profile[]>("list_profiles").catch(() => [] as Profile[]),
         invoke<string | null>("get_active_profile").catch(() => null),
+        invoke<WindowProfile>("window_profile").catch(
+          (): WindowProfile => ({ label: "main", profileId: null, isMain: true }),
+        ),
       ]);
       const layouts: Record<string, ProjectLayout> = {};
       for (const p of projects) {
@@ -1930,15 +2041,19 @@ export const useStore = create<AppState>((set, get) => {
       const visibleIds = projects
         .filter((p) => inProfile(p.profileId, activeProfileId, knownProfiles))
         .map((p) => p.id);
+      // A secondary window is permanently pinned to its own profile, not the global
+      // active one (that field is main's boot-time value here — see `stampProfileId`) —
+      // so it lands on the first project IN ITS OWN profile and ignores the last-project
+      // memory and openBehavior entirely, both of which are main's concept of "where I
+      // left off".
+      const selectedProjectId = wp.isMain
+        ? initialProjectSelection(visibleIds, get().openBehavior, readLastProject())
+        : (projects.find((p) => inProfile(p.profileId, wp.profileId, knownProfiles))?.id ?? null);
       set({
         projects,
         homeDir: home,
         layouts,
-        selectedProjectId: initialProjectSelection(
-          visibleIds,
-          get().openBehavior,
-          readLastProject(),
-        ),
+        selectedProjectId,
         accounts,
         defaultAccounts,
         privateMode: trust.privateMode,
@@ -1946,7 +2061,115 @@ export const useStore = create<AppState>((set, get) => {
         hotExit,
         profiles,
         activeProfileId,
+        windowProfile: wp,
       });
+      void get().loadRootChats();
+    },
+
+    mergeSyncedSlices: async () => {
+      const [projects, profiles, accounts, defaultAccounts] = await Promise.all([
+        invoke<Project[]>("load_projects").catch(() => null),
+        invoke<Profile[]>("list_profiles").catch(() => null),
+        invoke<Account[]>("list_accounts").catch(() => null),
+        invoke<DefaultAccounts>("get_default_accounts").catch(() => null),
+      ]);
+      const cur = get();
+      const patch: Partial<AppState> = {};
+      if (projects) {
+        // Identity preservation (case b) only matters for a layout this window actually
+        // renders. In switch mode every project is mounted everywhere, so this is every
+        // fetched id — a no-op narrowing.
+        const knownProfileIds = new Set((profiles ?? cur.profiles).map((p) => p.id));
+        const mountedIds = new Set(
+          projects
+            .filter((p) => mountedInWindow(p, WINDOWED, cur.windowProfile.profileId, knownProfileIds))
+            .map((p) => p.id),
+        );
+        const merged = mergeSlices(
+          { projects: cur.projects, layouts: cur.layouts },
+          projects,
+          (p) => validateLayout(p.layout ?? defaultLayout(p), p, projects),
+          mountedIds,
+        );
+        // A project removed in another window is dropped by mergeSlices (case c) without
+        // ever going through removeProject's own cleanup — replay that cleanup here, against
+        // the LOCAL layout (mergeSlices only returns survivors, so cur.layouts still holds
+        // it): clear dirty (same "last reference" guard removeProject uses — leaving it true
+        // with no tab left to clear it keeps pushing a stale set_dirty_count to Rust's
+        // per-window DirtyGuard, so quit gets a phantom confirm forever), release the model
+        // ref, and drop the project's maximized entry.
+        for (const id of merged.removedProjectIds) {
+          for (const g of cur.layouts[id]?.groups ?? []) {
+            for (const t of g.tabs) {
+              if (t.kind !== "file") continue;
+              // Clear dirty only when this was the model's last reference — the same
+              // absolute path can be open under another project, whose buffer (and its
+              // unsaved edits) survives this release.
+              if ((registry.model(t.ref)?.refCount ?? 1) <= 1) cur.setDirty(t.ref, false);
+              registry.release(t.ref);
+              registry.disposeIfUnreferenced(t.ref);
+            }
+          }
+        }
+        if (merged.removedProjectIds.length) {
+          const maxima = { ...cur.maximized };
+          for (const id of merged.removedProjectIds) delete maxima[id];
+          patch.maximized = maxima;
+        }
+        // Balance close/removeProject release: acquire a model ref for every file tab a
+        // NEWLY added project's layout carries. An existing MOUNTED project keeps its
+        // local layout (mergeSlices never touches it for those), so its refs were
+        // already acquired.
+        for (const id of merged.addedProjectIds) {
+          for (const g of merged.layouts[id]?.groups ?? []) {
+            for (const t of g.tabs) {
+              if (t.kind === "file") registry.acquire(t.ref);
+            }
+          }
+        }
+        // Same balance for an existing NON-MOUNTED project whose layout mergeSlices
+        // swapped wholesale (case b' — this window doesn't render it, so it always
+        // adopts the freshly fetched layout on every sync, not just when added/removed).
+        // Without this, every such swap would leak the OLD layout's file-tab refs
+        // (never released) while never acquiring the NEW layout's — this project isn't
+        // mounted here, so nothing else in this window would ever balance them either.
+        // A ref shared with a MOUNTED tab elsewhere in this window is untouched net: the
+        // release only drops it to 0 (and disposes) when NOTHING else references it, and
+        // the immediate re-acquire below only matters for a ref that genuinely still
+        // appears in the new layout.
+        const addedOrRemoved = new Set([...merged.addedProjectIds, ...merged.removedProjectIds]);
+        for (const [id, next] of Object.entries(merged.layouts)) {
+          if (addedOrRemoved.has(id)) continue;
+          const prev = cur.layouts[id];
+          if (!prev || prev === next) continue;
+          for (const g of prev.groups) {
+            for (const t of g.tabs) {
+              if (t.kind !== "file") continue;
+              // Guarded (unlike the removedProjectIds block above, which fires only on
+              // an actual removal): this loop reruns on every debounced sync tick for
+              // every non-mounted project whose layout changed, and `setDirty` has no
+              // short-circuit of its own — an unconditional call here would `set()` the
+              // store for a ref that is, overwhelmingly, already NOT dirty.
+              if ((registry.model(t.ref)?.refCount ?? 1) <= 1 && cur.dirty[t.ref]) {
+                cur.setDirty(t.ref, false);
+              }
+              registry.release(t.ref);
+              registry.disposeIfUnreferenced(t.ref);
+            }
+          }
+          for (const g of next.groups) {
+            for (const t of g.tabs) {
+              if (t.kind === "file") registry.acquire(t.ref);
+            }
+          }
+        }
+        patch.projects = merged.projects;
+        patch.layouts = merged.layouts;
+      }
+      if (profiles) patch.profiles = profiles;
+      if (accounts) patch.accounts = accounts;
+      if (defaultAccounts) patch.defaultAccounts = defaultAccounts;
+      set(patch);
       void get().loadRootChats();
     },
 
@@ -1972,7 +2195,11 @@ export const useStore = create<AppState>((set, get) => {
       const profile = await invoke<Profile>("add_profile", { name: clean }).catch(() => null);
       if (!profile) return;
       set((s) => ({ profiles: [...s.profiles, profile] }));
-      await get().setActiveProfile(profile.id);
+      // In window mode, switching the global active profile would silently repoint
+      // main's boot profile out from under it — a secondary window's identity is fixed
+      // to the profile it was opened for, not to this. Just append; the new profile is
+      // picked up the next time a window is opened for it.
+      if (!WINDOWED) await get().setActiveProfile(profile.id);
     },
 
     setActiveProfile: async (id) => {
@@ -1997,6 +2224,11 @@ export const useStore = create<AppState>((set, get) => {
         }
         return patch;
       });
+    },
+
+    setProfileWindowMode: (v) => {
+      writeProfileWindowMode(v);
+      set({ profileWindowMode: v });
     },
 
     setDefaultAgent: (id) => {
@@ -2397,7 +2629,10 @@ export const useStore = create<AppState>((set, get) => {
     },
 
     addProject: async (path) => {
-      const project = await invoke<Project>("add_project", { path });
+      const project = await invoke<Project>("add_project", {
+        path,
+        profileId: stampProfileId(),
+      });
       set((s) => ({
         projects: [...s.projects, project],
         layouts: { ...s.layouts, [project.id]: defaultLayout(project) },
@@ -2434,7 +2669,14 @@ export const useStore = create<AppState>((set, get) => {
         delete maxima[id];
         const projects = st.projects.filter((p) => p.id !== id);
         // Other projects may have borrowed this one's sessions into their panes.
-        const { layouts, maximized } = revalidateAllLayouts(remaining, maxima, projects);
+        const knownProfileIds = new Set(st.profiles.map((p) => p.id));
+        const { layouts, maximized } = revalidateAllLayouts(
+          remaining,
+          maxima,
+          projects,
+          st.windowProfile.profileId,
+          knownProfileIds,
+        );
         const selectedProjectId =
           st.selectedProjectId === id ? projects[0]?.id ?? null : st.selectedProjectId;
         return { projects, layouts, selectedProjectId, maximized };
@@ -2649,7 +2891,14 @@ export const useStore = create<AppState>((set, get) => {
         );
         // Every layout, not just this project's: a removed session may have been borrowed
         // into ANOTHER project's panes, and that tab would otherwise point at nothing.
-        const { layouts, maximized } = revalidateAllLayouts(s.layouts, s.maximized, projects);
+        const knownProfileIds = new Set(s.profiles.map((p) => p.id));
+        const { layouts, maximized } = revalidateAllLayouts(
+          s.layouts,
+          s.maximized,
+          projects,
+          s.windowProfile.profileId,
+          knownProfileIds,
+        );
         return { projects, live, sessionContext, layouts, maximized };
       });
     },
@@ -2665,7 +2914,9 @@ export const useStore = create<AppState>((set, get) => {
     },
 
     addRootChat: async () => {
-      const chat = await invoke<RootChat>("add_root_chat").catch(() => null);
+      const chat = await invoke<RootChat>("add_root_chat", {
+        profileId: stampProfileId(),
+      }).catch(() => null);
       if (!chat) return;
       set((st) => ({
         rootChats: [...st.rootChats, chat],
@@ -2779,10 +3030,11 @@ export const useStore = create<AppState>((set, get) => {
         rootChatRunning: { ...st.rootChatRunning, [chatId]: false },
       })),
 
-    loadPendingDecisions: async () => {
-      const list = await invoke<PendingDecision[]>("list_pending_decisions").catch(
+    loadPendingDecisions: async (accept) => {
+      const fetched = await invoke<PendingDecision[]>("list_pending_decisions").catch(
         () => [] as PendingDecision[],
       );
+      const list = accept ? fetched.filter((d) => accept(d.projectId)) : fetched;
       set({ pendingDecisions: list });
       for (const p of projectsNeedingRoutes(list, get().decisionRoutes)) {
         void get().loadDecisionRouting(p);
@@ -3463,6 +3715,17 @@ export const useStore = create<AppState>((set, get) => {
       set({ restoreSessionsOnOpen: v });
     },
 
+    setAnnounceAsIde: (v) => {
+      writeAnnounceAsIde(v);
+      set({ announceAsIde: v });
+    },
+
+    ideDiffArrived: (d) => set({ pendingDiffs: pushDiff(get().pendingDiffs, d) }),
+    ideDiffResolved: (sessionId, diffId) =>
+      set({ pendingDiffs: popDiff(get().pendingDiffs, sessionId, diffId) }),
+    ideDiffsClosed: (sessionId, tabName) =>
+      set({ pendingDiffs: closeDiffs(get().pendingDiffs, sessionId, tabName) }),
+
     setOpenBehavior: (v) => {
       writeOpenBehavior(v);
       set({ openBehavior: v });
@@ -3589,6 +3852,10 @@ export const useStore = create<AppState>((set, get) => {
     setActivity: (id, activity) =>
       set((s) => ({
         live: { ...s.live, [id]: { ...(s.live[id] ?? EMPTY_LIVE), activity } },
+      })),
+    setPermissionMode: (id, permissionMode) =>
+      set((s) => ({
+        live: { ...s.live, [id]: { ...(s.live[id] ?? EMPTY_LIVE), permissionMode } },
       })),
     setCompacting: (id, compacting) =>
       set((s) => ({
@@ -3863,7 +4130,14 @@ export const useStore = create<AppState>((set, get) => {
     setCenterMode: (projectId, mode) =>
       set((s) => ({ centerMode: { ...s.centerMode, [projectId]: mode } })),
 
-    setCanvasOpen: (open) => set({ canvasOpen: open }),
+    // The canvas is one global board; a secondary window mounts only its own profile's
+    // projects (see mountedInWindow/allSessions in WorkspaceCenter.tsx), so opening it
+    // there would show a board that can place nothing from another profile. This is the
+    // ONE choke point every entry point routes through (the header toggle, ⇧⌘C in
+    // App.tsx, the command palette) — gating only the button would leave the keyboard
+    // shortcut and palette able to open a canvas with its own close button hidden.
+    setCanvasOpen: (open) =>
+      set({ canvasOpen: open && !(WINDOWED && !get().windowProfile.isMain) }),
     setGlobalCanvas: (next) =>
       set(() => {
         writeCanvas(next);
@@ -3890,6 +4164,11 @@ export const useStore = create<AppState>((set, get) => {
 // update is worse than none. Cheap — one localStorage write per project switch, and only when
 // the id actually changes.
 useStore.subscribe((s, prev) => {
+  // A secondary window's "last project" is not a memory Conduit should overwrite with —
+  // it never reads this memory back (`load()` restores it from its own pinned profile
+  // instead), and letting it write would clobber main's memory with whatever the
+  // secondary happened to have selected.
+  if (!s.windowProfile.isMain) return;
   if (s.selectedProjectId !== prev.selectedProjectId) writeLastProject(s.selectedProjectId);
 });
 

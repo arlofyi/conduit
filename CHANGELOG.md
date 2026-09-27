@@ -21,6 +21,48 @@ All notable changes to Conduit are documented here. This project uses
   until it finished. That work now runs in the background, a slow repo can no longer stack
   up refreshes behind each other, and busy terminals send their output in fewer, larger
   pieces — which matters most with many sessions open across several profiles.
+- **Fixed — Opening a profile window no longer risks freezing Conduit on Windows.** The
+  window was created on the UI thread, which WebView2 can deadlock on; it is now created
+  in the background.
+- **Changed — Merged upstream Conduit 0.38.0–0.40.0.** The items below shipped upstream
+  under those numbers and are new to this build.
+- **Changed — the session chat view speaks HQ's design language.** The rich session view
+  is now the same condensed, centered conversation the root chat uses — warm accent
+  bubbles for you, plain prose for the agent, quiet one-line tool calls — instead of a
+  full-width wall of grey boxes and badges.
+- **Added — permission mode from the chat.** The session chat's composer carries a mode
+  chip showing Claude's current mode (normal / auto-accept / plan — read live from the
+  hook stream) and clicking it cycles modes, the same Shift+Tab the terminal takes.
+- **Added — the chat shows what the agent is doing.** While a session runs, the thread
+  ends in a pulse plus the tool it is in right now ("Editing store.ts", "Compacting…"),
+  so a working agent never looks stalled.
+- **Changed — Insight blocks render as callouts.** The explanatory output style's
+  `★ Insight` sections draw as accent cards instead of raw dash-rule chrome.
+- **Fixed — chat and settings text is selectable.** Conversation threads (HQ and
+  session chat) and settings explanations can be selected and copied; app chrome
+  stays non-selectable like a native app.
+- **Changed — profile windows carry their profile's name.** A second window is titled
+  "Conduit (Streaming)" instead of a second bare "Conduit", so the window switcher and
+  Mission Control can tell them apart.
+- **Changed — Settings → General is scannable.** Every option is now a short one-line
+  title with an (i) that unfolds the full explanation, instead of a wall of paragraphs.
+  Notes you must see — restart requirements, a missing tmux, the CLI install path —
+  stay visible without clicking.
+- **Added — Profiles can open in their own windows.** A new Settings → General option makes
+  picking a profile open (or focus) a separate window pinned to it, Obsidian-style — run two
+  profiles side by side. Each window shows and runs only its profile's projects; closing a
+  window leaves its sessions running and they reattach warm when it reopens.
+- **Fixed — closed-window terminals no longer go permanently silent.** A terminal whose
+  window disappeared used to be unrecoverable after ~2000 dropped frames; it now detaches
+  cleanly and reattaches on the next open.
+- **Added — Conduit is now a Claude Code IDE.** Claude sessions launched in Conduit
+  connect back to the app the way they connect to VS Code: review Claude's proposed
+  file changes in a side-by-side diff with Keep/Reject (edit the proposal right in the
+  diff before keeping it), send editor selections to a session as context
+  (right-click → "Send selection to Claude"), and let Claude open files in Conduit's
+  editor. Each session gets its own private, authenticated connection, so the diff
+  always lands on the session that asked. Toggle under Settings → General →
+  "Announce as IDE"; applies to sessions started after the change.
 
 ## 0.41.0 — 2026-09-19
 
