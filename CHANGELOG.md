@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — Codex fleet tiers use served model IDs, preserve supported reasoning effort, and fall back to the default after a rejected pin.**
+
 - **Fixed — Codex sessions use the selected model and reasoning effort.** A routed Codex
   session now starts with its chosen model and effort on macOS and Windows.
 
