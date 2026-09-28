@@ -3,6 +3,7 @@ import {
   agyRow,
   claudeRow,
   commandCodeRow,
+  codexRow,
   meterView,
   rowHealth,
   summaryRemaining,
@@ -58,6 +59,19 @@ describe("meterView", () => {
 });
 
 describe("row builders normalize every agent to consumption", () => {
+  it("maps Codex rollout percentages into quota windows", () => {
+    const row = codexRow({
+      windows: [
+        { kind: "fiveHour", usedPercent: 21, resetsAt: 2_000_000_000 },
+        { kind: "weekly", usedPercent: 4, resetsAt: 2_000_100_000 },
+      ],
+      stale: false,
+    });
+    expect(row.windows.map((w) => w.used)).toEqual([0.21, 0.04]);
+    expect(row.windows.map((w) => w.label)).toEqual(["5-hour", "Weekly"]);
+    expect(row.minRemaining).toBeCloseTo(0.79);
+    expect(meterView(row.windows[0], "remaining").pct).toBe(79);
+  });
   it("takes Claude's pctUsed through unchanged", () => {
     const entry: ClaudeAccountUsage = {
       accountId: null,

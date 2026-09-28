@@ -15,6 +15,7 @@ mod claude_usage;
 pub mod cli_open;
 pub mod cli_shim;
 mod clipboard;
+mod codex_usage;
 mod commandcode_config;
 mod commandcode_usage;
 mod context_window;
@@ -2944,6 +2945,7 @@ pub fn run() {
             commandcode_config::set_command_code_config,
             commandcode_config::command_code_models,
             commandcode_usage::fetch_command_code_usage,
+            codex_usage::fetch_codex_usage,
             claude_usage::connect_claude_plan_usage,
             agy_usage::fetch_agy_usage,
             agy_usage::agy_usage_tracking_enabled,

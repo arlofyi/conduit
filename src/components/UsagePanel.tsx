@@ -12,6 +12,7 @@ import {
   agyRow,
   claudeRow,
   commandCodeRow,
+  codexRow,
   meterView,
   rowHealth,
   visibleWindows,
@@ -108,7 +109,9 @@ function RowBlock({
         {/* The endpoint rate-limits; rather than blanking the meters we keep showing the
             last good read and say so, so a number never silently means "a minute ago". */}
         {row.stale && (
-          <span className="usage-stale-chip" title="The last check was rate-limited; these are the most recent numbers we could read.">
+          <span className="usage-stale-chip" title={row.agent === "codex"
+            ? "Codex has not written a recent local rate-limit snapshot."
+            : "The last check was rate-limited; these are the most recent numbers we could read."}>
             last known
           </span>
         )}
@@ -192,6 +195,7 @@ export function UsagePanel() {
   const claudeUsage = useStore((s) => s.claudeUsage);
   const agyMap = useStore((s) => s.agyUsageByAccount);
   const commandCodeUsage = useStore((s) => s.commandCodeUsage);
+  const codexUsage = useStore((s) => s.codexUsage);
   const prefs = useStore((s) => s.usagePrefs);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const setSettingsTab = useStore((s) => s.setSettingsTab);
@@ -223,6 +227,7 @@ export function UsagePanel() {
     // A signed-out account has no windows to draw and nothing actionable in this panel,
     // so it is left out entirely rather than rendered as an empty row.
     ...commandCodeUsage.filter((u) => u.usage.windows?.length).map(commandCodeRow),
+    ...(codexUsage?.windows.length ? [codexRow(codexUsage)] : []),
   ].map((row) => {
     const wins = visibleWindows(row.windows, prefs.windows);
     return { row, wins, health: rowHealth(wins) };

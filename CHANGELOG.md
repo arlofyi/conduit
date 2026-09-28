@@ -3,6 +3,11 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+- **Added — Codex quota in the usage meter.** Recent local Codex rollout snapshots now
+  show the five-hour and weekly limits and inform routing when a readable snapshot exists.
+
 ## 0.40.0 — 2026-09-24
 
 - **Changed — the session chat view speaks HQ's design language.** The rich session view

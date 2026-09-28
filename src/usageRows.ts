@@ -2,6 +2,7 @@ import type {
   AgyUsage,
   ClaudeAccountUsage,
   CommandCodeAccountUsage,
+  CodexUsage,
 } from "./store";
 import type { AgentId, AgentInfo } from "./agents";
 import type { AgentAvailability, AvailabilityMap } from "./routing";
@@ -284,6 +285,29 @@ export function commandCodeRow(entry: CommandCodeAccountUsage): URow {
   };
 }
 
+export function codexRow(usage: CodexUsage): URow {
+  const windows: UWindow[] = usage.windows.map((w) => ({
+    key: w.kind,
+    label: windowLabel(w.kind),
+    kind: w.kind,
+    group: "plan",
+    used: clamp01(w.usedPercent / 100),
+    quota: true,
+    resetsAt: new Date(w.resetsAt * 1000).toISOString(),
+    disabled: false,
+  }));
+  return {
+    agent: "codex",
+    key: accountKey(null),
+    accountId: null,
+    label: "Codex",
+    windows,
+    connectable: false,
+    stale: usage.stale,
+    minRemaining: summaryRemaining(windows),
+  };
+}
+
 export function agyRow(u: AgyUsage): URow {
   const windows: UWindow[] = [];
   for (const g of u.groups) {
@@ -340,10 +364,8 @@ export function agyRow(u: AgyUsage): URow {
  * signed in, one being spent does not make Claude unusable, and rerouting away from it
  * would be wrong. The usage bar still shows both rows -- this is only the routing view.
  *
- * `remaining: null` means UNKNOWN, and is deliberately distinct from 0. Codex, Gemini,
- * OpenCode and agy expose no plan meter Conduit can read, so their entries carry null and
- * `pickTarget` treats them as usable. Anything else would make "no usage API" mean "never
- * route here".
+ * `remaining: null` means UNKNOWN, and is deliberately distinct from 0. Agents with no
+ * readable snapshot stay routable; missing data must not mean exhausted quota.
  */
 export function availabilityFrom(agents: AgentInfo[] | null, rows: URow[]): AvailabilityMap {
   const out: AvailabilityMap = {};

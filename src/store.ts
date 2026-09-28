@@ -430,6 +430,12 @@ export interface CommandCodeAccountUsage {
   usage: CommandCodeUsage;
 }
 
+// ---- Codex rate limits from local rollout token_count events ----
+export interface CodexUsage {
+  windows: { kind: "fiveHour" | "weekly"; usedPercent: number; resetsAt: number }[];
+  stale: boolean;
+}
+
 // ---- Antigravity (agy) usage — mirror Rust agy_usage.rs (camelCase) ----
 export interface AgyBucket {
   bucketId: string;
@@ -1243,6 +1249,7 @@ interface AppState {
   /** Per-account Command Code usage. Empty when Command Code is not set up at all —
    *  the usage bar then simply has no Command Code rows, rather than showing zeros. */
   commandCodeUsage: CommandCodeAccountUsage[];
+  codexUsage: CodexUsage | null;
   /** Per-account "plan usage connected" flags, keyed by accountKey. */
   planConnected: Record<string, boolean>;
   /** agy usage per account, keyed by accountKey (accountId ?? "default"). */
@@ -1675,6 +1682,7 @@ interface AppState {
   refreshClaudeStatus: () => Promise<void>;
   refreshClaudeUsage: () => Promise<void>;
   refreshCommandCodeUsage: () => Promise<void>;
+  refreshCodexUsage: () => Promise<void>;
   /** Connect plan usage for one account (null = env default). */
   connectPlanUsage: (accountId: string | null) => Promise<boolean>;
   /** One click: enable agy push-tracking + connect plan usage for every Claude account. */
@@ -1779,6 +1787,7 @@ export const useStore = create<AppState>((set, get) => {
     routes: null,
     taskKinds: [],
     commandCodeUsage: [],
+    codexUsage: null,
     planConnected: readPlanConnected(),
     updateInfo: null,
     updatePhase: "idle",
@@ -3663,6 +3672,13 @@ export const useStore = create<AppState>((set, get) => {
         const u = await invoke<CommandCodeAccountUsage[]>("fetch_command_code_usage");
         set({ commandCodeUsage: u });
       } catch { /* fail-open: keep last-known */ }
+    },
+
+    refreshCodexUsage: async () => {
+      try {
+        const usage = await invoke<CodexUsage | null>("fetch_codex_usage");
+        set({ codexUsage: usage });
+      } catch { /* fail-open: a missing local snapshot leaves quota unknown */ }
     },
 
     checkForUpdates: async (opts) => {
