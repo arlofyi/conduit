@@ -1212,14 +1212,16 @@ fn build_script(
             shell_quote(path)
         ));
     }
-    // SPEC-B: only ever populated for Claude (the caller in lib.rs gates on
-    // agent == AgentId::Claude before resolving these) -- verified real flags, not a guess
-    // (`claude --help` lists both `--model <model>` and `--effort <level>`).
+    // The adapter supplies each CLI's verified spelling for model and effort.
     if let Some(m) = model {
-        flags.push_str(&format!(" --model {}", shell_quote(m)));
+        flags.push_str(&format!(" {} {}", adapter.model_flag(), shell_quote(m)));
     }
     if let Some(e) = effort {
-        flags.push_str(&format!(" --effort {}", shell_quote(e)));
+        flags.push_str(&format!(
+            " {} {}",
+            adapter.effort_flag(),
+            shell_quote(&adapter.effort_value(e))
+        ));
     }
     let invocation = adapter.build_invocation(
         session_id,
@@ -1291,12 +1293,16 @@ fn build_script_win(
     if let Some(path) = system_prompt_file {
         flags.push_str(&format!(" --append-system-prompt-file {}", quote_arg(path)));
     }
-    // SPEC-B: only ever populated for Claude -- see build_script's matching comment.
+    // Keep the Windows script in step with the POSIX invocation.
     if let Some(m) = model {
-        flags.push_str(&format!(" --model {}", quote_arg(m)));
+        flags.push_str(&format!(" {} {}", adapter.model_flag(), quote_arg(m)));
     }
     if let Some(e) = effort {
-        flags.push_str(&format!(" --effort {}", quote_arg(e)));
+        flags.push_str(&format!(
+            " {} {}",
+            adapter.effort_flag(),
+            quote_arg(&adapter.effort_value(e))
+        ));
     }
     adapter.build_invocation(
         session_id,
@@ -1895,6 +1901,34 @@ mod tests {
         assert!(script.contains("--effort 'high'"), "{script}");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_script_uses_model_and_reasoning_config() {
+        let script = build_script(
+            &*crate::agent::adapter_for(crate::agent::AgentId::Codex),
+            "sid-1",
+            8423,
+            "/repo",
+            "/bin/sh",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("gpt-6-sol"),
+            Some("high"),
+            None,
+            false,
+            None,
+        );
+        assert!(
+            script.contains("codex -m 'gpt-6-sol' -c 'model_reasoning_effort=high'"),
+            "{script}"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn build_script_win_appends_model_and_effort_flags() {
@@ -1915,6 +1949,30 @@ mod tests {
         );
         assert!(script.contains("--model claude-opus-4-8"), "{script}");
         assert!(script.contains("--effort high"), "{script}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_script_win_uses_model_and_reasoning_config() {
+        let script = build_script_win(
+            &*crate::agent::adapter_for(crate::agent::AgentId::Codex),
+            "sid-1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("gpt-6-sol"),
+            Some("high"),
+            None,
+            false,
+        );
+        assert!(
+            script.contains("codex -m gpt-6-sol -c model_reasoning_effort=high"),
+            "{script}"
+        );
     }
 
     #[cfg(not(windows))]

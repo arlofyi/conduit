@@ -3,6 +3,11 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+- **Fixed — Codex sessions use the selected model and reasoning effort.** A routed Codex
+  session now starts with its chosen model and effort on macOS and Windows.
+
 ## 0.40.0 — 2026-09-24
 
 - **Changed — the session chat view speaks HQ's design language.** The rich session view

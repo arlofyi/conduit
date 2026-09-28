@@ -231,16 +231,25 @@ pub trait ProviderAdapter {
     fn supports_worktree(&self) -> bool {
         false
     }
-    /// Whether this CLI takes `--model <id>` and `--effort <level>` per invocation, so a
+    /// Whether this CLI takes model and effort overrides per invocation, so a
     /// route (or a fleet tier) can pin them at spawn.
     ///
-    /// Default false, and the bar for flipping it is a VERIFIED flag in that CLI's own
-    /// `--help`, not a plausible guess: a wrong flag here does not degrade, it makes every
+    /// Default false, and the bar for flipping it is a verified CLI flag or documented
+    /// config override, not a plausible guess: a wrong argument here makes every
     /// session for that agent fail to launch. Claude and Command Code both list the pair;
-    /// Codex and Gemini have a `--model` but no verified `--effort`, so they stay false
-    /// until someone checks rather than shipping half a pair.
+    /// Codex uses `-m` and `-c model_reasoning_effort=<level>`; Gemini remains false
+    /// until its effort override is verified.
     fn supports_model_flags(&self) -> bool {
         false
+    }
+    fn model_flag(&self) -> &'static str {
+        "--model"
+    }
+    fn effort_flag(&self) -> &'static str {
+        "--effort"
+    }
+    fn effort_value(&self, effort: &str) -> String {
+        effort.to_string()
     }
     /// Extra env vars to set on the child process for this agent.
     fn env_overrides(&self) -> Vec<(&'static str, &'static str)> {
@@ -535,6 +544,18 @@ impl ProviderAdapter for CodexAdapter {
     fn binary(&self) -> &'static str {
         "codex"
     }
+    fn supports_model_flags(&self) -> bool {
+        true
+    }
+    fn model_flag(&self) -> &'static str {
+        "-m"
+    }
+    fn effort_flag(&self) -> &'static str {
+        "-c"
+    }
+    fn effort_value(&self, effort: &str) -> String {
+        format!("model_reasoning_effort={effort}")
+    }
     fn install_command(&self) -> Option<String> {
         Some("npm install -g @openai/codex".into())
     }
@@ -567,7 +588,7 @@ impl ProviderAdapter for CodexAdapter {
         _resume_token: Option<&str>,
     ) -> String {
         let Some(prompt) = initial_prompt else {
-            return "codex || codex".to_string();
+            return format!("codex{flags} || codex{flags}");
         };
         let quoted = crate::pty::quote_arg(prompt);
         // `.conduit/result.schema.json` (and, on Windows, `.conduit\result.cmd`) are
@@ -1949,6 +1970,16 @@ mod tests {
         assert_eq!(
             CodexAdapter.build_invocation("sid", None, "", None, None),
             "codex || codex"
+        );
+    }
+
+    #[test]
+    fn codex_routed_flags_reach_both_launch_attempts() {
+        assert!(CodexAdapter.supports_model_flags());
+        let flags = " -m gpt-6-sol -c model_reasoning_effort=high";
+        assert_eq!(
+            CodexAdapter.build_invocation("sid", None, flags, None, None),
+            format!("codex{flags} || codex{flags}")
         );
     }
 
