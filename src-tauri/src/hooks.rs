@@ -842,6 +842,96 @@ fn entries_for(rows: &[HookRow], port: u16) -> Vec<(&'static str, Vec<Value>)> {
     out
 }
 
+/// Codex accepts inline hook tables through repeated `-c hooks.<Event>=...` flags.
+/// The definitions read the session environment, so their trust hash stays stable
+/// across listener port changes and no project hook file is needed.
+pub fn codex_hook_overrides(rows: &[HookRow]) -> Vec<String> {
+    let mut events: Vec<(&str, Vec<String>)> = Vec::new();
+    for row in rows {
+        let posix = format!("sh \"$CONDUIT_CODEX_HOOK_RELAY\" {}", row.verb);
+        let windows = format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -File $env:CONDUIT_CODEX_HOOK_RELAY {}", row.verb);
+        let matcher = row
+            .matcher
+            .map(|m| format!("matcher={},", serde_json::to_string(m).unwrap()))
+            .unwrap_or_default();
+        let entry = format!(
+            "{{{matcher}hooks=[{{type='command',command='{posix}',commandWindows='{windows}'}}]}}"
+        );
+        match events.iter_mut().find(|(event, _)| *event == row.event) {
+            Some((_, entries)) => entries.push(entry),
+            None => events.push((row.event, vec![entry])),
+        }
+    }
+    events
+        .into_iter()
+        .map(|(event, entries)| format!("hooks.{event}=[{}]", entries.join(",")))
+        .collect()
+}
+
+pub fn codex_hook_relay_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let name = "codex-hook-relay.ps1";
+    #[cfg(not(windows))]
+    let name = "codex-hook-relay.sh";
+    crate::store::data_dir().join(name)
+}
+
+fn codex_hook_relay_contents() -> &'static str {
+    #[cfg(windows)]
+    {
+        "param([string]$EventName)\r\nif (-not $env:CONDUIT_SESSION_ID -or -not $env:CONDUIT_HOOK_PORT) { exit 0 }\r\n$url = 'http://127.0.0.1:' + $env:CONDUIT_HOOK_PORT + '/hook?session=' + $env:CONDUIT_SESSION_ID + '&event=' + $EventName\r\ncurl.exe -s -m 2 -X POST -H 'Content-Type: application/json' --data-binary '@-' -o NUL $url\r\nexit 0\r\n"
+    }
+    #[cfg(not(windows))]
+    {
+        "#!/bin/sh\n[ -n \"$CONDUIT_SESSION_ID\" ] || exit 0\n[ -n \"$CONDUIT_HOOK_PORT\" ] || exit 0\ncurl -s -m 2 -X POST -H 'Content-Type: application/json' --data-binary @- \"http://127.0.0.1:$CONDUIT_HOOK_PORT/hook?session=$CONDUIT_SESSION_ID&event=$1\" >/dev/null 2>&1 || true\n"
+    }
+}
+
+pub fn write_codex_hook_relay() -> std::io::Result<()> {
+    let path = codex_hook_relay_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, codex_hook_relay_contents())
+}
+
+/// Remove only Conduit's legacy Codex project hooks. Foreign hook entries and
+/// unrelated JSON keys are preserved; malformed files are left untouched.
+pub fn remove_codex_project_hooks(dir: &str) {
+    let path = Path::new(dir).join(".codex/hooks.json");
+    let Ok(data) = fs::read(&path) else { return };
+    let Ok(mut root) = serde_json::from_slice::<Value>(&data) else {
+        return;
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(hooks) = obj.get_mut("hooks").and_then(Value::as_object_mut) {
+        hooks.retain(|_, entries| {
+            if let Some(array) = entries.as_array_mut() {
+                let before = array.len();
+                array.retain(|entry| !is_conduit_entry(entry));
+                changed |= array.len() != before;
+                !array.is_empty()
+            } else {
+                true
+            }
+        });
+        if hooks.is_empty() {
+            obj.remove("hooks");
+        }
+    }
+    if !changed {
+        return;
+    }
+    if obj.is_empty() {
+        let _ = fs::remove_file(path);
+    } else if let Ok(out) = serde_json::to_vec_pretty(&root) {
+        let _ = fs::write(path, out);
+    }
+}
+
 /// What a Claude `SessionStart` means for the session's tracked conversation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ClaudeConversationUpdate {
@@ -1196,11 +1286,6 @@ fn merged(existing: Option<&Value>, entries: Vec<Value>) -> Value {
 /// still recognizes entries written by older Conduit versions — which is what keeps
 /// `install` replacing them rather than stacking a second copy on upgrade.
 fn is_conduit_entry(entry: &Value) -> bool {
-    #[cfg(windows)]
-    const MARKER: &str = "/hook?session=%CONDUIT_SESSION_ID%";
-    #[cfg(not(windows))]
-    const MARKER: &str = "/hook?session=${CONDUIT_SESSION_ID";
-
     entry
         .get("hooks")
         .and_then(|h| h.as_array())
@@ -1208,7 +1293,11 @@ fn is_conduit_entry(entry: &Value) -> bool {
             hooks.iter().any(|h| {
                 h.get("command")
                     .and_then(|c| c.as_str())
-                    .map(|c| c.contains(MARKER))
+                    .map(|c| {
+                        c.contains("/hook?session=%CONDUIT_SESSION_ID%")
+                            || c.contains("/hook?session=${CONDUIT_SESSION_ID")
+                            || c.contains("/hook?session=$env:CONDUIT_SESSION_ID")
+                    })
                     .unwrap_or(false)
             })
         })
@@ -1218,8 +1307,73 @@ fn is_conduit_entry(entry: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ProviderAdapter;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn codex_overrides_are_per_launch_and_guard_missing_session() {
+        let rows = crate::agent::CodexAdapter.hooks_profile().unwrap().rows;
+        let flags = codex_hook_overrides(&rows);
+        let start = flags
+            .iter()
+            .find(|f| f.starts_with("hooks.SessionStart="))
+            .unwrap();
+        assert!(start.contains("commandWindows="));
+        assert!(start.contains("CONDUIT_CODEX_HOOK_RELAY"));
+        assert!(
+            !start.contains("\\\""),
+            "TOML escapes break cmd.exe quoting"
+        );
+        assert!(!start.contains("8423"));
+        assert!(flags.iter().map(String::len).sum::<usize>() * 2 < 3_500);
+        let relay = codex_hook_relay_contents();
+        assert!(relay.contains("CONDUIT_SESSION_ID"));
+        assert!(relay.contains("exit 0"));
+        #[cfg(windows)]
+        assert!(relay.contains("curl.exe"));
+    }
+
+    #[test]
+    fn codex_cleanup_preserves_foreign_hooks_and_keys() {
+        let dir = fresh_test_dir("codex_cleanup");
+        let path = dir.join(".codex/hooks.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&json!({
+            "description": "kept",
+            "hooks": {"Stop": [
+                {"hooks": [{"type": "command", "command": "curl http://127.0.0.1:8423/hook?session=%CONDUIT_SESSION_ID%&event=stop"}]},
+                {"hooks": [{"type": "command", "command": "echo foreign"}]}
+            ]}
+        })).unwrap()).unwrap();
+        remove_codex_project_hooks(dir.to_str().unwrap());
+        let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["description"], "kept");
+        assert_eq!(after["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        remove_codex_project_hooks(dir.to_str().unwrap());
+        assert_eq!(
+            after,
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_cleanup_removes_file_when_only_our_hooks_remain() {
+        let dir = fresh_test_dir("codex_cleanup_only_ours");
+        let path = dir.join(".codex/hooks.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "hooks": {"Stop": [{"hooks": [{"type": "command", "command":
+                    "curl http://127.0.0.1:8423/hook?session=%CONDUIT_SESSION_ID%&event=stop"}]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        remove_codex_project_hooks(dir.to_str().unwrap());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn publishes_event_to_bus() {

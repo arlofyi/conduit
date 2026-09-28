@@ -567,7 +567,7 @@ impl ProviderAdapter for CodexAdapter {
         _resume_token: Option<&str>,
     ) -> String {
         let Some(prompt) = initial_prompt else {
-            return "codex || codex".to_string();
+            return format!("codex{flags} || codex");
         };
         let quoted = crate::pty::quote_arg(prompt);
         // `.conduit/result.schema.json` (and, on Windows, `.conduit\result.cmd`) are

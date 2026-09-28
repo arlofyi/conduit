@@ -3,6 +3,10 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+- **Fixed — Codex hooks are passed per launch and old Conduit-owned project hooks are removed without touching other hooks.**
+
 ## 0.40.0 — 2026-09-24
 
 - **Changed — the session chat view speaks HQ's design language.** The rich session view

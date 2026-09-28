@@ -437,9 +437,11 @@ fn pty_spawn(
                 return Err(format!("worktree setup failed: {e}"));
             }
         }
-        // Install this adapter's status/result/note channel INTO the worktree, not the
-        // repo root -- routing must be scoped to the worker's own tree.
-        if let Some(profile) = adapter.hooks_profile() {
+        // Install file-based adapters into the worktree. Codex receives its hooks
+        // through CLI overrides and only needs old project entries cleaned up.
+        if agent == crate::agent::AgentId::Codex {
+            hooks::remove_codex_project_hooks(&wt_path);
+        } else if let Some(profile) = adapter.hooks_profile() {
             hooks::install_profile(&wt_path, port, &profile);
         }
         if let Some(plugin) = adapter.plugin_profile() {
@@ -488,10 +490,11 @@ fn pty_spawn(
         }
         (wt_path, None, None)
     } else {
-        // Normal session: install this agent's status integration. Hook-based agents
-        // (Claude/Codex/Gemini) write a settings/hooks file; OpenCode installs a JS
-        // status plugin instead. An agent has one or the other, never both.
-        if let Some(profile) = adapter.hooks_profile() {
+        // Normal session: file-based agents install status hooks, while Codex gets
+        // per-launch hooks in pty.rs. OpenCode installs a JS status plugin.
+        if agent == crate::agent::AgentId::Codex {
+            hooks::remove_codex_project_hooks(&working_directory);
+        } else if let Some(profile) = adapter.hooks_profile() {
             hooks::install_profile(&working_directory, port, &profile);
         }
         if let Some(plugin) = adapter.plugin_profile() {
@@ -540,6 +543,11 @@ fn pty_spawn(
         } else {
             None
         };
+    if agent == crate::agent::AgentId::Codex {
+        if let Err(e) = hooks::write_codex_hook_relay() {
+            eprintln!("conduit: failed to write codex hook relay: {e}");
+        }
+    }
     pty.spawn(
         session_id,
         cwd,
