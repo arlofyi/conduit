@@ -555,12 +555,12 @@ fn write_lock_file(path: &Path, _port: u16, workspace_dir: &str, token: &str) {
     let body = lock_json(std::process::id(), workspace_dir, token);
     if std::fs::write(path, body).is_err() {
         eprintln!("conduit: could not write ide lock file {path:?}");
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 }
 

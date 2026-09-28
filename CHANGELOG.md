@@ -3,6 +3,10 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+- **Fixed — Writing an IDE lock file avoids a Windows-only Clippy failure while retaining Unix file permissions.**
+
 ## 0.40.0 — 2026-09-24
 
 - **Changed — the session chat view speaks HQ's design language.** The rich session view
