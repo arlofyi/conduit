@@ -308,6 +308,11 @@ export function codexRow(usage: CodexUsage): URow {
   };
 }
 
+/** A stale unexpired snapshot is a lower bound on consumption, so routing keeps it. */
+export function codexAvailabilityRows(usage: CodexUsage | null): URow[] {
+  return usage?.windows.length ? [codexRow(usage)] : [];
+}
+
 export function agyRow(u: AgyUsage): URow {
   const windows: UWindow[] = [];
   for (const g of u.groups) {

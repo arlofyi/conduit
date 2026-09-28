@@ -81,13 +81,23 @@ fn parse_rate_limits(body: &str, now: u64) -> Option<Vec<CodexWindow>> {
     latest.filter(|w| !w.is_empty())
 }
 
-fn collect_rollouts(dir: &Path, depth: usize, out: &mut Vec<(SystemTime, PathBuf)>) {
+fn collect_rollouts(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if out.len() >= MAX_FILES {
+        return;
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
+    // Codex names these paths sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl.
+    // Descending names visit recent sessions first without statting every file.
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+    for entry in entries {
+        if out.len() >= MAX_FILES {
+            break;
+        }
         let path = entry.path();
-        if depth < 3 && path.is_dir() {
+        if depth < 3 && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             collect_rollouts(&path, depth + 1, out);
         } else if depth == 3
             && path
@@ -95,9 +105,7 @@ fn collect_rollouts(dir: &Path, depth: usize, out: &mut Vec<(SystemTime, PathBuf
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
         {
-            if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
-                out.push((modified, path));
-            }
+            out.push(path);
         }
     }
 }
@@ -119,12 +127,12 @@ fn read_tail(path: &Path) -> Option<String> {
 fn read_usage(home: &Path, now: u64) -> Option<CodexUsage> {
     let mut files = Vec::new();
     collect_rollouts(&home.join("sessions"), 0, &mut files);
-    files.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
-    for (modified, path) in files.into_iter().take(MAX_FILES) {
+    for path in files {
         let Some(body) = read_tail(&path) else {
             continue;
         };
         if let Some(windows) = parse_rate_limits(&body, now) {
+            let modified = path.metadata().ok()?.modified().ok()?;
             let age = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
             return Some(CodexUsage {
                 windows,
@@ -180,5 +188,35 @@ mod tests {
             parse_rate_limits(&body, 1000).unwrap()[0].used_percent,
             67.0
         );
+    }
+
+    #[test]
+    fn rollout_scan_stops_at_limit_in_newest_named_day() {
+        let root = std::env::temp_dir().join(format!(
+            "conduit_codex_usage_scan_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for day in ["01", "02"] {
+            let dir = root.join("2026").join("09").join(day);
+            fs::create_dir_all(&dir).unwrap();
+            for n in 0..MAX_FILES {
+                fs::write(
+                    dir.join(format!("rollout-2026-09-{day}T12-{n:02}.jsonl")),
+                    "",
+                )
+                .unwrap();
+            }
+        }
+        let mut out = Vec::new();
+        collect_rollouts(&root, 0, &mut out);
+        assert_eq!(out.len(), MAX_FILES);
+        assert!(out.iter().all(
+            |p| p.to_string_lossy().contains("/02/") || p.to_string_lossy().contains("\\02\\")
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 }

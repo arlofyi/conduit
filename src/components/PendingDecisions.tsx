@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { useStore } from "../store";
 import { summarize } from "../rootProposals";
 import { decisionRoute } from "../pendingDecisionRouting";
-import { agyRow, availabilityFrom, claudeRow, codexRow, commandCodeRow } from "../usageRows";
+import { agyRow, availabilityFrom, claudeRow, codexAvailabilityRows, commandCodeRow } from "../usageRows";
 
 /** Cards for work root chat wants to start. Rendered at the app root so an approval is
  *  reachable from anywhere, not only from the chat that asked. */
@@ -26,7 +26,7 @@ export function PendingDecisions() {
         ...claudeUsage.map(claudeRow),
         ...Object.values(agyMap).map(agyRow),
         ...commandCodeUsage.filter((u) => u.usage.windows?.length).map(commandCodeRow),
-        ...(codexUsage?.windows.length && !codexUsage.stale ? [codexRow(codexUsage)] : []),
+        ...codexAvailabilityRows(codexUsage),
       ]),
     [detected, claudeUsage, agyMap, commandCodeUsage, codexUsage],
   );

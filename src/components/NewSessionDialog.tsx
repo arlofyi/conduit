@@ -4,7 +4,7 @@ import { AGENTS, agentMeta, type AgentId } from "../agents";
 import { AgentGlyph } from "./AgentGlyph";
 import { Dropdown } from "./Dropdown";
 import { pickTarget, type TaskKind } from "../routing";
-import { agyRow, availabilityFrom, claudeRow, codexRow, commandCodeRow } from "../usageRows";
+import { agyRow, availabilityFrom, claudeRow, codexAvailabilityRows, commandCodeRow } from "../usageRows";
 
 export function NewSessionDialog({
   projectId,
@@ -91,7 +91,7 @@ export function NewSessionDialog({
         ...claudeUsage.map(claudeRow),
         ...Object.values(agyMap).map(agyRow),
         ...commandCodeUsage.filter((u) => u.usage.windows?.length).map(commandCodeRow),
-        ...(codexUsage?.windows.length && !codexUsage.stale ? [codexRow(codexUsage)] : []),
+        ...codexAvailabilityRows(codexUsage),
       ]),
     [detected, claudeUsage, agyMap, commandCodeUsage, codexUsage],
   );

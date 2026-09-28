@@ -3,7 +3,9 @@ import {
   agyRow,
   claudeRow,
   commandCodeRow,
+  codexAvailabilityRows,
   codexRow,
+  availabilityFrom,
   meterView,
   rowHealth,
   summaryRemaining,
@@ -59,6 +61,15 @@ describe("meterView", () => {
 });
 
 describe("row builders normalize every agent to consumption", () => {
+  it("routes using a stale Codex snapshot as a lower bound on quota used", () => {
+    const rows = codexAvailabilityRows({
+      windows: [{ kind: "fiveHour", usedPercent: 96, resetsAt: 2_000_000_000 }],
+      stale: true,
+    });
+    const available = availabilityFrom(null, rows);
+    expect(available.codex?.remaining).toBeCloseTo(0.04);
+    expect(rows[0].stale).toBe(true);
+  });
   it("maps Codex rollout percentages into quota windows", () => {
     const row = codexRow({
       windows: [
