@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.43.0 — 2026-09-29
+
 - **Added — orchestration policy and context display.** Settings now offers versioned, scoped policy import and export with a preview. Optional context rings show session-attributed Claude and agy readings, and show Unknown when no reliable reading exists. Policy limits do not enforce behavior yet.
 
 
