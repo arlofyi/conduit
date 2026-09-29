@@ -567,7 +567,7 @@ impl ProviderAdapter for CodexAdapter {
         _resume_token: Option<&str>,
     ) -> String {
         let Some(prompt) = initial_prompt else {
-            return format!("codex{flags} || codex");
+            return format!("codex{flags} || codex{flags}");
         };
         let quoted = crate::pty::quote_arg(prompt);
         // `.conduit/result.schema.json` (and, on Windows, `.conduit\result.cmd`) are
@@ -1949,6 +1949,15 @@ mod tests {
         assert_eq!(
             CodexAdapter.build_invocation("sid", None, "", None, None),
             "codex || codex"
+        );
+    }
+
+    #[test]
+    fn codex_retry_keeps_inline_hooks() {
+        let flags = " -c hooks.SessionStart=[]";
+        assert_eq!(
+            CodexAdapter.build_invocation("sid", None, flags, None, None),
+            format!("codex{flags} || codex{flags}")
         );
     }
 

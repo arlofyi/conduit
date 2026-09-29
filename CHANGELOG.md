@@ -5,7 +5,9 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
-- **Fixed — Codex hooks are passed per launch and old Conduit-owned project hooks are removed without touching other hooks.**
+- **Fixed — Codex hooks no longer change your project.** Conduit passes hooks when it
+  starts Codex and removes its old project hook entries. Review the hooks in an
+  interactive Codex session; Codex silently skips untrusted fleet hooks.
 
 ## 0.40.0 — 2026-09-24
 
