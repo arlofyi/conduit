@@ -4,6 +4,9 @@ import {
   claudeRow,
   commandCodeRow,
   openRouterRow,
+  codexAvailabilityRows,
+  codexRow,
+  availabilityFrom,
   meterView,
   rowHealth,
   summaryRemaining,
@@ -59,6 +62,28 @@ describe("meterView", () => {
 });
 
 describe("row builders normalize every agent to consumption", () => {
+  it("routes using a stale Codex snapshot as a lower bound on quota used", () => {
+    const rows = codexAvailabilityRows({
+      windows: [{ kind: "fiveHour", usedPercent: 96, resetsAt: 2_000_000_000 }],
+      stale: true,
+    });
+    const available = availabilityFrom(null, rows);
+    expect(available.codex?.remaining).toBeCloseTo(0.04);
+    expect(rows[0].stale).toBe(true);
+  });
+  it("maps Codex rollout percentages into quota windows", () => {
+    const row = codexRow({
+      windows: [
+        { kind: "fiveHour", usedPercent: 21, resetsAt: 2_000_000_000 },
+        { kind: "weekly", usedPercent: 4, resetsAt: 2_000_100_000 },
+      ],
+      stale: false,
+    });
+    expect(row.windows.map((w) => w.used)).toEqual([0.21, 0.04]);
+    expect(row.windows.map((w) => w.label)).toEqual(["5-hour", "Weekly"]);
+    expect(row.minRemaining).toBeCloseTo(0.79);
+    expect(meterView(row.windows[0], "remaining").pct).toBe(79);
+  });
   it("takes Claude's pctUsed through unchanged", () => {
     const entry: ClaudeAccountUsage = {
       accountId: null,

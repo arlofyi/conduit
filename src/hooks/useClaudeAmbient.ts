@@ -26,6 +26,7 @@ export function useClaudeAmbient(): void {
   const refreshAgy = useStore((s) => s.refreshAgyUsage);
   const refreshCommandCode = useStore((s) => s.refreshCommandCodeUsage);
   const refreshOpenRouter = useStore((s) => s.loadOpenRouterUsage);
+  const refreshCodex = useStore((s) => s.refreshCodexUsage);
   const connectPlan = useStore((s) => s.connectPlanUsage);
   const planConnected = useStore((s) => s.planConnected);
 
@@ -56,6 +57,7 @@ export function useClaudeAmbient(): void {
       // refresh (e.g. after enabling tracking) shows without waiting for the next agy tick.
       // Local read, so it stays on the fast tick.
       void refreshAgy();
+      void refreshCodex();
       if (Date.now() - lastUsageAt >= USAGE_POLL_MS) pollUsage();
     };
 

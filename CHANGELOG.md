@@ -5,6 +5,12 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — Stale Codex quota snapshots continue to guide routing; rollout discovery now stops after the newest 32 candidates.**
+
+- **Added — Codex quota in the usage meter.** Recent local Codex rollout snapshots now
+  show the five-hour and weekly limits and inform routing when a readable snapshot exists.
+
+
 - **Fixed — Writing an IDE lock file avoids a Windows-only Clippy failure while retaining Unix file permissions.**
 
 

@@ -13,6 +13,7 @@ import {
   claudeRow,
   commandCodeRow,
   openRouterRow,
+  codexRow,
   meterView,
   rowHealth,
   visibleWindows,
@@ -128,7 +129,9 @@ function RowBlock({
         {/* The endpoint rate-limits; rather than blanking the meters we keep showing the
             last good read and say so, so a number never silently means "a minute ago". */}
         {row.stale && (
-          <span className="usage-stale-chip" title="The last check was rate-limited; these are the most recent numbers we could read.">
+          <span className="usage-stale-chip" title={row.agent === "codex"
+            ? "Codex has not written a recent local rate-limit snapshot."
+            : "The last check was rate-limited; these are the most recent numbers we could read."}>
             last known
           </span>
         )}
@@ -213,6 +216,7 @@ export function UsagePanel() {
   const agyMap = useStore((s) => s.agyUsageByAccount);
   const commandCodeUsage = useStore((s) => s.commandCodeUsage);
   const openrouterUsage = useStore((s) => s.openrouterUsage);
+  const codexUsage = useStore((s) => s.codexUsage);
   const prefs = useStore((s) => s.usagePrefs);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const setSettingsTab = useStore((s) => s.setSettingsTab);
@@ -248,6 +252,7 @@ export function UsagePanel() {
     // report and nothing this panel could do about it -- the fix lives in the endpoint
     // editor -- so it is left out rather than shown as $0.00, which would read as "free".
     ...openrouterUsage.filter((u) => u.source === "live").map(openRouterRow),
+    ...(codexUsage?.windows.length ? [codexRow(codexUsage)] : []),
   ].map((row) => {
     const wins = visibleWindows(row.windows, prefs.windows);
     return { row, wins, health: rowHealth(wins) };
