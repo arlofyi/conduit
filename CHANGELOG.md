@@ -5,6 +5,9 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — Writing an IDE lock file avoids a Windows-only Clippy failure while retaining Unix file permissions.**
+
+
 ## 0.42.1 — 2026-09-27
 
 - **Fixed — Opening several sessions at once can no longer corrupt shared settings.** Sessions
