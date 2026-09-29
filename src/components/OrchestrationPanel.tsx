@@ -61,8 +61,10 @@ export function OrchestrationPanel({ openRouting }: { openRouting: () => void })
   const projects = useStore((s) => s.projects);
   const selectedProjectId = useStore((s) => s.selectedProjectId);
   const project = useMemo(() => projects.find((p) => p.id === selectedProjectId) ?? projects[0], [projects, selectedProjectId]);
-  const [scopeId, setScopeId] = useState<string | null>(null);
-  const [view, setView] = useState<PolicyView | null>(null);
+  const [scope, setScope] = useState<"global" | "project">("global");
+  const scopeId = scope === "project" ? project?.id ?? null : null;
+  const [loaded, setLoaded] = useState<{ scopeId: string | null; view: PolicyView } | null>(null);
+  const view = loaded?.scopeId === scopeId ? loaded.view : null;
   const [error, setError] = useState("");
   const [json, setJson] = useState("");
   const [preview, setPreview] = useState<ImportPreview | null>(null);
@@ -70,14 +72,15 @@ export function OrchestrationPanel({ openRouting }: { openRouting: () => void })
   useEffect(() => {
     let active = true;
     void invoke<PolicyView>("orchestration_policy_view", { projectId: scopeId })
-      .then((v) => { if (active) { setView(v); setError(""); } })
+      .then((v) => { if (active) { setLoaded({ scopeId, view: v }); setError(""); } })
       .catch((e) => { if (active) setError(String(e)); });
     return () => { active = false; };
   }, [scopeId]);
 
   async function write(overlay: Overlay) {
     try {
-      setView(await invoke<PolicyView>("set_orchestration_overlay", { projectId: scopeId, overlay }));
+      const updated = await invoke<PolicyView>("set_orchestration_overlay", { projectId: scopeId, overlay });
+      setLoaded({ scopeId, view: updated });
       setError("");
     } catch (e) { setError(String(e)); }
   }
@@ -95,7 +98,7 @@ export function OrchestrationPanel({ openRouting }: { openRouting: () => void })
   async function applyImport() {
     try {
       await invoke("import_orchestration_policy", { json });
-      setView(await invoke<PolicyView>("orchestration_policy_view", { projectId: scopeId }));
+      setLoaded({ scopeId, view: await invoke<PolicyView>("orchestration_policy_view", { projectId: scopeId }) });
       setPreview(null); setError("");
     } catch (e) { setError(String(e)); }
   }
@@ -103,8 +106,8 @@ export function OrchestrationPanel({ openRouting }: { openRouting: () => void })
   return <div className="routing-panel">
     <p className="settings-intro">Context display and future orchestration preferences. Limits and role rules are saved for later phases; they do not control sessions yet.</p>
     <div className="route-scope">
-      <button className={`route-scope-btn${scopeId === null ? " on" : ""}`} onClick={() => setScopeId(null)}>Global</button>
-      <button className={`route-scope-btn${scopeId !== null ? " on" : ""}`} disabled={!project} onClick={() => project && setScopeId(project.id)}>{project?.name ?? "This project"}</button>
+      <button className={`route-scope-btn${scope === "global" ? " on" : ""}`} onClick={() => setScope("global")}>Global</button>
+      <button className={`route-scope-btn${scope === "project" ? " on" : ""}`} disabled={!project} onClick={() => project && setScope("project")}>{project?.name ?? "This project"}</button>
     </div>
     <p className="settings-intro">Agent routes are configured in <button className="route-btn" onClick={openRouting}>Routing settings</button>.</p>
     {error && <p role="alert">{error}</p>}
