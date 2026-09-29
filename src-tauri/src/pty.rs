@@ -1212,6 +1212,7 @@ fn build_script(
             shell_quote(path)
         ));
     }
+    let retry_flags = flags.clone();
     // The adapter supplies each CLI's verified spelling for model and effort.
     if let Some(m) = model {
         flags.push_str(&format!(" {} {}", adapter.model_flag(), shell_quote(m)));
@@ -1223,10 +1224,11 @@ fn build_script(
             shell_quote(&adapter.effort_value(e))
         ));
     }
-    let invocation = adapter.build_invocation(
+    let invocation = adapter.build_invocation_with_retry_flags(
         session_id,
         projects_dir,
         &flags,
+        &retry_flags,
         initial_prompt,
         resume_token,
     );
@@ -1293,6 +1295,7 @@ fn build_script_win(
     if let Some(path) = system_prompt_file {
         flags.push_str(&format!(" --append-system-prompt-file {}", quote_arg(path)));
     }
+    let retry_flags = flags.clone();
     // Keep the Windows script in step with the POSIX invocation.
     if let Some(m) = model {
         flags.push_str(&format!(" {} {}", adapter.model_flag(), quote_arg(m)));
@@ -1304,10 +1307,11 @@ fn build_script_win(
             quote_arg(&adapter.effort_value(e))
         ));
     }
-    adapter.build_invocation(
+    adapter.build_invocation_with_retry_flags(
         session_id,
         projects_dir,
         &flags,
+        &retry_flags,
         initial_prompt,
         resume_token,
     )
@@ -1973,6 +1977,7 @@ mod tests {
             script.contains("codex -m gpt-6-sol -c model_reasoning_effort=high"),
             "{script}"
         );
+        assert!(script.ends_with(" || codex"), "{script}");
     }
 
     #[cfg(not(windows))]

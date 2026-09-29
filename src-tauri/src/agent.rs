@@ -291,6 +291,25 @@ pub trait ProviderAdapter {
         initial_prompt: Option<&str>,
         resume_token: Option<&str>,
     ) -> String;
+    /// Retry with structural flags intact when a model or effort pin is rejected.
+    /// Other adapters already own their fallback and ignore the separate retry flags.
+    fn build_invocation_with_retry_flags(
+        &self,
+        session_id: &str,
+        projects_dir: Option<&Path>,
+        flags: &str,
+        _retry_flags: &str,
+        initial_prompt: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> String {
+        self.build_invocation(
+            session_id,
+            projects_dir,
+            flags,
+            initial_prompt,
+            resume_token,
+        )
+    }
     /// A config file, RELATIVE TO THE SESSION'S WORKING DIRECTORY, that this CLI reads
     /// MCP servers from at startup -- the file-based equivalent of Claude's
     /// `--mcp-config <path>` flag, for an adapter that has no such flag.
@@ -582,13 +601,34 @@ impl ProviderAdapter for CodexAdapter {
     fn build_invocation(
         &self,
         session_id: &str,
+        projects_dir: Option<&Path>,
+        flags: &str,
+        initial_prompt: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> String {
+        // Without separate pin metadata, keep all flags on the retry. The PTY builder
+        // supplies the pre-pin base explicitly through the method below.
+        self.build_invocation_with_retry_flags(
+            session_id,
+            projects_dir,
+            flags,
+            flags,
+            initial_prompt,
+            resume_token,
+        )
+    }
+    #[cfg_attr(windows, allow(unused_variables))]
+    fn build_invocation_with_retry_flags(
+        &self,
+        session_id: &str,
         _projects_dir: Option<&Path>,
         flags: &str,
+        retry_flags: &str,
         initial_prompt: Option<&str>,
         _resume_token: Option<&str>,
     ) -> String {
         let Some(prompt) = initial_prompt else {
-            return format!("codex{flags} || codex");
+            return format!("codex{flags} || codex{retry_flags}");
         };
         let quoted = crate::pty::quote_arg(prompt);
         // `.conduit/result.schema.json` (and, on Windows, `.conduit\result.cmd`) are
@@ -606,7 +646,7 @@ impl ProviderAdapter for CodexAdapter {
             // a failed `codex exec` must still be followed by the interactive fallback,
             // and a failed curl must not abort the sequence either.
             format!(
-                "codex{flags} exec --json --output-last-message .conduit\\result.json --output-schema .conduit\\result.schema.json {quoted} & call .conduit\\result.cmd & codex{flags} || codex"
+                "codex{flags} exec --json --output-last-message .conduit\\result.json --output-schema .conduit\\result.schema.json {quoted} & call .conduit\\result.cmd & codex{flags} || codex{retry_flags}"
             )
         }
         #[cfg(not(windows))]
@@ -615,7 +655,7 @@ impl ProviderAdapter for CodexAdapter {
                 "curl -s -m 5 -X POST -H \"Content-Type: application/json\" --data-binary @.conduit/result.json \"http://127.0.0.1:${{CONDUIT_HOOK_PORT:-0}}/hook?session=${{CONDUIT_SESSION_ID:-{session_id}}}&event=result\" >/dev/null 2>&1 || true"
             );
             format!(
-                "codex{flags} exec --json --output-last-message .conduit/result.json --output-schema .conduit/result.schema.json {quoted}; {tail}; codex{flags} || codex"
+                "codex{flags} exec --json --output-last-message .conduit/result.json --output-schema .conduit/result.schema.json {quoted}; {tail}; codex{flags} || codex{retry_flags}"
             )
         }
     }
@@ -1976,9 +2016,28 @@ mod tests {
         assert!(CodexAdapter.supports_model_flags());
         let flags = " -m gpt-6-sol -c model_reasoning_effort=high";
         assert_eq!(
-            CodexAdapter.build_invocation("sid", None, flags, None, None),
+            CodexAdapter.build_invocation_with_retry_flags("sid", None, flags, "", None, None),
             format!("codex{flags} || codex")
         );
+    }
+
+    #[test]
+    fn codex_retry_preserves_structural_flags_on_both_paths() {
+        let base = " -c hooks.SessionStart=[]";
+        let pinned = " -c hooks.SessionStart=[] -m gpt-6-sol -c model_reasoning_effort=high";
+        let plain =
+            CodexAdapter.build_invocation_with_retry_flags("sid", None, pinned, base, None, None);
+        assert_eq!(plain, format!("codex{pinned} || codex{base}"));
+        let prompted = CodexAdapter.build_invocation_with_retry_flags(
+            "sid",
+            None,
+            pinned,
+            base,
+            Some("task"),
+            None,
+        );
+        assert!(prompted.contains(&format!("codex{pinned} exec")));
+        assert!(prompted.ends_with(&format!("codex{pinned} || codex{base}")));
     }
 
     #[cfg(not(windows))]
@@ -1996,10 +2055,13 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn codex_with_prompt_and_flags_ends_with_bare_fallback() {
+    fn codex_with_prompt_and_flags_keeps_structural_fallback() {
         let cmd =
             CodexAdapter.build_invocation("sid-1", None, " --worktree 'wt'", Some("hi"), None);
-        assert!(cmd.ends_with("; codex --worktree 'wt' || codex"), "{cmd}");
+        assert!(
+            cmd.ends_with("; codex --worktree 'wt' || codex --worktree 'wt'"),
+            "{cmd}"
+        );
     }
 
     #[cfg(windows)]
@@ -2021,9 +2083,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn codex_with_prompt_and_flags_has_bare_windows_fallback() {
+    fn codex_with_prompt_and_flags_keeps_windows_fallback() {
         let cmd = CodexAdapter.build_invocation("sid-1", None, " -m gpt-6-sol", Some("hi"), None);
-        assert!(cmd.ends_with(" & codex -m gpt-6-sol || codex"), "{cmd}");
+        assert!(
+            cmd.ends_with(" & codex -m gpt-6-sol || codex -m gpt-6-sol"),
+            "{cmd}"
+        );
     }
 
     #[test]
