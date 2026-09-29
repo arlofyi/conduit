@@ -73,8 +73,8 @@ pub fn tool_specs() -> Vec<Value> {
                     "outputShape": { "type": "string", "description": "What a done result should look like." },
                     "boundaries": { "type": "string", "description": "What the worker must NOT do." },
                     "modelTier": { "type": "string", "enum": ["cheap", "standard", "hard"], "description": "Cost/capability tier, mapped to a concrete model per agent. Omit to use the agent's own default." },
-                    "model": { "type": "string", "description": "Pin one exact model id, in the agent's own spelling (\"opus\" for claude; \"claude-opus-5\", \"google/gemini-3.7-flash\", \"deepseek/deepseek-v4-flash\" for commandcode). Wins over modelTier, which is only a coarse per-agent lookup. Acted on by the agents whose CLI takes --model (claude, commandcode, hermes); recorded but inert for the rest." },
-                    "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "Claude, Command Code and Hermes. Hermes spells the flag --reasoning and accepts a wider set of its own; these five are the values every one of them takes. xhigh is Opus-only on Claude -- silently clamped to high on any other modelTier." },
+                    "model": { "type": "string", "description": "Pin one exact model id in the agent's own spelling. Wins over modelTier. Applied by agents whose CLI supports model flags: Claude, Codex, Command Code and Hermes." },
+                    "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "Applied by Claude, Codex, Command Code and Hermes using each CLI's effort flag. Claude xhigh is clamped to high outside its hard tier." },
                     "accountId": { "type": "string", "description": "Pin this worker to a specific registered Claude account (Settings -> Accounts), instead of the global default." }
                 },
                 "required": ["task"] }
@@ -405,13 +405,13 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
             // SPEC-B, §7.2/§7.5: model_tier + effort, written onto the fresh session. Both
             // are optional; a freshly created session already has every trust field at its
             // default, so this can never clobber anything real. `clamp_effort` keeps what
-            // Conduit records in sync with what the API actually does with an
-            // Opus-only "xhigh" request on a cheaper tier.
+            // Conduit records in sync with Claude's Opus-only "xhigh" rule;
+            // Codex keeps its supported effort across all tiers.
             let model_tier = args.get("modelTier").and_then(|v| v.as_str());
             let effort = args
                 .get("effort")
                 .and_then(|v| v.as_str())
-                .map(|e| crate::agent::clamp_effort(e, model_tier));
+                .map(|e| crate::agent::clamp_effort(agent, e, model_tier));
             if model_tier.is_some() || effort.is_some() {
                 ctx.store.set_session_trust(
                     &session.id,

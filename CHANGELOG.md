@@ -5,6 +5,11 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — Codex sessions use the chosen model.** Routed sessions now start with a
+  supported model and reasoning effort; if a pin is rejected, Codex retries with its
+  default while keeping session hooks and other launch settings.
+
+
 - **Fixed — Stale Codex quota snapshots continue to guide routing; rollout discovery now stops after the newest 32 candidates.**
 
 - **Added — Codex quota in the usage meter.** Recent local Codex rollout snapshots now

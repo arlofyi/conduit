@@ -234,16 +234,19 @@ pub trait ProviderAdapter {
     fn supports_worktree(&self) -> bool {
         false
     }
-    /// Whether this CLI takes `--model <id>` and `--effort <level>` per invocation, so a
+    /// Whether this CLI takes model and effort overrides per invocation, so a
     /// route (or a fleet tier) can pin them at spawn.
     ///
-    /// Default false, and the bar for flipping it is a VERIFIED flag in that CLI's own
-    /// `--help`, not a plausible guess: a wrong flag here does not degrade, it makes every
+    /// Default false, and the bar for flipping it is a verified CLI flag or documented
+    /// config override, not a plausible guess: a wrong argument here makes every
     /// session for that agent fail to launch. Claude and Command Code both list the pair;
-    /// Codex and Gemini have a `--model` but no verified `--effort`, so they stay false
-    /// until someone checks rather than shipping half a pair.
+    /// Codex uses `-m` and `-c model_reasoning_effort=<level>`; Gemini remains false
+    /// until its effort override is verified.
     fn supports_model_flags(&self) -> bool {
         false
+    }
+    fn model_flag(&self) -> &'static str {
+        "--model"
     }
     /// How THIS CLI spells the reasoning-effort flag.
     ///
@@ -255,6 +258,9 @@ pub trait ProviderAdapter {
     /// consulted when `supports_model_flags()` is true.
     fn effort_flag(&self) -> &'static str {
         "--effort"
+    }
+    fn effort_value(&self, effort: &str) -> String {
+        effort.to_string()
     }
     /// The agent's OWN in-session command to change model mid-conversation, or None when
     /// it has none.
@@ -337,6 +343,25 @@ pub trait ProviderAdapter {
         initial_prompt: Option<&str>,
         resume_token: Option<&str>,
     ) -> String;
+    /// Retry with structural flags intact when a model or effort pin is rejected.
+    /// Other adapters already own their fallback and ignore the separate retry flags.
+    fn build_invocation_with_retry_flags(
+        &self,
+        session_id: &str,
+        projects_dir: Option<&Path>,
+        flags: &str,
+        _retry_flags: &str,
+        initial_prompt: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> String {
+        self.build_invocation(
+            session_id,
+            projects_dir,
+            flags,
+            initial_prompt,
+            resume_token,
+        )
+    }
     /// A config file, RELATIVE TO THE SESSION'S WORKING DIRECTORY, that this CLI reads
     /// MCP servers from at startup -- the file-based equivalent of Claude's
     /// `--mcp-config <path>` flag, for an adapter that has no such flag.
@@ -601,6 +626,18 @@ impl ProviderAdapter for CodexAdapter {
     fn binary(&self) -> &'static str {
         "codex"
     }
+    fn supports_model_flags(&self) -> bool {
+        true
+    }
+    fn model_flag(&self) -> &'static str {
+        "-m"
+    }
+    fn effort_flag(&self) -> &'static str {
+        "-c"
+    }
+    fn effort_value(&self, effort: &str) -> String {
+        format!("model_reasoning_effort={effort}")
+    }
     fn install_command(&self) -> Option<String> {
         Some("npm install -g @openai/codex".into())
     }
@@ -627,13 +664,34 @@ impl ProviderAdapter for CodexAdapter {
     fn build_invocation(
         &self,
         session_id: &str,
+        projects_dir: Option<&Path>,
+        flags: &str,
+        initial_prompt: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> String {
+        // Without separate pin metadata, keep all flags on the retry. The PTY builder
+        // supplies the pre-pin base explicitly through the method below.
+        self.build_invocation_with_retry_flags(
+            session_id,
+            projects_dir,
+            flags,
+            flags,
+            initial_prompt,
+            resume_token,
+        )
+    }
+    #[cfg_attr(windows, allow(unused_variables))]
+    fn build_invocation_with_retry_flags(
+        &self,
+        session_id: &str,
         _projects_dir: Option<&Path>,
         flags: &str,
+        retry_flags: &str,
         initial_prompt: Option<&str>,
         _resume_token: Option<&str>,
     ) -> String {
         let Some(prompt) = initial_prompt else {
-            return "codex || codex".to_string();
+            return format!("codex{flags} || codex{retry_flags}");
         };
         let quoted = crate::pty::quote_arg(prompt);
         // `.conduit/result.schema.json` (and, on Windows, `.conduit\result.cmd`) are
@@ -651,7 +709,7 @@ impl ProviderAdapter for CodexAdapter {
             // a failed `codex exec` must still be followed by the interactive fallback,
             // and a failed curl must not abort the sequence either.
             format!(
-                "codex{flags} exec --json --output-last-message .conduit\\result.json --output-schema .conduit\\result.schema.json {quoted} & call .conduit\\result.cmd & codex{flags}"
+                "codex{flags} exec --json --output-last-message .conduit\\result.json --output-schema .conduit\\result.schema.json {quoted} & call .conduit\\result.cmd & codex{flags} || codex{retry_flags}"
             )
         }
         #[cfg(not(windows))]
@@ -660,7 +718,7 @@ impl ProviderAdapter for CodexAdapter {
                 "curl -s -m 5 -X POST -H \"Content-Type: application/json\" --data-binary @.conduit/result.json \"http://127.0.0.1:${{CONDUIT_HOOK_PORT:-0}}/hook?session=${{CONDUIT_SESSION_ID:-{session_id}}}&event=result\" >/dev/null 2>&1 || true"
             );
             format!(
-                "codex{flags} exec --json --output-last-message .conduit/result.json --output-schema .conduit/result.schema.json {quoted}; {tail}; codex{flags}"
+                "codex{flags} exec --json --output-last-message .conduit/result.json --output-schema .conduit/result.schema.json {quoted}; {tail}; codex{flags} || codex{retry_flags}"
             )
         }
     }
@@ -1179,9 +1237,9 @@ pub fn model_for_tier(agent: AgentId, tier: &str) -> Option<&'static str> {
         (AgentId::Claude, "hard") => Some("claude-opus-4-8"),
         (AgentId::OpenCode, "standard") => Some("anthropic/claude-sonnet-5"),
         (AgentId::OpenCode, "hard") => Some("anthropic/claude-opus-4-8"),
-        (AgentId::Codex, "cheap") => Some("gpt-5-mini"),
-        (AgentId::Codex, "standard") => Some("codex-mini-latest"),
-        (AgentId::Codex, "hard") => Some("gpt-5.5"),
+        (AgentId::Codex, "cheap") => Some("gpt-6-luna"),
+        (AgentId::Codex, "standard") => Some("gpt-6-sol"),
+        (AgentId::Codex, "hard") => Some("gpt-6-astra"),
         // Gemini 3 Flash beats Gemini 3 Pro on SWE-bench Verified (78% vs 76.2%) -- the
         // cheaper model is the better agentic-coding choice, so "hard" is the only tier
         // that reaches Pro; never default to Pro for cost "safety."
@@ -1212,12 +1270,10 @@ pub fn model_for_tier(agent: AgentId, tier: &str) -> Option<&'static str> {
     }
 }
 
-/// SPEC-B, §7.2: `xhigh` is Opus-only. On any tier other than `"hard"` (Claude's Opus
-/// tier), the API silently falls back to `"high"` anyway -- wasting the intent and
-/// desyncing what Conduit recorded from what actually happened. Clamp here instead, so
-/// the two always agree. `effort` values other than `"xhigh"` pass through unchanged.
-pub fn clamp_effort<'a>(effort: &'a str, model_tier: Option<&str>) -> &'a str {
-    if effort == "xhigh" && model_tier != Some("hard") {
+/// SPEC-B, §7.2: Claude's `xhigh` needs its Opus tier. Codex's served models
+/// accept `xhigh` across tiers, so only clamp Claude's request.
+pub fn clamp_effort<'a>(agent: AgentId, effort: &'a str, model_tier: Option<&str>) -> &'a str {
+    if agent == AgentId::Claude && effort == "xhigh" && model_tier != Some("hard") {
         "high"
     } else {
         effort
@@ -2266,6 +2322,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_routed_flags_fall_back_to_default_after_rejection() {
+        assert!(CodexAdapter.supports_model_flags());
+        let flags = " -m gpt-6-sol -c model_reasoning_effort=high";
+        assert_eq!(
+            CodexAdapter.build_invocation_with_retry_flags("sid", None, flags, "", None, None),
+            format!("codex{flags} || codex")
+        );
+    }
+
+    #[test]
+    fn codex_retry_preserves_structural_flags_on_both_paths() {
+        let base = " -c hooks.SessionStart=[]";
+        let pinned = " -c hooks.SessionStart=[] -m gpt-6-sol -c model_reasoning_effort=high";
+        let plain =
+            CodexAdapter.build_invocation_with_retry_flags("sid", None, pinned, base, None, None);
+        assert_eq!(plain, format!("codex{pinned} || codex{base}"));
+        let prompted = CodexAdapter.build_invocation_with_retry_flags(
+            "sid",
+            None,
+            pinned,
+            base,
+            Some("task"),
+            None,
+        );
+        assert!(prompted.contains(&format!("codex{pinned} exec")));
+        assert!(prompted.ends_with(&format!("codex{pinned} || codex{base}")));
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn codex_with_prompt_chains_exec_then_interactive() {
@@ -2281,10 +2366,13 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn codex_with_prompt_and_flags_ends_with_flagged_fallback() {
+    fn codex_with_prompt_and_flags_keeps_structural_fallback() {
         let cmd =
             CodexAdapter.build_invocation("sid-1", None, " --worktree 'wt'", Some("hi"), None);
-        assert!(cmd.ends_with("; codex --worktree 'wt'"), "{cmd}");
+        assert!(
+            cmd.ends_with("; codex --worktree 'wt' || codex --worktree 'wt'"),
+            "{cmd}"
+        );
     }
 
     #[cfg(windows)]
@@ -2302,6 +2390,16 @@ mod tests {
         // call itself lives in the pre-written result.cmd file instead.
         assert!(!cmd.contains("curl"), "{cmd}");
         assert!(cmd.ends_with("codex"), "{cmd}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_with_prompt_and_flags_keeps_windows_fallback() {
+        let cmd = CodexAdapter.build_invocation("sid-1", None, " -m gpt-6-sol", Some("hi"), None);
+        assert!(
+            cmd.ends_with(" & codex -m gpt-6-sol || codex -m gpt-6-sol"),
+            "{cmd}"
+        );
     }
 
     #[test]
@@ -2988,8 +3086,12 @@ mod tests {
 
     #[test]
     fn model_tier_maps_every_pinned_adapter_column() {
-        assert_eq!(model_for_tier(AgentId::Codex, "cheap"), Some("gpt-5-mini"));
-        assert_eq!(model_for_tier(AgentId::Codex, "hard"), Some("gpt-5.5"));
+        assert_eq!(model_for_tier(AgentId::Codex, "cheap"), Some("gpt-6-luna"));
+        assert_eq!(
+            model_for_tier(AgentId::Codex, "standard"),
+            Some("gpt-6-sol")
+        );
+        assert_eq!(model_for_tier(AgentId::Codex, "hard"), Some("gpt-6-astra"));
         assert_eq!(
             model_for_tier(AgentId::Gemini, "cheap"),
             Some("gemini-3-flash")
@@ -3011,19 +3113,30 @@ mod tests {
 
     #[test]
     fn effort_xhigh_clamped_to_high_on_non_hard_tier() {
-        assert_eq!(clamp_effort("xhigh", Some("standard")), "high");
-        assert_eq!(clamp_effort("xhigh", None), "high");
+        assert_eq!(
+            clamp_effort(AgentId::Claude, "xhigh", Some("standard")),
+            "high"
+        );
+        assert_eq!(clamp_effort(AgentId::Claude, "xhigh", None), "high");
     }
 
     #[test]
     fn effort_xhigh_passes_through_on_hard_tier() {
-        assert_eq!(clamp_effort("xhigh", Some("hard")), "xhigh");
+        assert_eq!(
+            clamp_effort(AgentId::Claude, "xhigh", Some("hard")),
+            "xhigh"
+        );
+        for tier in [None, Some("cheap"), Some("standard"), Some("hard")] {
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
+                assert_eq!(clamp_effort(AgentId::Codex, effort, tier), effort);
+            }
+        }
     }
 
     #[test]
     fn effort_non_xhigh_values_are_never_clamped() {
         for e in ["low", "medium", "high", "max"] {
-            assert_eq!(clamp_effort(e, Some("cheap")), e);
+            assert_eq!(clamp_effort(AgentId::Claude, e, Some("cheap")), e);
         }
     }
 

@@ -1299,6 +1299,7 @@ fn build_script(
             shell_quote(path)
         ));
     }
+    let retry_flags = flags.clone();
     // SPEC-B: populated for any adapter whose `supports_model_flags()` is true (the
     // caller in lib.rs gates on exactly that) -- verified real flags per CLI, not a guess.
     // `--model` is spelled the same by every agent that takes one; the effort flag is NOT
@@ -1306,15 +1307,20 @@ fn build_script(
     // flag does not degrade -- the CLI exits non-zero and the whole session falls through
     // to its bare `||` fallback with the effort silently lost.
     if let Some(m) = model {
-        flags.push_str(&format!(" --model {}", shell_quote(m)));
+        flags.push_str(&format!(" {} {}", adapter.model_flag(), shell_quote(m)));
     }
     if let Some(e) = effort {
-        flags.push_str(&format!(" {} {}", adapter.effort_flag(), shell_quote(e)));
+        flags.push_str(&format!(
+            " {} {}",
+            adapter.effort_flag(),
+            shell_quote(&adapter.effort_value(e))
+        ));
     }
-    let invocation = adapter.build_invocation(
+    let invocation = adapter.build_invocation_with_retry_flags(
         session_id,
         projects_dir,
         &flags,
+        &retry_flags,
         initial_prompt,
         resume_token,
     );
@@ -1381,18 +1387,24 @@ fn build_script_win(
     if let Some(path) = system_prompt_file {
         flags.push_str(&format!(" --append-system-prompt-file {}", quote_arg(path)));
     }
+    let retry_flags = flags.clone();
     // SPEC-B: see build_script's matching comment -- the effort flag's spelling is the
     // adapter's, because Hermes spells it `--reasoning`.
     if let Some(m) = model {
-        flags.push_str(&format!(" --model {}", quote_arg(m)));
+        flags.push_str(&format!(" {} {}", adapter.model_flag(), quote_arg(m)));
     }
     if let Some(e) = effort {
-        flags.push_str(&format!(" {} {}", adapter.effort_flag(), quote_arg(e)));
+        flags.push_str(&format!(
+            " {} {}",
+            adapter.effort_flag(),
+            quote_arg(&adapter.effort_value(e))
+        ));
     }
-    adapter.build_invocation(
+    adapter.build_invocation_with_retry_flags(
         session_id,
         projects_dir,
         &flags,
+        &retry_flags,
         initial_prompt,
         resume_token,
     )
@@ -2038,6 +2050,34 @@ mod tests {
         assert!(script.contains("--effort 'high'"), "{script}");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_script_uses_model_and_reasoning_config() {
+        let script = build_script(
+            &*crate::agent::adapter_for(crate::agent::AgentId::Codex),
+            "sid-1",
+            8423,
+            "/repo",
+            "/bin/sh",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("gpt-6-sol"),
+            Some("high"),
+            None,
+            false,
+            None,
+        );
+        assert!(
+            script.contains("codex -m 'gpt-6-sol' -c 'model_reasoning_effort=high'"),
+            "{script}"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn build_script_win_appends_model_and_effort_flags() {
@@ -2058,6 +2098,31 @@ mod tests {
         );
         assert!(script.contains("--model claude-opus-4-8"), "{script}");
         assert!(script.contains("--effort high"), "{script}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_script_win_uses_model_and_reasoning_config() {
+        let script = build_script_win(
+            &*crate::agent::adapter_for(crate::agent::AgentId::Codex),
+            "sid-1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("gpt-6-sol"),
+            Some("high"),
+            None,
+            false,
+        );
+        assert!(
+            script.contains("codex -m gpt-6-sol -c model_reasoning_effort=high"),
+            "{script}"
+        );
+        assert!(script.ends_with(" || codex"), "{script}");
     }
 
     #[cfg(not(windows))]
