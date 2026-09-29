@@ -848,20 +848,23 @@ fn entries_for(rows: &[HookRow], port: u16) -> Vec<(&'static str, Vec<Value>)> {
 pub fn codex_hook_overrides(rows: &[HookRow]) -> Vec<String> {
     let mut events: Vec<(&str, Vec<String>)> = Vec::new();
     for row in rows {
-        let posix = format!("sh \"$CONDUIT_CODEX_HOOK_RELAY\" {}", row.verb);
-        // This Codex build launches commandWindows through PowerShell. Give cmd.exe a
-        // single quoted command so it expands %VAR% and preserves spaces in the path.
-        let windows = format!(
-            "cmd.exe /d /c '\"\"%CONDUIT_CODEX_HOOK_RELAY%\" {}\"'",
-            row.verb
-        );
         let matcher = row
             .matcher
             .map(|m| format!("matcher={},", serde_json::to_string(m).unwrap()))
             .unwrap_or_default();
+        // cmd.exe /K reparses the entire Codex invocation. A quote inside a -c value
+        // splits that value into extra CLI arguments, so the Windows override must be
+        // quote-free. Codex's hook runner uses PowerShell; its call operator invokes
+        // the .cmd relay by environment path, including paths with spaces.
+        #[cfg(windows)]
         let entry = format!(
-            "{{{matcher}hooks=[{{type='command',command='{posix}',commandWindows={}}}]}}",
-            serde_json::to_string(&windows).unwrap()
+            "{{{matcher}hooks=[{{type='command',command='echo',commandWindows='& $env:CONDUIT_CODEX_HOOK_RELAY {}'}}]}}",
+            row.verb
+        );
+        #[cfg(not(windows))]
+        let entry = format!(
+            "{{{matcher}hooks=[{{type='command',command='sh \"$CONDUIT_CODEX_HOOK_RELAY\" {}'}}]}}",
+            row.verb
         );
         match events.iter_mut().find(|(event, _)| *event == row.event) {
             Some((_, entries)) => entries.push(entry),
@@ -885,7 +888,10 @@ pub fn codex_hook_relay_path() -> std::path::PathBuf {
 fn codex_hook_relay_contents() -> &'static str {
     #[cfg(windows)]
     {
-        "@echo off\r\nif not defined CONDUIT_SESSION_ID exit /b 0\r\nif not defined CONDUIT_HOOK_PORT exit /b 0\r\ncurl.exe -s -m 2 -X POST -H \"Content-Type: application/json\" --data-binary @- -o NUL \"http://127.0.0.1:%CONDUIT_HOOK_PORT%/hook?session=%CONDUIT_SESSION_ID%&event=%~1\" >NUL 2>NUL\r\nexit /b 0\r\n"
+        // This Codex build keeps a Windows hook's stdin pipe open while it waits for
+        // the hook to finish. curl's @- waits for EOF and deadlocks PreToolUse. The
+        // lifecycle/status path only needs the event verb, so send a bounded body.
+        "@echo off\r\nif not defined CONDUIT_SESSION_ID exit /b 0\r\nif not defined CONDUIT_HOOK_PORT exit /b 0\r\ncurl.exe -s -m 2 -X POST -H \"Content-Type: application/json\" --data-raw \"{}\" -o NUL \"http://127.0.0.1:%CONDUIT_HOOK_PORT%/hook?session=%CONDUIT_SESSION_ID%&event=%~1\" >NUL 2>NUL\r\nexit /b 0\r\n"
     }
     #[cfg(not(windows))]
     {
@@ -1325,10 +1331,14 @@ mod tests {
             .iter()
             .find(|f| f.starts_with("hooks.SessionStart="))
             .unwrap();
+        #[cfg(windows)]
         assert!(start.contains("commandWindows="));
         assert!(start.contains("CONDUIT_CODEX_HOOK_RELAY"));
-        assert!(start.contains("cmd.exe /d /c"));
-        assert!(start.contains("%CONDUIT_CODEX_HOOK_RELAY%"));
+        #[cfg(windows)]
+        {
+            assert!(start.contains("& $env:CONDUIT_CODEX_HOOK_RELAY"));
+            assert!(!start.contains('"'), "cmd.exe splits quoted -c values");
+        }
         assert!(!start.contains("8423"));
         assert!(flags.iter().map(String::len).sum::<usize>() * 2 < 3_500);
         let relay = codex_hook_relay_contents();
@@ -1344,7 +1354,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn codex_windows_relay_runs_from_spaced_path_and_posts_event() {
+    fn codex_windows_relay_runs_in_powershell_5_and_7() {
         use std::process::{Command, Stdio};
 
         let dir = fresh_test_dir("codex relay with spaces");
@@ -1355,49 +1365,70 @@ mod tests {
             .find(|flag| flag.starts_with("hooks.SessionStart="))
             .unwrap();
         let windows = start.split_once("commandWindows=").unwrap().1;
-        let last_quote = windows.rfind('"').unwrap();
-        let command: String = serde_json::from_str(&windows[..=last_quote]).unwrap();
-        let no_session = Command::new("pwsh")
-            .args(["-NoProfile", "-Command", &command])
-            .env("CONDUIT_CODEX_HOOK_RELAY", &relay)
-            .env_remove("CONDUIT_SESSION_ID")
-            .env_remove("CONDUIT_HOOK_PORT")
-            .output()
-            .unwrap();
-        assert!(no_session.status.success(), "{no_session:?}");
-        let no_port = Command::new("pwsh")
-            .args(["-NoProfile", "-Command", &command])
-            .env("CONDUIT_CODEX_HOOK_RELAY", &relay)
-            .env("CONDUIT_SESSION_ID", "session-1")
-            .env_remove("CONDUIT_HOOK_PORT")
-            .output()
-            .unwrap();
-        assert!(no_port.status.success(), "{no_port:?}");
-
-        let server = Server::http("127.0.0.1:0").unwrap();
-        let port = server.server_addr().to_ip().unwrap().port();
-        let receiver = thread::spawn(move || {
-            let request = server
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
+        let command = windows.split('\'').nth(1).unwrap();
+        for shell in ["pwsh", "powershell.exe"] {
+            let no_session = Command::new(shell)
+                .args(["-NoProfile", "-Command", command])
+                .env("CONDUIT_CODEX_HOOK_RELAY", &relay)
+                .env_remove("CONDUIT_SESSION_ID")
+                .env_remove("CONDUIT_HOOK_PORT")
+                .output()
                 .unwrap();
-            let url = request.url().to_owned();
-            request.respond(Response::from_string("ok")).unwrap();
-            url
-        });
-        let sent = Command::new("pwsh")
-            .args(["-NoProfile", "-Command", &command])
-            .env("CONDUIT_CODEX_HOOK_RELAY", &relay)
-            .env("CONDUIT_SESSION_ID", "session-1")
-            .env("CONDUIT_HOOK_PORT", port.to_string())
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(sent.status.success(), "{sent:?}");
-        assert_eq!(
-            receiver.join().unwrap(),
-            "/hook?session=session-1&event=sessionstart"
-        );
+            assert!(no_session.status.success(), "{no_session:?}");
+            let no_port = Command::new(shell)
+                .args(["-NoProfile", "-Command", command])
+                .env("CONDUIT_CODEX_HOOK_RELAY", &relay)
+                .env("CONDUIT_SESSION_ID", "session-1")
+                .env_remove("CONDUIT_HOOK_PORT")
+                .output()
+                .unwrap();
+            assert!(no_port.status.success(), "{no_port:?}");
+
+            let server = Server::http("127.0.0.1:0").unwrap();
+            let port = server.server_addr().to_ip().unwrap().port();
+            let receiver = thread::spawn(move || {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                let url = request.url().to_owned();
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                request.respond(Response::from_string("ok")).unwrap();
+                (url, body)
+            });
+            let mut sent = Command::new(shell)
+                .args(["-NoProfile", "-Command", command])
+                .env("CONDUIT_CODEX_HOOK_RELAY", &relay)
+                .env("CONDUIT_SESSION_ID", "session-1")
+                .env("CONDUIT_HOOK_PORT", port.to_string())
+                // Match Codex's hook runner: the parent keeps stdin open until the
+                // child exits. A relay that reads @- cannot finish in this setup.
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = sent.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = sent.kill();
+                    panic!("relay waited for stdin EOF");
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            assert!(status.success(), "{status:?}");
+            assert_eq!(
+                receiver.join().unwrap(),
+                (
+                    "/hook?session=session-1&event=sessionstart".to_string(),
+                    "{}".to_string()
+                )
+            );
+        }
     }
 
     #[test]
