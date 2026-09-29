@@ -13,6 +13,7 @@ import { OpenCodePanel } from "./OpenCodePanel";
 import { EndpointsPanel } from "./EndpointsPanel";
 import { CommandCodePanel } from "./CommandCodePanel";
 import { RoutingPanel } from "./RoutingPanel";
+import { OrchestrationPanel } from "./OrchestrationPanel";
 import { PluginsPanel } from "./PluginsPanel";
 
 // Exported for the native menu integration (menu → open Settings at a specific tab).
@@ -27,6 +28,7 @@ export type SettingsTab =
   | "endpoints"
   | "commandcode"
   | "routing"
+  | "orchestration"
   | "formatting"
   | "security"
   | "privacy"
@@ -50,6 +52,7 @@ const NAV: Array<{ group: string; items: Array<{ id: SettingsTab; label: string 
       { id: "endpoints", label: "Model endpoints" },
       { id: "commandcode", label: "Command Code" },
       { id: "routing", label: "Routing" },
+      { id: "orchestration", label: "Orchestration" },
       { id: "mcp", label: "MCP servers" },
     ],
   },
@@ -174,6 +177,7 @@ export function Settings({
               )}
               {tab === "commandcode" && <CommandCodePanel />}
               {tab === "routing" && <RoutingPanel />}
+              {tab === "orchestration" && <OrchestrationPanel openRouting={() => setTab("routing")} />}
               {tab === "formatting" && <FormatPrefsPanel />}
               {tab === "security" && (
                 <>

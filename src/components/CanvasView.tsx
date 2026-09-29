@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useStore, type Session } from "../store";
+import { ContextRing } from "./ContextRing";
+import { useOrchestrationDisplay } from "../hooks/useOrchestrationDisplay";
 import { TERM_BASE_FONT } from "./Terminal";
 import { snapZoom } from "../terminalZoom";
 import {
@@ -102,6 +104,7 @@ export function CanvasUnderlay({
   // rather than guessing a project for it.
   const selectedProjectId = useStore((s) => s.selectedProjectId);
   const sessionContext = useStore((s) => s.sessionContext);
+  const contextDisplay = useOrchestrationDisplay(projects.map((p) => p.id));
   const autoProjectColors = useStore((s) => s.autoProjectColors);
   // canvas/setCanvas/snapshot/undo/redo all come from useCanvas — the ONE seam every board
   // edit flows through, which is what lets CanvasControls (a sibling component, its own
@@ -1004,7 +1007,7 @@ export function CanvasUnderlay({
                 {/* Context fill, same reading as the session's tab. On a card it is a
                     number rather than a hairline: a card is big enough to read one, and at
                     canvas distances a 2px bar says nothing. */}
-                {sessionContext[node.ref] && (
+                {contextDisplay[node.projectId] ? <ContextRing usage={sessionContext[node.ref]} large /> : sessionContext[node.ref] && (
                   <span
                     className={`canvas-ctx ${meterLevel(sessionContext[node.ref].fraction)}`}
                     title={meterTitle(sessionContext[node.ref])}
