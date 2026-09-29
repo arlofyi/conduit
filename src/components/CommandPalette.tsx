@@ -29,6 +29,7 @@ const SETTINGS_PAGES: Array<[SettingsTab, string]> = [
   ["accounts", "Accounts"],
   ["agents", "Agents"],
   ["usage", "Usage display"],
+  ["orchestration", "Orchestration"],
   ["formatting", "Formatting"],
   ["mcp", "MCP"],
   ["localmodels", "Local models"],

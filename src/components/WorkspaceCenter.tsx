@@ -28,6 +28,8 @@ import { BoardView } from "./BoardView";
 import { CanvasControls, CanvasUnderlay } from "./CanvasView";
 import { CanvasRail } from "./CanvasRail";
 import { ContextMeter } from "./ContextMeter";
+import { ContextRing } from "./ContextRing";
+import { useOrchestrationDisplay } from "../hooks/useOrchestrationDisplay";
 import { FOOTER_H, HEADER_H, LIVE_ZOOM_MIN, nodeH, nodeW } from "../canvas";
 import { useCanvas } from "../hooks/useCanvas";
 import { TerminalIcon, FileIcon, CodeIcon, CloseIcon } from "./Icons";
@@ -679,6 +681,7 @@ function GroupTabStrip({
   const dropSessionIntoPane = useStore((s) => s.dropSessionIntoPane);
   const sessionDirs = useStore((s) => s.sessionDirs);
   const sessionContext = useStore((s) => s.sessionContext);
+  const contextDisplay = useOrchestrationDisplay(projects.map((p) => p.id));
   const richSessionView = useStore((s) => s.richSessionView);
   const richViewOpen = useStore((s) => s.richViewOpen);
   const toggleRichView = useStore((s) => s.toggleRichView);
@@ -815,6 +818,7 @@ function GroupTabStrip({
               <CloseIcon size={10} />
             </button>
             {t.kind === "session" && <ContextMeter usage={sessionContext[t.ref]} />}
+            {t.kind === "session" && contextDisplay[tabProjectId(t, projectId)] && <ContextRing usage={sessionContext[t.ref]} />}
           </div>
         </Fragment>
       ))}

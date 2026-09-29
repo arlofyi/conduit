@@ -999,6 +999,23 @@ button {
   color: var(--red);
 }
 
+.context-ring {
+  width: 20px;
+  height: 20px;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  color: var(--text-dim);
+  font: 8px var(--mono-font);
+}
+.context-ring.large { width: 28px; height: 28px; font-size: 9px; }
+.context-ring svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); fill: none; stroke-width: 2.5; }
+.context-ring-track { stroke: var(--border); }
+.context-ring-fill { stroke: var(--text-dim); stroke-linecap: round; }
+.context-ring-label { position: relative; }
+
 /* Tethers. Under every box on the plane, so each line is clipped to the gap between the
    two things it joins. */
 .canvas-links {

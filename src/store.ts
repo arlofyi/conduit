@@ -318,6 +318,8 @@ export interface ContextUsage {
   fraction: number;
   /** The model the latest usage line named, when it named one. */
   model: string | null;
+  source?: string;
+  observedAt?: number;
 }
 
 export interface LiveState {
@@ -3490,11 +3492,12 @@ export const useStore = create<AppState>((set, get) => {
       set((s) => {
         const cur = s.sessionContext[sessionId];
         if (!usage) {
-          // Keep the last known fill rather than blanking the meter: a transcript that
-          // momentarily fails to read has not emptied the context window.
-          return {};
+          if (!cur) return {};
+          const next = { ...s.sessionContext };
+          delete next[sessionId];
+          return { sessionContext: next };
         }
-        if (cur && cur.used === usage.used && cur.window === usage.window) return {};
+        if (cur && cur.used === usage.used && cur.window === usage.window && cur.observedAt === usage.observedAt) return {};
         return { sessionContext: { ...s.sessionContext, [sessionId]: usage } };
       });
     },

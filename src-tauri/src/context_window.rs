@@ -38,6 +38,17 @@ pub struct ContextUsage {
     pub fraction: f64,
     /// The model the latest usage line named, when it named one.
     pub model: Option<String>,
+    /// The adapter that supplied this session-attributed reading.
+    pub source: String,
+    /// Milliseconds since Unix epoch, so callers can discard stale readings.
+    pub observed_at: i64,
+}
+
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// The context window for a model id.
@@ -65,6 +76,23 @@ pub fn window_for(model: Option<&str>) -> u64 {
         return LARGE_WINDOW;
     }
     DEFAULT_WINDOW
+}
+
+fn measured_window_for(model: Option<&str>) -> Option<u64> {
+    let name = model?.to_ascii_lowercase();
+    if name.contains("haiku")
+        || name.contains("opus")
+        || name.contains("sonnet")
+        || name.contains("fable")
+        || name.contains("mythos")
+        || name
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|part| part == "1m")
+    {
+        Some(window_for(Some(&name)))
+    } else {
+        None
+    }
 }
 
 /// The latest assistant message's input-token total and model, scanned from transcript text.
@@ -119,7 +147,7 @@ pub fn parse_latest_usage(text: &str) -> Option<(u64, Option<String>)> {
 /// Build a `ContextUsage` from raw transcript text.
 pub fn usage_from_text(text: &str) -> Option<ContextUsage> {
     let (used, model) = parse_latest_usage(text)?;
-    let window = window_for(model.as_deref());
+    let window = measured_window_for(model.as_deref())?;
     Some(ContextUsage {
         used,
         window,
@@ -127,6 +155,8 @@ pub fn usage_from_text(text: &str) -> Option<ContextUsage> {
         // clamp is real rather than defensive.
         fraction: (used as f64 / window as f64).clamp(0.0, 1.0),
         model,
+        source: "claude-transcript".into(),
+        observed_at: now_ms(),
     })
 }
 
@@ -148,6 +178,17 @@ fn read_tail(path: &Path) -> Option<String> {
 
 /// A session's context fill, or `None` when the transcript is missing or says nothing yet.
 pub fn for_transcript(path: &Path) -> Option<ContextUsage> {
+    let age = File::open(path)
+        .ok()?
+        .metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()?;
+    if age > std::time::Duration::from_secs(30 * 60) {
+        return None;
+    }
     usage_from_text(&read_tail(path)?)
 }
 
@@ -228,6 +269,12 @@ mod tests {
             u.window, LARGE_WINDOW,
             "the earlier line's model still governs"
         );
+    }
+
+    #[test]
+    fn unknown_model_has_no_measured_denominator() {
+        assert!(usage_from_text(&assistant(12_000, 0, 0, Some("future-model"))).is_none());
+        assert!(usage_from_text(&assistant(12_000, 0, 0, None)).is_none());
     }
 
     #[test]

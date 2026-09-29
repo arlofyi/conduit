@@ -62,6 +62,7 @@ pub fn start(
     pty: Arc<crate::pty::PtyManager>,
     board: Arc<crate::board::BoardState>,
     agy_usage: Arc<crate::agy_usage::AgyUsageState>,
+    agy_context: Arc<crate::agy_usage::AgyContextState>,
     agy_resume: Arc<crate::agy_usage::AgyResumeState>,
     reg: Arc<crate::window_registry::WindowRegistry>,
     pending_opens: Arc<crate::window_registry::PendingOpens>,
@@ -224,6 +225,14 @@ pub fn start(
             if event == "agyusage" {
                 let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                 let mut usage = crate::agy_usage::parse_statusline_payload(&parsed);
+                if let (Some(sid), Some(context)) = (session.as_deref(), usage.context.as_ref()) {
+                    if store.has_session(sid)
+                        && store.session_agent(sid) == crate::agent::AgentId::Antigravity
+                    {
+                        agy_context.set(sid, context);
+                        let _ = app.emit("agycontext", sid);
+                    }
+                }
                 // Key the snapshot by the posting session's resolved account so multiple agy
                 // accounts don't clobber one slot (None = the environment default).
                 usage.account_id = session

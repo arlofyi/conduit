@@ -35,6 +35,7 @@ pub mod ide_host;
 mod local_llm;
 mod menu;
 mod notify;
+mod orchestration_policy;
 mod plugins;
 mod project_new;
 mod proposals;
@@ -748,7 +749,17 @@ fn set_session_persistence(enabled: bool, pty: State<Arc<PtyManager>>) {
 fn session_context(
     session_id: String,
     store: State<Arc<store::Store>>,
+    agy_context: State<Arc<agy_usage::AgyContextState>>,
 ) -> Option<context_window::ContextUsage> {
+    if !store.has_session(&session_id) {
+        return None;
+    }
+    if store.session_agent(&session_id) == crate::agent::AgentId::Antigravity {
+        return agy_context.get(&session_id);
+    }
+    if store.session_agent(&session_id) != crate::agent::AgentId::Claude {
+        return None;
+    }
     let projects = pty::session_projects_dir(&store, &session_id)?;
     let path = pty::transcript_path(&store.claude_conversation_id(&session_id), &projects)?;
     context_window::for_transcript(&path)
@@ -2551,6 +2562,7 @@ pub fn run() {
         .manage(Arc::new(TaskBoard::default()))
         .manage(Arc::new(claude_usage::ClaudeAuth::default()))
         .manage(Arc::new(agy_usage::AgyUsageState::default()))
+        .manage(Arc::new(agy_usage::AgyContextState::default()))
         .manage(Arc::new(agy_usage::AgyResumeState::default()))
         .manage(Arc::new(root_chat::RootChatState::default()))
         .manage(Arc::new(hookbus::HookBus::default()))
@@ -2638,6 +2650,10 @@ pub fn run() {
                 .state::<Arc<crate::agy_usage::AgyUsageState>>()
                 .inner()
                 .clone();
+            let agy_context = app
+                .state::<Arc<crate::agy_usage::AgyContextState>>()
+                .inner()
+                .clone();
             let agy_resume = app
                 .state::<Arc<crate::agy_usage::AgyResumeState>>()
                 .inner()
@@ -2666,6 +2682,7 @@ pub fn run() {
                 pty.clone(),
                 board.clone(),
                 agy_usage,
+                agy_context,
                 agy_resume,
                 reg,
                 pending_opens,
@@ -2940,6 +2957,11 @@ pub fn run() {
             routing::agent_routes,
             routing::set_agent_route,
             routing::task_kinds,
+            orchestration_policy::orchestration_policy_view,
+            orchestration_policy::set_orchestration_overlay,
+            orchestration_policy::export_orchestration_policy,
+            orchestration_policy::preview_orchestration_import,
+            orchestration_policy::import_orchestration_policy,
             commandcode_config::command_code_config,
             commandcode_config::set_command_code_config,
             commandcode_config::command_code_models,

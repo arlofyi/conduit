@@ -518,6 +518,11 @@ pub struct PersistState {
     /// Global routing overrides, layered over the built-in defaults and under any project's.
     #[serde(default)]
     pub routes: crate::routing::AgentRoutes,
+    #[serde(
+        default,
+        deserialize_with = "crate::orchestration_policy::deserialize_persisted_safe"
+    )]
+    pub orchestration_policy: crate::orchestration_policy::PolicyDocument,
     #[serde(default)]
     pub profiles: Vec<Profile>,
     /// The profile the sidebar was last filtered to; restored on launch. None = Default.
@@ -536,6 +541,8 @@ pub struct Store {
     plugins: Mutex<Vec<crate::plugins::PluginRecord>>,
     root_chats: Mutex<Vec<RootChat>>,
     routes: Mutex<crate::routing::AgentRoutes>,
+    orchestration_policy: Mutex<crate::orchestration_policy::PolicyDocument>,
+    policy_write: Mutex<()>,
     profiles: Mutex<Vec<Profile>>,
     active_profile_id: Mutex<Option<String>>,
     /// The local-endpoint API key, held in memory for the app's lifetime only. Never part
@@ -761,6 +768,8 @@ impl Store {
             plugins: Mutex::new(state.plugins),
             root_chats: Mutex::new(state.root_chats),
             routes: Mutex::new(state.routes),
+            orchestration_policy: Mutex::new(state.orchestration_policy),
+            policy_write: Mutex::new(()),
             profiles: Mutex::new(state.profiles),
             active_profile_id: Mutex::new(state.active_profile_id),
             opencode_key: Mutex::new(None),
@@ -773,7 +782,7 @@ impl Store {
         let _ = self.on_save.set(f);
     }
 
-    fn save(&self, projects: &[Project]) {
+    fn save(&self, projects: &[Project]) -> bool {
         // Atomic write: serialize, write a temp file, then rename over the target so
         // a crash mid-write can't corrupt state.json. Errors are surfaced to stderr.
         // Assemble the full persisted object (projects + account registry); the caller
@@ -797,6 +806,11 @@ impl Store {
             trust: self.trust.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             routes: self
                 .routes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            orchestration_policy: self
+                .orchestration_policy
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
@@ -830,7 +844,7 @@ impl Store {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("conduit: failed to serialize state: {e}");
-                return;
+                return false;
             }
         };
         let tmp = self.save_path.with_extension("json.tmp");
@@ -838,7 +852,7 @@ impl Store {
         // can land the rename ahead of the data and leave a zero-length state.json.
         if let Err(e) = write_synced(&tmp, &data) {
             eprintln!("conduit: failed to write state: {e}");
-            return;
+            return false;
         }
         rotate_backup(&self.save_path);
         // Rename over the target. On Windows a transient lock (AV scan / Search indexer /
@@ -878,6 +892,7 @@ impl Store {
                 f();
             }
         }
+        success
     }
 
     pub fn list(&self) -> Vec<Project> {
@@ -1364,9 +1379,74 @@ impl Store {
 
     /// Re-serialize the full state to disk after an account/default change. Callers must
     /// NOT hold the accounts / default_account locks (save() re-locks them).
-    fn persist(&self) {
+    fn persist(&self) -> bool {
         let projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
-        self.save(&projects);
+        self.save(&projects)
+    }
+
+    pub fn orchestration_policy(&self) -> crate::orchestration_policy::PolicyDocument {
+        self.orchestration_policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Validate before replacing memory, and restore the prior value if the atomic save fails.
+    pub fn set_orchestration_policy(
+        &self,
+        next: crate::orchestration_policy::PolicyDocument,
+    ) -> Result<(), String> {
+        next.validate()?;
+        let _write = self.policy_write.lock().unwrap_or_else(|e| e.into_inner());
+        self.replace_policy_locked(next)
+    }
+
+    /// Change exactly one scope while serializing policy writes, preserving other projects.
+    pub fn set_orchestration_overlay(
+        &self,
+        project_id: Option<&str>,
+        overlay: crate::orchestration_policy::PolicyOverlay,
+    ) -> Result<crate::orchestration_policy::PolicyDocument, String> {
+        overlay.validate()?;
+        let _write = self.policy_write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = self.orchestration_policy();
+        match project_id {
+            Some(id) => {
+                if !self.list().iter().any(|p| p.id == id) {
+                    return Err("Project not found".into());
+                }
+                if overlay == Default::default() {
+                    next.projects.remove(id);
+                } else {
+                    next.projects.insert(id.to_string(), overlay);
+                }
+            }
+            None => next.global = overlay,
+        }
+        next.validate()?;
+        self.replace_policy_locked(next.clone())?;
+        Ok(next)
+    }
+
+    fn replace_policy_locked(
+        &self,
+        next: crate::orchestration_policy::PolicyDocument,
+    ) -> Result<(), String> {
+        let previous = {
+            let mut current = self
+                .orchestration_policy
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *current, next)
+        };
+        if !self.persist() {
+            *self
+                .orchestration_policy
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = previous;
+            return Err("Could not save policy; prior policy restored".into());
+        }
+        Ok(())
     }
 
     /// Resolve a session's account config dir along the chain
@@ -2166,6 +2246,8 @@ mod tests {
                 plugins: Mutex::new(Vec::new()),
                 root_chats: Mutex::new(Vec::new()),
                 routes: Mutex::new(Default::default()),
+                orchestration_policy: Mutex::new(Default::default()),
+                policy_write: Mutex::new(()),
                 profiles: Mutex::new(Vec::new()),
                 active_profile_id: Mutex::new(None),
                 opencode_key: Mutex::new(None),
@@ -2180,6 +2262,75 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn old_state_has_inert_policy_and_invalid_write_preserves_state() {
+        let old = br#"{"projects":[],"accounts":[],"routes":{}}"#;
+        let parsed = parse_state(old).expect("legacy state parses");
+        assert_eq!(
+            parsed.orchestration_policy,
+            crate::orchestration_policy::PolicyDocument::default()
+        );
+        let future = br#"{"projects":[],"orchestrationPolicy":{"version":2,"futureKey":true}}"#;
+        assert!(
+            parse_state(future).is_some(),
+            "unsupported policy cannot erase sessions"
+        );
+
+        let dir = temp_dir("policy_rollback");
+        let store = Store::for_test(&dir);
+        let project = store.add_project("/repo".into(), None);
+        let before = fs::read(dir.join("state.json")).unwrap();
+        let mut invalid = store.orchestration_policy();
+        invalid.projects.insert(
+            project.id,
+            crate::orchestration_policy::PolicyOverlay {
+                quota_pause_percent: Some(101),
+                ..Default::default()
+            },
+        );
+        assert!(store.set_orchestration_policy(invalid).is_err());
+        assert_eq!(fs::read(dir.join("state.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn policy_project_write_preserves_other_scope_and_round_trips() {
+        let dir = temp_dir("policy_scopes");
+        let store = Store::for_test(&dir);
+        let a = store.add_project("/a".into(), None);
+        let b = store.add_project("/b".into(), None);
+        let overlay = crate::orchestration_policy::PolicyOverlay {
+            context_display: Some(true),
+            ..Default::default()
+        };
+        store
+            .set_orchestration_overlay(Some(&a.id), overlay.clone())
+            .unwrap();
+        store
+            .set_orchestration_overlay(Some(&b.id), overlay)
+            .unwrap();
+        store
+            .set_orchestration_overlay(Some(&a.id), Default::default())
+            .unwrap();
+        let state = load_state(&dir.join("state.json"));
+        assert!(!state.orchestration_policy.projects.contains_key(&a.id));
+        assert_eq!(
+            state.orchestration_policy.projects[&b.id].context_display,
+            Some(true)
+        );
+        assert_eq!(state.projects.len(), 2);
+    }
+
+    #[test]
+    fn policy_save_failure_rolls_back_memory() {
+        let dir = temp_dir("policy_io_failure").join("missing_parent");
+        let store = Store::for_test(&dir);
+        let mut next = store.orchestration_policy();
+        next.global.context_display = Some(true);
+        assert!(store.set_orchestration_policy(next).is_err());
+        assert_eq!(store.orchestration_policy(), Default::default());
+        assert!(!dir.join("state.json").exists());
     }
 
     #[test]

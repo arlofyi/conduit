@@ -3,6 +3,10 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+- **Added — orchestration policy and context display.** Settings now offers versioned, scoped policy import and export with a preview. Optional context rings show session-attributed Claude and agy readings, and show Unknown when no reliable reading exists. Policy limits do not enforce behavior yet.
+
 ## 0.40.0 — 2026-09-24
 
 - **Changed — the session chat view speaks HQ's design language.** The rich session view
