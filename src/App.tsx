@@ -18,6 +18,8 @@ import {
 import { type AgentId } from "./agents";
 import { eventInThisWindow, normalizeProfileId } from "./profiles";
 import { matchProjectByPath } from "./cliOpen";
+import { askGateOpen, askShouldHandOff, type PendingAsk } from "./asks";
+import { effectiveCenterMode } from "./centerViews";
 import { type PendingDiff } from "./ideBridge";
 import { isEditableTarget, isInTerminal } from "./keyboardGuards";
 import { type ChatItem } from "./rootChat";
@@ -130,6 +132,9 @@ async function applyCliOpenPayload(payload: CliOpenPayload): Promise<void> {
     await useStore.getState().addSession(projectId, { agent: payload.agent as AgentId });
   }
 }
+
+/** Ask ids already handed back to the terminal (see the hand-off subscription). */
+const handedOff = new Set<string>();
 
 export default function App() {
   // Poll Claude + agy usage at the app root so it refreshes for every account regardless of
@@ -895,6 +900,68 @@ export default function App() {
       void unSpawn.then((f) => f());
       void unConfirm.then((f) => f());
     };
+  }, []);
+
+  // AskUserQuestion cards (asks.rs): live requests, resolutions, and a catch-up for asks
+  // raised before this window loaded.
+  useEffect(() => {
+    const st = useStore.getState();
+    void invoke<PendingAsk[]>("ask_pending")
+      .then((list) => list.forEach((a) => st.addAsk(a)))
+      .catch(() => {});
+    const un1 = listen<PendingAsk>("ask-request", ({ payload }) => useStore.getState().addAsk(payload));
+    const un2 = listen<{ id: string; how: string }>("ask-resolved", ({ payload }) => {
+      const s = useStore.getState();
+      const a = s.asks[payload.id];
+      s.removeAsk(payload.id);
+      handedOff.delete(payload.id);
+      if (a && payload.how !== "answered") s.pushToast("Question moved to the session's terminal");
+    });
+    const onFocus = () => useStore.getState().setWindowFocused(true);
+    const onBlur = () => useStore.getState().setWindowFocused(false);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      void un1.then((f) => f());
+      void un2.then((f) => f());
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
+
+  // Keep Rust's gate in step: capture questions only when a card could be seen. With
+  // profile windows every window writes the gate; the last writer wins, which is the
+  // focused window -- the one whose card could actually be seen.
+  const askGate = useStore((s) =>
+    askGateOpen({
+      enabled: s.continuityViewEnabled,
+      viewOpen:
+        !!s.selectedProjectId &&
+        effectiveCenterMode(s.centerMode[s.selectedProjectId], s) === "continuity",
+      windowFocused: s.windowFocused,
+    }),
+  );
+  useEffect(() => {
+    void invoke("set_ask_gate", { open: askGate }).catch(() => {});
+  }, [askGate]);
+
+  // Hand a question back once its session's own terminal is in front of the user. Each id
+  // is invoked once; it is forgotten when the ask leaves the store.
+  useEffect(() => {
+    return useStore.subscribe((s) => {
+      for (const id of handedOff) if (!(id in s.asks)) handedOff.delete(id);
+      const continuityVisible =
+        !!s.selectedProjectId &&
+        effectiveCenterMode(s.centerMode[s.selectedProjectId], s) === "continuity";
+      const selectedSessionId = globalSelectedSessionId(s);
+      for (const a of Object.values(s.asks)) {
+        if (handedOff.has(a.id)) continue;
+        if (askShouldHandOff(a, { selectedSessionId, continuityVisible, windowFocused: s.windowFocused })) {
+          handedOff.add(a.id);
+          void invoke("ask_handoff", { id: a.id }).catch(() => handedOff.delete(a.id));
+        }
+      }
+    });
   }, []);
 
   // Returning to the app clears "needs you" on whatever session you're viewing.

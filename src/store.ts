@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { PendingAsk } from "./asks";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir as getHomeDir } from "@tauri-apps/api/path";
 import {
@@ -1716,6 +1717,13 @@ interface AppState {
   canvasEnabled: boolean;
   boardEnabled: boolean;
   continuityViewEnabled: boolean;
+  /** Pending AskUserQuestion prompts held open by Rust (asks.rs), keyed by ask id. */
+  asks: Record<string, PendingAsk>;
+  /** Whether this window has focus; feeds the ask capture gate. */
+  windowFocused: boolean;
+  addAsk: (a: PendingAsk) => void;
+  removeAsk: (id: string) => void;
+  setWindowFocused: (v: boolean) => void;
   setCanvasEnabled: (v: boolean) => void;
   setBoardEnabled: (v: boolean) => void;
   setContinuityViewEnabled: (v: boolean) => void;
@@ -3889,6 +3897,17 @@ export const useStore = create<AppState>((set, get) => {
     canvasEnabled: readViewPref(CANVAS_ENABLED_KEY, false),
     boardEnabled: readViewPref(BOARD_ENABLED_KEY, false),
     continuityViewEnabled: readViewPref(CONTINUITY_VIEW_ENABLED_KEY, true),
+    asks: {},
+    windowFocused: typeof document !== "undefined" ? document.hasFocus() : true,
+    addAsk: (a) => set((s) => ({ asks: { ...s.asks, [a.id]: a } })),
+    removeAsk: (id) =>
+      set((s) => {
+        if (!(id in s.asks)) return s;
+        const next = { ...s.asks };
+        delete next[id];
+        return { asks: next };
+      }),
+    setWindowFocused: (v) => set({ windowFocused: v }),
     canvas: readCanvas(),
     canvasOpen: false,
     boards: {},
