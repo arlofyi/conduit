@@ -676,6 +676,10 @@ animal avatars linked by the Continuity messages they exchange, plus Claude Code
   the canvas themselves.
 - E2E: `e2e/continuity-view.e2e.ts` (+ `continuityFixture.ts`) drives the real window; the
   harness gives every spec its own `CONTINUITY_DB_PATH` so none reads the developer's real DB.
+- **Tables read through `continuity_tables.rs`, scoped by the same `resolve_session_ids` as the
+  map, and refetch on `continuity-changed`.** Task "open" means status is not `completed` or
+  `released` AND the claim is not past `expires_at`; continuity has no `expired` status, so
+  expiry is computed on read and shown as expired, never written back.
 - Design: `docs/superpowers/specs/2026-10-12-continuity-view-design.md`.
 
 ## Where Command Code lives

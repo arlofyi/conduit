@@ -3,6 +3,10 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.42.0 — 2026-10-12
+
+- **Added — Continuity tables.** The Continuity view gains tabs for Decisions, Handoffs, Tasks, Files and Activity — everything your sessions record in Continuity, for this project only. Tasks shows a claim that has run past its expiry as expired rather than open. Files highlights a path two sessions are editing at once. Click any session's avatar to jump to it on the map.
+
 ## 0.41.0 — 2026-10-12
 
 - **Added — Continuity view.** A live map of a project's sessions (⇧⌘K): each session is a
