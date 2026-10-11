@@ -11,6 +11,7 @@ import { blocksGlobalShortcut } from "../keyboardGuards";
 export function SessionDrawer({ node, onClose }: { projectId: string; node: GraphNode | null; onClose: () => void }) {
   const projects = useStore((s) => s.projects);
   const selectSession = useStore((s) => s.selectSession);
+  const setCenterMode = useStore((s) => s.setCenterMode);
   useEffect(() => {
     const k = (e: KeyboardEvent) => {
       // Esc inside a terminal interrupts the agent; inside a field it belongs to the field.
@@ -39,6 +40,8 @@ export function SessionDrawer({ node, onClose }: { projectId: string; node: Grap
             className="header-btn"
             onClick={() => {
               selectSession(found.project.id, found.session.id);
+              // The Continuity overlay covers the terminals; "open" means the terminal.
+              setCenterMode(found.project.id, "terminals");
               onClose();
             }}
           >
@@ -51,7 +54,7 @@ export function SessionDrawer({ node, onClose }: { projectId: string; node: Grap
       </header>
       <div className="session-drawer-body">
         {found && isClaude ? (
-          <SessionChat sessionId={found.session.id} onClose={onClose} readOnly />
+          <SessionChat key={found.session.id} sessionId={found.session.id} onClose={onClose} readOnly />
         ) : found ? (
           <p className="session-drawer-note">
             This agent has no conversation view. Open the session to see its terminal.

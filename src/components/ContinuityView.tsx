@@ -8,6 +8,7 @@ import { SessionDrawer } from "./SessionDrawer";
 import { ContinuityTables } from "./ContinuityTables";
 import { useContinuityTables } from "../hooks/useContinuityTables";
 import { tabCount, type ServiceTab, type TableTab } from "../continuityTables";
+import { sessionsAwaitingAnswer } from "../asks";
 
 const TABS: { id: TableTab; label: string }[] = [
   { id: "graph", label: "Graph" },
@@ -26,6 +27,7 @@ export function ContinuityView({ projectId }: { projectId: string }) {
   const projects = useStore((s) => s.projects);
   const live = useStore((s) => s.live);
   const asks = useStore((s) => s.asks);
+  const answeredAsks = useStore((s) => s.answeredAsks);
   const autoColors = useStore((s) => s.autoProjectColors);
   const [open, setOpen] = useState<string | null>(null);
   const setRendered = useStore((s) => s.setContinuityRendered);
@@ -59,16 +61,19 @@ export function ContinuityView({ projectId }: { projectId: string }) {
     for (const a of Object.values(asks).sort((x, y) => x.createdMs - y.createdMs)) {
       if (!askBySession.has(a.session)) askBySession.set(a.session, a);
     }
+    // A card holding its "Sent to …" confirmation no longer makes the avatar amber.
+    const waiting = sessionsAwaitingAnswer(Object.values(asks), answeredAsks);
     for (const n of snap.nodes) {
       const sid = n.conduitSessionId;
       const found = sid ? findSession(projects, sid) : null;
       const session = found?.session;
       const ask = sid ? askBySession.get(sid) : undefined;
+      const waitingOnYou = !!sid && waiting.has(sid);
       const status = sid ? live[sid]?.status : undefined;
       const visitorProject = n.visitorProjectId ? projects.find((p) => p.id === n.visitorProjectId) : undefined;
       const tone: AvatarTone = n.visitor
         ? "visitor"
-        : ask || status === "needsInput"
+        : waitingOnYou || status === "needsInput"
           ? "needs"
           : session?.stopped
             ? "stopped"
@@ -84,7 +89,7 @@ export function ContinuityView({ projectId }: { projectId: string }) {
           ? `${focusLine.slice(0, 39)}…`
           : focusLine
         : n.status;
-      const meta = ask
+      const meta = waitingOnYou
         ? "waiting on you"
         : unmatched
           ? unmatchedMeta
@@ -109,7 +114,7 @@ export function ContinuityView({ projectId }: { projectId: string }) {
       };
     }
     return out;
-  }, [snap, projects, live, asks, autoColors]);
+  }, [snap, projects, live, asks, answeredAsks, autoColors]);
 
   return (
     <div className="continuity-view">

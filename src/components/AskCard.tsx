@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useStore } from "../store";
+import { useStore, findSession } from "../store";
 import { answerSummary, buildAnswers, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "../asks";
 import { blocksGlobalShortcut } from "../keyboardGuards";
 
@@ -83,13 +83,32 @@ export function AskCard({
     setState("sending");
     try {
       const ok = await invoke<boolean>("ask_answer", { id: ask.id, answers: payload });
-      if (ok) setSent(answerSummary(payload));
+      if (ok) {
+        setSent(answerSummary(payload));
+        useStore.getState().markAskAnswered(ask.id);
+      }
       setState(ok ? "done" : "gone");
     } catch {
       setState("error");
     } finally {
       inFlight.current = false;
     }
+  };
+
+  /** Give the question back to Claude's own menu, then take the user to that terminal —
+   *  the arrow promises the jump. The overlay covers the terminals, so drop it too. */
+  const handOffToTerminal = async () => {
+    try {
+      await invoke("ask_handoff", { id: ask.id });
+    } catch {
+      setState("error");
+      return;
+    }
+    const st = useStore.getState();
+    const found = findSession(st.projects, ask.session);
+    if (!found) return;
+    st.selectSession(found.project.id, found.session.id);
+    st.setCenterMode(found.project.id, "terminals");
   };
 
   const goTo = (p: number) => {
@@ -359,7 +378,7 @@ export function AskCard({
                 <button
                   type="button"
                   className="ask-card-link"
-                  onClick={() => void invoke("ask_handoff", { id: ask.id }).catch(() => setState("error"))}
+                  onClick={() => void handOffToTerminal()}
                 >
                   Answer in terminal ↗
                 </button>

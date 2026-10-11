@@ -1721,8 +1721,12 @@ interface AppState {
   asks: Record<string, PendingAsk>;
   /** Whether this window has focus; feeds the ask capture gate. */
   windowFocused: boolean;
+  /** Ask ids already answered (by this window's card, or reported `answered` by Rust) whose
+   *  card is still up for its short done hold. They no longer make an avatar "need" you. */
+  answeredAsks: Record<string, true>;
   addAsk: (a: PendingAsk) => void;
   removeAsk: (id: string) => void;
+  markAskAnswered: (id: string) => void;
   /** Conduit session ids the open Continuity view draws as nodes (a raw map, replaced
    *  only when the set changes). An ask whose session is NOT in here has no card in the
    *  graph, so the dock must show it even while the view is visible. */
@@ -3904,14 +3908,19 @@ export const useStore = create<AppState>((set, get) => {
     continuityViewEnabled: readViewPref(CONTINUITY_VIEW_ENABLED_KEY, true),
     asks: {},
     windowFocused: typeof document !== "undefined" ? document.hasFocus() : true,
+    answeredAsks: {},
     addAsk: (a) => set((s) => ({ asks: { ...s.asks, [a.id]: a } })),
     removeAsk: (id) =>
       set((s) => {
-        if (!(id in s.asks)) return s;
+        if (!(id in s.asks) && !(id in s.answeredAsks)) return s;
         const next = { ...s.asks };
         delete next[id];
-        return { asks: next };
+        const answered = { ...s.answeredAsks };
+        delete answered[id];
+        return { asks: next, answeredAsks: answered };
       }),
+    markAskAnswered: (id) =>
+      set((s) => (s.answeredAsks[id] || !(id in s.asks) ? s : { answeredAsks: { ...s.answeredAsks, [id]: true } })),
     setWindowFocused: (v) => set({ windowFocused: v }),
     continuityRendered: {},
     setContinuityRendered: (ids) =>

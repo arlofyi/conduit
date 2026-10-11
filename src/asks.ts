@@ -21,6 +21,21 @@ export function askShouldHandOff(
   return v.windowFocused && !v.continuityVisible && v.selectedSessionId === ask.session;
 }
 
+/** Sessions with at least one ask still unanswered. An ask in `answered` is only holding
+ *  its "Sent to …" confirmation, so it no longer makes its avatar "need" you. */
+export function sessionsAwaitingAnswer(asks: Iterable<PendingAsk>, answered: Record<string, true>): Set<string> {
+  const out = new Set<string>();
+  for (const a of asks) if (!answered[a.id]) out.add(a.session);
+  return out;
+}
+
+/** Whether an `ask-resolved` deserves a toast. A hand-off (automatic, or the card's own
+ *  link) is the user already looking at the terminal, and an answer has its own done state;
+ *  only a card the user could see running into the ceiling needs telling where it went. */
+export function askResolvedToast(how: string, cardWasShown: boolean): boolean {
+  return how === "timeout" && cardWasShown;
+}
+
 /** The `answers` map for ask_answer, or null while any question is unanswered. Free text
  *  (trimmed, non-empty) wins over picks; multi-select picks join in option order. */
 export function buildAnswers(

@@ -18,7 +18,7 @@ import {
 import { type AgentId } from "./agents";
 import { eventInThisWindow, normalizeProfileId } from "./profiles";
 import { matchProjectByPath } from "./cliOpen";
-import { askGateOpen, askShouldHandOff, type PendingAsk } from "./asks";
+import { askGateOpen, askResolvedToast, askShouldHandOff, type PendingAsk } from "./asks";
 import { effectiveCenterMode } from "./centerViews";
 import { type PendingDiff } from "./ideBridge";
 import { isEditableTarget, isInTerminal } from "./keyboardGuards";
@@ -139,6 +139,33 @@ async function applyCliOpenPayload(payload: CliOpenPayload): Promise<void> {
 
 /** Ask ids already handed back to the terminal (see the hand-off subscription). */
 const handedOff = new Set<string>();
+
+/** Where the user is looking, for the hand-off rule. */
+function handOffView(s: ReturnType<typeof useStore.getState>) {
+  return {
+    selectedSessionId: globalSelectedSessionId(s),
+    continuityVisible:
+      !!s.selectedProjectId && effectiveCenterMode(s.centerMode[s.selectedProjectId], s) === "continuity",
+    windowFocused: s.windowFocused,
+  };
+}
+
+/** An incoming ask (live or catch-up). One for the terminal the user is already watching
+ *  goes straight back to it and never becomes a card: adding it first would flash a docked
+ *  card for a frame and then toast about moving it. If the hand-off fails, show the card. */
+function admitAsk(a: PendingAsk) {
+  const s = useStore.getState();
+  if (handedOff.has(a.id) || a.id in s.asks) return;
+  if (askShouldHandOff(a, handOffView(s))) {
+    handedOff.add(a.id);
+    void invoke<boolean>("ask_handoff", { id: a.id }).catch(() => {
+      handedOff.delete(a.id);
+      useStore.getState().addAsk(a);
+    });
+    return;
+  }
+  s.addAsk(a);
+}
 
 export default function App() {
   // Poll Claude + agy usage at the app root so it refreshes for every account regardless of
@@ -297,6 +324,10 @@ export default function App() {
       if (e.shiftKey && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "k") {
         const st = useStore.getState();
         if (!st.selectedProjectId || !st.continuityViewEnabled) return;
+        // Same guard as ⇧⌘C below: on Windows/Linux Ctrl+Shift+K inside a terminal is the
+        // terminal's, and an editable field keeps its own keys on every platform.
+        const isMac = /Mac|iPhone|iPod|iPad/i.test(navigator.platform || navigator.userAgent);
+        if (isInTerminal(e.target) ? !isMac : isEditableTarget(e.target)) return;
         e.preventDefault();
         st.toggleCenterMode(st.selectedProjectId, "continuity");
         return;
@@ -907,30 +938,44 @@ export default function App() {
   }, []);
 
   // AskUserQuestion cards (asks.rs): live requests, resolutions, and a catch-up for asks
-  // raised before this window loaded.
+  // raised before this window loaded. Both listeners are registered BEFORE the catch-up
+  // fetch: an ask raised between a fetch and a later registration would get no card for
+  // the whole 600 s ceiling.
   useEffect(() => {
-    const st = useStore.getState();
-    void invoke<PendingAsk[]>("ask_pending")
-      .then((list) => list.forEach((a) => st.addAsk(a)))
-      .catch(() => {});
-    const un1 = listen<PendingAsk>("ask-request", ({ payload }) => useStore.getState().addAsk(payload));
-    const un2 = listen<{ id: string; how: string }>("ask-resolved", ({ payload }) => {
-      const s = useStore.getState();
-      const a = s.asks[payload.id];
-      // An answer from a card: Rust resolves before the card's own ask_answer reply lands,
-      // so hold the card long enough for its "Sent to …" confirmation to be seen.
-      if (payload.how === "answered") setTimeout(() => useStore.getState().removeAsk(payload.id), ASK_DONE_HOLD_MS);
-      else s.removeAsk(payload.id);
-      handedOff.delete(payload.id);
-      if (a && payload.how !== "answered") s.pushToast("Question moved to the session's terminal");
-    });
+    let disposed = false;
+    const uns: (() => void)[] = [];
+    void (async () => {
+      const ready = await Promise.all([
+        listen<PendingAsk>("ask-request", ({ payload }) => admitAsk(payload)),
+        listen<{ id: string; how: string }>("ask-resolved", ({ payload }) => {
+          const s = useStore.getState();
+          const shown = payload.id in s.asks;
+          // An answer from a card: Rust resolves before the card's own ask_answer reply lands,
+          // so hold the card long enough for its "Sent to …" confirmation to be seen — and
+          // stop it reading as "needs you" meanwhile.
+          if (payload.how === "answered") {
+            s.markAskAnswered(payload.id);
+            setTimeout(() => useStore.getState().removeAsk(payload.id), ASK_DONE_HOLD_MS);
+          } else s.removeAsk(payload.id);
+          handedOff.delete(payload.id);
+          if (askResolvedToast(payload.how, shown)) s.pushToast("Question moved to the session's terminal");
+        }),
+      ]).catch(() => [] as (() => void)[]);
+      if (disposed) {
+        ready.forEach((f) => f());
+        return;
+      }
+      uns.push(...ready);
+      const list = await invoke<PendingAsk[]>("ask_pending").catch(() => [] as PendingAsk[]);
+      if (!disposed) list.forEach(admitAsk);
+    })();
     const onFocus = () => useStore.getState().setWindowFocused(true);
     const onBlur = () => useStore.getState().setWindowFocused(false);
     window.addEventListener("focus", onFocus);
     window.addEventListener("blur", onBlur);
     return () => {
-      void un1.then((f) => f());
-      void un2.then((f) => f());
+      disposed = true;
+      uns.forEach((f) => f());
       window.removeEventListener("focus", onFocus);
       window.removeEventListener("blur", onBlur);
     };
@@ -953,17 +998,13 @@ export default function App() {
   }, [askGate]);
 
   // Hand a question back once its session's own terminal is in front of the user. Each id
-  // is invoked once; it is forgotten when the ask leaves the store.
+  // is invoked once; it is forgotten when its `ask-resolved` arrives.
   useEffect(() => {
     return useStore.subscribe((s) => {
-      for (const id of handedOff) if (!(id in s.asks)) handedOff.delete(id);
-      const continuityVisible =
-        !!s.selectedProjectId &&
-        effectiveCenterMode(s.centerMode[s.selectedProjectId], s) === "continuity";
-      const selectedSessionId = globalSelectedSessionId(s);
+      const view = handOffView(s);
       for (const a of Object.values(s.asks)) {
         if (handedOff.has(a.id)) continue;
-        if (askShouldHandOff(a, { selectedSessionId, continuityVisible, windowFocused: s.windowFocused })) {
+        if (askShouldHandOff(a, view)) {
           handedOff.add(a.id);
           void invoke("ask_handoff", { id: a.id }).catch(() => handedOff.delete(a.id));
         }

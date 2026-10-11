@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { answerSummary, askGateOpen, askShouldHandOff, buildAnswers, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "./asks";
+import { answerSummary, askGateOpen, askResolvedToast, askShouldHandOff, buildAnswers, sessionsAwaitingAnswer, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "./asks";
 import { MULTISELECT_JOIN } from "./askProtocol";
 
 const ask: PendingAsk = {
@@ -83,5 +83,26 @@ describe("waitingClock", () => {
     expect(waitingClock(0, 125_400)).toBe("2:05");
     expect(waitingClock(10_000, 5_000)).toBe("0:00");
     expect(waitingClock(0, 61 * 60_000)).toBe("61:00");
+  });
+});
+
+describe("sessionsAwaitingAnswer", () => {
+  const a2: PendingAsk = { ...ask, id: "ask-2", createdMs: 5 };
+  const other: PendingAsk = { ...ask, id: "ask-3", session: "s2" };
+  it("counts a session while any of its asks is unanswered", () => {
+    expect([...sessionsAwaitingAnswer([ask, a2, other], {})].sort()).toEqual(["s1", "s2"]);
+    expect([...sessionsAwaitingAnswer([ask, a2], { "ask-1": true })]).toEqual(["s1"]);
+  });
+  it("drops a session whose only ask is holding its sent confirmation", () => {
+    expect([...sessionsAwaitingAnswer([ask, other], { "ask-1": true })]).toEqual(["s2"]);
+  });
+});
+
+describe("askResolvedToast", () => {
+  it("speaks only when a card the user could see ran out of time", () => {
+    expect(askResolvedToast("timeout", true)).toBe(true);
+    expect(askResolvedToast("timeout", false)).toBe(false);
+    expect(askResolvedToast("handoff", true)).toBe(false);
+    expect(askResolvedToast("answered", true)).toBe(false);
   });
 });
