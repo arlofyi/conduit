@@ -72,18 +72,33 @@ export function supersedeChain(decisions: FeedDecision[], id: string): string[] 
   return out;
 }
 
-const TASK_DONE = new Set(["completed", "released", "expired", "abandoned"]);
+/** Continuity's task_claims statuses are claimed / in_progress / pr_open / released /
+ *  completed; expiry is not a status, it is `expires_at`. */
+const TASK_DONE = new Set(["completed", "released"]);
+
+/** A claim still holding its issue: not finished and not past its expiry. The ONE rule for
+ *  both the tab count and the row's muting/"expired" display. */
+export function isTaskOpen(t: TaskRow, nowMs: number): boolean {
+  if (TASK_DONE.has(t.status)) return false;
+  const at = Date.parse(t.expiresAt);
+  return !Number.isNaN(at) && at > nowMs;
+}
+
+/** Finished by status (as opposed to merely lapsed). */
+export function isTaskDone(t: TaskRow): boolean {
+  return TASK_DONE.has(t.status);
+}
 
 /** The tab-strip number: what still wants attention, not the row total — active decisions,
  *  pending handoffs, open claims. Null for tabs whose count is not cheap or not meaningful. */
-export function tabCount<T extends ServiceTab>(tab: T, rows: TableRows[T]): number | null {
+export function tabCount<T extends ServiceTab>(tab: T, rows: TableRows[T], nowMs: number): number | null {
   switch (tab) {
     case "decisions":
       return (rows as FeedDecision[]).filter((d) => d.status === "active").length;
     case "handoffs":
       return (rows as HandoffRow[]).filter((h) => h.status === "pending").length;
     case "tasks":
-      return (rows as TaskRow[]).filter((t) => !TASK_DONE.has(t.status)).length;
+      return (rows as TaskRow[]).filter((t) => isTaskOpen(t, nowMs)).length;
     default:
       return null;
   }

@@ -23,13 +23,18 @@ export function useContinuityTables(projectId: string, tab: TableTab) {
   // A reply for the previous project must not land under this one.
   const projRef = useRef(projectId);
   projRef.current = projectId;
+  // Per-tab request sequence: replies can land out of order (a debounced stream refetch and a
+  // tab-open refetch overlap), and only the newest request for a tab may write its rows.
+  const seqRef = useRef<Partial<Record<ServiceTab, number>>>({});
 
   const pull = (tabs: ServiceTab[]) => {
     const pid = projectId;
     for (const t of tabs) {
+      const seq = (seqRef.current[t] ?? 0) + 1;
+      seqRef.current[t] = seq;
       invoke<TablesView>("continuity_tables", { projectId: pid, tab: t })
         .then((v) => {
-          if (projRef.current === pid) setData((d) => ({ ...d, [t]: v }));
+          if (projRef.current === pid && seqRef.current[t] === seq) setData((d) => ({ ...d, [t]: v }));
         })
         .catch(() => {
           /* keep the last good read */

@@ -7,6 +7,8 @@ import {
   nodeKeyForContinuityId,
   relativeTime,
   relativeUntil,
+  isTaskDone,
+  isTaskOpen,
   supersedeChain,
   type ActivityRow,
   type FileRow,
@@ -45,7 +47,7 @@ function Who({ nodeKey, raw, ctx, compact = false }: { nodeKey: string | null; r
       aria-label={`Show ${v.name} on the graph`}
       onClick={() => ctx.onFocusNode(nodeKey)}
     >
-      <SessionAvatar nodeKey={nodeKey} size={22} tone={v.tone} chipColor={v.chip} />
+      <SessionAvatar nodeKey={nodeKey} size={28} tone={v.tone} chipColor={v.chip} />
       {!compact && <span className="ctable-who-name">{v.name}</span>}
     </button>
   );
@@ -124,7 +126,8 @@ function Handoffs({ rows, ctx }: { rows: HandoffRow[]; ctx: Ctx }) {
           <td>
             <span className="ctable-pair">
               {byId(h.from, ctx)}
-              <span className="ctable-arrow" aria-label="to">→</span>
+              <span className="ctable-arrow" aria-hidden="true">→</span>
+              <span className="visually-hidden">to</span>
               {h.to ? byId(h.to, ctx) : <span className="ctable-none">anyone</span>}
             </span>
           </td>
@@ -144,24 +147,22 @@ function Handoffs({ rows, ctx }: { rows: HandoffRow[]; ctx: Ctx }) {
   );
 }
 
-const TASK_DONE = new Set(["completed", "released", "expired", "abandoned"]);
-
 function Tasks({ rows, ctx }: { rows: TaskRow[]; ctx: Ctx }) {
   return (
     <Table head={["Issue", "Status", "Claimant", "PR", "Expires"]}>
       {rows.map((t) => {
-        const done = TASK_DONE.has(t.status);
-        const until = relativeUntil(t.expiresAt, ctx.now);
+        const open = isTaskOpen(t, ctx.now);
+        const done = isTaskDone(t);
         return (
-          <tr key={t.id} className={done ? "muted" : ""}>
+          <tr key={t.id} className={open ? "" : "muted"}>
             <td className="ctable-mono">
               <span className="ctable-dim">{t.repo}</span>#{t.issue}
             </td>
             <td><Status s={t.status} /></td>
             <td>{byId(t.claimant, ctx)}</td>
             <td className="ctable-mono">{t.pr != null ? `#${t.pr}` : <span className="ctable-none">—</span>}</td>
-            <td className={`ctable-num ${!done && until === "expired" ? "warn" : ""}`}>
-              {done ? <span className="ctable-none">—</span> : until}
+            <td className={`ctable-num ${!done && !open ? "warn" : ""}`}>
+              {done ? <span className="ctable-none">—</span> : open ? relativeUntil(t.expiresAt, ctx.now) : "expired"}
             </td>
           </tr>
         );
@@ -288,5 +289,9 @@ export function ContinuityTables({
         break;
     }
   }
-  return <div className={`ctable-wrap t-${tab}`}>{body}</div>;
+  return (
+    <div className={`ctable-wrap t-${tab}`} role="tabpanel" aria-labelledby={`continuity-tab-${tab}`}>
+      {body}
+    </div>
+  );
 }

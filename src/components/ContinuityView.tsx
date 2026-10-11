@@ -113,27 +113,31 @@ export function ContinuityView({ projectId }: { projectId: string }) {
 
   return (
     <div className="continuity-view">
-      <nav className="continuity-tabs" aria-label="Continuity">
-        {TABS.map((t) => {
-          const v = t.id === "graph" ? undefined : data[t.id];
-          const n = v?.available ? tabCount(t.id as ServiceTab, v.rows) : null;
-          return (
-            <button
-              key={t.id}
-              type="button"
-              className={`continuity-tab ${tab === t.id ? "on" : ""}`}
-              aria-current={tab === t.id ? "page" : undefined}
-              onClick={() => setTab(t.id)}
-            >
-              {t.label}
-              {n ? <span className="continuity-tab-count">{n}</span> : null}
-            </button>
-          );
-        })}
+      <div className="continuity-tabs">
+        <div className="continuity-tablist" role="tablist" aria-label="Continuity">
+          {TABS.map((t) => {
+            const v = t.id === "graph" ? undefined : data[t.id];
+            const n = v?.available ? tabCount(t.id as ServiceTab, v.rows, now) : null;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                role="tab"
+                id={`continuity-tab-${t.id}`}
+                aria-selected={tab === t.id}
+                className={`continuity-tab ${tab === t.id ? "on" : ""}`}
+                onClick={() => setTab(t.id)}
+              >
+                {t.label}
+                {n ? <span className="continuity-tab-count">{n}</span> : null}
+              </button>
+            );
+          })}
+        </div>
         {!snap.available && tab === "graph" && (
           <span className="continuity-unavail">Continuity isn't running for this project — showing sessions only.</span>
         )}
-      </nav>
+      </div>
       {/* The graph stays mounted behind the tables so pins, pan and zoom survive a tab switch. */}
       <ContinuityGraph
         projectId={projectId}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { nodeKeyForAuthorLabel, nodeKeyForContinuityId, relativeTime, supersedeChain, tabCount, relativeUntil } from "./continuityTables";
+import { nodeKeyForAuthorLabel, nodeKeyForContinuityId, relativeTime, supersedeChain, tabCount, relativeUntil, isTaskOpen, type TaskRow } from "./continuityTables";
 import type { GraphSnapshot } from "./continuityGraph";
 import type { FeedDecision } from "./continuityFeed";
 
@@ -92,16 +92,37 @@ describe("supersedeChain", () => {
   });
 });
 
+const task = (status: string, expiresInMs: number): TaskRow => ({
+  id: `t-${status}-${expiresInMs}`, repo: "o/r", issue: 1, status,
+  expiresAt: new Date(NOW + expiresInMs).toISOString(), lastActivityAt: "",
+});
+
+describe("isTaskOpen", () => {
+  it("is open while claimed / in progress / PR open and unexpired", () => {
+    expect(isTaskOpen(task("claimed", 60_000), NOW)).toBe(true);
+    expect(isTaskOpen(task("in_progress", 60_000), NOW)).toBe(true);
+    expect(isTaskOpen(task("pr_open", 60_000), NOW)).toBe(true);
+  });
+  it("is closed once expired, even if still claimed", () => {
+    expect(isTaskOpen(task("claimed", -1000), NOW)).toBe(false);
+    expect(isTaskOpen(task("claimed", 0), NOW)).toBe(false);
+  });
+  it("is closed for both done statuses", () => {
+    expect(isTaskOpen(task("completed", 60_000), NOW)).toBe(false);
+    expect(isTaskOpen(task("released", 60_000), NOW)).toBe(false);
+  });
+  it("treats an unparseable expiry as closed", () => {
+    expect(isTaskOpen({ ...task("claimed", 60_000), expiresAt: "x" }, NOW)).toBe(false);
+  });
+});
+
 describe("tabCount", () => {
   it("counts what still wants attention", () => {
-    expect(tabCount("decisions", [d("a", null), { ...d("b", null), status: "superseded" }])).toBe(1);
+    expect(tabCount("decisions", [d("a", null), { ...d("b", null), status: "superseded" }], NOW)).toBe(1);
     expect(
-      tabCount("tasks", [
-        { id: "t1", repo: "o/r", issue: 1, status: "claimed", expiresAt: "", lastActivityAt: "" },
-        { id: "t2", repo: "o/r", issue: 2, status: "released", expiresAt: "", lastActivityAt: "" },
-      ]),
+      tabCount("tasks", [task("claimed", 60_000), task("claimed", -60_000), task("released", 60_000), task("completed", 60_000)], NOW),
     ).toBe(1);
-    expect(tabCount("files", [])).toBeNull();
+    expect(tabCount("files", [], NOW)).toBeNull();
   });
 });
 
