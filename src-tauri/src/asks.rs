@@ -18,6 +18,9 @@ use std::time::Duration;
 pub const ASK_CEILING: Duration = Duration::from_secs(600);
 pub const ASK_CURL_MAX_SECS: u64 = 650;
 pub const ASK_HOOK_TIMEOUT_SECS: u64 = 660;
+// Compile-time, so every build enforces the order (not just test builds).
+const _: () =
+    assert!(ASK_CEILING.as_secs() < ASK_CURL_MAX_SECS && ASK_CURL_MAX_SECS < ASK_HOOK_TIMEOUT_SECS);
 pub const MAX_ANSWER_BYTES: usize = 4096;
 
 // Mirrored by hand from src/askProtocol.ts (plan Task 1). Change both together.
@@ -78,12 +81,11 @@ impl Asks {
 
     /// First responder wins: the entry is removed, so a second resolve finds nothing.
     pub fn resolve(&self, id: &str, outcome: AskOutcome) -> bool {
-        let entry = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
-        match entry {
+        // Hold the guard across remove + try_send (never blocks on sync_channel(1)), so
+        // `forget` + `try_recv` in the holder is a true check-and-set: a resolve either
+        // completes before the forget (and is seen by try_recv) or finds nothing.
+        let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match map.remove(id) {
             Some(p) => {
                 let _ = p.tx.try_send(outcome);
                 true
@@ -246,14 +248,17 @@ mod tests {
             "options":[{"label":"Apple","description":"red"},{"label":"Banana","description":"yellow"}]}]})
     }
 
-    // Compile-time: clippy rejects a runtime assert on constants.
-    const _: () = assert!(
-        ASK_CEILING.as_secs() < ASK_CURL_MAX_SECS && ASK_CURL_MAX_SECS < ASK_HOOK_TIMEOUT_SECS
-    );
-
     #[test]
-    fn ceilings_are_strictly_ordered() {
-        // Enforced by the const assertion above; this keeps the name greppable.
+    fn forget_then_resolve_delivers_nothing_and_resolve_then_forget_is_seen() {
+        let asks = Asks::default();
+        let (a, rx_a) = asks.register("s".into(), "t".into(), json!([]), 0);
+        asks.forget(&a);
+        assert!(!asks.resolve(&a, AskOutcome::HandOff));
+        assert!(rx_a.try_recv().is_err(), "nothing may arrive after forget");
+        let (b, rx_b) = asks.register("s".into(), "t".into(), json!([]), 0);
+        assert!(asks.resolve(&b, AskOutcome::HandOff));
+        asks.forget(&b);
+        assert_eq!(rx_b.try_recv().unwrap(), AskOutcome::HandOff);
     }
 
     #[test]

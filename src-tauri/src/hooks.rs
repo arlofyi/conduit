@@ -664,6 +664,11 @@ fn handle_ask(
     store: &crate::store::Store,
 ) {
     let has_origin = request.headers().iter().any(|h| h.field.equiv("Origin"));
+    // Origin first, before touching the body.
+    if has_origin {
+        let _ = request.respond(Response::from_string("{}"));
+        return;
+    }
     let (session, _event) = parse_query(url);
     let mut body = String::new();
     let _ = request
@@ -704,8 +709,9 @@ fn handle_ask(
         let _ = app.emit("ask-request", &view);
     }
     let received = rx.recv_timeout(crate::asks::ASK_CEILING).ok();
-    // Forget FIRST, then drain once: a resolve racing the timeout either landed before the
-    // forget (caught by try_recv) or finds nothing and reports false to its card.
+    // Forget FIRST, then drain once. `Asks::resolve` removes + sends under one lock, so a
+    // resolve either completed before the forget (caught by try_recv) or finds nothing and
+    // reports false to its card: the card is never told "answered" when we replied `{}`.
     asks.forget(&id);
     let outcome = crate::asks::pick_outcome(received, rx.try_recv().ok());
     let how = crate::asks::how(&outcome);
@@ -1614,10 +1620,24 @@ mod tests {
         let known = |s: &str| s == "sess-1";
         let body = json!({"tool_name":"AskUserQuestion","tool_use_id":"tu",
             "tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}});
-        assert!(matches!(
-            ask_decision(true, false, Some("sess-1"), &body, known),
-            AskDecision::Hold { .. }
-        ));
+        match ask_decision(true, false, Some("sess-1"), &body, known) {
+            AskDecision::Hold {
+                session,
+                tool_use_id,
+                questions,
+            } => {
+                assert_eq!(session, "sess-1");
+                assert_eq!(tool_use_id, "tu");
+                assert_eq!(questions, body["tool_input"]["questions"]);
+            }
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        let no_id =
+            json!({"tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}});
+        match ask_decision(true, false, Some("sess-1"), &no_id, known) {
+            AskDecision::Hold { tool_use_id, .. } => assert_eq!(tool_use_id, ""),
+            other => panic!("expected Hold, got {other:?}"),
+        }
         assert_eq!(
             ask_decision(true, true, Some("sess-1"), &body, known),
             AskDecision::Skip,
