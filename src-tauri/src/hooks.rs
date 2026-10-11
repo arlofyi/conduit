@@ -25,6 +25,9 @@ use tiny_http::{Method, Request, Response, Server};
 use crate::broker::{Broker, Decision, Presence};
 use crate::hookbus::{HookBus, HookEvent};
 
+/// The verb (and route) of the blocking `AskUserQuestion` hook. See `asks.rs`.
+pub const ASK_VERB: &str = "ask";
+
 /// Holds the port the listener actually bound to, so pty spawns can inject it.
 pub struct HookState {
     pub port: AtomicU16,
@@ -833,7 +836,12 @@ fn entries_for(rows: &[HookRow], port: u16) -> Vec<(&'static str, Vec<Value>)> {
         if let Some(m) = r.matcher {
             entry.insert("matcher".into(), Value::String(m.to_string()));
         }
-        entry.insert("hooks".into(), Value::Array(vec![command(r.verb, port)]));
+        let cmd = if r.verb == ASK_VERB {
+            ask_command(port)
+        } else {
+            command(r.verb, port)
+        };
+        entry.insert("hooks".into(), Value::Array(vec![cmd]));
         match out.iter_mut().find(|(e, _)| *e == r.event) {
             Some((_, v)) => v.push(Value::Object(entry)),
             None => out.push((r.event, vec![Value::Object(entry)])),
@@ -911,6 +919,11 @@ pub fn claude_profile() -> HooksProfile {
                 event: "PreToolUse",
                 matcher: None,
                 verb: "pretool",
+            },
+            HookRow {
+                event: "PreToolUse",
+                matcher: Some("AskUserQuestion"),
+                verb: ASK_VERB,
             },
             HookRow {
                 event: "PreCompact",
@@ -1174,6 +1187,33 @@ fn command(event: &str, port: u16) -> Value {
     json!({ "type": "command", "command": cmd })
 }
 
+/// The blocking `AskUserQuestion` hook. Unlike `command`, its stdout is NOT discarded:
+/// `/ask`'s response body IS the hook output Claude reads (allow + answers, or `{}`).
+/// `-f` makes an HTTP error print nothing, and `|| true` swallows a dead socket, so every
+/// failure reaches Claude as empty output -- the normal menu. `-m` and the entry's
+/// `timeout` are the outer two of the three ceilings `asks.rs` pins.
+fn ask_command(port: u16) -> Value {
+    let max = crate::asks::ASK_CURL_MAX_SECS;
+    #[cfg(windows)]
+    let cmd = {
+        let url = format!("http://127.0.0.1:{port}/ask?session=%CONDUIT_SESSION_ID%");
+        format!(
+            "curl -s -f -m {max} -X POST -H \"Content-Type: application/json\" --data-binary @- \"{url}\" 2>NUL || ver >NUL"
+        )
+    };
+    #[cfg(not(windows))]
+    let cmd = {
+        let url = format!(
+            "http://127.0.0.1:${{CONDUIT_HOOK_PORT:-{port}}}/ask?session=${{CONDUIT_SESSION_ID:-unknown}}"
+        );
+        format!(
+            "[ -n \"$CONDUIT_HOOK_ENDPOINT\" ] && [ -r \"$CONDUIT_HOOK_ENDPOINT\" ] && . \"$CONDUIT_HOOK_ENDPOINT\"; \
+             curl -s -f -m {max} -X POST -H \"Content-Type: application/json\" --data-binary @- \"{url}\" 2>/dev/null || true"
+        )
+    };
+    json!({ "type": "command", "command": cmd, "timeout": crate::asks::ASK_HOOK_TIMEOUT_SECS })
+}
+
 /// Strip any prior Conduit entries (idempotent), then append ours.
 fn merged(existing: Option<&Value>, entries: Vec<Value>) -> Value {
     let mut array: Vec<Value> = existing
@@ -1197,9 +1237,15 @@ fn merged(existing: Option<&Value>, entries: Vec<Value>) -> Value {
 /// `install` replacing them rather than stacking a second copy on upgrade.
 fn is_conduit_entry(entry: &Value) -> bool {
     #[cfg(windows)]
-    const MARKER: &str = "/hook?session=%CONDUIT_SESSION_ID%";
+    const MARKERS: [&str; 2] = [
+        "/hook?session=%CONDUIT_SESSION_ID%",
+        "/ask?session=%CONDUIT_SESSION_ID%",
+    ];
     #[cfg(not(windows))]
-    const MARKER: &str = "/hook?session=${CONDUIT_SESSION_ID";
+    const MARKERS: [&str; 2] = [
+        "/hook?session=${CONDUIT_SESSION_ID",
+        "/ask?session=${CONDUIT_SESSION_ID",
+    ];
 
     entry
         .get("hooks")
@@ -1208,7 +1254,7 @@ fn is_conduit_entry(entry: &Value) -> bool {
             hooks.iter().any(|h| {
                 h.get("command")
                     .and_then(|c| c.as_str())
-                    .map(|c| c.contains(MARKER))
+                    .map(|c| MARKERS.iter().any(|m| c.contains(m)))
                     .unwrap_or(false)
             })
         })
@@ -1489,6 +1535,57 @@ mod tests {
             broker.pending_for("s1").is_empty(),
             "a hook that gave up waiting must not leave a question on screen"
         );
+    }
+
+    #[test]
+    fn claude_profile_installs_a_blocking_ask_row() {
+        let rows = claude_profile().rows;
+        let ask: Vec<_> = rows.iter().filter(|r| r.verb == ASK_VERB).collect();
+        assert_eq!(ask.len(), 1);
+        assert_eq!(ask[0].event, "PreToolUse");
+        assert_eq!(ask[0].matcher, Some("AskUserQuestion"));
+    }
+
+    #[test]
+    fn only_the_ask_entry_carries_a_timeout_and_a_long_curl() {
+        let entries = entries_for(&claude_profile().rows, 8423);
+        let mut asks = 0;
+        for (_event, list) in &entries {
+            for e in list {
+                let h = &e["hooks"][0];
+                let cmd = h["command"].as_str().unwrap();
+                if e["matcher"] == "AskUserQuestion" {
+                    asks += 1;
+                    assert_eq!(h["timeout"], json!(crate::asks::ASK_HOOK_TIMEOUT_SECS));
+                    assert!(cmd.contains(&format!("-m {}", crate::asks::ASK_CURL_MAX_SECS)));
+                    assert!(cmd.contains("/ask?session="));
+                    assert!(cmd.contains(" -f "), "an HTTP error must print nothing");
+                    assert!(
+                        !cmd.contains(" >/dev/null") && !cmd.contains(" >NUL"),
+                        "the response body IS the hook's stdout"
+                    );
+                } else {
+                    assert!(h.get("timeout").is_none(), "no other row grows a timeout");
+                    assert!(cmd.contains("-m 2 "));
+                }
+            }
+        }
+        assert_eq!(asks, 1);
+    }
+
+    #[test]
+    fn reinstall_does_not_duplicate_the_ask_entry() {
+        let dir = fresh_test_dir("ask-idempotent");
+        install(dir.to_str().unwrap(), 8423);
+        install(dir.to_str().unwrap(), 8424);
+        let v = read_settings(&dir);
+        let n = v["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["matcher"] == "AskUserQuestion")
+            .count();
+        assert_eq!(n, 1);
     }
 
     /// A unique, empty temp directory for one test. Removed if a stale copy exists.
