@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { askCardSide, pulsesFor, readPins, writePins, type GraphSnapshot } from "./continuityGraph";
+import { askCardGeometry, askCardSide, pulsesFor, readPins, writePins, type GraphSnapshot } from "./continuityGraph";
 
 const snap: GraphSnapshot = {
   available: true,
@@ -55,5 +55,17 @@ describe("askCardSide", () => {
   });
   it("honours a custom card size", () => {
     expect(askCardSide(me, [{ x: 200, y: 60 }], 100, 220)).toBe("right");
+  });
+});
+
+describe("askCardGeometry", () => {
+  it("keeps the card and tail on the avatar centre for both node sizes", () => {
+    expect(askCardGeometry(72)).toEqual({ top: -6, tail: 36 });
+    expect(askCardGeometry(56)).toEqual({ top: -14, tail: 36 });
+    // The tail's centre (tail + 6) sits at the avatar centre in card coords (size/2 - top).
+    for (const s of [56, 72]) {
+      const g = askCardGeometry(s);
+      expect(g.tail + 6).toBe(s / 2 - g.top);
+    }
   });
 });

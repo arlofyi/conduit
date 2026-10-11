@@ -1,7 +1,7 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { SessionAvatar, type AvatarTone } from "../avatars";
 import { clipSegment, layoutGraph, type Pt } from "../graphLayout";
-import { askCardSide, readPins, writePins, type GraphSnapshot, type Pulse } from "../continuityGraph";
+import { askCardGeometry, askCardSide, readPins, writePins, type GraphSnapshot, type Pulse } from "../continuityGraph";
 import type { PendingAsk } from "../asks";
 import { AskCard } from "./AskCard";
 
@@ -47,6 +47,13 @@ function PulseDot({ path, reverse }: { path: string; reverse: boolean }) {
       />
     </circle>
   );
+}
+
+/** The card's top and tail offsets for an avatar of this size, as the CSS variables the
+ *  `.ask-card.anchored` rules read. */
+function askAnchorStyle(size: number): CSSProperties {
+  const g = askCardGeometry(size);
+  return { "--ask-top": `${g.top}px`, "--ask-tail": `${g.tail}px` } as CSSProperties;
 }
 
 /** DOM + SVG only — no terminals live here, so scale() is safe (crisp vectors) and none of
@@ -211,8 +218,10 @@ export function ContinuityGraph({
                   className="anchored"
                   side={askCardSide(
                     p,
-                    snap.nodes.filter((o) => o.key !== n.key && pos[o.key]).map((o) => pos[o.key]),
+                    // Only nodes actually drawn: a snapshot row without a view has no avatar to cover.
+                    snap.nodes.filter((o) => o.key !== n.key && views[o.key] && pos[o.key]).map((o) => pos[o.key]),
                   )}
+                  style={askAnchorStyle(n.visitor ? 56 : 72)}
                   keyboard
                 />
               )}

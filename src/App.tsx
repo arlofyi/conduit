@@ -53,6 +53,9 @@ import { useHotExit } from "./hooks/useHotExit";
 import { useStoreSync } from "./hooks/useStoreSync";
 import { initPlugins, feedHook, feedFleet } from "./plugins";
 
+/** How long an answered question card stays up showing its done state. */
+const ASK_DONE_HOLD_MS = 1600;
+
 interface HookPayload {
   session: string;
   event: string;
@@ -914,7 +917,10 @@ export default function App() {
     const un2 = listen<{ id: string; how: string }>("ask-resolved", ({ payload }) => {
       const s = useStore.getState();
       const a = s.asks[payload.id];
-      s.removeAsk(payload.id);
+      // An answer from a card: Rust resolves before the card's own ask_answer reply lands,
+      // so hold the card long enough for its "Sent to …" confirmation to be seen.
+      if (payload.how === "answered") setTimeout(() => useStore.getState().removeAsk(payload.id), ASK_DONE_HOLD_MS);
+      else s.removeAsk(payload.id);
       handedOff.delete(payload.id);
       if (a && payload.how !== "answered") s.pushToast("Question moved to the session's terminal");
     });

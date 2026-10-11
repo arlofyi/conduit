@@ -82,3 +82,11 @@ export function askCardSide(node: Pt, others: Pt[], cardW = 300, cardH = 220): "
   const left = inside(node.x - ASK_CARD_GAP - cardW);
   return left < right ? "left" : "right";
 }
+
+/** Where an anchored card and its tail sit, in px, for an avatar of `size`. The node box's
+ *  top edge is the avatar's top (it is translated up by size/2), so the card's top is
+ *  `size/2 - ASK_CARD_TOP` and the 12px tail is centred ASK_CARD_TOP below the card's top —
+ *  on the avatar centre whatever the node's size (visitors are 56px, members 72px). */
+export function askCardGeometry(size: number): { top: number; tail: number } {
+  return { top: size / 2 - ASK_CARD_TOP, tail: ASK_CARD_TOP - 6 };
+}

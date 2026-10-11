@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useStore } from "../store";
 import { answerSummary, buildAnswers, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "../asks";
@@ -28,6 +28,7 @@ export function AskCard({
   className = "",
   side,
   keyboard = false,
+  style,
 }: {
   ask: PendingAsk;
   sessionName: string;
@@ -36,6 +37,8 @@ export function AskCard({
   side?: "right" | "left";
   /** Also answer keys sent to the window, while this is the only card visible. */
   keyboard?: boolean;
+  /** Anchor geometry (`--ask-top` / `--ask-tail`) from the node that carries the card. */
+  style?: CSSProperties;
 }) {
   const [page, setPage] = useState(0);
   const [picks, setPicks] = useState<Record<string, string[]>>({});
@@ -180,8 +183,14 @@ export function AskCard({
   useEffect(() => {
     if (!keyboard) return;
     const k = (e: KeyboardEvent) => {
-      if (e.defaultPrevented) return;
+      if (e.defaultPrevented || e.repeat) return;
       if (rootRef.current?.contains(e.target as Node)) return; // the card's own handler has it
+      // Only a keystroke aimed at nothing in particular — the page itself or the graph. A
+      // focused button, menu or drawer control owns its Enter/Space/arrows; sending an
+      // answer from one would be an irreversible surprise.
+      const t = e.target as Element | null;
+      const onGraph = !!t?.closest?.(".cgraph") && !t.closest(".session-drawer");
+      if (t !== document.body && !onGraph) return;
       if (blocksGlobalShortcut(e.target)) return;
       if (document.querySelectorAll(".ask-card").length !== 1) return;
       if (keyRef.current(e)) e.preventDefault();
@@ -307,6 +316,7 @@ export function AskCard({
   return (
     <div
       ref={rootRef}
+      style={style}
       className={`ask-card ${className} ${side ?? ""} ${state === "done" ? "done" : ""}`}
       role="group"
       aria-label={`${sessionName} asks: ${q.question}`}

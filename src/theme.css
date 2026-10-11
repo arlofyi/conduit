@@ -6015,11 +6015,13 @@ input[type="number"]:focus {
 .ask-card:focus { outline: none; }
 .ask-card:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent); outline-offset: 2px; }
 .ask-card :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.ask-card.anchored { position: absolute; top: -6px; left: calc(50% + 50px); z-index: 3; }
+/* --ask-top / --ask-tail come from the node (askCardGeometry): a visitor's avatar is smaller,
+   so the card and its tail sit relative to THAT avatar's centre. */
+.ask-card.anchored { position: absolute; top: var(--ask-top, -6px); left: calc(50% + 50px); z-index: 3; }
 .ask-card.anchored.left { left: auto; right: calc(50% + 50px); }
 /* The tail: a rotated square in the card's own fill, pointing back at the avatar. */
 .ask-card.right::before, .ask-card.left::before {
-  content: ""; position: absolute; top: 34px; width: 12px; height: 12px; background: inherit;
+  content: ""; position: absolute; top: var(--ask-tail, 34px); width: 12px; height: 12px; background: inherit;
   border: 1px solid var(--ask-edge); transform: rotate(45deg);
 }
 .ask-card.right::before { left: -7px; border-top: 0; border-right: 0; }
@@ -6097,5 +6099,6 @@ input[type="number"]:focus {
 .session-drawer-note { padding: 16px; color: var(--text-mid); font-size: 13px; }
 .session-drawer-facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; padding: 16px; font-size: 13px; }
 .session-drawer-facts dt { color: var(--text-mid); }
-@keyframes ask-pop { from { opacity: 0; transform: translateY(4px) scale(0.98); filter: blur(2px); } to { opacity: 1; transform: none; filter: none; } }
+/* No filter here: in WKWebView a filter in these keyframes left the card unpainted. */
+@keyframes ask-pop { from { opacity: 0; transform: translateY(4px) scale(0.98); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .ask-card { animation: none; } .cgraph-pulse { display: none; } }
