@@ -1560,10 +1560,19 @@ mod tests {
                     assert!(cmd.contains(&format!("-m {}", crate::asks::ASK_CURL_MAX_SECS)));
                     assert!(cmd.contains("/ask?session="));
                     assert!(cmd.contains(" -f "), "an HTTP error must print nothing");
+                    #[cfg(not(windows))]
                     assert!(
-                        !cmd.contains(" >/dev/null") && !cmd.contains(" >NUL"),
+                        !cmd.contains(" >/dev/null"),
                         "the response body IS the hook's stdout"
                     );
+                    #[cfg(windows)]
+                    {
+                        assert!(
+                            !cmd.contains("\" >NUL"),
+                            "the response body IS the hook's stdout"
+                        );
+                        assert!(cmd.contains("\" 2>NUL"));
+                    }
                 } else {
                     assert!(h.get("timeout").is_none(), "no other row grows a timeout");
                     assert!(cmd.contains("-m 2 "));
