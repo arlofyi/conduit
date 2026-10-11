@@ -279,14 +279,18 @@ export default function App() {
       // accelerator wired yet, so handled here like the other window-level shortcuts).
       if (e.shiftKey && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "b") {
         const st = useStore.getState();
-        if (!st.selectedProjectId) return;
+        if (!st.selectedProjectId || !st.boardEnabled) return;
         e.preventDefault();
+        // setCenterMode also closes the global canvas (three-way exclusion).
         st.toggleCenterMode(st.selectedProjectId);
-        // The canvas is a global flag independent of this project's centerMode (see the
-        // tab-click handler in WorkspaceCenter.tsx, which does the same) -- closing it
-        // here is what makes the board and the canvas mutually exclusive in BOTH
-        // directions, not just the direction the board overlay's own render gate covers.
-        st.setCanvasOpen(false);
+      }
+      // ⇧⌘K: toggle the Continuity view for the selected project.
+      if (e.shiftKey && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "k") {
+        const st = useStore.getState();
+        if (!st.selectedProjectId || !st.continuityViewEnabled) return;
+        e.preventDefault();
+        st.toggleCenterMode(st.selectedProjectId, "continuity");
+        return;
       }
       // ⇧⌘C: toggle the global canvas. Unlike ⇧⌘B above, this needs no selected project —
       // the canvas is global — and no native menu accelerator claims CmdOrCtrl+Shift+C
@@ -308,6 +312,8 @@ export default function App() {
       if (e.shiftKey && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "c") {
         const isMac = /Mac|iPhone|iPod|iPad/i.test(navigator.platform || navigator.userAgent);
         if (isInTerminal(e.target) ? !isMac : isEditableTarget(e.target)) return;
+        // Canvas pref off: inert (leave the key to the terminal / default behaviour).
+        if (!useStore.getState().canvasEnabled) return;
         e.preventDefault();
         const s = useStore.getState();
         s.setCanvasOpen(!s.canvasOpen);
@@ -637,7 +643,7 @@ export default function App() {
           if (st.selectedProjectId) st.toggleMaximizeGroup(st.selectedProjectId);
           break;
         case "toggle-board":
-          if (st.selectedProjectId) st.toggleCenterMode(st.selectedProjectId);
+          if (st.selectedProjectId && st.boardEnabled) st.toggleCenterMode(st.selectedProjectId);
           break;
         case "command-palette":
           setPalette("commands");

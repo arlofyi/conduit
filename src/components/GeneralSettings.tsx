@@ -97,6 +97,12 @@ export function GeneralSettings() {
   const tmuxSupported = useStore((s) => s.tmuxSupported);
   const richSessionView = useStore((s) => s.richSessionView);
   const setRichSessionView = useStore((s) => s.setRichSessionView);
+  const continuityViewEnabled = useStore((s) => s.continuityViewEnabled);
+  const setContinuityViewEnabled = useStore((s) => s.setContinuityViewEnabled);
+  const canvasEnabled = useStore((s) => s.canvasEnabled);
+  const setCanvasEnabled = useStore((s) => s.setCanvasEnabled);
+  const boardEnabled = useStore((s) => s.boardEnabled);
+  const setBoardEnabled = useStore((s) => s.setBoardEnabled);
   const autoProjectColors = useStore((s) => s.autoProjectColors);
   const setAutoProjectColors = useStore((s) => s.setAutoProjectColors);
   const profileWindowMode = useStore((s) => s.profileWindowMode);
@@ -208,6 +214,28 @@ export function GeneralSettings() {
         checked={richSessionView}
         onChange={setRichSessionView}
         detail="Adds a Chat button to each session tab that renders the conversation as messages and tool cards instead of terminal output, with a proper input box. The terminal keeps running underneath the whole time and is one click away; nothing is regenerated or summarized, so it costs no tokens. Claude sessions only, since it reads Claude’s transcript."
+      />
+
+      <SettingRow
+        id="continuity-view"
+        title="Continuity view"
+        checked={continuityViewEnabled}
+        onChange={setContinuityViewEnabled}
+        detail="A live map of this project's sessions: who is messaging whom through Continuity, and any question a Claude session is waiting on you to answer. ⇧⌘K. Off = the view and its question cards are hidden, and questions appear in the terminal as usual."
+      />
+      <SettingRow
+        id="canvas-enabled"
+        title="Canvas"
+        checked={canvasEnabled}
+        onChange={setCanvasEnabled}
+        detail="The global board you arrange sessions on by hand (⇧⌘C). Off hides its button, shortcut and palette entry. Your board is kept and comes back when you turn this on."
+      />
+      <SettingRow
+        id="board-enabled"
+        title="Task board"
+        checked={boardEnabled}
+        onChange={setBoardEnabled}
+        detail="The per-project Kanban backed by .conduit/ files (⇧⌘B). Off hides its button, shortcut and palette entry. Cards are kept and come back when you turn this on."
       />
 
       <SettingRow
