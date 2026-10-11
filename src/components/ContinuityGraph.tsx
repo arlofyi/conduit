@@ -66,12 +66,21 @@ export function ContinuityGraph({
   views,
   pulses,
   onOpen,
+  focusKey = null,
+  focusSeq = 0,
+  hidden = false,
 }: {
   projectId: string;
   snap: GraphSnapshot;
   views: Record<string, NodeView>;
   pulses: Pulse[];
   onOpen: (key: string) => void;
+  /** Node to centre and ring; `focusSeq` changes on every request so a repeat click on the
+   *  same avatar focuses again. */
+  focusKey?: string | null;
+  focusSeq?: number;
+  /** Kept mounted behind a table tab so pins, pan and zoom survive the switch. */
+  hidden?: boolean;
 }) {
   const [pins, setPins] = useState(() => readPins(projectId));
   useEffect(() => setPins(readPins(projectId)), [projectId]);
@@ -102,6 +111,30 @@ export function ContinuityGraph({
   const reduced =
     typeof window !== "undefined" && !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
+  // Focus: pan so the node's centre lands on the viewport centre (the layer's origin), glide
+  // there and ring it for 1.2 s. Under reduced motion the jump is instant and unringed.
+  const [ring, setRing] = useState<string | null>(null);
+  const [gliding, setGliding] = useState(false);
+  useEffect(() => {
+    if (!focusKey) return;
+    const p = pos[focusKey];
+    if (!p) return;
+    setPan({ x: -p.x * zoom, y: -p.y * zoom });
+    if (reduced) return;
+    setGliding(true);
+    setRing(focusKey);
+    const t1 = setTimeout(() => setGliding(false), 400);
+    const t2 = setTimeout(() => setRing(null), 1200);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      setGliding(false);
+      setRing(null);
+    };
+    // Only a new request moves the camera — not a relayout or a zoom.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSeq]);
+
   const quietBefore = new Date(Date.now() - QUIET_AFTER_MS).toISOString();
   const radiusOf = (key: string) => (snap.nodes.find((n) => n.key === key)?.visitor ? 32 : 40);
   const pathOf = (a: string, b: string) => {
@@ -126,6 +159,7 @@ export function ContinuityGraph({
   return (
     <div
       className="cgraph"
+      hidden={hidden}
       onPointerDown={(e) => {
         if ((e.target as HTMLElement).closest(".cgraph-node, .ask-card")) return;
         drag.current = { kind: "pan", sx: e.clientX, sy: e.clientY, ox: pan.x, oy: pan.y, moved: false };
@@ -162,7 +196,7 @@ export function ContinuityGraph({
       onWheel={(e) => setZoom((z) => Math.min(2, Math.max(0.4, z * (e.deltaY > 0 ? 0.92 : 1.08))))}
     >
       <div
-        className="cgraph-layer"
+        className={`cgraph-layer ${gliding ? "gliding" : ""}`}
         style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
       >
         <svg className="cgraph-edges" overflow="visible">
@@ -190,7 +224,7 @@ export function ContinuityGraph({
           return (
             <div
               key={n.key}
-              className={`cgraph-node ${n.visitor ? "visitor" : ""}`}
+              className={`cgraph-node ${n.visitor ? "visitor" : ""} ${ring === n.key ? "focus-ring" : ""}`}
               style={{ left: p.x, top: p.y }}
               onPointerDown={(e) => {
                 if ((e.target as HTMLElement).closest(".ask-card")) return;
@@ -222,7 +256,7 @@ export function ContinuityGraph({
                     snap.nodes.filter((o) => o.key !== n.key && views[o.key] && pos[o.key]).map((o) => pos[o.key]),
                   )}
                   style={askAnchorStyle(n.visitor ? 56 : 72)}
-                  keyboard
+                  keyboard={!hidden}
                 />
               )}
             </div>

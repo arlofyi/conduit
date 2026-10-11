@@ -5974,8 +5974,15 @@ input[type="number"]:focus {
 /* ---- Continuity view ---- */
 .continuity-view { position: absolute; inset: 0; display: flex; flex-direction: column; background: var(--panel-bg); }
 .continuity-tabs { display: flex; align-items: center; gap: 8px; height: 38px; flex: none; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--sidebar-bg); }
-.continuity-tab { padding: 4px 10px; border-radius: 6px; color: var(--text-mid); font-size: 13px; cursor: pointer; }
+.continuity-tab {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--text-mid); font: 13px var(--ui-font); cursor: pointer;
+}
+.continuity-tab:hover { color: var(--text-bright); }
 .continuity-tab.on { background: var(--selection-bg); color: var(--text-bright); }
+.continuity-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.continuity-tab-count { color: var(--text-mid); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.continuity-tab.on .continuity-tab-count { color: var(--accent); }
 .continuity-unavail { margin-left: auto; font-size: 10.5px; color: var(--text-mid); }
 .continuity-empty { position: absolute; inset: 38px 0 0; display: grid; place-items: center; color: var(--text-mid); pointer-events: none; }
 .cgraph {
@@ -5987,6 +5994,93 @@ input[type="number"]:focus {
   background-size: 24px 24px;
 }
 .cgraph:active { cursor: grabbing; }
+.cgraph[hidden] { display: none; }
+.cgraph-layer.gliding { transition: transform 0.38s cubic-bezier(0.2, 0.7, 0.2, 1); }
+.cgraph-node.focus-ring .session-avatar::after {
+  content: ""; position: absolute; inset: -7px; border-radius: 32%; pointer-events: none;
+  border: 2px solid var(--accent); animation: cgraph-focus 1.2s ease-out forwards;
+}
+@keyframes cgraph-focus {
+  0% { opacity: 0; transform: scale(0.86); }
+  18% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1.18); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cgraph-layer.gliding { transition: none; }
+  .cgraph-node.focus-ring .session-avatar::after { display: none; }
+}
+
+/* ---- Continuity view: service tables ---- */
+.ctable-wrap { flex: 1; min-height: 0; overflow: auto; }
+.ctable-state { display: grid; place-items: center; height: 100%; min-height: 160px; color: var(--text-mid); font-size: 13px; }
+.ctable { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ctable th {
+  text-align: left; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-mid); padding: 8px 12px; border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 1; background: var(--panel-bg); white-space: nowrap;
+}
+.ctable td { padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--text-bright); vertical-align: top; }
+.ctable th:first-child, .ctable td:first-child { padding-left: 20px; }
+.ctable th:last-child, .ctable td:last-child { padding-right: 20px; }
+.ctable tbody tr:hover td { background: var(--hover); }
+.ctable tr.muted td { color: var(--text-mid); }
+.ctable tr.muted .ctable-key { color: var(--text-mid); }
+.ctable tr.collision td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
+.ctable-main { max-width: 0; width: 38%; }
+.ctable-key { font-family: var(--mono-font); font-size: 12px; color: var(--text-bright); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctable-sub { margin-top: 2px; color: var(--text-mid); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctable-dim { color: var(--text-mid); }
+.ctable-none { color: var(--text-dim); }
+.ctable-mono { font-family: var(--mono-font); font-size: 12px; white-space: nowrap; }
+.ctable-num, .ctable-when { font-variant-numeric: tabular-nums; color: var(--text-mid); white-space: nowrap; }
+.ctable-num.warn { color: var(--amber); }
+.ctable-chain { font-family: var(--mono-font); font-size: 11.5px; color: var(--text-mid); max-width: 260px; overflow-wrap: anywhere; }
+.ctable-prose { max-width: 0; width: 30%; color: var(--text-mid); }
+.ctable-clamp2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-line; line-height: 1.45; }
+.ctable-path { max-width: 0; width: 55%; overflow: hidden; text-overflow: ellipsis; }
+.ctable-collide {
+  margin-left: 10px; padding: 1px 7px; border-radius: 9px; font: 11px var(--ui-font); font-variant-numeric: tabular-nums;
+  color: var(--amber); background: color-mix(in srgb, var(--amber) 14%, transparent);
+}
+.ctable-payload { max-width: 0; width: 55%; color: var(--text-mid); overflow: hidden; text-overflow: ellipsis; }
+.ctable-pair { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.ctable-arrow { color: var(--text-dim); }
+.ctable-stack { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+/* A session is its avatar + name; clicking it shows that node on the graph. */
+.ctable-who {
+  display: inline-flex; align-items: center; gap: 7px; max-width: 200px; padding: 2px 6px 2px 2px; margin: -2px 0;
+  border: 0; border-radius: 7px; background: transparent; color: var(--text-bright); font: 13px var(--ui-font);
+  cursor: pointer; text-align: left;
+}
+.ctable-who:hover { background: var(--selection-bg); }
+.ctable-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ctable-who.unknown { cursor: default; color: var(--text-mid); }
+.ctable-who.unknown:hover { background: transparent; }
+.ctable-who-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctable-who .session-avatar { border-width: 1.5px; box-shadow: none; animation: none; }
+.ctable-who .session-avatar-chip { width: 7px; height: 7px; right: -3px; bottom: -3px; border-width: 1.5px; border-radius: 2px; }
+.ctable-anon {
+  display: grid; place-items: center; flex: none; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--selection-bg); border: 1.5px solid var(--border); color: var(--text-mid);
+  font: 600 9.5px var(--mono-font); text-transform: lowercase;
+}
+.ctable-status { display: inline-flex; align-items: center; gap: 6px; color: var(--text-mid); white-space: nowrap; }
+.ctable-status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); }
+.ctable-status.s-active::before, .ctable-status.s-claimed::before, .ctable-status.s-in_progress::before { background: var(--green); }
+.ctable-status.s-active, .ctable-status.s-claimed, .ctable-status.s-in_progress { color: var(--text-bright); }
+.ctable-status.s-pending::before, .ctable-status.s-pr_open::before { background: var(--amber); }
+.ctable-status.s-pending, .ctable-status.s-pr_open { color: var(--amber); }
+.ctable-status.s-accepted::before { background: var(--accent); }
+.ctable-type, .ctable-chip {
+  display: inline-block; padding: 1px 8px; border-radius: 9px; font: 11.5px var(--mono-font); white-space: nowrap;
+  color: var(--text-mid); background: var(--selection-bg);
+}
+.ctable-filters { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 20px 10px; border-bottom: 1px solid var(--border); }
+.ctable-chip { border: 1px solid transparent; cursor: pointer; padding: 3px 10px; }
+.ctable-chip:hover { color: var(--text-bright); }
+.ctable-chip.on { color: var(--text-bright); border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: color-mix(in srgb, var(--accent) 14%, var(--selection-bg)); }
+.ctable-chip.clear { background: transparent; font-family: var(--ui-font); }
+.ctable-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 /* left/top 50% centres world 0,0; the inline transform carries pan + zoom only. */
 .cgraph-layer { position: absolute; left: 50%; top: 50%; width: 0; height: 0; transform-origin: 0 0; }
 .cgraph-edges { position: absolute; left: 0; top: 0; width: 1px; height: 1px; overflow: visible; }

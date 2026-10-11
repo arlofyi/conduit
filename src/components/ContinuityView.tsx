@@ -1,10 +1,22 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useStore, findSession } from "../store";
 import { resolveProjectColor } from "../layout";
 import type { AvatarTone } from "../avatars";
 import { useContinuityGraph } from "../hooks/useContinuityGraph";
 import { ContinuityGraph, type NodeView } from "./ContinuityGraph";
 import { SessionDrawer } from "./SessionDrawer";
+import { ContinuityTables } from "./ContinuityTables";
+import { useContinuityTables } from "../hooks/useContinuityTables";
+import { tabCount, type ServiceTab, type TableTab } from "../continuityTables";
+
+const TABS: { id: TableTab; label: string }[] = [
+  { id: "graph", label: "Graph" },
+  { id: "decisions", label: "Decisions" },
+  { id: "handoffs", label: "Handoffs" },
+  { id: "tasks", label: "Tasks" },
+  { id: "files", label: "Files" },
+  { id: "activity", label: "Activity" },
+];
 
 /** The per-project Continuity overlay. Renders over still-mounted terminals, like the
  *  task board. Read-only toward continuity; the only action is answering a question. */
@@ -17,11 +29,20 @@ export function ContinuityView({ projectId }: { projectId: string }) {
   const autoColors = useStore((s) => s.autoProjectColors);
   const [open, setOpen] = useState<string | null>(null);
   const setRendered = useStore((s) => s.setContinuityRendered);
+  const [tab, setTab] = useState<TableTab>("graph");
+  const [focus, setFocus] = useState<{ key: string | null; seq: number }>({ key: null, seq: 0 });
+  const { data, now } = useContinuityTables(projectId, tab);
+  useEffect(() => setTab("graph"), [projectId]);
+  const focusNode = useCallback((key: string) => {
+    setTab("graph");
+    setFocus((f) => ({ key, seq: f.seq + 1 }));
+  }, []);
 
   // Publish which sessions this view draws, so the dock covers every ask it does not
   // (another project's session, or one absent from the snapshot — incl. EMPTY_SNAPSHOT
   // right after opening). Cleared on close so the dock falls back to showing everything.
-  const renderedSig = snap.nodes
+  // Behind a table tab the graph's cards are hidden, so it draws nothing for the dock to skip.
+  const renderedSig = tab !== "graph" ? "" : snap.nodes
     .map((n) => n.conduitSessionId)
     .filter((x): x is string => !!x)
     .sort()
@@ -92,14 +113,44 @@ export function ContinuityView({ projectId }: { projectId: string }) {
 
   return (
     <div className="continuity-view">
-      <div className="continuity-tabs">
-        <span className="continuity-tab on">Graph</span>
-        {!snap.available && (
+      <nav className="continuity-tabs" aria-label="Continuity">
+        {TABS.map((t) => {
+          const v = t.id === "graph" ? undefined : data[t.id];
+          const n = v?.available ? tabCount(t.id as ServiceTab, v.rows) : null;
+          return (
+            <button
+              key={t.id}
+              type="button"
+              className={`continuity-tab ${tab === t.id ? "on" : ""}`}
+              aria-current={tab === t.id ? "page" : undefined}
+              onClick={() => setTab(t.id)}
+            >
+              {t.label}
+              {n ? <span className="continuity-tab-count">{n}</span> : null}
+            </button>
+          );
+        })}
+        {!snap.available && tab === "graph" && (
           <span className="continuity-unavail">Continuity isn't running for this project — showing sessions only.</span>
         )}
-      </div>
-      <ContinuityGraph projectId={projectId} snap={snap} views={views} pulses={pulses} onOpen={setOpen} />
-      {snap.nodes.length === 0 && <div className="continuity-empty">No sessions in this project yet.</div>}
+      </nav>
+      {/* The graph stays mounted behind the tables so pins, pan and zoom survive a tab switch. */}
+      <ContinuityGraph
+        projectId={projectId}
+        snap={snap}
+        views={views}
+        pulses={pulses}
+        onOpen={setOpen}
+        focusKey={focus.key}
+        focusSeq={focus.seq}
+        hidden={tab !== "graph"}
+      />
+      {tab === "graph" && snap.nodes.length === 0 && (
+        <div className="continuity-empty">No sessions in this project yet.</div>
+      )}
+      {tab !== "graph" && (
+        <ContinuityTables tab={tab} data={data} snap={snap} views={views} now={now} onFocusNode={focusNode} />
+      )}
       {open && (
         <SessionDrawer
           projectId={projectId}
