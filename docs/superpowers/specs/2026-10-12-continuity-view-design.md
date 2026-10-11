@@ -91,9 +91,20 @@ Spike, interactive TUI under tmux (memory `conduit-askuserquestion-hook-answer`)
   `options[{label,description}]`, `multiSelect`).
 - `claude -p` does not expose the tool — root chats and `-p` titlers are unaffected.
 
-Not yet pinned (plan task, before UI work): answer format for `multiSelect` (expected:
-labels joined with `, `) and multiple questions in one call (expected: one `answers` key per
-question text). If either fails, the card hands those shapes off to the terminal rather than guess.
+Pinned (Task 1 probe, `claude --version` = 2.1.293 (Claude Code)): both previously open shapes
+work. One AskUserQuestion call with two questions (a `multiSelect` one and a single-select one),
+answered by a PreToolUse hook returning `answers` = `{"Pick fruits": "Apple, Banana", "Pick a color": "Red"}`
+(multiSelect labels joined with `, `, one key per question text), showed no menu and rendered:
+
+```
+User answered Claude's questions:
+  · Pick fruits → Apple, Banana
+  · Pick a color → Red
+Q1=Apple, Banana Q2=Red
+```
+
+Constants: `MULTISELECT_ANSWERS_SUPPORTED = true`, `MULTISELECT_JOIN = ", "`,
+`MULTI_QUESTION_SUPPORTED = true` (`src/askProtocol.ts`).
 
 ### 5.2 Hook install
 
