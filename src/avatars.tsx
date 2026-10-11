@@ -69,7 +69,8 @@ const ART: Record<Animal, JSX.Element> = {
   ),
   panda: (
     <>
-      <circle cx="17" cy="19" r="8" fill="#2b2826" /><circle cx="47" cy="19" r="8" fill="#2b2826" />
+      {/* A light rim: the ears are near-black and would vanish into the dark tile. */}
+      <circle cx="17" cy="19" r="8" fill="#2b2826" stroke="#5e574f" strokeWidth={1.2} /><circle cx="47" cy="19" r="8" fill="#2b2826" stroke="#5e574f" strokeWidth={1.2} />
       <circle cx="32" cy="36" r="19" fill="#ece7e1" />
       <ellipse cx="24.5" cy="34" rx="5" ry="6" fill="#2b2826" transform="rotate(-20 24.5 34)" />
       <ellipse cx="39.5" cy="34" rx="5" ry="6" fill="#2b2826" transform="rotate(20 39.5 34)" />
