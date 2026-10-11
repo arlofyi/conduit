@@ -25,6 +25,7 @@ mod continuity_feed;
 mod continuity_fixture;
 mod continuity_graph;
 mod continuity_read;
+mod continuity_tables;
 mod continuity_watch;
 mod conversation_repair;
 mod fleet;
@@ -1623,6 +1624,29 @@ fn continuity_graph(
     )
 }
 
+/// Rows for one Continuity-view table tab (decisions / handoffs / tasks / files / activity),
+/// scoped exactly like the feed. Best-effort -- see `continuity_tables::tables_from_db`.
+#[tauri::command]
+fn continuity_tables(
+    store: State<Arc<Store>>,
+    project_id: String,
+    tab: String,
+) -> continuity_tables::TablesView {
+    let Some(project) = store.list().into_iter().find(|p| p.id == project_id) else {
+        return continuity_tables::TablesView {
+            tab,
+            ..Default::default()
+        };
+    };
+    let session_ids: Vec<String> = project.sessions.iter().map(|s| s.id.clone()).collect();
+    continuity_tables::tables_from_db(
+        &continuity_read::db_path(),
+        &session_ids,
+        &project_toplevels(&project),
+        &tab,
+    )
+}
+
 /// Read-only continuity feed for a project: the decisions and messages recorded by the
 /// sessions that belong to it. Scoped by Conduit session id (exact) plus the git toplevel
 /// of the project and each of its worktrees (for sessions started outside Conduit).
@@ -2945,6 +2969,7 @@ pub fn run() {
             list_continuity,
             continuity_feed,
             continuity_graph,
+            continuity_tables,
             ask_answer,
             ask_handoff,
             ask_pending,
