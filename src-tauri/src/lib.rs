@@ -21,7 +21,10 @@ mod commandcode_usage;
 mod context_window;
 mod continuity;
 mod continuity_feed;
+#[cfg(test)]
+mod continuity_fixture;
 mod continuity_read;
+mod continuity_watch;
 mod conversation_repair;
 mod fleet;
 mod fleet_mcp;
@@ -2709,6 +2712,7 @@ pub fn run() {
                 ask_gate,
             );
             bridge::start(app.handle().clone());
+            continuity_watch::start(app.handle().clone());
 
             // IDE announce: hand the host to the PTY manager (teardown needs it) and
             // sweep OUR stale lock files — every lock dir Conduit could have written

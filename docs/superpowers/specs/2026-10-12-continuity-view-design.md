@@ -178,12 +178,13 @@ One app-wide thread (started in `lib.rs` setup) with a read-only connection to
 `continuity_read::db_path()`:
 - Every 500 ms read `PRAGMA data_version`. Unchanged → sleep. (SQLite bumps it only on a
   commit by **another** connection, i.e. Continuity.)
-- Changed → read rows newer than per-table cursors `(created_at|touched_at|last_seen_at, id)`
-  for `messages`, `decisions`, `handoffs`, `task_claims`, `file_activity`, `agent_sessions`.
-  Timestamps are ISO-8601 `…Z` strings, so text comparison orders them; `id` breaks ties.
-- Emit **`continuity-changed`** `{ tables: [...], messages: [{id, from, to, kind, createdAt}] }`
-  — the message rows are tiny (~170/h across all projects) and are what pulses need with no
-  extra round-trip. Everything else is only "this table changed".
+- Changed → read `messages` newer than a single `(created_at, id)` cursor (ISO-8601 `…Z`
+  strings order as text; `id` breaks ties). Only `messages` has a cursor: only a NEW message
+  becomes a pulse, and a cursor on update-heavy tables (`agent_sessions.last_seen_at`, a
+  handoff's status) cannot be one monotonic column.
+- Emit **`continuity-changed`** `{ messages: [{id, from, to, kind, createdAt}] }` on EVERY
+  observed commit, possibly with zero messages — consumers refetch on it. (Deliberately no
+  per-table list; the message rows are tiny, ~170/h across all projects.)
 - Missing DB / schema drift / open failure → back off to a 10 s retry, emit nothing; the view
   shows its existing "Continuity unavailable" state. Never panics, never writes.
 - On first start, cursors initialise to "now" (no pulse storm for history).
