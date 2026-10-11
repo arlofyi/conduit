@@ -54,9 +54,20 @@ export function ContinuityView({ projectId }: { projectId: string }) {
             : status === "running"
               ? "running"
               : "idle";
+      // A Continuity-only row inside this project's checkout: not a Conduit session, not a
+      // visitor. Its raw label is machine-made (`conduit-8e755e`), so name it plainly.
+      const unmatched = !sid && !n.visitor;
+      const focusLine = (n.focus ?? "").split("\n")[0].trim();
+      const unmatchedMeta = focusLine
+        ? focusLine.length > 40
+          ? `${focusLine.slice(0, 39)}…`
+          : focusLine
+        : n.status;
       const meta = ask
         ? "waiting on you"
-        : n.visitor
+        : unmatched
+          ? unmatchedMeta
+          : n.visitor
           ? `visitor · ${visitorProject?.name ?? found?.project.name ?? "other checkout"}`
           : session?.stopped
             ? "stopped"
@@ -67,8 +78,9 @@ export function ContinuityView({ projectId }: { projectId: string }) {
                 : n.status;
       out[n.key] = {
         key: n.key,
-        name: session?.name ?? n.label,
+        name: unmatched ? "Terminal session" : (session?.name ?? n.label),
         meta,
+        title: unmatched ? n.label : undefined,
         tone,
         chip: visitorProject ? resolveProjectColor(visitorProject.id, visitorProject.color, autoColors) : null,
         badge: snap.unanswered[n.key] ?? 0,

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { SessionAvatar, type AvatarTone } from "../avatars";
-import { layoutGraph, type Pt } from "../graphLayout";
+import { clipSegment, layoutGraph, type Pt } from "../graphLayout";
 import { readPins, writePins, type GraphSnapshot, type Pulse } from "../continuityGraph";
 import type { PendingAsk } from "../asks";
 import { AskCard } from "./AskCard";
@@ -9,6 +9,8 @@ export type NodeView = {
   key: string;
   name: string;
   meta: string;
+  /** Avatar tooltip when it should differ from the name (e.g. a raw continuity label). */
+  title?: string;
   tone: AvatarTone;
   chip: string | null;
   badge: number;
@@ -94,15 +96,24 @@ export function ContinuityGraph({
     typeof window !== "undefined" && !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
   const quietBefore = new Date(Date.now() - QUIET_AFTER_MS).toISOString();
+  const radiusOf = (key: string) => (snap.nodes.find((n) => n.key === key)?.visitor ? 32 : 40);
   const pathOf = (a: string, b: string) => {
     const p = pos[a],
       q = pos[b];
     if (!p || !q) return "";
-    const mx = (p.x + q.x) / 2,
-      my = (p.y + q.y) / 2;
-    const nx = -(q.y - p.y) * 0.15,
-      ny = (q.x - p.x) * 0.15;
-    return `M${p.x} ${p.y} Q${mx + nx} ${my + ny} ${q.x} ${q.y}`;
+    const seg = clipSegment(p, q, radiusOf(a), radiusOf(b));
+    if (!seg) return "";
+    const mx = (seg.a.x + seg.b.x) / 2,
+      my = (seg.a.y + seg.b.y) / 2;
+    // Bend perpendicular to the line, to the side with negative y (away from the labels,
+    // which sit below each avatar).
+    let nx = -(seg.b.y - seg.a.y) * 0.15,
+      ny = (seg.b.x - seg.a.x) * 0.15;
+    if (ny > 0 || (ny === 0 && nx > 0)) {
+      nx = -nx;
+      ny = -ny;
+    }
+    return `M${seg.a.x} ${seg.a.y} Q${mx + nx} ${my + ny} ${seg.b.x} ${seg.b.y}`;
   };
 
   return (
@@ -148,14 +159,17 @@ export function ContinuityGraph({
         style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
       >
         <svg className="cgraph-edges" overflow="visible">
-          {snap.edges.map((e) => (
-            <path
-              key={`${e.a}|${e.b}`}
-              d={pathOf(e.a, e.b)}
-              className={`cgraph-edge ${e.lastAt < quietBefore ? "quiet" : ""}`}
-              strokeWidth={Math.min(5, 1 + Math.log2(1 + e.count))}
-            />
-          ))}
+          {snap.edges.map((e) => {
+            const d = pathOf(e.a, e.b);
+            return d ? (
+              <path
+                key={`${e.a}|${e.b}`}
+                d={d}
+                className={`cgraph-edge ${e.lastAt < quietBefore ? "quiet" : ""}`}
+                strokeWidth={Math.min(5, 1 + Math.log2(1 + e.count))}
+              />
+            ) : null;
+          })}
           {!reduced &&
             pulses.map((p) => {
               const d = pathOf(p.a, p.b);
@@ -185,7 +199,7 @@ export function ContinuityGraph({
                 tone={v.tone}
                 chipColor={v.chip}
                 badge={v.badge}
-                title={v.name}
+                title={v.title ?? v.name}
               />
               <div className="cgraph-name">{v.name}</div>
               <div className={`cgraph-meta ${v.tone === "needs" ? "needs" : ""}`}>{v.meta}</div>

@@ -5,11 +5,11 @@
 export type Pt = { x: number; y: number };
 
 const ITER = 220;
-const REPULSE = 26000;
+const REPULSE = 60000;
 const SPRING = 0.02;
-const REST = 170;
+const REST = 240;
 const CENTER = 0.006;
-const MIN_GAP = 96;
+const MIN_GAP = 170;
 
 function seed(key: string): Pt {
   let h = 0x811c9dc5;
@@ -87,4 +87,18 @@ export function layoutGraph(
   const out: Record<string, Pt> = {};
   for (const k of nodes) out[k] = pins[k] ? { ...pins[k] } : { x: Math.round(pos[k].x), y: Math.round(pos[k].y) };
   return out;
+}
+
+/** Shorten the segment p->q by `rp` at p and `rq` at q along the line between them, so an
+ *  edge starts and ends at the avatar boundary rather than its centre. Null when the
+ *  centres are not farther apart than the two radii (nothing left to draw). */
+export function clipSegment(p: Pt, q: Pt, rp: number, rq: number): { a: Pt; b: Pt } | null {
+  const dx = q.x - p.x, dy = q.y - p.y;
+  const d = Math.hypot(dx, dy);
+  if (d <= rp + rq) return null;
+  const ux = dx / d, uy = dy / d;
+  return {
+    a: { x: p.x + ux * rp, y: p.y + uy * rp },
+    b: { x: q.x - ux * rq, y: q.y - uy * rq },
+  };
 }
