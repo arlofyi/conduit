@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pulsesFor, readPins, writePins, type GraphSnapshot } from "./continuityGraph";
+import { askCardSide, pulsesFor, readPins, writePins, type GraphSnapshot } from "./continuityGraph";
 
 const snap: GraphSnapshot = {
   available: true,
@@ -36,5 +36,24 @@ describe("pins", () => {
     expect(readPins("p1", ls)).toEqual({});
     store.set("conduit.continuityPins", JSON.stringify({ p1: { a: { x: "nope" } } }));
     expect(readPins("p1", ls)).toEqual({});
+  });
+});
+
+describe("askCardSide", () => {
+  const me = { x: 0, y: 0 };
+  it("opens right when nothing is nearby", () => {
+    expect(askCardSide(me, [])).toBe("right");
+    expect(askCardSide(me, [{ x: 0, y: 400 }, { x: -600, y: 0 }])).toBe("right");
+  });
+  it("flips left when a neighbour sits under the right-hand card", () => {
+    expect(askCardSide(me, [{ x: 200, y: 60 }])).toBe("left");
+  });
+  it("picks the side with fewer overlaps, ties going right", () => {
+    expect(askCardSide(me, [{ x: 200, y: 60 }, { x: 300, y: 100 }, { x: -200, y: 60 }])).toBe("left");
+    expect(askCardSide(me, [{ x: 200, y: 60 }, { x: -200, y: 60 }, { x: -300, y: 100 }])).toBe("right");
+    expect(askCardSide(me, [{ x: 200, y: 60 }, { x: -200, y: 60 }])).toBe("right");
+  });
+  it("honours a custom card size", () => {
+    expect(askCardSide(me, [{ x: 200, y: 60 }], 100, 220)).toBe("right");
   });
 });

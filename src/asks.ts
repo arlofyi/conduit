@@ -42,3 +42,31 @@ export function buildAnswers(
   }
   return out;
 }
+
+const RECOMMENDED_SUFFIX = /\s*\(recommended\)\s*$/i;
+
+/** Claude marks its preferred option by appending " (Recommended)" to the label. The card
+ *  shows that as a tag instead of label text. The ANSWER must still be the original label,
+ *  because Claude matches its own option text. A label that is only the marker is kept. */
+export function splitRecommended(label: string): { label: string; recommended: boolean } {
+  if (!RECOMMENDED_SUFFIX.test(label)) return { label, recommended: false };
+  const clean = label.replace(RECOMMENDED_SUFFIX, "");
+  if (!clean.trim()) return { label, recommended: false };
+  return { label: clean, recommended: true };
+}
+
+/** The done-state line: every answer joined with ", ", Recommended markers dropped,
+ *  truncated to `max` characters with an ellipsis. */
+export function answerSummary(answers: Record<string, string>, max = 60): string {
+  const s = Object.values(answers)
+    .flatMap((v) => v.split(MULTISELECT_JOIN))
+    .map((v) => splitRecommended(v).label)
+    .join(", ");
+  return s.length > max ? `${s.slice(0, max - 1).trimEnd()}…` : s;
+}
+
+/** How long a question has waited, as m:ss (minutes are not capped at 59). */
+export function waitingClock(createdMs: number, nowMs: number): string {
+  const secs = Math.max(0, Math.floor((nowMs - createdMs) / 1000));
+  return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+}

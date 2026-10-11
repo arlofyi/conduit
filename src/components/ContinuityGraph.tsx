@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { SessionAvatar, type AvatarTone } from "../avatars";
 import { clipSegment, layoutGraph, type Pt } from "../graphLayout";
-import { readPins, writePins, type GraphSnapshot, type Pulse } from "../continuityGraph";
+import { askCardSide, readPins, writePins, type GraphSnapshot, type Pulse } from "../continuityGraph";
 import type { PendingAsk } from "../asks";
 import { AskCard } from "./AskCard";
 
@@ -203,7 +203,19 @@ export function ContinuityGraph({
               />
               <div className="cgraph-name">{v.name}</div>
               <div className={`cgraph-meta ${v.tone === "needs" ? "needs" : ""}`}>{v.meta}</div>
-              {v.ask && <AskCard key={v.ask.id} ask={v.ask} sessionName={v.name} className="anchored" />}
+              {v.ask && (
+                <AskCard
+                  key={v.ask.id}
+                  ask={v.ask}
+                  sessionName={v.name}
+                  className="anchored"
+                  side={askCardSide(
+                    p,
+                    snap.nodes.filter((o) => o.key !== n.key && pos[o.key]).map((o) => pos[o.key]),
+                  )}
+                  keyboard
+                />
+              )}
             </div>
           );
         })}

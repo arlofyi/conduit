@@ -65,3 +65,20 @@ export function writePins(projectId: string, pins: Record<string, Pt>, ls: Stora
     /* quota — non-fatal */
   }
 }
+
+/** Card top sits this far above the node centre (`.ask-card.anchored` top + node offset). */
+const ASK_CARD_TOP = 42;
+/** The card's near edge sits this far from the node centre, on either side. */
+const ASK_CARD_GAP = 50;
+
+/** Which side of its avatar an anchored question card opens on: right unless another node's
+ *  centre would sit under the right-hand card, then whichever side covers fewer (ties right). */
+export function askCardSide(node: Pt, others: Pt[], cardW = 300, cardH = 220): "right" | "left" {
+  const top = node.y - ASK_CARD_TOP;
+  const inside = (x0: number) =>
+    others.filter((o) => o.x >= x0 && o.x <= x0 + cardW && o.y >= top && o.y <= top + cardH).length;
+  const right = inside(node.x + ASK_CARD_GAP);
+  if (right === 0) return "right";
+  const left = inside(node.x - ASK_CARD_GAP - cardW);
+  return left < right ? "left" : "right";
+}

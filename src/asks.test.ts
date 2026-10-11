@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { askGateOpen, askShouldHandOff, buildAnswers, type AskQuestion, type PendingAsk } from "./asks";
+import { answerSummary, askGateOpen, askShouldHandOff, buildAnswers, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "./asks";
 import { MULTISELECT_JOIN } from "./askProtocol";
 
 const ask: PendingAsk = {
@@ -44,5 +44,44 @@ describe("buildAnswers", () => {
   it("returns null until every question has an answer", () => {
     expect(buildAnswers(qs, { "One?": ["A"] }, {})).toBeNull();
     expect(buildAnswers(qs, { "One?": [], "Many?": ["X"] }, { "One?": "   " })).toBeNull();
+  });
+});
+
+describe("splitRecommended", () => {
+  it("strips a trailing (Recommended) and flags the row", () => {
+    expect(splitRecommended("Run it now (Recommended)")).toEqual({ label: "Run it now", recommended: true });
+    expect(splitRecommended("Run it now  (recommended)  ")).toEqual({ label: "Run it now", recommended: true });
+    expect(splitRecommended("Run it now (RECOMMENDED)")).toEqual({ label: "Run it now", recommended: true });
+    expect(splitRecommended("Run it now(Recommended)")).toEqual({ label: "Run it now", recommended: true });
+  });
+  it("leaves a label without the suffix alone", () => {
+    expect(splitRecommended("Hold for review")).toEqual({ label: "Hold for review", recommended: false });
+    expect(splitRecommended("(Recommended) first")).toEqual({ label: "(Recommended) first", recommended: false });
+  });
+  it("keeps a label that is only the marker, rather than emptying it", () => {
+    expect(splitRecommended("(Recommended)")).toEqual({ label: "(Recommended)", recommended: false });
+    expect(splitRecommended("  (Recommended) ")).toEqual({ label: "  (Recommended) ", recommended: false });
+  });
+});
+
+describe("answerSummary", () => {
+  it("joins every answer with a comma and drops the Recommended marker", () => {
+    expect(answerSummary({ "A?": "Run it now (Recommended)", "B?": "Unit, Integration" })).toBe(
+      "Run it now, Unit, Integration",
+    );
+  });
+  it("truncates a long answer with an ellipsis", () => {
+    const s = answerSummary({ "A?": "x".repeat(100) });
+    expect(s.length).toBe(60);
+    expect(s.endsWith("…")).toBe(true);
+  });
+});
+
+describe("waitingClock", () => {
+  it("formats elapsed time as m:ss and never goes negative", () => {
+    expect(waitingClock(1_000, 43_000)).toBe("0:42");
+    expect(waitingClock(0, 125_400)).toBe("2:05");
+    expect(waitingClock(10_000, 5_000)).toBe("0:00");
+    expect(waitingClock(0, 61 * 60_000)).toBe("61:00");
   });
 });
