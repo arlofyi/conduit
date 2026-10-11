@@ -23,6 +23,7 @@ mod continuity;
 mod continuity_feed;
 #[cfg(test)]
 mod continuity_fixture;
+mod continuity_graph;
 mod continuity_read;
 mod continuity_watch;
 mod conversation_repair;
@@ -1578,6 +1579,46 @@ fn set_ask_gate(gate: State<Arc<asks::AskGate>>, open: bool) {
     gate.set(open);
 }
 
+/// The project root plus every worktree, each its own git toplevel (and so its own
+/// continuity cwd_hash). A path that isn't a checkout simply drops out.
+fn project_toplevels(project: &store::Project) -> Vec<String> {
+    let mut dirs: Vec<String> = vec![project.path.clone()];
+    dirs.extend(
+        project
+            .sessions
+            .iter()
+            .filter_map(|s| s.worktree_path.clone()),
+    );
+    let mut tops: Vec<String> = dirs.iter().filter_map(|d| git::toplevel(d)).collect();
+    tops.sort();
+    tops.dedup();
+    tops
+}
+
+/// The Continuity view's graph for a project. Best-effort, read-only.
+#[tauri::command]
+fn continuity_graph(
+    store: State<Arc<Store>>,
+    project_id: String,
+) -> continuity_graph::GraphSnapshot {
+    let projects = store.list();
+    let Some(project) = projects.iter().find(|p| p.id == project_id) else {
+        return continuity_graph::GraphSnapshot::default();
+    };
+    let ids: Vec<String> = project.sessions.iter().map(|s| s.id.clone()).collect();
+    let foreign: std::collections::HashMap<String, String> = projects
+        .iter()
+        .filter(|p| p.id != project_id)
+        .flat_map(|p| p.sessions.iter().map(move |s| (s.id.clone(), p.id.clone())))
+        .collect();
+    continuity_graph::graph_from_db(
+        &continuity_read::db_path(),
+        &ids,
+        &project_toplevels(project),
+        &foreign,
+    )
+}
+
 /// Read-only continuity feed for a project: the decisions and messages recorded by the
 /// sessions that belong to it. Scoped by Conduit session id (exact) plus the git toplevel
 /// of the project and each of its worktrees (for sessions started outside Conduit).
@@ -1592,18 +1633,7 @@ fn continuity_feed(
     };
     let session_ids: Vec<String> = project.sessions.iter().map(|s| s.id.clone()).collect();
 
-    // The project root plus every worktree. Each is its own git toplevel and so its own
-    // cwd_hash; a path that isn't a checkout (a pending worktree) simply drops out.
-    let mut dirs: Vec<String> = vec![project.path.clone()];
-    dirs.extend(
-        project
-            .sessions
-            .iter()
-            .filter_map(|s| s.worktree_path.clone()),
-    );
-    let mut toplevels: Vec<String> = dirs.iter().filter_map(|d| git::toplevel(d)).collect();
-    toplevels.sort();
-    toplevels.dedup();
+    let toplevels = project_toplevels(&project);
 
     Ok(continuity_feed::feed_for_project(
         &session_ids,
@@ -2910,6 +2940,7 @@ pub fn run() {
             board_resolve_gate,
             list_continuity,
             continuity_feed,
+            continuity_graph,
             ask_answer,
             ask_handoff,
             ask_pending,
