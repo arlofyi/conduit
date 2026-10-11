@@ -3,6 +3,29 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.41.0 — 2026-10-12
+
+- **Added — Continuity view.** A live map of a project's sessions (⇧⌘K): each session is a
+  little animal, linked to the sessions it talks to through Continuity, with a pulse every
+  time one messages another. Sessions from other projects that message in appear as dimmed
+  visitors. Click an avatar to read its conversation.
+- **Added — Answer agent questions from the map.** When a Claude session asks you a
+  multiple-choice question, it appears as a card next to its avatar (or in the corner when
+  the view is closed) and you can answer it there. Answers are numbered so you can press
+  1–N, Claude's own "(Recommended)" choice is tagged, multi-select questions use checkboxes
+  with a Send button, and "Something else…" takes a typed answer. The card shows how long the
+  question has been waiting, confirms "Sent to <session>" when you answer, and opens on
+  whichever side of the avatar is clear. Open that session's terminal and the question moves
+  back to the terminal as usual.
+- **Changed — Canvas and Task board are now optional.** Both are off by default; turn them
+  on in Settings → General. Your canvas layout and board cards are kept and come back when
+  you switch them on.
+- **Fixed — sessions no longer appear twice in Continuity.** Conduit sessions were being
+  drawn as two avatars, and the Decisions and Messages panels attributed their rows through
+  the checkout instead of the session. Each session now shows once and is credited with its
+  own messages and decisions, including earlier rows written from its worktree. Restart a
+  session to pick this up.
+
 ## 0.40.1 — 2026-10-08
 
 - **Fixed — sessions pinned to another account now actually run under it.** A session
