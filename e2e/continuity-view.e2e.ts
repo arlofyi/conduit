@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -87,6 +87,27 @@ const domClick = (sel: string, text?: string) =>
     text,
   ) as Promise<boolean>;
 
+/** The embedded WebDriver click only synthesizes mouse events, and the graph listens to
+ *  pointer events, so press and release with real PointerEvents at the node's centre
+ *  (no movement: a drag would pin the node instead of opening it). */
+const pressFirstNode = () =>
+  browser.execute(() => {
+    const n = document.querySelector(".cgraph-node") as HTMLElement;
+    const r = n.getBoundingClientRect();
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 1,
+      pointerType: "mouse",
+      isPrimary: true,
+      button: 0,
+      clientX: r.x + r.width / 2,
+      clientY: r.y + r.height / 2,
+    };
+    n.dispatchEvent(new PointerEvent("pointerdown", { ...init, buttons: 1 }));
+    (n.closest(".cgraph") as HTMLElement).dispatchEvent(new PointerEvent("pointerup", init));
+  });
+
 async function headerButtons(): Promise<string[]> {
   return (await browser.execute(() =>
     Array.from(document.querySelectorAll(".board-tab")).map((e) => (e.textContent ?? "").trim()),
@@ -143,6 +164,18 @@ describe("the Continuity view", () => {
     await browser.pause(1500);
     await selectProject();
   }
+
+  // `onPrepare` creates the fixture with the sqlite3 CLI and only warns when it cannot
+  // (a runner image without sqlite3). Every assertion below writes that DB, so without it
+  // there is nothing honest to run: skip the whole suite and say why.
+  before(function () {
+    if (!existsSync(E2E_CONTINUITY_DB)) {
+      console.warn(
+        `[e2e] skipping the Continuity view spec: no fixture DB at ${E2E_CONTINUITY_DB} (sqlite3 CLI missing?)`,
+      );
+      this.skip();
+    }
+  });
 
   before(async () => {
     const dir = join(mkdtempSync(join(tmpdir(), "conduit-e2e-cview-")), name);
@@ -263,6 +296,10 @@ describe("the Continuity view", () => {
     expect(await domClick(".ask-card-link")).toBe(true);
     expect(await reply).toEqual({});
     await waitFor(async () => (await count(".ask-card")) === 0, "card did not go away");
+    // The arrow promises the jump: the overlay drops so the session's terminal shows.
+    await waitFor(async () => (await count(".cgraph")) === 0, "Continuity overlay still covers the terminal");
+    await waitFor(() => domClick(".board-tab", "Continuity"), "no Continuity button to reopen");
+    await waitFor(async () => (await count(".cgraph-node")) === 2, "graph did not come back");
   });
 
   it("a closed gate answers {} at once and raises no card", async () => {
@@ -276,28 +313,18 @@ describe("the Continuity view", () => {
   });
 
   it("a click on a node opens the drawer and Escape closes it", async () => {
-    // The embedded WebDriver click only synthesizes mouse events, and the graph listens to
-    // pointer events, so press and release with real PointerEvents at the node's centre
-    // (no movement: a drag would pin the node instead of opening it).
-    await browser.execute(() => {
-      const n = document.querySelector(".cgraph-node") as HTMLElement;
-      const r = n.getBoundingClientRect();
-      const init = {
-        bubbles: true,
-        cancelable: true,
-        pointerId: 1,
-        pointerType: "mouse",
-        isPrimary: true,
-        button: 0,
-        clientX: r.x + r.width / 2,
-        clientY: r.y + r.height / 2,
-      };
-      n.dispatchEvent(new PointerEvent("pointerdown", { ...init, buttons: 1 }));
-      (n.closest(".cgraph") as HTMLElement).dispatchEvent(new PointerEvent("pointerup", init));
-    });
+    await pressFirstNode();
     await waitFor(async () => (await count(".session-drawer")) === 1, "drawer never opened");
     await browser.execute(() => (document.activeElement as HTMLElement | null)?.blur());
     await browser.keys("Escape");
     await waitFor(async () => (await count(".session-drawer")) === 0, "drawer did not close");
+  });
+
+  it("'Open session' in the drawer shows that session's terminal, not the overlay", async () => {
+    await pressFirstNode();
+    await waitFor(async () => (await count(".session-drawer")) === 1, "drawer never opened");
+    expect(await domClick(".session-drawer .header-btn", "Open session")).toBe(true);
+    await waitFor(async () => (await count(".cgraph")) === 0, "Continuity overlay still covers the terminal");
+    expect(await count(".session-drawer")).toBe(0);
   });
 });

@@ -92,6 +92,19 @@ export const config: WebdriverIO.Config = {
     rmSync(e2eDataDir(), { recursive: true, force: true });
     rmSync(join(tmpdir(), "conduit-e2e-continuity"), { recursive: true, force: true });
     mkdirSync(join(tmpdir(), "conduit-e2e-continuity"), { recursive: true });
-    createContinuityDb(E2E_CONTINUITY_DB);
+    // Needs the `sqlite3` CLI, which not every runner image has (the Windows one may not).
+    // Only the Continuity-view spec writes this DB, and it skips itself when the file is
+    // absent; every other spec only needs CONTINUITY_DB_PATH to point AWAY from the real
+    // DB, which a missing file does just as well. So a failure here is a warning, never a
+    // reason to take the whole run down.
+    try {
+      createContinuityDb(E2E_CONTINUITY_DB);
+    } catch (e) {
+      console.warn(
+        `[e2e] could not create the Continuity fixture DB (is the sqlite3 CLI on PATH?): ${
+          (e as Error).message
+        }\n[e2e] the Continuity-view spec will be skipped; every other spec still runs.`,
+      );
+    }
   },
 };
