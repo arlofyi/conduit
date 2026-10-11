@@ -1580,9 +1580,18 @@ fn set_ask_gate(gate: State<Arc<asks::AskGate>>, open: bool) {
     gate.set(open);
 }
 
+/// How long a project's resolved git toplevels are reused (see `ToplevelCache`).
+const TOPLEVEL_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The project root plus every worktree, each its own git toplevel (and so its own
-/// continuity cwd_hash). A path that isn't a checkout simply drops out.
+/// continuity cwd_hash). A path that isn't a checkout simply drops out. Memoized per
+/// project for `TOPLEVEL_TTL`: every continuity read needs it and each miss forks one
+/// `git rev-parse` per worktree.
 fn project_toplevels(project: &store::Project) -> Vec<String> {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<continuity_read::ToplevelCache>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::Mutex::new(continuity_read::ToplevelCache::new(TOPLEVEL_TTL))
+        });
     let mut dirs: Vec<String> = vec![project.path.clone()];
     dirs.extend(
         project
@@ -1590,18 +1599,21 @@ fn project_toplevels(project: &store::Project) -> Vec<String> {
             .iter()
             .filter_map(|s| s.worktree_path.clone()),
     );
-    let mut tops: Vec<String> = dirs.iter().filter_map(|d| git::toplevel(d)).collect();
-    tops.sort();
-    tops.dedup();
-    tops
+    let resolve = |dirs: &[String]| {
+        let mut tops: Vec<String> = dirs.iter().filter_map(|d| git::toplevel(d)).collect();
+        tops.sort();
+        tops.dedup();
+        tops
+    };
+    match CACHE.lock() {
+        Ok(mut cache) => {
+            cache.get_or_compute(&project.id, &dirs, std::time::Instant::now(), resolve)
+        }
+        Err(_) => resolve(&dirs),
+    }
 }
 
-/// The Continuity view's graph for a project. Best-effort, read-only.
-#[tauri::command]
-fn continuity_graph(
-    store: State<Arc<Store>>,
-    project_id: String,
-) -> continuity_graph::GraphSnapshot {
+fn continuity_graph_inner(store: &Store, project_id: &str) -> continuity_graph::GraphSnapshot {
     let projects = store.list();
     let Some(project) = projects.iter().find(|p| p.id == project_id) else {
         return continuity_graph::GraphSnapshot::default();
@@ -1624,12 +1636,23 @@ fn continuity_graph(
     )
 }
 
-/// Rows for one Continuity-view table tab (decisions / handoffs / tasks / files / activity),
-/// scoped exactly like the feed. Best-effort -- see `continuity_tables::tables_from_db`.
+/// The Continuity view's graph for a project. Best-effort, read-only. Async + blocking
+/// pool: a sync command runs on the main thread, and this forks git and reads SQLite
+/// several times per `continuity-changed`.
 #[tauri::command]
-fn continuity_tables(
-    store: State<Arc<Store>>,
+async fn continuity_graph(
+    app: tauri::AppHandle,
     project_id: String,
+) -> continuity_graph::GraphSnapshot {
+    let store = app.state::<Arc<Store>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || continuity_graph_inner(&store, &project_id))
+        .await
+        .unwrap_or_default()
+}
+
+fn continuity_tables_inner(
+    store: &Store,
+    project_id: &str,
     tab: String,
 ) -> continuity_tables::TablesView {
     let Some(project) = store.list().into_iter().find(|p| p.id == project_id) else {
@@ -1645,6 +1668,25 @@ fn continuity_tables(
         &project_toplevels(&project),
         &tab,
     )
+}
+
+/// Rows for one Continuity-view table tab (decisions / handoffs / tasks / files / activity),
+/// scoped exactly like the feed. Best-effort -- see `continuity_tables::tables_from_db`.
+/// Off the main thread for the same reason as `continuity_graph`.
+#[tauri::command]
+async fn continuity_tables(
+    app: tauri::AppHandle,
+    project_id: String,
+    tab: String,
+) -> continuity_tables::TablesView {
+    let store = app.state::<Arc<Store>>().inner().clone();
+    let fallback = tab.clone();
+    tauri::async_runtime::spawn_blocking(move || continuity_tables_inner(&store, &project_id, tab))
+        .await
+        .unwrap_or_else(|_| continuity_tables::TablesView {
+            tab: fallback,
+            ..Default::default()
+        })
 }
 
 /// Read-only continuity feed for a project: the decisions and messages recorded by the

@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { debounceMaxWait } from "../debounce";
 import type { ServiceTab, TableTab, TablesView } from "../continuityTables";
 
 const REFETCH_DEBOUNCE_MS = 750; // same as the graph (useContinuityGraph)
+const REFETCH_MAX_WAIT_MS = 3000; // ditto: a steady stream still refreshes
 /** Files is a 30-minute window and Activity/age labels drift, so the visible table refreshes
  *  on this tick even without a database change. */
 const TICK_MS = 30_000;
@@ -49,12 +51,11 @@ export function useContinuityTables(projectId: string, tab: TableTab) {
   useEffect(() => {
     setData({});
     pull(wanted());
-    let timer: ReturnType<typeof setTimeout> | undefined;
     let alive = true;
+    const refetch = debounceMaxWait(() => pull(wanted()), REFETCH_DEBOUNCE_MS, REFETCH_MAX_WAIT_MS);
     const un = listen("continuity-changed", () => {
       if (!alive) return;
-      clearTimeout(timer);
-      timer = setTimeout(() => pull(wanted()), REFETCH_DEBOUNCE_MS);
+      refetch.call();
     });
     const tick = setInterval(() => {
       setNow(Date.now());
@@ -63,7 +64,7 @@ export function useContinuityTables(projectId: string, tab: TableTab) {
     }, TICK_MS);
     return () => {
       alive = false;
-      clearTimeout(timer);
+      refetch.cancel();
       clearInterval(tick);
       void un.then((f) => f());
     };

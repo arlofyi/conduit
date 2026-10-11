@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { debounceMaxWait } from "../debounce";
 import { EMPTY_SNAPSHOT, pulsesFor, type GraphSnapshot, type Pulse, type WatchedMessage } from "../continuityGraph";
 
 const REFETCH_DEBOUNCE_MS = 750;
+/** A steady commit stream must still refresh the snapshot this often. */
+const REFETCH_MAX_WAIT_MS = 3000;
 const MAX_LIVE_PULSES = 40;
 /** A pulse's animation runs 1.4 s; it is removed on this timer, not on SVG `endEvent`,
  *  which WebKit does not reliably deliver through React. */
@@ -23,7 +26,6 @@ export function useContinuityGraph(projectId: string | null, active: boolean) {
   useEffect(() => {
     if (!active || !projectId) return;
     let alive = true;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const reapers = new Set<ReturnType<typeof setTimeout>>();
     // A snapshot from the previous project must not draw under this one's id.
     setSnap(EMPTY_SNAPSHOT);
@@ -36,6 +38,7 @@ export function useContinuityGraph(projectId: string | null, active: boolean) {
           /* keep the last good snapshot */
         });
     void fetchNow();
+    const refetch = debounceMaxWait(() => void fetchNow(), REFETCH_DEBOUNCE_MS, REFETCH_MAX_WAIT_MS);
     const un = listen<{ messages: WatchedMessage[] }>("continuity-changed", ({ payload }) => {
       if (!alive) return;
       const fresh = pulsesFor(payload.messages, snapRef.current);
@@ -49,12 +52,11 @@ export function useContinuityGraph(projectId: string | null, active: boolean) {
           reapers.add(t);
         }
       }
-      clearTimeout(timer);
-      timer = setTimeout(fetchNow, REFETCH_DEBOUNCE_MS);
+      refetch.call();
     });
     return () => {
       alive = false;
-      clearTimeout(timer);
+      refetch.cancel();
       for (const t of reapers) clearTimeout(t);
       void un.then((f) => f());
       setPulses([]);
