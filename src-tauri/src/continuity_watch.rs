@@ -13,6 +13,11 @@ use tauri::{AppHandle, Emitter};
 
 pub const TICK: Duration = Duration::from_millis(500);
 pub const RETRY: Duration = Duration::from_secs(10);
+/// How many ticks between file-identity checks. An open connection keeps a deleted or
+/// renamed-over DB's old inode alive and `data_version` keeps answering from it, so without
+/// this the view freezes until restart. Unix compares the path's (dev, ino) every ~10 s;
+/// Windows has no inode to compare, so it simply drops and re-opens every ~30 s.
+pub const IDENTITY_CHECK_EVERY: u32 = if cfg!(windows) { 60 } else { 20 };
 /// A burst cap: a continuity backfill must not turn into a pulse storm.
 const MAX_MESSAGES_PER_TICK: usize = 200;
 
@@ -43,6 +48,28 @@ pub struct Watcher {
     conn: Option<rusqlite::Connection>,
     version: Option<i64>,
     cursor: Option<(String, String)>,
+    /// What the open connection was opened on (unix only; `None` elsewhere or when unread).
+    identity: Option<FileIdentity>,
+    ticks_since_check: u32,
+    /// The connection was dropped because the file under it changed: the first successful
+    /// re-open reports a change even when no new message survived the cursor.
+    replaced: bool,
+}
+
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type FileIdentity = ();
+
+#[cfg(unix)]
+fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_path: &std::path::Path) -> Option<FileIdentity> {
+    None
 }
 
 impl Watcher {
@@ -52,13 +79,39 @@ impl Watcher {
             conn: None,
             version: None,
             cursor: None,
+            identity: None,
+            ticks_since_check: 0,
+            replaced: false,
+        }
+    }
+
+    /// Every `IDENTITY_CHECK_EVERY` ticks: has the file under the open connection gone away
+    /// or been replaced? (On Windows, always "yes" — a blind periodic re-open.)
+    fn file_changed_under_us(&mut self) -> bool {
+        self.ticks_since_check += 1;
+        if self.ticks_since_check < IDENTITY_CHECK_EVERY {
+            return false;
+        }
+        self.ticks_since_check = 0;
+        if cfg!(unix) {
+            let now = file_identity(&self.path);
+            now.is_none() || now != self.identity
+        } else {
+            true
         }
     }
 
     pub fn tick(&mut self) -> Tick {
+        if self.conn.is_some() && self.file_changed_under_us() {
+            self.conn = None;
+            // A blind Windows re-open is not evidence of a change; a moved inode is.
+            self.replaced |= cfg!(unix);
+        }
         if self.conn.is_none() {
             self.conn = crate::continuity_read::open_ro(&self.path);
             self.version = None;
+            self.identity = file_identity(&self.path);
+            self.ticks_since_check = 0;
         }
         let Some(conn) = self.conn.as_ref() else {
             return Tick::Unavailable;
@@ -71,16 +124,37 @@ impl Watcher {
             }
         };
         let Some(prev) = self.version.replace(version) else {
-            // First look (or a re-open): baseline the cursor at "now" so history never pulses.
-            if self.cursor.is_none() {
+            // First look: baseline the cursor at "now" so history never pulses.
+            let Some((at, id)) = self.cursor.clone() else {
                 let now: String = conn
                     .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
                         r.get(0)
                     })
                     .unwrap_or_default();
                 self.cursor = Some((now, String::new()));
-            }
-            return Tick::Unchanged;
+                return Tick::Unchanged;
+            };
+            // A re-open keeps the cursor: the new version is only a baseline, but a message
+            // written past the cursor while we were away is still a pulse — never lost, and
+            // never one from before the cursor.
+            let replaced = std::mem::take(&mut self.replaced);
+            return match read_messages_after(conn, &at, &id) {
+                Ok(messages) => {
+                    if let Some(last) = messages.last() {
+                        self.cursor = Some((last.created_at.clone(), last.id.clone()));
+                    }
+                    if messages.is_empty() && !replaced {
+                        Tick::Unchanged
+                    } else {
+                        Tick::Changed(ChangedPayload { messages })
+                    }
+                }
+                Err(_) => {
+                    self.conn = None;
+                    self.replaced = replaced;
+                    Tick::Unavailable
+                }
+            };
         };
         if prev == version {
             return Tick::Unchanged;
@@ -224,6 +298,92 @@ mod tests {
         c.execute_batch(crate::continuity_fixture::DDL).unwrap();
         drop(c);
         assert_eq!(watcher.tick(), Tick::Unchanged, "re-opens and baselines");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Tick until something other than Unchanged comes back, at most `n` times.
+    fn tick_until_event(watcher: &mut Watcher, n: u32) -> Tick {
+        for _ in 0..n {
+            match watcher.tick() {
+                Tick::Unchanged => continue,
+                other => return other,
+            }
+        }
+        Tick::Unchanged
+    }
+
+    #[test]
+    fn an_identity_check_on_an_unchanged_file_emits_nothing() {
+        let path = temp_db("watch-steady");
+        let mut watcher = Watcher::new(path.clone());
+        assert_eq!(watcher.tick(), Tick::Unchanged);
+        assert_eq!(
+            tick_until_event(&mut watcher, IDENTITY_CHECK_EVERY * 3 + 2),
+            Tick::Unchanged,
+            "a check (or a periodic re-open) must not pulse or refetch on its own"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_database_is_reopened_and_its_new_messages_reported() {
+        let path = temp_db("watch-replace");
+        let mut watcher = Watcher::new(path.clone());
+        assert_eq!(watcher.tick(), Tick::Unchanged);
+        // Write a brand-new DB beside it and rename it over the watched path: the watcher's
+        // open connection still holds the old, now-unlinked inode.
+        let fresh = path.with_extension("fresh.db");
+        let _ = std::fs::remove_file(&fresh);
+        let c = rusqlite::Connection::open(&fresh).unwrap();
+        c.execute_batch(crate::continuity_fixture::DDL).unwrap();
+        drop(c);
+        for suffix in ["-wal", "-shm"] {
+            let mut side = path.clone().into_os_string();
+            side.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(side));
+        }
+        std::fs::rename(&fresh, &path).unwrap();
+        let w = rusqlite::Connection::open(&path).unwrap();
+        insert_message(&w, "after-swap", "a", "b", "2999-01-01T00:00:00.000Z");
+        drop(w);
+        match tick_until_event(&mut watcher, IDENTITY_CHECK_EVERY + 2) {
+            Tick::Changed(p) => {
+                let ids: Vec<&str> = p.messages.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(ids, vec!["after-swap"]);
+            }
+            other => panic!("expected Changed after the swap, got {other:?}"),
+        }
+        assert_eq!(
+            tick_until_event(&mut watcher, IDENTITY_CHECK_EVERY + 2),
+            Tick::Unchanged,
+            "the cursor survived the re-open: the message is not reported twice"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_database_goes_unavailable_and_recovers_with_its_cursor() {
+        let path = temp_db("watch-delete");
+        let mut watcher = Watcher::new(path.clone());
+        assert_eq!(watcher.tick(), Tick::Unchanged);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            tick_until_event(&mut watcher, IDENTITY_CHECK_EVERY + 2),
+            Tick::Unavailable
+        );
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(crate::continuity_fixture::DDL).unwrap();
+        insert_message(&c, "old", "a", "b", "2000-01-01T00:00:00.000Z");
+        insert_message(&c, "new", "a", "b", "2999-01-01T00:00:00.000Z");
+        drop(c);
+        match watcher.tick() {
+            Tick::Changed(p) => {
+                let ids: Vec<&str> = p.messages.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(ids, vec!["new"], "history before the cursor never pulses");
+            }
+            other => panic!("expected Changed on recovery, got {other:?}"),
+        }
         let _ = std::fs::remove_file(&path);
     }
 
