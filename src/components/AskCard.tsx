@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useStore } from "../store";
 import { buildAnswers, type PendingAsk } from "../asks";
 
 /** One AskUserQuestion. Answering resolves the blocked hook in Rust; "Answer in terminal"
@@ -10,6 +11,15 @@ export function AskCard({ ask, sessionName, className = "" }: { ask: PendingAsk;
   const [picks, setPicks] = useState<Record<string, string[]>>({});
   const [typed, setTyped] = useState<Record<string, string>>({});
   const [state, setState] = useState<"idle" | "sending" | "gone" | "error">("idle");
+  // Synchronous guard: a second Enter/click lands before React re-renders "sending".
+  const inFlight = useRef(false);
+  // `false` from ask_answer means it resolved elsewhere. Drop it locally after the note,
+  // so a missed `ask-resolved` cannot leave a stuck card hiding later asks.
+  useEffect(() => {
+    if (state !== "gone") return;
+    const t = setTimeout(() => useStore.getState().removeAsk(ask.id), 2500);
+    return () => clearTimeout(t);
+  }, [state, ask.id]);
   const q = ask.questions[page];
   if (!q) return null;
   const answers = buildAnswers(ask.questions, picks, typed);
@@ -23,12 +33,16 @@ export function AskCard({ ask, sessionName, className = "" }: { ask: PendingAsk;
     });
 
   const submit = async (payload: Record<string, string>) => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setState("sending");
     try {
       const ok = await invoke<boolean>("ask_answer", { id: ask.id, answers: payload });
       setState(ok ? "idle" : "gone");
     } catch {
       setState("error");
+    } finally {
+      inFlight.current = false;
     }
   };
 
@@ -86,7 +100,9 @@ export function AskCard({ ask, sessionName, className = "" }: { ask: PendingAsk;
             }}
           />
           <div className="ask-card-ft">
-            <button type="button" className="ask-card-link" onClick={() => void invoke("ask_handoff", { id: ask.id })}>
+            <button type="button" className="ask-card-link" onClick={() =>
+                void invoke("ask_handoff", { id: ask.id }).catch(() => setState("error"))
+              }>
               Answer in terminal ↗
             </button>
             {ask.questions.length > 1 && (

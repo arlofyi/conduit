@@ -125,12 +125,17 @@ export function ContinuityGraph({
           setPins((p) => ({ ...p, [k]: { x: d.ox + dx / zoom, y: d.oy + dy / zoom } }));
         }
       }}
-      onPointerUp={() => {
+      onPointerUp={(e) => {
         const d = drag.current;
         drag.current = null;
         if (d?.kind === "node" && d.key) {
-          if (d.moved) writePins(projectId, pins);
-          else onOpen(d.key);
+          if (d.moved) {
+            // Final pin from THIS event (same math as pointermove), not the `pins`
+            // closure, which may predate the last move's state update.
+            const final = { ...pins, [d.key]: { x: d.ox + (e.clientX - d.sx) / zoom, y: d.oy + (e.clientY - d.sy) / zoom } };
+            setPins(final);
+            writePins(projectId, final);
+          } else onOpen(d.key);
         }
       }}
       onPointerCancel={() => {

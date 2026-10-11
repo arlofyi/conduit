@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useStore, findSession } from "../store";
 import { resolveProjectColor } from "../layout";
 import type { AvatarTone } from "../avatars";
@@ -16,6 +16,20 @@ export function ContinuityView({ projectId }: { projectId: string }) {
   const asks = useStore((s) => s.asks);
   const autoColors = useStore((s) => s.autoProjectColors);
   const [open, setOpen] = useState<string | null>(null);
+  const setRendered = useStore((s) => s.setContinuityRendered);
+
+  // Publish which sessions this view draws, so the dock covers every ask it does not
+  // (another project's session, or one absent from the snapshot — incl. EMPTY_SNAPSHOT
+  // right after opening). Cleared on close so the dock falls back to showing everything.
+  const renderedSig = snap.nodes
+    .map((n) => n.conduitSessionId)
+    .filter((x): x is string => !!x)
+    .sort()
+    .join("|");
+  useEffect(() => {
+    setRendered(renderedSig ? [...new Set(renderedSig.split("|"))] : []);
+  }, [renderedSig, setRendered]);
+  useEffect(() => () => setRendered([]), [setRendered]);
 
   const views = useMemo(() => {
     const out: Record<string, NodeView> = {};

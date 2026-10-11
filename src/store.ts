@@ -1723,6 +1723,11 @@ interface AppState {
   windowFocused: boolean;
   addAsk: (a: PendingAsk) => void;
   removeAsk: (id: string) => void;
+  /** Conduit session ids the open Continuity view draws as nodes (a raw map, replaced
+   *  only when the set changes). An ask whose session is NOT in here has no card in the
+   *  graph, so the dock must show it even while the view is visible. */
+  continuityRendered: Record<string, true>;
+  setContinuityRendered: (ids: string[]) => void;
   setWindowFocused: (v: boolean) => void;
   setCanvasEnabled: (v: boolean) => void;
   setBoardEnabled: (v: boolean) => void;
@@ -3908,6 +3913,15 @@ export const useStore = create<AppState>((set, get) => {
         return { asks: next };
       }),
     setWindowFocused: (v) => set({ windowFocused: v }),
+    continuityRendered: {},
+    setContinuityRendered: (ids) =>
+      set((s) => {
+        const cur = Object.keys(s.continuityRendered);
+        if (cur.length === ids.length && ids.every((id) => s.continuityRendered[id])) return s;
+        const next: Record<string, true> = {};
+        for (const id of ids) next[id] = true;
+        return { continuityRendered: next };
+      }),
     canvas: readCanvas(),
     canvasOpen: false,
     boards: {},
