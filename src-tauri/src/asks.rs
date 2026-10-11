@@ -1,4 +1,3 @@
-#![cfg_attr(not(test), allow(dead_code))]
 //! Pending `AskUserQuestion` prompts held by the blocking `/ask` hook route.
 //!
 //! Not `broker.rs`: the broker decides allow/deny for an approval; an ask carries the
@@ -145,11 +144,17 @@ pub fn supported_questions(input: &Value) -> Option<Value> {
     if qs.is_empty() || (qs.len() > 1 && !MULTI_QUESTION_SUPPORTED) {
         return None;
     }
+    let mut seen: Vec<&str> = Vec::new();
     for q in qs {
         let text = q.get("question")?.as_str()?;
         if text.trim().is_empty() {
             return None;
         }
+        // Answers are keyed by question text: a repeat makes `validate_answers` unpassable.
+        if seen.contains(&text) {
+            return None;
+        }
+        seen.push(text);
         let opts = q.get("options")?.as_array()?;
         if opts.is_empty()
             || opts
@@ -197,6 +202,21 @@ pub fn validate_answers(questions: &Value, answers: &Map<String, Value>) -> Resu
     Ok(())
 }
 
+/// The outcome to honour: the one received in time, else one that slipped in between the
+/// timeout firing and the entry being forgotten (checked by the caller with `try_recv`).
+pub fn pick_outcome(received: Option<AskOutcome>, late: Option<AskOutcome>) -> Option<AskOutcome> {
+    received.or(late)
+}
+
+/// The `how` reported in `ask-resolved`.
+pub fn how(outcome: &Option<AskOutcome>) -> &'static str {
+    match outcome {
+        Some(AskOutcome::Answered(_)) => "answered",
+        Some(AskOutcome::HandOff) => "handoff",
+        None => "timeout",
+    }
+}
+
 /// The body `/ask` returns, which Claude reads as the hook's stdout. Answered = allow with
 /// the original input plus `answers`. Anything else = `{}`, which carries no decision, so
 /// Claude shows its own menu exactly as if Conduit were not there (fail-open).
@@ -226,10 +246,38 @@ mod tests {
             "options":[{"label":"Apple","description":"red"},{"label":"Banana","description":"yellow"}]}]})
     }
 
+    // Compile-time: clippy rejects a runtime assert on constants.
+    const _: () = assert!(
+        ASK_CEILING.as_secs() < ASK_CURL_MAX_SECS && ASK_CURL_MAX_SECS < ASK_HOOK_TIMEOUT_SECS
+    );
+
     #[test]
     fn ceilings_are_strictly_ordered() {
-        assert!(ASK_CEILING.as_secs() < ASK_CURL_MAX_SECS);
-        assert!(ASK_CURL_MAX_SECS < ASK_HOOK_TIMEOUT_SECS);
+        // Enforced by the const assertion above; this keeps the name greppable.
+    }
+
+    #[test]
+    fn supported_questions_refuses_duplicate_question_text() {
+        let dup = json!({"questions":[
+            {"question":"Same?","options":[{"label":"x"}]},
+            {"question":"Same?","options":[{"label":"y"}]}]});
+        assert!(supported_questions(&dup).is_none());
+    }
+
+    #[test]
+    fn pick_outcome_prefers_a_late_resolve_over_timeout() {
+        assert_eq!(
+            pick_outcome(Some(AskOutcome::HandOff), None),
+            Some(AskOutcome::HandOff)
+        );
+        assert_eq!(
+            pick_outcome(None, Some(AskOutcome::HandOff)),
+            Some(AskOutcome::HandOff)
+        );
+        assert_eq!(pick_outcome(None, None), None);
+        assert_eq!(how(&None), "timeout");
+        assert_eq!(how(&Some(AskOutcome::HandOff)), "handoff");
+        assert_eq!(how(&Some(AskOutcome::Answered(Map::new()))), "answered");
     }
 
     #[test]

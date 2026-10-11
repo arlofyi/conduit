@@ -1545,6 +1545,36 @@ fn list_continuity(
     Ok(continuity_read::view_for_project(&project_id, &session_ids))
 }
 
+/// Answer a pending AskUserQuestion from its card. `false` = it already resolved
+/// (handed off or timed out) -- the card says so; nothing was sent.
+#[tauri::command]
+fn ask_answer(
+    asks: State<Arc<asks::Asks>>,
+    id: String,
+    answers: serde_json::Map<String, serde_json::Value>,
+) -> Result<bool, String> {
+    let Some(view) = asks.get(&id) else {
+        return Ok(false);
+    };
+    asks::validate_answers(&view.questions, &answers)?;
+    Ok(asks.resolve(&id, asks::AskOutcome::Answered(answers)))
+}
+
+#[tauri::command]
+fn ask_handoff(asks: State<Arc<asks::Asks>>, id: String) -> bool {
+    asks.resolve(&id, asks::AskOutcome::HandOff)
+}
+
+#[tauri::command]
+fn ask_pending(asks: State<Arc<asks::Asks>>) -> Vec<asks::AskView> {
+    asks.pending()
+}
+
+#[tauri::command]
+fn set_ask_gate(gate: State<Arc<asks::AskGate>>, open: bool) {
+    gate.set(open);
+}
+
 /// Read-only continuity feed for a project: the decisions and messages recorded by the
 /// sessions that belong to it. Scoped by Conduit session id (exact) plus the git toplevel
 /// of the project and each of its worktrees (for sessions started outside Conduit).
@@ -2557,6 +2587,8 @@ pub fn run() {
         .manage(Arc::new(hookbus::HookBus::default()))
         .manage(Arc::new(broker::Broker::default()))
         .manage(Arc::new(broker::Presence::default()))
+        .manage(Arc::new(asks::Asks::default()))
+        .manage(Arc::new(asks::AskGate::default()))
         .manage(Arc::new(proposals::Proposals::default()))
         .manage(Arc::new(window_registry::WindowRegistry::default()))
         .manage(Arc::new(window_registry::PendingOpens::default()))
@@ -2656,6 +2688,8 @@ pub fn run() {
                 .state::<Arc<window_registry::WindowModeFlag>>()
                 .inner()
                 .clone();
+            let asks_state = app.state::<Arc<asks::Asks>>().inner().clone();
+            let ask_gate = app.state::<Arc<asks::AskGate>>().inner().clone();
             hooks::start(
                 app.handle().clone(),
                 hook_state,
@@ -2671,6 +2705,8 @@ pub fn run() {
                 reg,
                 pending_opens,
                 window_mode,
+                asks_state,
+                ask_gate,
             );
             bridge::start(app.handle().clone());
 
@@ -2870,6 +2906,10 @@ pub fn run() {
             board_resolve_gate,
             list_continuity,
             continuity_feed,
+            ask_answer,
+            ask_handoff,
+            ask_pending,
+            set_ask_gate,
             add_session,
             detect_agents,
             rename_session,

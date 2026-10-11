@@ -69,6 +69,8 @@ pub fn start(
     reg: Arc<crate::window_registry::WindowRegistry>,
     pending_opens: Arc<crate::window_registry::PendingOpens>,
     window_mode: Arc<crate::window_registry::WindowModeFlag>,
+    asks: Arc<crate::asks::Asks>,
+    ask_gate: Arc<crate::asks::AskGate>,
 ) {
     thread::spawn(move || {
         let mut server: Option<Server> = None;
@@ -204,6 +206,16 @@ pub fn start(
                 let presence = presence.clone();
                 let bus = bus.clone();
                 thread::spawn(move || handle_approve(request, &url, &broker, &presence, &bus));
+                continue;
+            }
+
+            // AskUserQuestion: blocking, own thread. See asks.rs.
+            if url.starts_with("/ask") {
+                let app = app.clone();
+                let asks = asks.clone();
+                let gate = ask_gate.clone();
+                let store = store.clone();
+                thread::spawn(move || handle_ask(request, &url, &app, &asks, &gate, &store));
                 continue;
             }
 
@@ -594,6 +606,113 @@ fn handle_approve(
     let _ = request.respond(Response::from_string(
         approve_response(decision.as_ref()).to_string(),
     ));
+}
+
+#[derive(Debug, PartialEq)]
+enum AskDecision {
+    /// Answer `{}` now: Claude shows its own menu.
+    Skip,
+    Hold {
+        session: String,
+        tool_use_id: String,
+        questions: Value,
+    },
+}
+
+/// Every reason `/ask` declines to hold a question, in one pure place. `has_origin` is
+/// checked FIRST (a browser page must not raise cards), then the gate, then whether the
+/// session is one of ours -- the same settings file is read by a `claude` the user runs by
+/// hand in that checkout, which posts `session=unknown`.
+fn ask_decision(
+    gate_open: bool,
+    has_origin: bool,
+    session: Option<&str>,
+    body: &Value,
+    known_session: impl Fn(&str) -> bool,
+) -> AskDecision {
+    if has_origin || !gate_open {
+        return AskDecision::Skip;
+    }
+    let Some(session) = session.filter(|s| known_session(s)) else {
+        return AskDecision::Skip;
+    };
+    let Some(questions) = body
+        .get("tool_input")
+        .and_then(crate::asks::supported_questions)
+    else {
+        return AskDecision::Skip;
+    };
+    AskDecision::Hold {
+        session: session.to_string(),
+        tool_use_id: body
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        questions,
+    }
+}
+
+/// Blocking `AskUserQuestion` handler (own thread, like `/approve`). The HTTP response is
+/// the hook's stdout. Every path answers -- `{}` unless the card answered in time.
+fn handle_ask(
+    mut request: Request,
+    url: &str,
+    app: &AppHandle,
+    asks: &crate::asks::Asks,
+    gate: &crate::asks::AskGate,
+    store: &crate::store::Store,
+) {
+    let has_origin = request.headers().iter().any(|h| h.field.equiv("Origin"));
+    let (session, _event) = parse_query(url);
+    let mut body = String::new();
+    let _ = request
+        .as_reader()
+        .take(1024 * 1024)
+        .read_to_string(&mut body);
+    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let input = parsed.get("tool_input").cloned().unwrap_or(Value::Null);
+
+    let known = |id: &str| {
+        store
+            .list()
+            .iter()
+            .any(|p| p.sessions.iter().any(|s| s.id == id))
+    };
+    let AskDecision::Hold {
+        session,
+        tool_use_id,
+        questions,
+    } = ask_decision(
+        gate.is_open(),
+        has_origin,
+        session.as_deref(),
+        &parsed,
+        known,
+    )
+    else {
+        let _ = request.respond(Response::from_string("{}"));
+        return;
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let (id, rx) = asks.register(session, tool_use_id, questions, now_ms);
+    if let Some(view) = asks.get(&id) {
+        let _ = app.emit("ask-request", &view);
+    }
+    let received = rx.recv_timeout(crate::asks::ASK_CEILING).ok();
+    // Forget FIRST, then drain once: a resolve racing the timeout either landed before the
+    // forget (caught by try_recv) or finds nothing and reports false to its card.
+    asks.forget(&id);
+    let outcome = crate::asks::pick_outcome(received, rx.try_recv().ok());
+    let how = crate::asks::how(&outcome);
+    let _ = request.respond(Response::from_string(
+        crate::asks::ask_response(&input, outcome.as_ref()).to_string(),
+    ));
+    let _ = app.emit("ask-resolved", json!({ "id": id, "how": how }));
 }
 
 /// How long the hook holds its request open waiting for a human.
@@ -1488,6 +1607,41 @@ mod tests {
         let foreign = json!({ "hooks": [ { "type": "command", "command":
             "echo \"$CONDUIT_SESSION_ID\" >> ~/my-own-audit.log" } ] });
         assert!(!is_conduit_entry(&foreign));
+    }
+
+    #[test]
+    fn ask_decision_fails_open_on_every_refusal() {
+        let known = |s: &str| s == "sess-1";
+        let body = json!({"tool_name":"AskUserQuestion","tool_use_id":"tu",
+            "tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}});
+        assert!(matches!(
+            ask_decision(true, false, Some("sess-1"), &body, known),
+            AskDecision::Hold { .. }
+        ));
+        assert_eq!(
+            ask_decision(true, true, Some("sess-1"), &body, known),
+            AskDecision::Skip,
+            "Origin refused"
+        );
+        assert_eq!(
+            ask_decision(false, false, Some("sess-1"), &body, known),
+            AskDecision::Skip,
+            "gate closed"
+        );
+        assert_eq!(
+            ask_decision(true, false, Some("unknown"), &body, known),
+            AskDecision::Skip,
+            "a claude outside Conduit reads the same settings file"
+        );
+        assert_eq!(
+            ask_decision(true, false, None, &body, known),
+            AskDecision::Skip
+        );
+        let bad = json!({"tool_input":{"questions":[]}});
+        assert_eq!(
+            ask_decision(true, false, Some("sess-1"), &bad, known),
+            AskDecision::Skip
+        );
     }
 
     #[test]
