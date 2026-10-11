@@ -5944,3 +5944,28 @@ input[type="number"]:focus {
   flex: 1 1 auto;
   min-height: 0;
 }
+
+/* ---- Continuity view: session avatars ---- */
+.session-avatar {
+  position: relative; display: grid; place-items: center; flex: none;
+  border-radius: 28%; background: var(--selection-bg);
+  border: 2px solid var(--border); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.session-avatar.tone-running { border-color: color-mix(in srgb, var(--green) 70%, var(--border)); }
+.session-avatar.tone-needs { border-color: var(--amber); animation: avatar-breathe 1.6s ease-in-out infinite; }
+.session-avatar.tone-stopped { opacity: 0.4; filter: grayscale(0.6); }
+.session-avatar.tone-visitor { border-style: dashed; opacity: 0.6; }
+.session-avatar-badge {
+  position: absolute; top: -6px; right: -6px; min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 9px; background: var(--accent); color: var(--panel-bg);
+  font-size: 10.5px; font-weight: 700; line-height: 18px; text-align: center;
+}
+.session-avatar-chip {
+  position: absolute; bottom: -5px; right: -5px; width: 12px; height: 12px;
+  border-radius: 4px; border: 2px solid var(--panel-bg);
+}
+@keyframes avatar-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--amber) 45%, transparent); }
+  50% { box-shadow: 0 0 0 8px transparent; }
+}
+@media (prefers-reduced-motion: reduce) { .session-avatar.tone-needs { animation: none; } }
