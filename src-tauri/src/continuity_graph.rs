@@ -51,6 +51,7 @@ struct Row {
     status: String,
     focus: Option<String>,
     last_seen: String,
+    cwd_hash: String,
 }
 
 fn conduit_only(project_sessions: &[String]) -> Vec<GraphNode> {
@@ -66,14 +67,18 @@ fn conduit_only(project_sessions: &[String]) -> Vec<GraphNode> {
         .collect()
 }
 
+/// `project_sessions` is `(conduit session id, worktree path if any)`. The worktree path lets a
+/// row written before continuity identity crossed tmux (unsalted `cwd_hash` of the worktree,
+/// default label) fold into its Conduit session instead of becoming a second node.
 pub fn graph_from_db(
     path: &std::path::Path,
-    project_sessions: &[String],
+    project_sessions: &[(String, Option<String>)],
     toplevels: &[String],
     foreign_sessions: &HashMap<String, String>,
 ) -> GraphSnapshot {
+    let ids: Vec<String> = project_sessions.iter().map(|(id, _)| id.clone()).collect();
     let unavailable = || GraphSnapshot {
-        nodes: conduit_only(project_sessions),
+        nodes: conduit_only(&ids),
         ..Default::default()
     };
     let Some(conn) = crate::continuity_read::open_ro(path) else {
@@ -90,7 +95,7 @@ fn rows_by_id(conn: &rusqlite::Connection, ids: &[String]) -> rusqlite::Result<V
         return Ok(vec![]);
     }
     let sql = format!(
-        "SELECT id, agent_label, status, current_focus, last_seen_at FROM agent_sessions WHERE id IN ({})",
+        "SELECT id, agent_label, status, current_focus, last_seen_at, cwd_hash FROM agent_sessions WHERE id IN ({})",
         crate::continuity_feed::placeholders(ids.len())
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -101,6 +106,7 @@ fn rows_by_id(conn: &rusqlite::Connection, ids: &[String]) -> rusqlite::Result<V
             status: r.get(2)?,
             focus: r.get(3)?,
             last_seen: r.get(4)?,
+            cwd_hash: r.get(5)?,
         })
     })?;
     rows.collect()
@@ -108,10 +114,30 @@ fn rows_by_id(conn: &rusqlite::Connection, ids: &[String]) -> rusqlite::Result<V
 
 fn read(
     conn: &rusqlite::Connection,
-    project_sessions: &[String],
+    sessions: &[(String, Option<String>)],
     toplevels: &[String],
     foreign_sessions: &HashMap<String, String>,
 ) -> rusqlite::Result<GraphSnapshot> {
+    let project_sessions: &[String] = &sessions
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    // worktree cwd_hash -> the one Conduit session that owns it. A hash two sessions share
+    // is ambiguous and is dropped (the row then stays its own node).
+    let mut owners: HashMap<String, Vec<&str>> = HashMap::new();
+    for (id, wt) in sessions {
+        if let Some(wt) = wt {
+            owners
+                .entry(crate::continuity_feed::cwd_hash_of(wt))
+                .or_default()
+                .push(id.as_str());
+        }
+    }
+    let worktree_owner: HashMap<String, String> = owners
+        .into_iter()
+        .filter(|(_, v)| v.len() == 1)
+        .map(|(h, v)| (h, v[0].to_string()))
+        .collect();
     let scope = crate::continuity_feed::resolve_session_ids(conn, project_sessions, toplevels);
     let in_scope: HashSet<&str> = scope.iter().map(String::as_str).collect();
     let own: HashSet<&str> = project_sessions.iter().map(String::as_str).collect();
@@ -125,15 +151,20 @@ fn read(
         .collect();
     let mut freshest: HashMap<String, (bool, String)> = HashMap::new(); // node key -> last_seen of the row shown
     for row in rows_by_id(conn, &scope)? {
-        if own.contains(row.label.as_str()) {
-            key_of.insert(row.id.clone(), row.label.clone());
+        let owner: Option<String> = if own.contains(row.label.as_str()) {
+            Some(row.label.clone())
+        } else {
+            worktree_owner.get(&row.cwd_hash).cloned()
+        };
+        if let Some(owner) = owner {
+            key_of.insert(row.id.clone(), owner.clone());
             // A live row outranks a gone one (a restart leaves the old row behind), then the
             // later last_seen wins.
             let rank = (row.status != "gone", row.last_seen.clone());
-            let newer = freshest.get(&row.label).is_none_or(|seen| rank > *seen);
+            let newer = freshest.get(&owner).is_none_or(|seen| rank > *seen);
             if newer {
-                freshest.insert(row.label.clone(), rank);
-                if let Some(n) = nodes.get_mut(&row.label) {
+                freshest.insert(owner.clone(), rank);
+                if let Some(n) = nodes.get_mut(&owner) {
                     n.continuity_id = Some(row.id.clone());
                     n.status = row.status.clone();
                     n.focus = row.focus.clone();
@@ -276,9 +307,10 @@ mod tests {
     ///   c-cli -> plain CLI in P's checkout   c-gone -> CLI in P's checkout, gone
     ///   c-vis -> other project's Conduit session os-9 (messaged 3 min ago)
     ///   c-old -> stranger who messaged 30 min ago (visitor window expired)
+    #[allow(clippy::type_complexity)]
     fn fixture() -> (
         std::path::PathBuf,
-        Vec<String>,
+        Vec<(String, Option<String>)>,
         Vec<String>,
         HashMap<String, String>,
     ) {
@@ -300,7 +332,7 @@ mod tests {
         foreign.insert("os-9".to_string(), "proj-other".to_string());
         (
             path,
-            vec!["cs-1".into(), "cs-2".into()],
+            vec![("cs-1".into(), None), ("cs-2".into(), None)],
             vec!["/repo/p".into()],
             foreign,
         )
@@ -366,12 +398,57 @@ mod tests {
     fn no_database_is_unavailable_with_conduit_nodes_only() {
         let path = std::env::temp_dir().join("conduit-graph-absent-xyz.db");
         let _ = std::fs::remove_file(&path);
-        let s = graph_from_db(&path, &["cs-1".into()], &[], &HashMap::new());
+        let s = graph_from_db(&path, &[("cs-1".into(), None)], &[], &HashMap::new());
         assert!(!s.available);
         assert_eq!(
             keys(&s),
             vec!["cs-1"],
             "the project's own sessions still render"
         );
+    }
+
+    #[test]
+    fn a_worktree_row_folds_into_its_conduit_session() {
+        let path = temp_db("graph-fold");
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let wt = "/repo/p/.wt/w";
+        session(
+            &c,
+            "c-w",
+            "repo-abc123",
+            &crate::continuity_feed::cwd_hash_of(wt),
+            "active",
+        );
+        session(&c, "c-x", "os-x", "elsewhere", "active");
+        msg(&c, "m1", "c-w", "c-x", 2, false);
+        let sessions = vec![("cs-w".to_string(), Some(wt.to_string()))];
+        let mut foreign = HashMap::new();
+        foreign.insert("os-x".to_string(), "proj-other".to_string());
+        let s = graph_from_db(&path, &sessions, &[wt.to_string()], &foreign);
+        assert_eq!(keys(&s), vec!["c-x", "cs-w"]);
+        let n = s.nodes.iter().find(|n| n.key == "cs-w").unwrap();
+        assert_eq!(n.continuity_id.as_deref(), Some("c-w"));
+        assert_eq!(n.status, "active");
+        assert!(s.edges.iter().any(|e| e.a == "c-x" && e.b == "cs-w"));
+    }
+
+    #[test]
+    fn colliding_worktree_paths_do_not_fold() {
+        let path = temp_db("graph-collide");
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let wt = "/repo/p/.wt/w";
+        session(
+            &c,
+            "c-w",
+            "repo-abc123",
+            &crate::continuity_feed::cwd_hash_of(wt),
+            "active",
+        );
+        let sessions = vec![
+            ("cs-a".to_string(), Some(wt.to_string())),
+            ("cs-b".to_string(), Some(wt.to_string())),
+        ];
+        let s = graph_from_db(&path, &sessions, &[wt.to_string()], &HashMap::new());
+        assert_eq!(keys(&s), vec!["c-w", "cs-a", "cs-b"]);
     }
 }

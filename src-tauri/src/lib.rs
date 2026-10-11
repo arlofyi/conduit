@@ -1605,7 +1605,11 @@ fn continuity_graph(
     let Some(project) = projects.iter().find(|p| p.id == project_id) else {
         return continuity_graph::GraphSnapshot::default();
     };
-    let ids: Vec<String> = project.sessions.iter().map(|s| s.id.clone()).collect();
+    let ids: Vec<(String, Option<String>)> = project
+        .sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.worktree_path.clone()))
+        .collect();
     let foreign: std::collections::HashMap<String, String> = projects
         .iter()
         .filter(|p| p.id != project_id)
