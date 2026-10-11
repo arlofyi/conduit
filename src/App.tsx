@@ -39,6 +39,7 @@ import { UpdateNotice } from "./components/UpdateNotice";
 import { TmuxNotice } from "./components/TmuxNotice";
 import { ConversationRepairNotice } from "./components/ConversationRepairNotice";
 import { Toasts } from "./components/Toasts";
+import { AskDock } from "./components/AskDock";
 import { NewProjectDialog } from "./components/NewProjectDialog";
 import { PendingDecisions } from "./components/PendingDecisions";
 import { Settings } from "./components/Settings";
@@ -1092,6 +1093,7 @@ export default function App() {
       <TmuxNotice />
       <ConversationRepairNotice />
       <Toasts />
+      <AskDock />
       <PendingDecisions />
       {showSettings && (
         <Settings onClose={() => setShowSettings(false)} initialTab={settingsTab} />

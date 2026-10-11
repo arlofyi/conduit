@@ -25,6 +25,7 @@ import { mountedInWindow, normalizeProfileId } from "../profiles";
 import { TerminalView } from "./Terminal";
 import { CodeEditorPane } from "./CodeEditorPane";
 import { BoardView } from "./BoardView";
+import { ContinuityView } from "./ContinuityView";
 import { CanvasControls, CanvasUnderlay } from "./CanvasView";
 import { CanvasRail } from "./CanvasRail";
 import { effectiveCenterMode } from "../centerViews";
@@ -625,6 +626,14 @@ export function WorkspaceCenter({
           </div>
         )}
 
+        {/* Same overlay contract as the board: it paints over the still-mounted terminal
+            stack and never unmounts or reparents one. */}
+        {projectId && centerMode === "continuity" && !canvasMode && (
+          <div className="board-overlay continuity-overlay">
+            <ContinuityView projectId={projectId} />
+          </div>
+        )}
+
 
 
         {tabMenu && activeProject && projectId && (
@@ -680,6 +689,13 @@ function GroupTabStrip({
   const boardEnabled = useStore((s) => s.boardEnabled);
   const continuityViewEnabled = useStore((s) => s.continuityViewEnabled);
   const centerMode = effectiveCenterMode(storedCenterMode, { canvasEnabled, boardEnabled, continuityViewEnabled });
+  const toggleCenterMode = useStore((s) => s.toggleCenterMode);
+  // Raw map, counted in a memo — a selector deriving a fresh value per call loops in v5.
+  const asks = useStore((s) => s.asks);
+  const askCount = useMemo(() => {
+    const own = new Set(projects.find((p) => p.id === projectId)?.sessions.map((x) => x.id) ?? []);
+    return Object.values(asks).filter((a) => own.has(a.session)).length;
+  }, [asks, projects, projectId]);
   const canvasOpen = useStore((s) => s.canvasOpen);
   const setCanvasOpen = useStore((s) => s.setCanvasOpen);
   const requestCloseTab = useStore((s) => s.requestCloseTab);
@@ -855,6 +871,18 @@ function GroupTabStrip({
         >
           <span className="board-tab-dot" />
           <span>{richViewOpen[activeTab.ref] ? "Terminal" : "Chat"}</span>
+        </button>
+      )}
+      {isActiveGroup && continuityViewEnabled && (
+        <button
+          type="button"
+          className={`header-btn board-tab ${centerMode === "continuity" ? "active" : ""}`}
+          title="Continuity view (⇧⌘K)"
+          onClick={() => toggleCenterMode(projectId, "continuity")}
+        >
+          <span className="board-tab-dot" />
+          <span>Continuity</span>
+          {askCount > 0 && <span className="header-badge">{askCount}</span>}
         </button>
       )}
       {isActiveGroup && boardEnabled && (

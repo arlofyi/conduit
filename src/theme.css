@@ -5644,17 +5644,18 @@ input[type="number"]:focus {
   --hq-rose: var(--accent); --hq-rose-2: color-mix(in srgb, var(--accent) 85%, #000);
   --hq-rose-soft: color-mix(in srgb, var(--accent) 18%, transparent);
   --hq-rose-line: color-mix(in srgb, var(--accent) 34%, transparent);
-  --hq-grid-line: rgba(255, 255, 255, 0.04);
+  /* --hq-grid-line is a theme token now (defined at :root / [data-theme="warm-light"]
+     below) so the Continuity graph surface can use it outside .hq-* scopes. */
 }
 .root-chat {
   position: relative; overflow: hidden;
   display: flex; flex-direction: column; flex: 1; min-width: 0; height: 100%;
   background: var(--hq-bg); color: var(--hq-ink);
 }
-[data-theme="warm-light"] .root-chat,
-[data-theme="warm-light"] .chat-pane {
-  --hq-grid-line: rgba(0, 0, 0, 0.05);
-}
+/* Grid-line token, hoisted from the .root-chat/.chat-pane scope so every grid surface
+   (HQ texture, Continuity graph) reads one definition per theme. */
+:root { --hq-grid-line: rgba(255, 255, 255, 0.04); }
+:root[data-theme="warm-light"] { --hq-grid-line: rgba(0, 0, 0, 0.05); }
 
 /* Texture: a masked 60px grid (arlo's vault backdrop, sans glow). */
 .hq-grid {
@@ -5969,3 +5970,76 @@ input[type="number"]:focus {
   50% { box-shadow: 0 0 0 8px transparent; }
 }
 @media (prefers-reduced-motion: reduce) { .session-avatar.tone-needs { animation: none; } }
+
+/* ---- Continuity view ---- */
+.continuity-view { position: absolute; inset: 0; display: flex; flex-direction: column; background: var(--panel-bg); }
+.continuity-tabs { display: flex; align-items: center; gap: 8px; height: 38px; flex: none; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--sidebar-bg); }
+.continuity-tab { padding: 4px 10px; border-radius: 6px; color: var(--text-mid); font-size: 13px; cursor: pointer; }
+.continuity-tab.on { background: var(--selection-bg); color: var(--text-bright); }
+.continuity-unavail { margin-left: auto; font-size: 10.5px; color: var(--text-mid); }
+.continuity-empty { position: absolute; inset: 38px 0 0; display: grid; place-items: center; color: var(--text-mid); pointer-events: none; }
+.cgraph {
+  position: relative; flex: 1; overflow: hidden; cursor: grab; touch-action: none;
+  background-color: var(--panel-bg);
+  background-image:
+    linear-gradient(var(--hq-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--hq-grid-line) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+.cgraph:active { cursor: grabbing; }
+/* left/top 50% centres world 0,0; the inline transform carries pan + zoom only. */
+.cgraph-layer { position: absolute; left: 50%; top: 50%; width: 0; height: 0; transform-origin: 0 0; }
+.cgraph-edges { position: absolute; left: 0; top: 0; width: 1px; height: 1px; overflow: visible; }
+.cgraph-edge { fill: none; stroke: color-mix(in srgb, var(--accent) 55%, transparent); stroke-linecap: round; }
+.cgraph-edge.quiet { stroke: color-mix(in srgb, var(--text-dim) 60%, transparent); }
+.cgraph-pulse { fill: var(--accent); filter: drop-shadow(0 0 6px var(--accent)); }
+.cgraph-node { position: absolute; width: 112px; transform: translate(-50%, -36px); display: flex; flex-direction: column; align-items: center; cursor: pointer; }
+.cgraph-node.visitor { transform: translate(-50%, -28px); }
+/* Each transformed node is its own stacking context, so a card's z-index cannot beat a
+   later sibling node by itself — lift the whole node that carries a card. */
+.cgraph-node:has(.ask-card) { z-index: 2; }
+.cgraph-name { margin-top: 7px; font-size: 13px; color: var(--text-bright); white-space: nowrap; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.cgraph-meta { font-size: 10.5px; color: var(--text-mid); white-space: nowrap; }
+.cgraph-meta.needs { color: var(--amber); }
+.ask-card {
+  width: 260px; padding: 11px 12px 12px; border-radius: 14px; text-align: left; cursor: default;
+  background: color-mix(in srgb, var(--amber) 10%, var(--sidebar-bg));
+  border: 1px solid color-mix(in srgb, var(--amber) 45%, var(--border));
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45); animation: ask-pop 0.35s ease-out both;
+}
+.ask-card.anchored { position: absolute; left: calc(50% + 50px); top: -6px; z-index: 3; }
+.ask-card-hd { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: color-mix(in srgb, var(--amber) 75%, var(--text-bright)); }
+.ask-card-q { margin: 4px 0 9px; font-size: 13px; line-height: 1.35; color: var(--text-bright); }
+.ask-card-opt {
+  display: block; width: 100%; margin: 0 0 6px; padding: 7px 9px; border-radius: 9px; text-align: left;
+  background: var(--selection-bg); border: 1px solid var(--border); color: var(--text-bright); font: 13px var(--ui-font); cursor: pointer;
+}
+.ask-card-opt small { display: block; margin-top: 1px; font-size: 10.5px; color: var(--text-mid); }
+.ask-card-opt:hover, .ask-card-opt.on { border-color: var(--accent); }
+.ask-card-opt:disabled { opacity: 0.6; cursor: default; }
+.ask-card-text { width: 100%; margin: 2px 0 6px; padding: 6px 9px; border-radius: 9px; border: 1px solid var(--border); background: var(--panel-bg); color: var(--text-bright); font: 13px var(--ui-font); }
+.ask-card-text:focus { outline: none; border-color: var(--accent); }
+.ask-card-ft { display: flex; align-items: center; gap: 8px; font-size: 10.5px; }
+.ask-card-link { background: none; border: 0; padding: 0; color: var(--accent); font: inherit; cursor: pointer; }
+.ask-card-send { margin-left: auto; padding: 4px 12px; border-radius: 7px; border: 0; background: var(--accent); color: var(--panel-bg); font: 600 13px var(--ui-font); cursor: pointer; }
+.ask-card-send:disabled { opacity: 0.45; cursor: default; }
+.ask-card-pages { display: flex; gap: 4px; }
+.ask-card-pages i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); }
+.ask-card-pages i.on { background: var(--amber); }
+.ask-card-note { margin-top: 6px; font-size: 10.5px; color: var(--text-mid); }
+.ask-dock { position: fixed; right: 16px; bottom: 16px; z-index: 60; }
+.ask-dock-more { margin-top: 6px; text-align: right; font-size: 10.5px; color: var(--text-mid); }
+.header-badge {
+  min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; margin-left: 2px;
+  background: var(--amber); color: var(--panel-bg); font-size: 10.5px; font-weight: 700; line-height: 16px; text-align: center;
+}
+/* Minimal drawer (Task 11); Task 12 fills it in. */
+.session-drawer {
+  position: absolute; top: 38px; right: 0; bottom: 0; width: 320px; z-index: 4; padding: 14px 16px;
+  background: var(--sidebar-bg); border-left: 1px solid var(--border); color: var(--text-bright);
+}
+.session-drawer h3 { font-size: 13px; font-weight: 600; }
+.session-drawer-x { position: absolute; top: 8px; right: 10px; background: none; border: 0; color: var(--text-mid); font-size: 18px; cursor: pointer; }
+.session-drawer-x:hover { color: var(--text-bright); }
+@keyframes ask-pop { from { opacity: 0; transform: translateY(6px) scale(0.97); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .ask-card { animation: none; } .cgraph-pulse { display: none; } }
