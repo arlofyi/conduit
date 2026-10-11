@@ -6033,13 +6033,17 @@ input[type="number"]:focus {
   min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; margin-left: 2px;
   background: var(--amber); color: var(--panel-bg); font-size: 10.5px; font-weight: 700; line-height: 16px; text-align: center;
 }
-/* Minimal drawer (Task 11); Task 12 fills it in. */
-.session-drawer {
-  position: absolute; top: 38px; right: 0; bottom: 0; width: 320px; z-index: 4; padding: 14px 16px;
-  background: var(--sidebar-bg); border-left: 1px solid var(--border); color: var(--text-bright);
-}
-.session-drawer h3 { font-size: 13px; font-weight: 600; }
-.session-drawer-x { position: absolute; top: 8px; right: 10px; background: none; border: 0; color: var(--text-mid); font-size: 18px; cursor: pointer; }
+/* Continuity avatar drawer */
+.session-drawer { position: absolute; top: 38px; right: 0; bottom: 0; width: 420px; max-width: 90%; z-index: 5; display: flex; flex-direction: column; background: var(--sidebar-bg); border-left: 1px solid var(--border); box-shadow: -12px 0 30px rgba(0, 0, 0, 0.35); color: var(--text-bright); }
+.session-drawer-hd { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.session-drawer-name { font-size: 13px; color: var(--text-bright); }
+.session-drawer-meta { font-size: 10.5px; color: var(--text-mid); }
+.session-drawer-hd .header-btn { margin-left: auto; }
+.session-drawer-x { background: none; border: 0; color: var(--text-mid); font-size: 16px; cursor: pointer; }
 .session-drawer-x:hover { color: var(--text-bright); }
+.session-drawer-body { position: relative; flex: 1; overflow: auto; }
+.session-drawer-note { padding: 16px; color: var(--text-mid); font-size: 13px; }
+.session-drawer-facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; padding: 16px; font-size: 13px; }
+.session-drawer-facts dt { color: var(--text-mid); }
 @keyframes ask-pop { from { opacity: 0; transform: translateY(6px) scale(0.97); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .ask-card { animation: none; } .cgraph-pulse { display: none; } }
