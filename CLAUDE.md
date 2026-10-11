@@ -66,8 +66,15 @@ This writes to `…/ConduitTauri-dev/state.json`, so dev and the installed app c
   `workflow_dispatch` and pushes to `main`, not on pull requests, because it costs a
   full app build per run. It does not replace launching the app by hand for UI work —
   it covers three specific CLI-launcher assertions plus the conversation-continuity and
-  Continuity-view specs (every spec runs against a hermetic Continuity DB via
-  `CONTINUITY_DB_PATH`). See "Where the `conduit` CLI lives" and "Where the Continuity view lives".
+  Continuity-view specs. Every spec runs with `CONTINUITY_DB_PATH` pointed at a hermetic
+  fixture DB, but that covers **Conduit's own READS only**: the vendored continuity
+  plugin's `hooks.json`/`.mcp.json` set `CONTINUITY_DB_PATH` from `${user_config.dbPath}`
+  (falling back to `~/.continuity`), so a `claude` a spec spawns inside a GIT repo writes
+  the developer's REAL continuity DB. The Continuity-view spec is safe only because its
+  project is a fresh non-git `mkdtemp` dir — keep any new spec that spawns an agent out of
+  a git checkout, or it will. The fixture needs the `sqlite3` CLI; without it `onPrepare`
+  warns and the Continuity-view spec skips itself. See "Where the `conduit` CLI lives" and
+  "Where the Continuity view lives".
 - **`src/store.seam.test.ts` guards the session-directory seam** — it fails if anything
   outside the sanctioned consumers references `workingDirOf`. If you add a consumer that
   genuinely needs intent rather than reality, add it to that test's allowlist with a
@@ -675,7 +682,22 @@ animal avatars linked by the Continuity messages they exchange, plus Claude Code
   `centerViews.ts` owns the gating and the three-way exclusion — callers no longer close
   the canvas themselves.
 - E2E: `e2e/continuity-view.e2e.ts` (+ `continuityFixture.ts`) drives the real window; the
-  harness gives every spec its own `CONTINUITY_DB_PATH` so none reads the developer's real DB.
+  harness gives every spec its own `CONTINUITY_DB_PATH` so none READS the developer's real
+  DB. It does not stop one WRITING it: the vendored plugin's hooks/MCP server take their DB
+  path from `${user_config.dbPath}` (default `~/.continuity`), not from Conduit's env, so a
+  spawned `claude` in a git repo records into the real DB. This spec is safe only because
+  its project is a fresh non-git `mkdtemp` dir. No `sqlite3` CLI → the spec skips itself.
+- **`continuity_watch.rs` re-opens a replaced DB.** An open connection pins the old inode
+  and `data_version` keeps answering from it, so the watcher compares the path's
+  (dev, ino) every ~10 s on unix and blindly re-opens every ~30 s on Windows. The cursor
+  survives a re-open (no history storm, no lost pulse).
+- **`continuity_graph`/`continuity_tables` are async commands on the blocking pool**, and
+  `project_toplevels` is memoized 30 s per (project, dir list) — one `continuity-changed`
+  fans out into several reads, each forking `git rev-parse` per worktree. The frontend
+  refetches are debounced with a 3 s ceiling (`debounce.ts`) so a steady stream still refreshes.
+- **An ask for the terminal already in front of the user never becomes a card**: `App.tsx`
+  `admitAsk` hands it off before `addAsk`. Listeners are registered before the
+  `ask_pending` catch-up, and the "moved to the terminal" toast is for timeouts only.
 - **Tables read through `continuity_tables.rs`, scoped by the same `resolve_session_ids` as the
   map, and refetch on `continuity-changed`.** Task "open" means status is not `completed` or
   `released` AND the claim is not past `expires_at`; continuity has no `expired` status, so
