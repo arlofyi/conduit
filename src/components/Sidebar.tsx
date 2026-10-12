@@ -831,6 +831,7 @@ function SessionContextMenu() {
   const removeRootChat = useStore((s) => s.removeRootChat);
   const selectProject = useStore((s) => s.selectProject);
   const setCenterMode = useStore((s) => s.setCenterMode);
+  const boardEnabled = useStore((s) => s.boardEnabled);
   const setProjectColor = useStore((s) => s.setProjectColor);
   const removeSession = useStore((s) => s.removeSession);
   const removeProject = useStore((s) => s.removeProject);
@@ -914,15 +915,17 @@ function SessionContextMenu() {
         onClick={(e) => e.stopPropagation()}
       >
         <button onClick={() => startProjectRename(menu.projectId)}>Rename</button>
-        <button
-          onClick={() => {
-            selectProject(menu.projectId);
-            setCenterMode(menu.projectId, "board");
-            closeMenu();
-          }}
-        >
-          Open board
-        </button>
+        {boardEnabled && (
+          <button
+            onClick={() => {
+              selectProject(menu.projectId);
+              setCenterMode(menu.projectId, "board");
+              closeMenu();
+            }}
+          >
+            Open board
+          </button>
+        )}
         <div
           className="context-flyout-item"
           onMouseEnter={() => setColorOpen(true)}

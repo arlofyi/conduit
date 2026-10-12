@@ -6,6 +6,7 @@
 
 mod agent;
 mod agy_usage;
+mod asks;
 mod board;
 mod bridge;
 mod broker;
@@ -20,7 +21,12 @@ mod commandcode_usage;
 mod context_window;
 mod continuity;
 mod continuity_feed;
+#[cfg(test)]
+mod continuity_fixture;
+mod continuity_graph;
 mod continuity_read;
+mod continuity_tables;
+mod continuity_watch;
 mod conversation_repair;
 mod fleet;
 mod fleet_mcp;
@@ -1544,6 +1550,145 @@ fn list_continuity(
     Ok(continuity_read::view_for_project(&project_id, &session_ids))
 }
 
+/// Answer a pending AskUserQuestion from its card. `false` = it already resolved
+/// (handed off or timed out) -- the card says so; nothing was sent.
+#[tauri::command]
+fn ask_answer(
+    asks: State<Arc<asks::Asks>>,
+    id: String,
+    answers: serde_json::Map<String, serde_json::Value>,
+) -> Result<bool, String> {
+    let Some(view) = asks.get(&id) else {
+        return Ok(false);
+    };
+    asks::validate_answers(&view.questions, &answers)?;
+    Ok(asks.resolve(&id, asks::AskOutcome::Answered(answers)))
+}
+
+#[tauri::command]
+fn ask_handoff(asks: State<Arc<asks::Asks>>, id: String) -> bool {
+    asks.resolve(&id, asks::AskOutcome::HandOff)
+}
+
+#[tauri::command]
+fn ask_pending(asks: State<Arc<asks::Asks>>) -> Vec<asks::AskView> {
+    asks.pending()
+}
+
+#[tauri::command]
+fn set_ask_gate(gate: State<Arc<asks::AskGate>>, open: bool) {
+    gate.set(open);
+}
+
+/// How long a project's resolved git toplevels are reused (see `ToplevelCache`).
+const TOPLEVEL_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The project root plus every worktree, each its own git toplevel (and so its own
+/// continuity cwd_hash). A path that isn't a checkout simply drops out. Memoized per
+/// project for `TOPLEVEL_TTL`: every continuity read needs it and each miss forks one
+/// `git rev-parse` per worktree.
+fn project_toplevels(project: &store::Project) -> Vec<String> {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<continuity_read::ToplevelCache>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::Mutex::new(continuity_read::ToplevelCache::new(TOPLEVEL_TTL))
+        });
+    let mut dirs: Vec<String> = vec![project.path.clone()];
+    dirs.extend(
+        project
+            .sessions
+            .iter()
+            .filter_map(|s| s.worktree_path.clone()),
+    );
+    let resolve = |dirs: &[String]| {
+        let mut tops: Vec<String> = dirs.iter().filter_map(|d| git::toplevel(d)).collect();
+        tops.sort();
+        tops.dedup();
+        tops
+    };
+    match CACHE.lock() {
+        Ok(mut cache) => {
+            cache.get_or_compute(&project.id, &dirs, std::time::Instant::now(), resolve)
+        }
+        Err(_) => resolve(&dirs),
+    }
+}
+
+fn continuity_graph_inner(store: &Store, project_id: &str) -> continuity_graph::GraphSnapshot {
+    let projects = store.list();
+    let Some(project) = projects.iter().find(|p| p.id == project_id) else {
+        return continuity_graph::GraphSnapshot::default();
+    };
+    let ids: Vec<(String, Option<String>)> = project
+        .sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.worktree_path.clone()))
+        .collect();
+    let foreign: std::collections::HashMap<String, String> = projects
+        .iter()
+        .filter(|p| p.id != project_id)
+        .flat_map(|p| p.sessions.iter().map(move |s| (s.id.clone(), p.id.clone())))
+        .collect();
+    continuity_graph::graph_from_db(
+        &continuity_read::db_path(),
+        &ids,
+        &project_toplevels(project),
+        &foreign,
+    )
+}
+
+/// The Continuity view's graph for a project. Best-effort, read-only. Async + blocking
+/// pool: a sync command runs on the main thread, and this forks git and reads SQLite
+/// several times per `continuity-changed`.
+#[tauri::command]
+async fn continuity_graph(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> continuity_graph::GraphSnapshot {
+    let store = app.state::<Arc<Store>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || continuity_graph_inner(&store, &project_id))
+        .await
+        .unwrap_or_default()
+}
+
+fn continuity_tables_inner(
+    store: &Store,
+    project_id: &str,
+    tab: String,
+) -> continuity_tables::TablesView {
+    let Some(project) = store.list().into_iter().find(|p| p.id == project_id) else {
+        return continuity_tables::TablesView {
+            tab,
+            ..Default::default()
+        };
+    };
+    let session_ids: Vec<String> = project.sessions.iter().map(|s| s.id.clone()).collect();
+    continuity_tables::tables_from_db(
+        &continuity_read::db_path(),
+        &session_ids,
+        &project_toplevels(&project),
+        &tab,
+    )
+}
+
+/// Rows for one Continuity-view table tab (decisions / handoffs / tasks / files / activity),
+/// scoped exactly like the feed. Best-effort -- see `continuity_tables::tables_from_db`.
+/// Off the main thread for the same reason as `continuity_graph`.
+#[tauri::command]
+async fn continuity_tables(
+    app: tauri::AppHandle,
+    project_id: String,
+    tab: String,
+) -> continuity_tables::TablesView {
+    let store = app.state::<Arc<Store>>().inner().clone();
+    let fallback = tab.clone();
+    tauri::async_runtime::spawn_blocking(move || continuity_tables_inner(&store, &project_id, tab))
+        .await
+        .unwrap_or_else(|_| continuity_tables::TablesView {
+            tab: fallback,
+            ..Default::default()
+        })
+}
+
 /// Read-only continuity feed for a project: the decisions and messages recorded by the
 /// sessions that belong to it. Scoped by Conduit session id (exact) plus the git toplevel
 /// of the project and each of its worktrees (for sessions started outside Conduit).
@@ -1558,18 +1703,7 @@ fn continuity_feed(
     };
     let session_ids: Vec<String> = project.sessions.iter().map(|s| s.id.clone()).collect();
 
-    // The project root plus every worktree. Each is its own git toplevel and so its own
-    // cwd_hash; a path that isn't a checkout (a pending worktree) simply drops out.
-    let mut dirs: Vec<String> = vec![project.path.clone()];
-    dirs.extend(
-        project
-            .sessions
-            .iter()
-            .filter_map(|s| s.worktree_path.clone()),
-    );
-    let mut toplevels: Vec<String> = dirs.iter().filter_map(|d| git::toplevel(d)).collect();
-    toplevels.sort();
-    toplevels.dedup();
+    let toplevels = project_toplevels(&project);
 
     Ok(continuity_feed::feed_for_project(
         &session_ids,
@@ -2556,6 +2690,8 @@ pub fn run() {
         .manage(Arc::new(hookbus::HookBus::default()))
         .manage(Arc::new(broker::Broker::default()))
         .manage(Arc::new(broker::Presence::default()))
+        .manage(Arc::new(asks::Asks::default()))
+        .manage(Arc::new(asks::AskGate::default()))
         .manage(Arc::new(proposals::Proposals::default()))
         .manage(Arc::new(window_registry::WindowRegistry::default()))
         .manage(Arc::new(window_registry::PendingOpens::default()))
@@ -2655,6 +2791,8 @@ pub fn run() {
                 .state::<Arc<window_registry::WindowModeFlag>>()
                 .inner()
                 .clone();
+            let asks_state = app.state::<Arc<asks::Asks>>().inner().clone();
+            let ask_gate = app.state::<Arc<asks::AskGate>>().inner().clone();
             hooks::start(
                 app.handle().clone(),
                 hook_state,
@@ -2670,8 +2808,11 @@ pub fn run() {
                 reg,
                 pending_opens,
                 window_mode,
+                asks_state,
+                ask_gate,
             );
             bridge::start(app.handle().clone());
+            continuity_watch::start(app.handle().clone());
 
             // IDE announce: hand the host to the PTY manager (teardown needs it) and
             // sweep OUR stale lock files — every lock dir Conduit could have written
@@ -2869,6 +3010,12 @@ pub fn run() {
             board_resolve_gate,
             list_continuity,
             continuity_feed,
+            continuity_graph,
+            continuity_tables,
+            ask_answer,
+            ask_handoff,
+            ask_pending,
+            set_ask_gate,
             add_session,
             detect_agents,
             rename_session,

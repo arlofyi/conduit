@@ -444,6 +444,10 @@ impl PtyManager {
                 if let Some(dir) = account_config_dir.as_deref() {
                     session_env.extend(adapter.account_env(dir));
                 }
+                // Continuity identity must ride the export line too: `cmd.env` below
+                // dies at the tmux server boundary, and continuity would fall back to
+                // an unsalted cwd-hash label.
+                session_env.extend(continuity_env(&session_id, plugin_dir.is_some()));
                 let script = build_script(
                     adapter.as_ref(),
                     &session_id,
@@ -1278,6 +1282,19 @@ fn env_export_prefix(env: &[(String, String)]) -> String {
     }
 }
 
+/// Continuity identity env for a spawn: empty unless continuity is on. Shared by the POSIX
+/// export line (the only channel that crosses the tmux server) and unit tests.
+#[cfg_attr(windows, allow(dead_code))]
+fn continuity_env(session_id: &str, enabled: bool) -> Vec<(String, String)> {
+    if !enabled {
+        return Vec::new();
+    }
+    vec![
+        ("CONTINUITY_SESSION_ID".to_string(), session_id.to_string()),
+        ("CONTINUITY_AGENT_ID".to_string(), session_id.to_string()),
+    ]
+}
+
 /// Windows counterpart of `build_script`: returns just the agent invocation (with its
 /// worktree/settings flags) to hand to `cmd.exe /K`. The working directory and Conduit's
 /// own env (CONDUIT_SESSION_ID/HOOK_PORT) are applied natively by `CommandBuilder`
@@ -1551,6 +1568,17 @@ mod tests {
             )
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn continuity_identity_rides_the_export_line_only_when_enabled() {
+        let on = env_export_prefix(&continuity_env("sid-9", true));
+        assert!(on.contains("CONTINUITY_SESSION_ID='sid-9'"), "{on}");
+        assert!(on.contains("CONTINUITY_AGENT_ID='sid-9'"), "{on}");
+        let off = env_export_prefix(&continuity_env("sid-9", false));
+        assert!(!off.contains("CONTINUITY_"), "{off}");
+        assert!(continuity_env("sid-9", false).is_empty());
     }
 
     #[cfg(not(windows))]

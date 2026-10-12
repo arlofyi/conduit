@@ -131,9 +131,79 @@ fn read_card_handoffs(
     rows.collect()
 }
 
+/// A short-lived memo of each project's git toplevels. Resolving them shells out to
+/// `git rev-parse` once per worktree, and one `continuity-changed` fans out into several
+/// reads (graph + table tab + feed), so without this a burst of commits forks a burst of
+/// gits. Keyed by project AND by the exact directory list, so a new worktree is never
+/// hidden behind a cached answer; only time-based staleness (a checkout appearing or
+/// vanishing under an unchanged path) can lag, by at most `ttl`.
+pub(crate) struct ToplevelCache {
+    ttl: std::time::Duration,
+    entries: std::collections::HashMap<String, (std::time::Instant, Vec<String>, Vec<String>)>,
+}
+
+impl ToplevelCache {
+    pub(crate) fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    pub(crate) fn get_or_compute(
+        &mut self,
+        project_id: &str,
+        dirs: &[String],
+        now: std::time::Instant,
+        compute: impl FnOnce(&[String]) -> Vec<String>,
+    ) -> Vec<String> {
+        if let Some((at, cached_dirs, tops)) = self.entries.get(project_id) {
+            if cached_dirs.as_slice() == dirs && now.saturating_duration_since(*at) < self.ttl {
+                return tops.clone();
+            }
+        }
+        let tops = compute(dirs);
+        self.entries
+            .insert(project_id.to_string(), (now, dirs.to_vec(), tops.clone()));
+        tops
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toplevel_cache_reuses_a_fresh_answer_and_recomputes_a_stale_or_changed_one() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let mut cache = ToplevelCache::new(Duration::from_secs(30));
+        let calls = Cell::new(0);
+        let compute = |dirs: &[String]| {
+            calls.set(calls.get() + 1);
+            dirs.to_vec()
+        };
+        let t0 = Instant::now();
+        let a = vec!["/p".to_string()];
+        assert_eq!(cache.get_or_compute("p1", &a, t0, compute), a);
+        assert_eq!(
+            cache.get_or_compute("p1", &a, t0 + Duration::from_secs(29), compute),
+            a
+        );
+        assert_eq!(calls.get(), 1, "a fresh answer for the same dirs is reused");
+        cache.get_or_compute("p1", &a, t0 + Duration::from_secs(31), compute);
+        assert_eq!(calls.get(), 2, "a stale answer is recomputed");
+        let b = vec!["/p".to_string(), "/p/wt".to_string()];
+        let t1 = t0 + Duration::from_secs(32);
+        assert_eq!(cache.get_or_compute("p1", &b, t1, compute), b);
+        assert_eq!(
+            calls.get(),
+            3,
+            "a new worktree is never hidden by the cache"
+        );
+        cache.get_or_compute("p2", &a, t1, compute);
+        assert_eq!(calls.get(), 4, "keyed per project");
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Continuity's real DDL for `agent_sessions` + `handoffs`, copied verbatim from

@@ -18,6 +18,8 @@ import {
 import { type AgentId } from "./agents";
 import { eventInThisWindow, normalizeProfileId } from "./profiles";
 import { matchProjectByPath } from "./cliOpen";
+import { askGateOpen, askResolvedToast, askShouldHandOff, type PendingAsk } from "./asks";
+import { effectiveCenterMode } from "./centerViews";
 import { type PendingDiff } from "./ideBridge";
 import { isEditableTarget, isInTerminal } from "./keyboardGuards";
 import { type ChatItem } from "./rootChat";
@@ -37,6 +39,7 @@ import { UpdateNotice } from "./components/UpdateNotice";
 import { TmuxNotice } from "./components/TmuxNotice";
 import { ConversationRepairNotice } from "./components/ConversationRepairNotice";
 import { Toasts } from "./components/Toasts";
+import { AskDock } from "./components/AskDock";
 import { NewProjectDialog } from "./components/NewProjectDialog";
 import { PendingDecisions } from "./components/PendingDecisions";
 import { Settings } from "./components/Settings";
@@ -49,6 +52,9 @@ import { useFileWatch } from "./hooks/useFileWatch";
 import { useHotExit } from "./hooks/useHotExit";
 import { useStoreSync } from "./hooks/useStoreSync";
 import { initPlugins, feedHook, feedFleet } from "./plugins";
+
+/** How long an answered question card stays up showing its done state. */
+const ASK_DONE_HOLD_MS = 1600;
 
 interface HookPayload {
   session: string;
@@ -129,6 +135,36 @@ async function applyCliOpenPayload(payload: CliOpenPayload): Promise<void> {
   if (projectId && payload.agent) {
     await useStore.getState().addSession(projectId, { agent: payload.agent as AgentId });
   }
+}
+
+/** Ask ids already handed back to the terminal (see the hand-off subscription). */
+const handedOff = new Set<string>();
+
+/** Where the user is looking, for the hand-off rule. */
+function handOffView(s: ReturnType<typeof useStore.getState>) {
+  return {
+    selectedSessionId: globalSelectedSessionId(s),
+    continuityVisible:
+      !!s.selectedProjectId && effectiveCenterMode(s.centerMode[s.selectedProjectId], s) === "continuity",
+    windowFocused: s.windowFocused,
+  };
+}
+
+/** An incoming ask (live or catch-up). One for the terminal the user is already watching
+ *  goes straight back to it and never becomes a card: adding it first would flash a docked
+ *  card for a frame and then toast about moving it. If the hand-off fails, show the card. */
+function admitAsk(a: PendingAsk) {
+  const s = useStore.getState();
+  if (handedOff.has(a.id) || a.id in s.asks) return;
+  if (askShouldHandOff(a, handOffView(s))) {
+    handedOff.add(a.id);
+    void invoke<boolean>("ask_handoff", { id: a.id }).catch(() => {
+      handedOff.delete(a.id);
+      useStore.getState().addAsk(a);
+    });
+    return;
+  }
+  s.addAsk(a);
 }
 
 export default function App() {
@@ -279,14 +315,22 @@ export default function App() {
       // accelerator wired yet, so handled here like the other window-level shortcuts).
       if (e.shiftKey && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "b") {
         const st = useStore.getState();
-        if (!st.selectedProjectId) return;
+        if (!st.selectedProjectId || !st.boardEnabled) return;
         e.preventDefault();
+        // setCenterMode also closes the global canvas (three-way exclusion).
         st.toggleCenterMode(st.selectedProjectId);
-        // The canvas is a global flag independent of this project's centerMode (see the
-        // tab-click handler in WorkspaceCenter.tsx, which does the same) -- closing it
-        // here is what makes the board and the canvas mutually exclusive in BOTH
-        // directions, not just the direction the board overlay's own render gate covers.
-        st.setCanvasOpen(false);
+      }
+      // ⇧⌘K: toggle the Continuity view for the selected project.
+      if (e.shiftKey && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "k") {
+        const st = useStore.getState();
+        if (!st.selectedProjectId || !st.continuityViewEnabled) return;
+        // Same guard as ⇧⌘C below: on Windows/Linux Ctrl+Shift+K inside a terminal is the
+        // terminal's, and an editable field keeps its own keys on every platform.
+        const isMac = /Mac|iPhone|iPod|iPad/i.test(navigator.platform || navigator.userAgent);
+        if (isInTerminal(e.target) ? !isMac : isEditableTarget(e.target)) return;
+        e.preventDefault();
+        st.toggleCenterMode(st.selectedProjectId, "continuity");
+        return;
       }
       // ⇧⌘C: toggle the global canvas. Unlike ⇧⌘B above, this needs no selected project —
       // the canvas is global — and no native menu accelerator claims CmdOrCtrl+Shift+C
@@ -308,6 +352,8 @@ export default function App() {
       if (e.shiftKey && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "c") {
         const isMac = /Mac|iPhone|iPod|iPad/i.test(navigator.platform || navigator.userAgent);
         if (isInTerminal(e.target) ? !isMac : isEditableTarget(e.target)) return;
+        // Canvas pref off: inert (leave the key to the terminal / default behaviour).
+        if (!useStore.getState().canvasEnabled) return;
         e.preventDefault();
         const s = useStore.getState();
         s.setCanvasOpen(!s.canvasOpen);
@@ -637,7 +683,7 @@ export default function App() {
           if (st.selectedProjectId) st.toggleMaximizeGroup(st.selectedProjectId);
           break;
         case "toggle-board":
-          if (st.selectedProjectId) st.toggleCenterMode(st.selectedProjectId);
+          if (st.selectedProjectId && st.boardEnabled) st.toggleCenterMode(st.selectedProjectId);
           break;
         case "command-palette":
           setPalette("commands");
@@ -891,6 +937,81 @@ export default function App() {
     };
   }, []);
 
+  // AskUserQuestion cards (asks.rs): live requests, resolutions, and a catch-up for asks
+  // raised before this window loaded. Both listeners are registered BEFORE the catch-up
+  // fetch: an ask raised between a fetch and a later registration would get no card for
+  // the whole 600 s ceiling.
+  useEffect(() => {
+    let disposed = false;
+    const uns: (() => void)[] = [];
+    void (async () => {
+      const ready = await Promise.all([
+        listen<PendingAsk>("ask-request", ({ payload }) => admitAsk(payload)),
+        listen<{ id: string; how: string }>("ask-resolved", ({ payload }) => {
+          const s = useStore.getState();
+          const shown = payload.id in s.asks;
+          // An answer from a card: Rust resolves before the card's own ask_answer reply lands,
+          // so hold the card long enough for its "Sent to …" confirmation to be seen — and
+          // stop it reading as "needs you" meanwhile.
+          if (payload.how === "answered") {
+            s.markAskAnswered(payload.id);
+            setTimeout(() => useStore.getState().removeAsk(payload.id), ASK_DONE_HOLD_MS);
+          } else s.removeAsk(payload.id);
+          handedOff.delete(payload.id);
+          if (askResolvedToast(payload.how, shown)) s.pushToast("Question moved to the session's terminal");
+        }),
+      ]).catch(() => [] as (() => void)[]);
+      if (disposed) {
+        ready.forEach((f) => f());
+        return;
+      }
+      uns.push(...ready);
+      const list = await invoke<PendingAsk[]>("ask_pending").catch(() => [] as PendingAsk[]);
+      if (!disposed) list.forEach(admitAsk);
+    })();
+    const onFocus = () => useStore.getState().setWindowFocused(true);
+    const onBlur = () => useStore.getState().setWindowFocused(false);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      disposed = true;
+      uns.forEach((f) => f());
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
+
+  // Keep Rust's gate in step: capture questions only when a card could be seen. With
+  // profile windows every window writes the gate; the last writer wins, which is the
+  // focused window -- the one whose card could actually be seen.
+  const askGate = useStore((s) =>
+    askGateOpen({
+      enabled: s.continuityViewEnabled,
+      viewOpen:
+        !!s.selectedProjectId &&
+        effectiveCenterMode(s.centerMode[s.selectedProjectId], s) === "continuity",
+      windowFocused: s.windowFocused,
+    }),
+  );
+  useEffect(() => {
+    void invoke("set_ask_gate", { open: askGate }).catch(() => {});
+  }, [askGate]);
+
+  // Hand a question back once its session's own terminal is in front of the user. Each id
+  // is invoked once; it is forgotten when its `ask-resolved` arrives.
+  useEffect(() => {
+    return useStore.subscribe((s) => {
+      const view = handOffView(s);
+      for (const a of Object.values(s.asks)) {
+        if (handedOff.has(a.id)) continue;
+        if (askShouldHandOff(a, view)) {
+          handedOff.add(a.id);
+          void invoke("ask_handoff", { id: a.id }).catch(() => handedOff.delete(a.id));
+        }
+      }
+    });
+  }, []);
+
   // Returning to the app clears "needs you" on whatever session you're viewing.
   useEffect(() => {
     const onFocus = () => {
@@ -1019,6 +1140,7 @@ export default function App() {
       <TmuxNotice />
       <ConversationRepairNotice />
       <Toasts />
+      <AskDock />
       <PendingDecisions />
       {showSettings && (
         <Settings onClose={() => setShowSettings(false)} initialTab={settingsTab} />

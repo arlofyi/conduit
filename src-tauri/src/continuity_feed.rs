@@ -82,7 +82,7 @@ pub fn resolve_session_ids(
 
 /// `?,?,?` for n bindings. An empty list yields `NULL`, which matches nothing -- so an
 /// empty arm contributes no rows instead of producing invalid SQL.
-fn placeholders(n: usize) -> String {
+pub(crate) fn placeholders(n: usize) -> String {
     if n == 0 {
         return "NULL".to_string();
     }

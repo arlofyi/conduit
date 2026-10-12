@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { PendingAsk } from "./asks";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir as getHomeDir } from "@tauri-apps/api/path";
 import {
@@ -40,6 +41,18 @@ import { projectsNeedingRoutes, type RoutesByProject } from "./pendingDecisionRo
 import { inProfile, mountedInWindow, type Profile, type WindowProfile } from "./profiles";
 import { type CanvasState, emptyCanvas, migrateNotes } from "./canvas";
 import type { ContinuityFeed } from "./continuityFeed";
+import {
+  BOARD_ENABLED_KEY,
+  CANVAS_ENABLED_KEY,
+  CONTINUITY_VIEW_ENABLED_KEY,
+  canOpenCanvas,
+  readViewPref,
+  resolveCenterMode,
+  toggledMode,
+  writeViewPref,
+  type CenterMode,
+  type ViewPrefs,
+} from "./centerViews";
 import type * as Monaco from "monaco-editor";
 import type { SettingsTab } from "./components/Settings";
 import type { PluginDescriptor, PluginPermission } from "./plugins/types";
@@ -284,12 +297,13 @@ export interface ContinuityView { presence: Presence[]; handoffs: CardHandoff[] 
 // every store type from one place.
 export type { ContinuityFeed, FeedDecision, FeedMessage } from "./continuityFeed";
 
-/** Center pane mode, per project: the terminal workspace or the task board. The spatial
+/** Center pane mode, per project: the terminal workspace, the task board or the Continuity
+ *  view (type lives in centerViews.ts, store-free; gated by the three view prefs). The spatial
  *  canvas used to be a third mode here, per project; it is now the global board
  *  (`canvas`/`canvasOpen` below), which is not a project's mode to be in — it can be open
  *  regardless of which project (if any) is selected. Every mode is an OVERLAY over the
  *  still-mounted terminals — none of them may unmount or reparent a TerminalView. */
-export type CenterMode = "terminals" | "board";
+export type { CenterMode } from "./centerViews";
 
 export type SessionStatus = "idle" | "running" | "needsInput" | "done";
 export type TodoStatus = "pending" | "in_progress" | "completed";
@@ -1697,7 +1711,31 @@ interface AppState {
    *  database being reachable. */
   continuityFeed: Record<string, ContinuityFeed>;
   setCenterMode: (projectId: string, mode: CenterMode) => void;
-  toggleCenterMode: (projectId: string) => void;
+  toggleCenterMode: (projectId: string, target?: "board" | "continuity") => void;
+  /** View prefs (localStorage, per machine): Canvas and Task board default off, the
+   *  Continuity view defaults on. A stored mode whose pref is off renders as terminals. */
+  canvasEnabled: boolean;
+  boardEnabled: boolean;
+  continuityViewEnabled: boolean;
+  /** Pending AskUserQuestion prompts held open by Rust (asks.rs), keyed by ask id. */
+  asks: Record<string, PendingAsk>;
+  /** Whether this window has focus; feeds the ask capture gate. */
+  windowFocused: boolean;
+  /** Ask ids already answered (by this window's card, or reported `answered` by Rust) whose
+   *  card is still up for its short done hold. They no longer make an avatar "need" you. */
+  answeredAsks: Record<string, true>;
+  addAsk: (a: PendingAsk) => void;
+  removeAsk: (id: string) => void;
+  markAskAnswered: (id: string) => void;
+  /** Conduit session ids the open Continuity view draws as nodes (a raw map, replaced
+   *  only when the set changes). An ask whose session is NOT in here has no card in the
+   *  graph, so the dock must show it even while the view is visible. */
+  continuityRendered: Record<string, true>;
+  setContinuityRendered: (ids: string[]) => void;
+  setWindowFocused: (v: boolean) => void;
+  setCanvasEnabled: (v: boolean) => void;
+  setBoardEnabled: (v: boolean) => void;
+  setContinuityViewEnabled: (v: boolean) => void;
 
   // ---- Canvas view (global board) ----
   /** The one global board. Cross-project, curated, per-machine. Persisted to localStorage
@@ -1747,6 +1785,14 @@ export const useStore = create<AppState>((set, get) => {
   // identity, never `activeProfileId` — that field is global, only "main" may write it
   // (lib.rs), and a secondary window's copy of it is frozen at main's boot-time value.
   // Stamping with it there would silently mis-file a project under main's profile.
+  const prefsOf = (): ViewPrefs => {
+    const s = get();
+    return {
+      canvasEnabled: s.canvasEnabled,
+      boardEnabled: s.boardEnabled,
+      continuityViewEnabled: s.continuityViewEnabled,
+    };
+  };
   const stampProfileId = (): string | null =>
     WINDOWED ? get().windowProfile.profileId : get().activeProfileId;
 
@@ -3857,13 +3903,48 @@ export const useStore = create<AppState>((set, get) => {
 
     // ---- Task board (Conductor board) ----
     centerMode: {},
+    canvasEnabled: readViewPref(CANVAS_ENABLED_KEY, false),
+    boardEnabled: readViewPref(BOARD_ENABLED_KEY, false),
+    continuityViewEnabled: readViewPref(CONTINUITY_VIEW_ENABLED_KEY, true),
+    asks: {},
+    windowFocused: typeof document !== "undefined" ? document.hasFocus() : true,
+    answeredAsks: {},
+    addAsk: (a) => set((s) => ({ asks: { ...s.asks, [a.id]: a } })),
+    removeAsk: (id) =>
+      set((s) => {
+        if (!(id in s.asks) && !(id in s.answeredAsks)) return s;
+        const next = { ...s.asks };
+        delete next[id];
+        const answered = { ...s.answeredAsks };
+        delete answered[id];
+        return { asks: next, answeredAsks: answered };
+      }),
+    markAskAnswered: (id) =>
+      set((s) => (s.answeredAsks[id] || !(id in s.asks) ? s : { answeredAsks: { ...s.answeredAsks, [id]: true } })),
+    setWindowFocused: (v) => set({ windowFocused: v }),
+    continuityRendered: {},
+    setContinuityRendered: (ids) =>
+      set((s) => {
+        const cur = Object.keys(s.continuityRendered);
+        if (cur.length === ids.length && ids.every((id) => s.continuityRendered[id])) return s;
+        const next: Record<string, true> = {};
+        for (const id of ids) next[id] = true;
+        return { continuityRendered: next };
+      }),
     canvas: readCanvas(),
     canvasOpen: false,
     boards: {},
     continuity: {},
     continuityFeed: {},
-    setCenterMode: (projectId, mode) =>
-      set((s) => ({ centerMode: { ...s.centerMode, [projectId]: mode } })),
+    setCenterMode: (projectId, mode) => {
+      const next = resolveCenterMode(mode, prefsOf());
+      set((s) => ({
+        centerMode: { ...s.centerMode, [projectId]: next },
+        // Exclusion lives here, not in each caller: every non-terminals overlay closes the
+        // global canvas, so the palette and native-menu paths can no longer leave both up.
+        canvasOpen: next === "terminals" ? s.canvasOpen : false,
+      }));
+    },
 
     // The canvas is one global board; a secondary window mounts only its own profile's
     // projects (see mountedInWindow/allSessions in WorkspaceCenter.tsx), so opening it
@@ -3871,18 +3952,37 @@ export const useStore = create<AppState>((set, get) => {
     // ONE choke point every entry point routes through (the header toggle, ⇧⌘C in
     // App.tsx, the command palette) — gating only the button would leave the keyboard
     // shortcut and palette able to open a canvas with its own close button hidden.
-    setCanvasOpen: (open) =>
-      set({ canvasOpen: open && !(WINDOWED && !get().windowProfile.isMain) }),
+    // Also refuses while the Canvas pref is off, and opening it drops the selected
+    // project's overlay to terminals (three-way exclusion).
+    setCanvasOpen: (open) => {
+      const ok = open && canOpenCanvas(prefsOf(), WINDOWED && !get().windowProfile.isMain);
+      set((s) => {
+        const pid = s.selectedProjectId;
+        const centerMode = ok && pid ? { ...s.centerMode, [pid]: "terminals" as CenterMode } : s.centerMode;
+        return { canvasOpen: ok, centerMode };
+      });
+    },
+    setCanvasEnabled: (v) => {
+      writeViewPref(CANVAS_ENABLED_KEY, v);
+      set((s) => ({ canvasEnabled: v, canvasOpen: v ? s.canvasOpen : false }));
+    },
+    setBoardEnabled: (v) => {
+      writeViewPref(BOARD_ENABLED_KEY, v);
+      set({ boardEnabled: v });
+    },
+    setContinuityViewEnabled: (v) => {
+      writeViewPref(CONTINUITY_VIEW_ENABLED_KEY, v);
+      set({ continuityViewEnabled: v });
+    },
     setGlobalCanvas: (next) =>
       set(() => {
         writeCanvas(next);
         return { canvas: next };
       }),
-    toggleCenterMode: (projectId) =>
-      set((s) => {
-        const cur = s.centerMode[projectId] ?? "terminals";
-        return { centerMode: { ...s.centerMode, [projectId]: cur === "board" ? "terminals" : "board" } };
-      }),
+    toggleCenterMode: (projectId, target = "board") => {
+      const cur = get().centerMode[projectId] ?? "terminals";
+      get().setCenterMode(projectId, toggledMode(cur, target, prefsOf()));
+    },
     setBoard: (projectId, snapshot) =>
       set((s) => ({ boards: { ...s.boards, [projectId]: snapshot } })),
     setContinuity: (projectId, view) =>
