@@ -33,6 +33,17 @@ export function pulsesFor(messages: WatchedMessage[], snap: GraphSnapshot): Puls
   return out;
 }
 
+/** Messages `pulsesFor` dropped only because an endpoint is not in this snapshot YET — a
+ *  session's first message routinely lands before the refetch that draws its node. The
+ *  hook retries these once against the next snapshot; a self-message never qualifies. */
+export function awaitingNodes(messages: WatchedMessage[], snap: GraphSnapshot): WatchedMessage[] {
+  const known = new Set<string>();
+  for (const n of snap.nodes) {
+    if (n.continuityId) known.add(n.continuityId);
+  }
+  return messages.filter((m) => m.from !== m.to && (!known.has(m.from) || !known.has(m.to)));
+}
+
 const PINS_KEY = "conduit.continuityPins";
 type Storage = Pick<globalThis.Storage, "getItem" | "setItem">;
 const isPt = (v: unknown): v is Pt =>

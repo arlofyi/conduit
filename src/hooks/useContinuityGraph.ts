@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { debounceMaxWait } from "../debounce";
-import { EMPTY_SNAPSHOT, pulsesFor, type GraphSnapshot, type Pulse, type WatchedMessage } from "../continuityGraph";
+import { EMPTY_SNAPSHOT, awaitingNodes, pulsesFor, type GraphSnapshot, type Pulse, type WatchedMessage } from "../continuityGraph";
 
 const REFETCH_DEBOUNCE_MS = 750;
 /** A steady commit stream must still refresh the snapshot this often. */
@@ -29,10 +29,28 @@ export function useContinuityGraph(projectId: string | null, active: boolean) {
     const reapers = new Set<ReturnType<typeof setTimeout>>();
     // A snapshot from the previous project must not draw under this one's id.
     setSnap(EMPTY_SNAPSHOT);
+    // Messages whose endpoint had no node yet: retried ONCE against the next snapshot, so a
+    // new session's first message still pulses instead of vanishing.
+    let awaiting: WatchedMessage[] = [];
+    const fire = (fresh: Pulse[]) => {
+      if (!fresh.length) return;
+      setPulses((p) => [...p, ...fresh].slice(-MAX_LIVE_PULSES));
+      for (const f of fresh) {
+        const t = setTimeout(() => {
+          reapers.delete(t);
+          if (alive) dropPulse(f.id);
+        }, PULSE_LIFETIME_MS);
+        reapers.add(t);
+      }
+    };
     const fetchNow = () =>
       invoke<GraphSnapshot>("continuity_graph", { projectId })
         .then((s) => {
-          if (alive) setSnap(s);
+          if (!alive) return;
+          setSnap(s);
+          const retry = awaiting;
+          awaiting = [];
+          fire(pulsesFor(retry, s));
         })
         .catch(() => {
           /* keep the last good snapshot */
@@ -41,17 +59,8 @@ export function useContinuityGraph(projectId: string | null, active: boolean) {
     const refetch = debounceMaxWait(() => void fetchNow(), REFETCH_DEBOUNCE_MS, REFETCH_MAX_WAIT_MS);
     const un = listen<{ messages: WatchedMessage[] }>("continuity-changed", ({ payload }) => {
       if (!alive) return;
-      const fresh = pulsesFor(payload.messages, snapRef.current);
-      if (fresh.length) {
-        setPulses((p) => [...p, ...fresh].slice(-MAX_LIVE_PULSES));
-        for (const f of fresh) {
-          const t = setTimeout(() => {
-            reapers.delete(t);
-            if (alive) dropPulse(f.id);
-          }, PULSE_LIFETIME_MS);
-          reapers.add(t);
-        }
-      }
+      fire(pulsesFor(payload.messages, snapRef.current));
+      awaiting = [...awaiting, ...awaitingNodes(payload.messages, snapRef.current)].slice(-MAX_LIVE_PULSES);
       refetch.call();
     });
     return () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { askCardGeometry, askCardSide, pulsesFor, readPins, writePins, type GraphSnapshot } from "./continuityGraph";
+import { askCardGeometry, askCardSide, awaitingNodes, pulsesFor, readPins, writePins, type GraphSnapshot } from "./continuityGraph";
 
 const snap: GraphSnapshot = {
   available: true,
@@ -67,5 +67,27 @@ describe("askCardGeometry", () => {
       const g = askCardGeometry(s);
       expect(g.tail + 6).toBe(s / 2 - g.top);
     }
+  });
+});
+
+describe("awaitingNodes", () => {
+  const snap: GraphSnapshot = {
+    available: true,
+    nodes: [{ key: "s1", continuityId: "c-1" } as GraphSnapshot["nodes"][number]],
+    edges: [],
+    unanswered: {},
+  };
+  const msg = (id: string, from: string, to: string) => ({ id, from, to, kind: "message", createdAt: "t" });
+
+  it("keeps a message whose endpoint has no node yet", () => {
+    expect(awaitingNodes([msg("m1", "c-1", "c-new")], snap).map((m) => m.id)).toEqual(["m1"]);
+  });
+
+  it("drops a message both of whose endpoints are already drawn, and a self-message", () => {
+    const both: GraphSnapshot = {
+      ...snap,
+      nodes: [...snap.nodes, { key: "s2", continuityId: "c-2" } as GraphSnapshot["nodes"][number]],
+    };
+    expect(awaitingNodes([msg("m2", "c-1", "c-2"), msg("m3", "c-9", "c-9")], both)).toEqual([]);
   });
 });
