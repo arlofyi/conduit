@@ -25,8 +25,10 @@ import { mountedInWindow, normalizeProfileId } from "../profiles";
 import { TerminalView } from "./Terminal";
 import { CodeEditorPane } from "./CodeEditorPane";
 import { BoardView } from "./BoardView";
+import { ContinuityView } from "./ContinuityView";
 import { CanvasControls, CanvasUnderlay } from "./CanvasView";
 import { CanvasRail } from "./CanvasRail";
+import { effectiveCenterMode } from "../centerViews";
 import { ContextMeter } from "./ContextMeter";
 import { ContextRing } from "./ContextRing";
 import { useOrchestrationDisplay } from "../hooks/useOrchestrationDisplay";
@@ -82,7 +84,12 @@ export function WorkspaceCenter({
   home: string | null;
 }) {
   const layout = useStore((s) => (projectId ? s.layouts[projectId] : undefined));
-  const centerMode = useStore((s) => (projectId ? s.centerMode[projectId] ?? "terminals" : "terminals"));
+  const storedCenterMode = useStore((s) => (projectId ? s.centerMode[projectId] : undefined));
+  const canvasEnabled = useStore((s) => s.canvasEnabled);
+  const boardEnabled = useStore((s) => s.boardEnabled);
+  const continuityViewEnabled = useStore((s) => s.continuityViewEnabled);
+  // A stored "board" whose pref has since been turned off renders as terminals.
+  const centerMode = effectiveCenterMode(storedCenterMode, { canvasEnabled, boardEnabled, continuityViewEnabled });
   // Multi-window profiles: this window's own pinned identity (boot-stable — see WINDOWED
   // and mountedInWindow in profiles.ts) plus the known-profile set needed to normalize a
   // dangling profileId to Default. Drives which projects' terminals mount in THIS window.
@@ -621,6 +628,14 @@ export function WorkspaceCenter({
           </div>
         )}
 
+        {/* Same overlay contract as the board: it paints over the still-mounted terminal
+            stack and never unmounts or reparents one. */}
+        {projectId && centerMode === "continuity" && !canvasMode && (
+          <div className="board-overlay continuity-overlay">
+            <ContinuityView projectId={projectId} />
+          </div>
+        )}
+
 
 
         {tabMenu && activeProject && projectId && (
@@ -671,7 +686,18 @@ function GroupTabStrip({
   const setActiveTab = useStore((s) => s.setActiveTab);
   const setActiveGroup = useStore((s) => s.setActiveGroup);
   const setCenterMode = useStore((s) => s.setCenterMode);
-  const centerMode = useStore((s) => s.centerMode[projectId] ?? "terminals");
+  const storedCenterMode = useStore((s) => s.centerMode[projectId]);
+  const canvasEnabled = useStore((s) => s.canvasEnabled);
+  const boardEnabled = useStore((s) => s.boardEnabled);
+  const continuityViewEnabled = useStore((s) => s.continuityViewEnabled);
+  const centerMode = effectiveCenterMode(storedCenterMode, { canvasEnabled, boardEnabled, continuityViewEnabled });
+  const toggleCenterMode = useStore((s) => s.toggleCenterMode);
+  // Raw map, counted in a memo — a selector deriving a fresh value per call loops in v5.
+  const asks = useStore((s) => s.asks);
+  const askCount = useMemo(() => {
+    const own = new Set(projects.find((p) => p.id === projectId)?.sessions.map((x) => x.id) ?? []);
+    return Object.values(asks).filter((a) => own.has(a.session)).length;
+  }, [asks, projects, projectId]);
   const canvasOpen = useStore((s) => s.canvasOpen);
   const setCanvasOpen = useStore((s) => s.setCanvasOpen);
   const requestCloseTab = useStore((s) => s.requestCloseTab);
@@ -851,18 +877,26 @@ function GroupTabStrip({
           <span>{richViewOpen[activeTab.ref] ? "Terminal" : "Chat"}</span>
         </button>
       )}
-      {isActiveGroup && (
+      {isActiveGroup && continuityViewEnabled && (
+        <button
+          type="button"
+          className={`header-btn board-tab ${centerMode === "continuity" ? "active" : ""}`}
+          title="Continuity view (⇧⌘K)"
+          onClick={() => toggleCenterMode(projectId, "continuity")}
+        >
+          <span className="board-tab-dot" />
+          <span>Continuity</span>
+          {askCount > 0 && <span className="header-badge">{askCount}</span>}
+        </button>
+      )}
+      {isActiveGroup && boardEnabled && (
         <button
           type="button"
           className={`header-btn board-tab ${centerMode === "board" ? "active" : ""}`}
           title="Task board (⇧⌘B)"
           onClick={() => {
+            // setCenterMode also closes the global canvas (three-way exclusion).
             setCenterMode(projectId, centerMode === "board" ? "terminals" : "board");
-            // The canvas is a global flag independent of this project's centerMode (see
-            // the tab-click handler above) -- closing it here is what makes the board and
-            // the canvas mutually exclusive in BOTH directions, not just the direction the
-            // board overlay's own render gate covers.
-            setCanvasOpen(false);
           }}
         >
           <span className="board-tab-dot" />
@@ -908,6 +942,8 @@ function CanvasToggleButton() {
   const canvasOpen = useStore((s) => s.canvasOpen);
   const setCanvasOpen = useStore((s) => s.setCanvasOpen);
   const isMain = useStore((s) => s.windowProfile.isMain);
+  const canvasEnabled = useStore((s) => s.canvasEnabled);
+  if (!canvasEnabled) return null;
   // The canvas is a single global board; a secondary window mounts only its own
   // profile's projects (mountedInWindow above), so a card dragged onto it from another
   // profile would have no mounted terminal to place. Hiding the one entry point is

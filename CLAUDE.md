@@ -65,7 +65,16 @@ This writes to `…/ConduitTauri-dev/state.json`, so dev and the installed app c
   WebdriverIO (`wdio.conf.ts`, `e2e/`); `.github/workflows/e2e.yml` runs it on
   `workflow_dispatch` and pushes to `main`, not on pull requests, because it costs a
   full app build per run. It does not replace launching the app by hand for UI work —
-  it covers three specific CLI-launcher assertions. See "Where the `conduit` CLI lives".
+  it covers three specific CLI-launcher assertions plus the conversation-continuity and
+  Continuity-view specs. Every spec runs with `CONTINUITY_DB_PATH` pointed at a hermetic
+  fixture DB, but that covers **Conduit's own READS only**: the vendored continuity
+  plugin's `hooks.json`/`.mcp.json` set `CONTINUITY_DB_PATH` from `${user_config.dbPath}`
+  (falling back to `~/.continuity`), so a `claude` a spec spawns inside a GIT repo writes
+  the developer's REAL continuity DB. The Continuity-view spec is safe only because its
+  project is a fresh non-git `mkdtemp` dir — keep any new spec that spawns an agent out of
+  a git checkout, or it will. The fixture needs the `sqlite3` CLI; without it `onPrepare`
+  warns and the Continuity-view spec skips itself. See "Where the `conduit` CLI lives" and
+  "Where the Continuity view lives".
 - **`src/store.seam.test.ts` guards the session-directory seam** — it fails if anything
   outside the sanctioned consumers references `workingDirOf`. If you add a consumer that
   genuinely needs intent rather than reality, add it to that test's allowlist with a
@@ -654,7 +663,9 @@ for the active project. Conduit never writes that database — continuity owns e
   continuity install that has never run — the tabs then do not render at all.
 - Scoping is two allowlist arms, never a prefix or wildcard: `agent_label IN (this
   project's Conduit session ids)` — exact, because `pty.rs` sets `CONTINUITY_AGENT_ID` to
-  the session id — plus `cwd_hash IN (sha256(git toplevel)[..16])` for sessions started
+  the session id, and it rides `build_script`'s export line (`continuity_env`), because
+  `cmd.env` alone dies at the tmux server and the rows were attributed through the checkout
+  fallback — plus `cwd_hash IN (sha256(git toplevel)[..16])` for sessions started
   outside Conduit in the same checkout. Do NOT canonicalize the toplevel: continuity hashes
   git's raw output, and `/tmp` vs `/private/tmp` would break the match.
 - **Continuity's coordination surface is global; only authorship is project-bound.**
@@ -676,6 +687,64 @@ for the active project. Conduit never writes that database — continuity owns e
   `#[cfg(windows)]` so both CI legs test it. Dev builds never reproduce this: the
   `CARGO_MANIFEST_DIR` fallback is not canonicalized.
 - Design: `docs/superpowers/specs/2026-08-14-continuity-panels-design.md`.
+
+## Where the Continuity view lives
+
+A per-project center overlay (`CenterMode` `"continuity"`, ⇧⌘K) drawing sessions as derived
+animal avatars linked by the Continuity messages they exchange, plus Claude Code
+`AskUserQuestion` prompts answered from a card. Conduit still never writes continuity.
+
+- **Questions ride a BLOCKING hook, and every failure is `{}`.** `hooks.rs`'s `/ask` route +
+  `asks.rs`. The protocol was pinned empirically (claude 2.1.293): `allow` + `updatedInput`
+  with `answers` answers the question; an empty object makes the TUI menu appear. The three
+  ceilings are ordered and a test pins it: `ASK_CEILING` 600 s < curl `-m 650` < hook
+  `timeout: 660` — the default hook timeout is 60 s, so dropping the entry's `timeout` would
+  silently kill every card after a minute.
+- **The gate is closed unless a card can be seen** (`set_ask_gate`, `asks.ts askGateOpen`):
+  view open or a Conduit window focused. The same `settings.local.json` is read by a `claude`
+  the user runs by hand in that checkout; it posts `session=unknown` and is answered `{}` at once.
+- **Hand-off is to the session's own terminal** (`askShouldHandOff`), and `ask_answer`
+  returning `false` means "already answered there" — not an error.
+- **The card's answer model is Claude's, not ours.** Answers are numbered (keys 1–N); a
+  `(Recommended)` label suffix becomes a tag; multi-select is checkboxes with "Send K";
+  "Something else…" is a free-text answer. The card opens on whichever side of the avatar is
+  clear, and a sent answer shows a short "Sent to <name>" before it goes. Keys that belong to
+  the graph stay with the graph while a card is open.
+- **Identity must cross tmux.** `CONTINUITY_SESSION_ID`/`CONTINUITY_AGENT_ID` ride
+  `build_script`'s export line (`continuity_env` in `pty.rs`), never `cmd.env` — the tmux
+  server keeps its own environment. Without it every Conduit session appeared TWICE in the
+  graph (once as itself, once as a checkout-hash stranger). Rows written before that fix carry
+  the unsalted worktree `cwd_hash`; `continuity_graph.rs` folds them into the owning session
+  by worktree path, unless two sessions share the path (then it cannot tell and leaves them).
+- **`continuity_watch.rs` polls `PRAGMA data_version`**, which moves only on another
+  connection's commit; only `messages` has a cursor because only a new message is a pulse.
+- **Avatars are derived** (`avatarId.ts sessionAnimal`), never stored — same rule as
+  `projectAccent`.
+- Canvas and Board are opt-in (`canvasEnabled`/`boardEnabled`, default off);
+  `centerViews.ts` owns the gating and the three-way exclusion — callers no longer close
+  the canvas themselves.
+- E2E: `e2e/continuity-view.e2e.ts` (+ `continuityFixture.ts`) drives the real window; the
+  harness gives every spec its own `CONTINUITY_DB_PATH` so none READS the developer's real
+  DB. It does not stop one WRITING it: the vendored plugin's hooks/MCP server take their DB
+  path from `${user_config.dbPath}` (default `~/.continuity`), not from Conduit's env, so a
+  spawned `claude` in a git repo records into the real DB. This spec is safe only because
+  its project is a fresh non-git `mkdtemp` dir. No `sqlite3` CLI → the spec skips itself.
+- **`continuity_watch.rs` re-opens a replaced DB.** An open connection pins the old inode
+  and `data_version` keeps answering from it, so the watcher compares the path's
+  (dev, ino) every ~10 s on unix and blindly re-opens every ~30 s on Windows. The cursor
+  survives a re-open (no history storm, no lost pulse).
+- **`continuity_graph`/`continuity_tables` are async commands on the blocking pool**, and
+  `project_toplevels` is memoized 30 s per (project, dir list) — one `continuity-changed`
+  fans out into several reads, each forking `git rev-parse` per worktree. The frontend
+  refetches are debounced with a 3 s ceiling (`debounce.ts`) so a steady stream still refreshes.
+- **An ask for the terminal already in front of the user never becomes a card**: `App.tsx`
+  `admitAsk` hands it off before `addAsk`. Listeners are registered before the
+  `ask_pending` catch-up, and the "moved to the terminal" toast is for timeouts only.
+- **Tables read through `continuity_tables.rs`, scoped by the same `resolve_session_ids` as the
+  map, and refetch on `continuity-changed`.** Task "open" means status is not `completed` or
+  `released` AND the claim is not past `expires_at`; continuity has no `expired` status, so
+  expiry is computed on read and shown as expired, never written back.
+- Design: `docs/superpowers/specs/2026-10-12-continuity-view-design.md`.
 
 ## Where Command Code lives
 

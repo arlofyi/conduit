@@ -5661,17 +5661,18 @@ input[type="number"]:focus {
   --hq-rose: var(--accent); --hq-rose-2: color-mix(in srgb, var(--accent) 85%, #000);
   --hq-rose-soft: color-mix(in srgb, var(--accent) 18%, transparent);
   --hq-rose-line: color-mix(in srgb, var(--accent) 34%, transparent);
-  --hq-grid-line: rgba(255, 255, 255, 0.04);
+  /* --hq-grid-line is a theme token now (defined at :root / [data-theme="warm-light"]
+     below) so the Continuity graph surface can use it outside .hq-* scopes. */
 }
 .root-chat {
   position: relative; overflow: hidden;
   display: flex; flex-direction: column; flex: 1; min-width: 0; height: 100%;
   background: var(--hq-bg); color: var(--hq-ink);
 }
-[data-theme="warm-light"] .root-chat,
-[data-theme="warm-light"] .chat-pane {
-  --hq-grid-line: rgba(0, 0, 0, 0.05);
-}
+/* Grid-line token, hoisted from the .root-chat/.chat-pane scope so every grid surface
+   (HQ texture, Continuity graph) reads one definition per theme. */
+:root { --hq-grid-line: rgba(255, 255, 255, 0.04); }
+:root[data-theme="warm-light"] { --hq-grid-line: rgba(0, 0, 0, 0.05); }
 
 /* Texture: a masked 60px grid (arlo's vault backdrop, sans glow). */
 .hq-grid {
@@ -6579,3 +6580,259 @@ input[type="number"]:focus {
   flex: 1 1 auto;
   min-height: 0;
 }
+
+/* ---- Continuity view: session avatars ---- */
+.session-avatar {
+  position: relative; display: grid; place-items: center; flex: none;
+  border-radius: 28%; background: var(--selection-bg);
+  border: 2px solid var(--border); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.session-avatar.tone-running { border-color: color-mix(in srgb, var(--green) 70%, var(--border)); }
+.session-avatar.tone-needs { border-color: var(--amber); animation: avatar-breathe 1.6s ease-in-out infinite; }
+.session-avatar.tone-stopped { opacity: 0.4; filter: grayscale(0.6); }
+.session-avatar.tone-visitor { border-style: dashed; opacity: 0.6; }
+.session-avatar-badge {
+  position: absolute; top: -6px; right: -6px; min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 9px; background: var(--accent); color: var(--panel-bg);
+  font-size: 10.5px; font-weight: 700; line-height: 18px; text-align: center;
+}
+.session-avatar-chip {
+  position: absolute; bottom: -5px; right: -5px; width: 12px; height: 12px;
+  border-radius: 4px; border: 2px solid var(--panel-bg);
+}
+@keyframes avatar-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--amber) 45%, transparent); }
+  50% { box-shadow: 0 0 0 8px transparent; }
+}
+@media (prefers-reduced-motion: reduce) { .session-avatar.tone-needs { animation: none; } }
+
+/* ---- Continuity view ---- */
+.continuity-view { position: absolute; inset: 0; display: flex; flex-direction: column; background: var(--panel-bg); }
+.continuity-tabs { display: flex; align-items: center; gap: 8px; height: 38px; flex: none; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--sidebar-bg); }
+.continuity-tablist { display: flex; align-items: center; gap: 8px; }
+.continuity-tab {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--text-mid); font: 13px var(--ui-font); cursor: pointer;
+}
+.continuity-tab:hover { color: var(--text-bright); }
+.continuity-tab.on { background: var(--selection-bg); color: var(--text-bright); }
+.continuity-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.continuity-tab-count { color: var(--text-mid); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.continuity-tab.on .continuity-tab-count { color: var(--accent); }
+.continuity-unavail { margin-left: auto; font-size: 10.5px; color: var(--text-mid); }
+.continuity-empty { position: absolute; inset: 38px 0 0; display: grid; place-items: center; color: var(--text-mid); pointer-events: none; }
+.cgraph {
+  position: relative; flex: 1; overflow: hidden; cursor: grab; touch-action: none;
+  background-color: var(--panel-bg);
+  background-image:
+    linear-gradient(var(--hq-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--hq-grid-line) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+.cgraph:active { cursor: grabbing; }
+.cgraph[hidden] { display: none; }
+.cgraph-layer.gliding { transition: transform 0.38s cubic-bezier(0.2, 0.7, 0.2, 1); }
+.cgraph-node.focus-ring .session-avatar::after {
+  content: ""; position: absolute; inset: -7px; border-radius: 32%; pointer-events: none;
+  border: 2px solid var(--accent); animation: cgraph-focus 1.2s ease-out forwards;
+}
+@keyframes cgraph-focus {
+  0% { opacity: 0; transform: scale(0.86); }
+  18% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1.18); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cgraph-layer.gliding { transition: none; }
+  .cgraph-node.focus-ring .session-avatar::after { display: none; }
+}
+
+/* ---- Continuity view: service tables ---- */
+.ctable-wrap { flex: 1; min-height: 0; overflow: auto; }
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+.ctable-state { display: grid; place-items: center; height: 100%; min-height: 160px; color: var(--text-mid); font-size: 13px; }
+.ctable { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ctable th {
+  text-align: left; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-mid); padding: 8px 12px; border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 1; background: var(--panel-bg); white-space: nowrap;
+}
+.ctable td { padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--text-bright); vertical-align: top; }
+.ctable th:first-child, .ctable td:first-child { padding-left: 20px; }
+.ctable th:last-child, .ctable td:last-child { padding-right: 20px; }
+.ctable tbody tr:hover td { background: var(--hover); }
+.ctable tr.muted td { color: var(--text-mid); }
+.ctable tr.muted .ctable-key { color: var(--text-mid); }
+.ctable tr.collision td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
+.ctable-main { max-width: 0; width: 38%; }
+.ctable-key { font-family: var(--mono-font); font-size: 12px; color: var(--text-bright); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctable-sub { margin-top: 2px; color: var(--text-mid); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctable-dim { color: var(--text-mid); }
+.ctable-none { color: var(--text-dim); }
+.ctable-mono { font-family: var(--mono-font); font-size: 12px; white-space: nowrap; }
+.ctable-num, .ctable-when { font-variant-numeric: tabular-nums; color: var(--text-mid); white-space: nowrap; }
+.ctable-num.warn { color: var(--amber); }
+.ctable-chain { font-family: var(--mono-font); font-size: 11.5px; color: var(--text-mid); max-width: 260px; overflow-wrap: anywhere; }
+.ctable-prose { max-width: 0; width: 30%; color: var(--text-mid); }
+.ctable-clamp2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-line; line-height: 1.45; }
+.ctable-path { max-width: 0; width: 55%; overflow: hidden; text-overflow: ellipsis; }
+.ctable-collide {
+  margin-left: 10px; padding: 1px 7px; border-radius: 9px; font: 11px var(--ui-font); font-variant-numeric: tabular-nums;
+  color: var(--amber); background: color-mix(in srgb, var(--amber) 14%, transparent);
+}
+.ctable-payload { max-width: 0; width: 55%; color: var(--text-mid); overflow: hidden; text-overflow: ellipsis; }
+.ctable-pair { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.ctable-arrow { color: var(--text-dim); }
+.ctable-stack { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+/* A session is its avatar + name; clicking it shows that node on the graph. */
+.ctable-who {
+  display: inline-flex; align-items: center; gap: 8px; max-width: 210px; padding: 1px 6px 1px 1px; margin: -5px 0;
+  border: 0; border-radius: 7px; background: transparent; color: var(--text-bright); font: 13px var(--ui-font);
+  cursor: pointer; text-align: left;
+}
+.ctable-who:hover { background: var(--selection-bg); }
+.ctable-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ctable-who.unknown { cursor: default; color: var(--text-mid); }
+.ctable-who.unknown:hover { background: transparent; }
+.ctable-who-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctable-who .session-avatar { border-width: 1.5px; box-shadow: none; animation: none; }
+.ctable-who .session-avatar-chip { width: 7px; height: 7px; right: -3px; bottom: -3px; border-width: 1.5px; border-radius: 2px; }
+.ctable-anon {
+  display: grid; place-items: center; flex: none; width: 28px; height: 28px; border-radius: 50%;
+  background: var(--selection-bg); border: 1.5px solid var(--border); color: var(--text-mid);
+  font: 600 10.5px var(--mono-font); text-transform: lowercase;
+}
+.ctable-status { display: inline-flex; align-items: center; gap: 6px; color: var(--text-mid); white-space: nowrap; }
+.ctable-status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); }
+.ctable-status.s-active::before, .ctable-status.s-claimed::before, .ctable-status.s-in_progress::before { background: var(--green); }
+.ctable-status.s-active, .ctable-status.s-claimed, .ctable-status.s-in_progress { color: var(--text-bright); }
+.ctable-status.s-pending::before, .ctable-status.s-pr_open::before { background: var(--amber); }
+.ctable-status.s-pending, .ctable-status.s-pr_open { color: var(--amber); }
+.ctable-status.s-accepted::before { background: var(--accent); }
+.ctable-type, .ctable-chip {
+  display: inline-block; padding: 1px 8px; border-radius: 9px; font: 11.5px var(--mono-font); white-space: nowrap;
+  color: var(--text-mid); background: var(--selection-bg);
+}
+.ctable-filters { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 20px 10px; border-bottom: 1px solid var(--border); }
+.ctable-chip { border: 1px solid transparent; cursor: pointer; padding: 3px 10px; }
+.ctable-chip:hover { color: var(--text-bright); }
+.ctable-chip.on { color: var(--text-bright); border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: color-mix(in srgb, var(--accent) 14%, var(--selection-bg)); }
+.ctable-chip.clear { background: transparent; font-family: var(--ui-font); }
+.ctable-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* left/top 50% centres world 0,0; the inline transform carries pan + zoom only. */
+.cgraph-layer { position: absolute; left: 50%; top: 50%; width: 0; height: 0; transform-origin: 0 0; }
+.cgraph-edges { position: absolute; left: 0; top: 0; width: 1px; height: 1px; overflow: visible; }
+.cgraph-edge { fill: none; stroke: color-mix(in srgb, var(--accent) 55%, transparent); stroke-linecap: round; }
+.cgraph-edge.quiet { stroke: color-mix(in srgb, var(--text-dim) 60%, transparent); }
+.cgraph-pulse { fill: var(--accent); filter: drop-shadow(0 0 6px var(--accent)); }
+.cgraph-node { position: absolute; width: 112px; transform: translate(-50%, -36px); display: flex; flex-direction: column; align-items: center; cursor: pointer; }
+.cgraph-node.visitor { transform: translate(-50%, -28px); }
+/* Each transformed node is its own stacking context, so a card's z-index cannot beat a
+   later sibling node by itself — lift the whole node that carries a card above every other. */
+.cgraph-node:has(.ask-card) { z-index: 10; }
+.cgraph-name { margin-top: 7px; font-size: 13px; color: var(--text-bright); white-space: nowrap; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.cgraph-meta { font-size: 10.5px; color: var(--text-mid); white-space: nowrap; }
+.cgraph-meta.needs { color: var(--amber); }
+/* AskUserQuestion card (askcard-v2): the question is the heading, rows read like the
+   terminal menu, and an anchored card opens on whichever side of its avatar is clear. */
+.ask-card {
+  --ask-edge: color-mix(in srgb, var(--amber) 38%, var(--border));
+  position: relative; width: 300px; padding: 14px 14px 10px; border-radius: 14px; text-align: left; cursor: default;
+  background: color-mix(in srgb, var(--amber) 7%, var(--sidebar-bg)); color: var(--text-bright);
+  border: 1px solid var(--ask-edge); font: 13px var(--ui-font);
+  box-shadow: 0 14px 34px -6px rgba(0, 0, 0, 0.6), 0 2px 6px rgba(0, 0, 0, 0.3);
+  animation: ask-pop 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.ask-card ::selection, .ask-card::selection { background: color-mix(in srgb, var(--accent) 40%, transparent); }
+.ask-card:focus { outline: none; }
+.ask-card:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent); outline-offset: 2px; }
+.ask-card :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* --ask-top / --ask-tail come from the node (askCardGeometry): a visitor's avatar is smaller,
+   so the card and its tail sit relative to THAT avatar's centre. */
+.ask-card.anchored { position: absolute; top: var(--ask-top, -6px); left: calc(50% + 50px); z-index: 3; }
+.ask-card.anchored.left { left: auto; right: calc(50% + 50px); }
+/* The tail: a rotated square in the card's own fill, pointing back at the avatar. */
+.ask-card.right::before, .ask-card.left::before {
+  content: ""; position: absolute; top: var(--ask-tail, 34px); width: 12px; height: 12px; background: inherit;
+  border: 1px solid var(--ask-edge); transform: rotate(45deg);
+}
+.ask-card.right::before { left: -7px; border-top: 0; border-right: 0; }
+.ask-card.left::before { right: -7px; border-bottom: 0; border-left: 0; }
+.ask-card-q { margin: 0 0 4px; font-size: 15px; font-weight: 600; line-height: 1.3; letter-spacing: -0.005em; text-wrap: balance; color: var(--text-bright); }
+.ask-card-who { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 12px; font-size: 11.5px; color: color-mix(in srgb, var(--amber) 55%, var(--text-mid)); }
+.ask-card-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); flex: none; }
+.ask-card-name { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ask-card-t, .ask-card-step { font-variant-numeric: tabular-nums; }
+.ask-card-sep { opacity: 0.5; }
+.ask-card-opts { display: flex; flex-direction: column; gap: 2px; margin: 0 -6px; }
+.ask-card-opt {
+  display: grid; grid-template-columns: 22px 1fr auto; align-items: start; gap: 8px; width: 100%;
+  padding: 7px 8px; border-radius: 9px; border: 1px solid transparent; background: none; text-align: left;
+  color: var(--text-bright); font: 13px var(--ui-font); cursor: pointer;
+}
+.ask-card-opt:hover { background: color-mix(in srgb, var(--text-bright) 5%, transparent); }
+.ask-card-opt.hi { background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.ask-card-opt:disabled { opacity: 0.6; cursor: default; }
+.ask-card-opt.open { cursor: default; }
+.ask-card-key {
+  width: 20px; height: 20px; margin-top: 1px; border-radius: 6px; display: grid; place-items: center;
+  font: 600 11px var(--mono-font); color: var(--text-mid); background: var(--panel-bg); border: 1px solid var(--border);
+}
+.ask-card-opt.hi .ask-card-key { color: var(--panel-bg); background: var(--accent); border-color: var(--accent); }
+.ask-card-chk { width: 16px; height: 16px; margin: 3px 0 0 2px; border-radius: 5px; border: 1.5px solid var(--text-dim); display: grid; place-items: center; }
+.ask-card-chk.on { background: var(--accent); border-color: var(--accent); }
+.ask-card-chk.on::after { content: ""; width: 8px; height: 4px; border: 2px solid var(--panel-bg); border-top: 0; border-right: 0; transform: rotate(-45deg) translate(1px, -1px); }
+.ask-card-ol { font-size: 13px; line-height: 1.35; min-width: 0; overflow-wrap: anywhere; }
+.ask-card-od { display: block; margin-top: 2px; font-size: 11.5px; line-height: 1.35; color: var(--text-mid); }
+.ask-card-opt.other .ask-card-ol { color: var(--text-mid); }
+.ask-card-opt.other.open .ask-card-ol { color: var(--text-bright); }
+.ask-card-rec {
+  margin-top: 1px; padding: 2px 6px; border-radius: 999px; white-space: nowrap; font-size: 10.5px; font-weight: 600;
+  color: var(--green); background: color-mix(in srgb, var(--green) 14%, transparent);
+}
+.ask-card-field { grid-column: 2 / 4; margin-top: 6px; display: flex; gap: 6px; }
+.ask-card-text {
+  flex: 1; min-width: 0; padding: 7px 9px; border-radius: 8px; outline: none; caret-color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border)); background: var(--panel-bg); color: var(--text-bright); font: 13px var(--ui-font);
+}
+.ask-card .ask-card-text:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 0; }
+.ask-card-text::placeholder { color: var(--text-dim); }
+.ask-card-ft {
+  display: flex; align-items: center; gap: 10px; margin: 10px -2px 0; padding-top: 9px;
+  border-top: 1px solid color-mix(in srgb, var(--amber) 16%, var(--border)); font-size: 11.5px; color: var(--text-mid);
+}
+.ask-card-grow { flex: 1; }
+.ask-card-link { display: inline-flex; align-items: center; gap: 5px; background: none; border: 0; padding: 0; border-radius: 4px; color: var(--text-mid); font: inherit; cursor: pointer; }
+.ask-card-link:hover { color: var(--text-bright); }
+.ask-card-hint { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ask-card-kb { font: 600 10.5px var(--mono-font); padding: 1px 5px; border-radius: 5px; border: 1px solid var(--border); background: var(--panel-bg); color: var(--text-mid); }
+.ask-card-send { flex: none; padding: 5px 12px; border-radius: 8px; border: 0; background: var(--accent); color: var(--panel-bg); font: 600 12.5px var(--ui-font); cursor: pointer; }
+.ask-card-send:disabled { opacity: 0.4; cursor: default; }
+.ask-card-note { margin-top: 8px; font-size: 11.5px; color: var(--text-mid); }
+.ask-card-done { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-bright); overflow-wrap: anywhere; }
+.ask-card-done small { display: block; margin-top: 2px; font-size: 11.5px; color: var(--text-mid); }
+.ask-card-ck { flex: none; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; background: color-mix(in srgb, var(--green) 22%, transparent); }
+.ask-card-ck::after { content: ""; width: 8px; height: 4px; border: 2px solid var(--green); border-top: 0; border-right: 0; transform: rotate(-45deg) translate(1px, -1px); }
+.ask-dock { position: fixed; right: 16px; bottom: 16px; z-index: 60; }
+.ask-dock-more { margin-top: 6px; text-align: right; font-size: 10.5px; color: var(--text-mid); }
+.header-badge {
+  min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; margin-left: 2px;
+  background: var(--amber); color: var(--panel-bg); font-size: 10.5px; font-weight: 700; line-height: 16px; text-align: center;
+}
+/* Continuity avatar drawer */
+.session-drawer { position: absolute; top: 38px; right: 0; bottom: 0; width: 420px; max-width: 90%; z-index: 5; display: flex; flex-direction: column; background: var(--sidebar-bg); border-left: 1px solid var(--border); box-shadow: -12px 0 30px rgba(0, 0, 0, 0.35); color: var(--text-bright); }
+.session-drawer-hd { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.session-drawer-name { font-size: 13px; color: var(--text-bright); }
+.session-drawer-meta { font-size: 10.5px; color: var(--text-mid); }
+.session-drawer-hd .header-btn { margin-left: auto; }
+.session-drawer-x { background: none; border: 0; color: var(--text-mid); font-size: 16px; cursor: pointer; }
+.session-drawer-x:hover { color: var(--text-bright); }
+.session-drawer-body { position: relative; flex: 1; overflow: auto; }
+.session-drawer-note { padding: 16px; color: var(--text-mid); font-size: 13px; }
+.session-drawer-facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; padding: 16px; font-size: 13px; }
+.session-drawer-facts dt { color: var(--text-mid); }
+/* No filter here: in WKWebView a filter in these keyframes left the card unpainted. */
+@keyframes ask-pop { from { opacity: 0; transform: translateY(4px) scale(0.98); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .ask-card { animation: none; } .cgraph-pulse { display: none; } }

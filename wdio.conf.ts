@@ -1,6 +1,8 @@
-import { rmSync } from "node:fs";
-import { homedir, platform } from "node:os";
+import { mkdirSync, rmSync } from "node:fs";
+import { homedir, platform, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+
+import { createContinuityDb } from "./e2e/continuityFixture";
 
 /**
  * GUI end-to-end. Drives the REAL built app through WebdriverIO's embedded provider —
@@ -20,6 +22,16 @@ import { join, resolve } from "node:path";
  */
 export const E2E_DATA_DIR = "ConduitTauri-e2e";
 process.env.CONDUIT_DATA_DIR_NAME = E2E_DATA_DIR;
+
+/**
+ * A hermetic continuity database for every spec. The app reads `CONTINUITY_DB_PATH`
+ * (`continuity_read::db_path`) instead of `~/.continuity/continuity.db`, so no spec ever
+ * sees the developer's real sessions. Fixed path (not mkdtemp) because the launcher and
+ * the workers each evaluate this module and must agree; `onPrepare` creates it fresh.
+ * Only the specs write it -- the app never does.
+ */
+export const E2E_CONTINUITY_DB = join(tmpdir(), "conduit-e2e-continuity", "continuity.db");
+process.env.CONTINUITY_DB_PATH = E2E_CONTINUITY_DB;
 
 /**
  * The service SPAWNS this path, so on macOS it must be the executable inside the bundle
@@ -78,5 +90,21 @@ export const config: WebdriverIO.Config = {
       throw new Error(`refusing to reset ${E2E_DATA_DIR}: not an e2e data directory`);
     }
     rmSync(e2eDataDir(), { recursive: true, force: true });
+    rmSync(join(tmpdir(), "conduit-e2e-continuity"), { recursive: true, force: true });
+    mkdirSync(join(tmpdir(), "conduit-e2e-continuity"), { recursive: true });
+    // Needs the `sqlite3` CLI, which not every runner image has (the Windows one may not).
+    // Only the Continuity-view spec writes this DB, and it skips itself when the file is
+    // absent; every other spec only needs CONTINUITY_DB_PATH to point AWAY from the real
+    // DB, which a missing file does just as well. So a failure here is a warning, never a
+    // reason to take the whole run down.
+    try {
+      createContinuityDb(E2E_CONTINUITY_DB);
+    } catch (e) {
+      console.warn(
+        `[e2e] could not create the Continuity fixture DB (is the sqlite3 CLI on PATH?): ${
+          (e as Error).message
+        }\n[e2e] the Continuity-view spec will be skipped; every other spec still runs.`,
+      );
+    }
   },
 };

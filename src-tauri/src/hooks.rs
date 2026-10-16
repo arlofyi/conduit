@@ -25,6 +25,9 @@ use tiny_http::{Method, Request, Response, Server};
 use crate::broker::{Broker, Decision, Presence};
 use crate::hookbus::{HookBus, HookEvent};
 
+/// The verb (and route) of the blocking `AskUserQuestion` hook. See `asks.rs`.
+pub const ASK_VERB: &str = "ask";
+
 /// Holds the port the listener actually bound to, so pty spawns can inject it.
 pub struct HookState {
     pub port: AtomicU16,
@@ -67,6 +70,8 @@ pub fn start(
     reg: Arc<crate::window_registry::WindowRegistry>,
     pending_opens: Arc<crate::window_registry::PendingOpens>,
     window_mode: Arc<crate::window_registry::WindowModeFlag>,
+    asks: Arc<crate::asks::Asks>,
+    ask_gate: Arc<crate::asks::AskGate>,
 ) {
     thread::spawn(move || {
         let mut server: Option<Server> = None;
@@ -202,6 +207,16 @@ pub fn start(
                 let presence = presence.clone();
                 let bus = bus.clone();
                 thread::spawn(move || handle_approve(request, &url, &broker, &presence, &bus));
+                continue;
+            }
+
+            // AskUserQuestion: blocking, own thread. See asks.rs.
+            if url.starts_with("/ask") {
+                let app = app.clone();
+                let asks = asks.clone();
+                let gate = ask_gate.clone();
+                let store = store.clone();
+                thread::spawn(move || handle_ask(request, &url, &app, &asks, &gate, &store));
                 continue;
             }
 
@@ -602,6 +617,119 @@ fn handle_approve(
     ));
 }
 
+#[derive(Debug, PartialEq)]
+enum AskDecision {
+    /// Answer `{}` now: Claude shows its own menu.
+    Skip,
+    Hold {
+        session: String,
+        tool_use_id: String,
+        questions: Value,
+    },
+}
+
+/// Every reason `/ask` declines to hold a question, in one pure place. `has_origin` is
+/// checked FIRST (a browser page must not raise cards), then the gate, then whether the
+/// session is one of ours -- the same settings file is read by a `claude` the user runs by
+/// hand in that checkout, which posts `session=unknown`.
+fn ask_decision(
+    gate_open: bool,
+    has_origin: bool,
+    session: Option<&str>,
+    body: &Value,
+    known_session: impl Fn(&str) -> bool,
+) -> AskDecision {
+    if has_origin || !gate_open {
+        return AskDecision::Skip;
+    }
+    let Some(session) = session.filter(|s| known_session(s)) else {
+        return AskDecision::Skip;
+    };
+    let Some(questions) = body
+        .get("tool_input")
+        .and_then(crate::asks::supported_questions)
+    else {
+        return AskDecision::Skip;
+    };
+    AskDecision::Hold {
+        session: session.to_string(),
+        tool_use_id: body
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        questions,
+    }
+}
+
+/// Blocking `AskUserQuestion` handler (own thread, like `/approve`). The HTTP response is
+/// the hook's stdout. Every path answers -- `{}` unless the card answered in time.
+fn handle_ask(
+    mut request: Request,
+    url: &str,
+    app: &AppHandle,
+    asks: &crate::asks::Asks,
+    gate: &crate::asks::AskGate,
+    store: &crate::store::Store,
+) {
+    let has_origin = request.headers().iter().any(|h| h.field.equiv("Origin"));
+    // Origin first, before touching the body.
+    if has_origin {
+        let _ = request.respond(Response::from_string("{}"));
+        return;
+    }
+    let (session, _event) = parse_query(url);
+    let mut body = String::new();
+    let _ = request
+        .as_reader()
+        .take(1024 * 1024)
+        .read_to_string(&mut body);
+    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let input = parsed.get("tool_input").cloned().unwrap_or(Value::Null);
+
+    let known = |id: &str| {
+        store
+            .list()
+            .iter()
+            .any(|p| p.sessions.iter().any(|s| s.id == id))
+    };
+    let AskDecision::Hold {
+        session,
+        tool_use_id,
+        questions,
+    } = ask_decision(
+        gate.is_open(),
+        has_origin,
+        session.as_deref(),
+        &parsed,
+        known,
+    )
+    else {
+        let _ = request.respond(Response::from_string("{}"));
+        return;
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let (id, rx) = asks.register(session, tool_use_id, questions, now_ms);
+    if let Some(view) = asks.get(&id) {
+        let _ = app.emit("ask-request", &view);
+    }
+    let received = rx.recv_timeout(crate::asks::ASK_CEILING).ok();
+    // Forget FIRST, then drain once. `Asks::resolve` removes + sends under one lock, so a
+    // resolve either completed before the forget (caught by try_recv) or finds nothing and
+    // reports false to its card: the card is never told "answered" when we replied `{}`.
+    asks.forget(&id);
+    let outcome = crate::asks::pick_outcome(received, rx.try_recv().ok());
+    let how = crate::asks::how(&outcome);
+    let _ = request.respond(Response::from_string(
+        crate::asks::ask_response(&input, outcome.as_ref()).to_string(),
+    ));
+    let _ = app.emit("ask-resolved", json!({ "id": id, "how": how }));
+}
+
 /// How long the hook holds its request open waiting for a human.
 ///
 /// Must stay comfortably inside Claude's own hook timeout (60s by default) -- past that
@@ -842,7 +970,12 @@ fn entries_for(rows: &[HookRow], port: u16) -> Vec<(&'static str, Vec<Value>)> {
         if let Some(m) = r.matcher {
             entry.insert("matcher".into(), Value::String(m.to_string()));
         }
-        entry.insert("hooks".into(), Value::Array(vec![command(r.verb, port)]));
+        let cmd = if r.verb == ASK_VERB {
+            ask_command(port)
+        } else {
+            command(r.verb, port)
+        };
+        entry.insert("hooks".into(), Value::Array(vec![cmd]));
         match out.iter_mut().find(|(e, _)| *e == r.event) {
             Some((_, v)) => v.push(Value::Object(entry)),
             None => out.push((r.event, vec![Value::Object(entry)])),
@@ -920,6 +1053,11 @@ pub fn claude_profile() -> HooksProfile {
                 event: "PreToolUse",
                 matcher: None,
                 verb: "pretool",
+            },
+            HookRow {
+                event: "PreToolUse",
+                matcher: Some("AskUserQuestion"),
+                verb: ASK_VERB,
             },
             HookRow {
                 event: "PreCompact",
@@ -1183,6 +1321,33 @@ fn command(event: &str, port: u16) -> Value {
     json!({ "type": "command", "command": cmd })
 }
 
+/// The blocking `AskUserQuestion` hook. Unlike `command`, its stdout is NOT discarded:
+/// `/ask`'s response body IS the hook output Claude reads (allow + answers, or `{}`).
+/// `-f` makes an HTTP error print nothing, and `|| true` swallows a dead socket, so every
+/// failure reaches Claude as empty output -- the normal menu. `-m` and the entry's
+/// `timeout` are the outer two of the three ceilings `asks.rs` pins.
+fn ask_command(port: u16) -> Value {
+    let max = crate::asks::ASK_CURL_MAX_SECS;
+    #[cfg(windows)]
+    let cmd = {
+        let url = format!("http://127.0.0.1:{port}/ask?session=%CONDUIT_SESSION_ID%");
+        format!(
+            "curl -s -f -m {max} -X POST -H \"Content-Type: application/json\" --data-binary @- \"{url}\" 2>NUL || ver >NUL"
+        )
+    };
+    #[cfg(not(windows))]
+    let cmd = {
+        let url = format!(
+            "http://127.0.0.1:${{CONDUIT_HOOK_PORT:-{port}}}/ask?session=${{CONDUIT_SESSION_ID:-unknown}}"
+        );
+        format!(
+            "[ -n \"$CONDUIT_HOOK_ENDPOINT\" ] && [ -r \"$CONDUIT_HOOK_ENDPOINT\" ] && . \"$CONDUIT_HOOK_ENDPOINT\"; \
+             curl -s -f -m {max} -X POST -H \"Content-Type: application/json\" --data-binary @- \"{url}\" 2>/dev/null || true"
+        )
+    };
+    json!({ "type": "command", "command": cmd, "timeout": crate::asks::ASK_HOOK_TIMEOUT_SECS })
+}
+
 /// Strip any prior Conduit entries (idempotent), then append ours.
 fn merged(existing: Option<&Value>, entries: Vec<Value>) -> Value {
     let mut array: Vec<Value> = existing
@@ -1206,9 +1371,15 @@ fn merged(existing: Option<&Value>, entries: Vec<Value>) -> Value {
 /// `install` replacing them rather than stacking a second copy on upgrade.
 fn is_conduit_entry(entry: &Value) -> bool {
     #[cfg(windows)]
-    const MARKER: &str = "/hook?session=%CONDUIT_SESSION_ID%";
+    const MARKERS: [&str; 2] = [
+        "/hook?session=%CONDUIT_SESSION_ID%",
+        "/ask?session=%CONDUIT_SESSION_ID%",
+    ];
     #[cfg(not(windows))]
-    const MARKER: &str = "/hook?session=${CONDUIT_SESSION_ID";
+    const MARKERS: [&str; 2] = [
+        "/hook?session=${CONDUIT_SESSION_ID",
+        "/ask?session=${CONDUIT_SESSION_ID",
+    ];
 
     entry
         .get("hooks")
@@ -1217,7 +1388,7 @@ fn is_conduit_entry(entry: &Value) -> bool {
             hooks.iter().any(|h| {
                 h.get("command")
                     .and_then(|c| c.as_str())
-                    .map(|c| c.contains(MARKER))
+                    .map(|c| MARKERS.iter().any(|m| c.contains(m)))
                     .unwrap_or(false)
             })
         })
@@ -1454,6 +1625,55 @@ mod tests {
     }
 
     #[test]
+    fn ask_decision_fails_open_on_every_refusal() {
+        let known = |s: &str| s == "sess-1";
+        let body = json!({"tool_name":"AskUserQuestion","tool_use_id":"tu",
+            "tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}});
+        match ask_decision(true, false, Some("sess-1"), &body, known) {
+            AskDecision::Hold {
+                session,
+                tool_use_id,
+                questions,
+            } => {
+                assert_eq!(session, "sess-1");
+                assert_eq!(tool_use_id, "tu");
+                assert_eq!(questions, body["tool_input"]["questions"]);
+            }
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        let no_id =
+            json!({"tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}});
+        match ask_decision(true, false, Some("sess-1"), &no_id, known) {
+            AskDecision::Hold { tool_use_id, .. } => assert_eq!(tool_use_id, ""),
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        assert_eq!(
+            ask_decision(true, true, Some("sess-1"), &body, known),
+            AskDecision::Skip,
+            "Origin refused"
+        );
+        assert_eq!(
+            ask_decision(false, false, Some("sess-1"), &body, known),
+            AskDecision::Skip,
+            "gate closed"
+        );
+        assert_eq!(
+            ask_decision(true, false, Some("unknown"), &body, known),
+            AskDecision::Skip,
+            "a claude outside Conduit reads the same settings file"
+        );
+        assert_eq!(
+            ask_decision(true, false, None, &body, known),
+            AskDecision::Skip
+        );
+        let bad = json!({"tool_input":{"questions":[]}});
+        assert_eq!(
+            ask_decision(true, false, Some("sess-1"), &bad, known),
+            AskDecision::Skip
+        );
+    }
+
+    #[test]
     fn approve_response_allow_and_deny_shapes() {
         let allow = approve_response(Some(&Decision::Allow));
         assert_eq!(allow["hookSpecificOutput"]["hookEventName"], "PreToolUse");
@@ -1498,6 +1718,66 @@ mod tests {
             broker.pending_for("s1").is_empty(),
             "a hook that gave up waiting must not leave a question on screen"
         );
+    }
+
+    #[test]
+    fn claude_profile_installs_a_blocking_ask_row() {
+        let rows = claude_profile().rows;
+        let ask: Vec<_> = rows.iter().filter(|r| r.verb == ASK_VERB).collect();
+        assert_eq!(ask.len(), 1);
+        assert_eq!(ask[0].event, "PreToolUse");
+        assert_eq!(ask[0].matcher, Some("AskUserQuestion"));
+    }
+
+    #[test]
+    fn only_the_ask_entry_carries_a_timeout_and_a_long_curl() {
+        let entries = entries_for(&claude_profile().rows, 8423);
+        let mut asks = 0;
+        for (_event, list) in &entries {
+            for e in list {
+                let h = &e["hooks"][0];
+                let cmd = h["command"].as_str().unwrap();
+                if e["matcher"] == "AskUserQuestion" {
+                    asks += 1;
+                    assert_eq!(h["timeout"], json!(crate::asks::ASK_HOOK_TIMEOUT_SECS));
+                    assert!(cmd.contains(&format!("-m {}", crate::asks::ASK_CURL_MAX_SECS)));
+                    assert!(cmd.contains("/ask?session="));
+                    assert!(cmd.contains(" -f "), "an HTTP error must print nothing");
+                    #[cfg(not(windows))]
+                    assert!(
+                        !cmd.contains(" >/dev/null"),
+                        "the response body IS the hook's stdout"
+                    );
+                    #[cfg(windows)]
+                    {
+                        assert!(
+                            !cmd.contains("\" >NUL"),
+                            "the response body IS the hook's stdout"
+                        );
+                        assert!(cmd.contains("\" 2>NUL"));
+                    }
+                } else {
+                    assert!(h.get("timeout").is_none(), "no other row grows a timeout");
+                    assert!(cmd.contains("-m 2 "));
+                }
+            }
+        }
+        assert_eq!(asks, 1);
+    }
+
+    #[test]
+    fn reinstall_does_not_duplicate_the_ask_entry() {
+        let dir = fresh_test_dir("ask-idempotent");
+        install(dir.to_str().unwrap(), 8423);
+        install(dir.to_str().unwrap(), 8424);
+        let v = read_settings(&dir);
+        let n = v["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["matcher"] == "AskUserQuestion")
+            .count();
+        assert_eq!(n, 1);
     }
 
     /// A unique, empty temp directory for one test. Removed if a stale copy exists.

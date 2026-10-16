@@ -5,6 +5,49 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.42.0 — 2026-10-12
+
+- **Added — Continuity tables.** The Continuity view gains tabs for Decisions, Handoffs, Tasks, Files and Activity — everything your sessions record in Continuity, for this project only. Tasks shows a claim that has run past its expiry as expired rather than open. Files highlights a path two sessions are editing at once. Click any session's avatar to jump to it on the map.
+
+## 0.41.0 — 2026-10-12
+
+- **Added — Continuity view.** A live map of a project's sessions (⇧⌘K): each session is a
+  little animal, linked to the sessions it talks to through Continuity, with a pulse every
+  time one messages another. Sessions from other projects that message in appear as dimmed
+  visitors. Click an avatar to read its conversation.
+- **Added — Answer agent questions from the map.** When a Claude session asks you a
+  multiple-choice question, it appears as a card next to its avatar (or in the corner when
+  the view is closed) and you can answer it there. Answers are numbered so you can press
+  1–N, Claude's own "(Recommended)" choice is tagged, multi-select questions use checkboxes
+  with a Send button, and "Something else…" takes a typed answer. The card shows how long the
+  question has been waiting, confirms "Sent to <session>" when you answer, and opens on
+  whichever side of the avatar is clear. Open that session's terminal and the question moves
+  back to the terminal as usual.
+- **Changed — Canvas and Task board are now optional.** Both are off by default; turn them
+  on in Settings → General. Your canvas layout and board cards are kept and come back when
+  you switch them on.
+- **Fixed — sessions no longer appear twice in Continuity.** Conduit sessions were being
+  drawn as two avatars, and the Decisions and Messages panels attributed their rows through
+  the checkout instead of the session. Each session now shows once and is credited with its
+  own messages and decisions, including earlier rows written from its worktree. Restart a
+  session to pick this up.
+
+## 0.40.1 — 2026-10-08
+
+- **Fixed — sessions pinned to another account now actually run under it.** A session
+  assigned to a non-default account (per session, per project, or as the global default)
+  silently ran under your normal login, because the account switch never reached the
+  agent once the session was kept alive in the background. Restart any session you had
+  pinned to another account to pick it up.
+- **Fixed — Detect accounts finds `CLAUDE_CONFIG_DIR` profiles.** A second Claude login
+  kept in its own folder (e.g. a `claude-work` alias that sets
+  `CLAUDE_CONFIG_DIR=~/.claude-work`) is now offered by Detect accounts, not only
+  profiles that keep a `.claude` folder inside.
+- **Fixed — plan usage connects for those accounts on macOS.** Connect plan usage now
+  finds such an account's sign-in in the Keychain, so its usage row fills in instead of
+  staying "not connected".
+
+
 ## 0.43.0 — 2026-09-29
 
 - **Added — orchestration policy and context display.** Settings now offers versioned, scoped policy import and export with a preview. Optional context rings show session-attributed Claude and agy readings, and show Unknown when no reliable reading exists. Policy limits do not enforce behavior yet.

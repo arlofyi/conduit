@@ -91,7 +91,17 @@ function Item({ item }: { item: TranscriptItem }) {
   return null;
 }
 
-export function SessionChat({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
+export function SessionChat({
+  sessionId,
+  onClose,
+  readOnly = false,
+}: {
+  sessionId: string;
+  onClose: () => void;
+  /** No composer, no permission chip, no "Terminal" button: the viewer (the Continuity
+   *  drawer) only reads. Nothing here may write to the PTY or take focus in this mode. */
+  readOnly?: boolean;
+}) {
   const items = useStore((s) => s.transcripts[sessionId]);
   const loadTranscript = useStore((s) => s.loadTranscript);
   const agentId = useStore((s) => findSession(s.projects, sessionId)?.session.agent ?? "claude");
@@ -168,12 +178,14 @@ export function SessionChat({ sessionId, onClose }: { sessionId: string; onClose
 
   return (
     <div className="chat-pane">
-      <div className="chat-head">
-        <span className="chat-title">Conversation</span>
-        <button className="chat-close" onClick={onClose} title="Back to the terminal">
-          Terminal
-        </button>
-      </div>
+      {!readOnly && (
+        <div className="chat-head">
+          <span className="chat-title">Conversation</span>
+          <button className="chat-close" onClick={onClose} title="Back to the terminal">
+            Terminal
+          </button>
+        </div>
+      )}
 
       <div
         className="hq-scroll"
@@ -204,6 +216,7 @@ export function SessionChat({ sessionId, onClose }: { sessionId: string; onClose
         </div>
       </div>
 
+      {!readOnly && (
       <div className="hq-thread-composer">
         <div className="hq-column">
           <div className="hq-composer">
@@ -248,6 +261,7 @@ export function SessionChat({ sessionId, onClose }: { sessionId: string; onClose
           </div>
         </div>
       </div>
+      )}
     </div>
   );
 }
