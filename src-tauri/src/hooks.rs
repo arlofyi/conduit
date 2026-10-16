@@ -984,6 +984,108 @@ fn entries_for(rows: &[HookRow], port: u16) -> Vec<(&'static str, Vec<Value>)> {
     out
 }
 
+/// Codex accepts inline hook tables through repeated `-c hooks.<Event>=...` flags.
+/// The definitions read the session environment, so their trust hash stays stable
+/// across listener port changes and no project hook file is needed.
+pub fn codex_hook_overrides(rows: &[HookRow]) -> Vec<String> {
+    let mut events: Vec<(&str, Vec<String>)> = Vec::new();
+    for row in rows {
+        let matcher = row
+            .matcher
+            .map(|m| format!("matcher={},", serde_json::to_string(m).unwrap()))
+            .unwrap_or_default();
+        // cmd.exe /K reparses the entire Codex invocation. A quote inside a -c value
+        // splits that value into extra CLI arguments, so the Windows override must be
+        // quote-free. Codex's hook runner uses PowerShell; its call operator invokes
+        // the .cmd relay by environment path, including paths with spaces.
+        #[cfg(windows)]
+        let entry = format!(
+            "{{{matcher}hooks=[{{type='command',command='echo',commandWindows='& $env:CONDUIT_CODEX_HOOK_RELAY {}'}}]}}",
+            row.verb
+        );
+        #[cfg(not(windows))]
+        let entry = format!(
+            "{{{matcher}hooks=[{{type='command',command='sh \"$CONDUIT_CODEX_HOOK_RELAY\" {}'}}]}}",
+            row.verb
+        );
+        match events.iter_mut().find(|(event, _)| *event == row.event) {
+            Some((_, entries)) => entries.push(entry),
+            None => events.push((row.event, vec![entry])),
+        }
+    }
+    events
+        .into_iter()
+        .map(|(event, entries)| format!("hooks.{event}=[{}]", entries.join(",")))
+        .collect()
+}
+
+pub fn codex_hook_relay_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let name = "codex-hook-relay.cmd";
+    #[cfg(not(windows))]
+    let name = "codex-hook-relay.sh";
+    crate::store::data_dir().join(name)
+}
+
+fn codex_hook_relay_contents() -> &'static str {
+    #[cfg(windows)]
+    {
+        // This Codex build keeps a Windows hook's stdin pipe open while it waits for
+        // the hook to finish. curl's @- waits for EOF and deadlocks PreToolUse. The
+        // lifecycle/status path only needs the event verb, so send a bounded body.
+        "@echo off\r\nif not defined CONDUIT_SESSION_ID exit /b 0\r\nif not defined CONDUIT_HOOK_PORT exit /b 0\r\ncurl.exe -s -m 2 -X POST -H \"Content-Type: application/json\" --data-raw \"{}\" -o NUL \"http://127.0.0.1:%CONDUIT_HOOK_PORT%/hook?session=%CONDUIT_SESSION_ID%&event=%~1\" >NUL 2>NUL\r\nexit /b 0\r\n"
+    }
+    #[cfg(not(windows))]
+    {
+        "#!/bin/sh\n[ -n \"$CONDUIT_SESSION_ID\" ] || exit 0\n[ -n \"$CONDUIT_HOOK_PORT\" ] || exit 0\ncurl -s -m 2 -X POST -H 'Content-Type: application/json' --data-binary @- \"http://127.0.0.1:$CONDUIT_HOOK_PORT/hook?session=$CONDUIT_SESSION_ID&event=$1\" >/dev/null 2>&1 || true\n"
+    }
+}
+
+pub fn write_codex_hook_relay() -> std::io::Result<()> {
+    let path = codex_hook_relay_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, codex_hook_relay_contents())
+}
+
+/// Remove only Conduit's legacy Codex project hooks. Foreign hook entries and
+/// unrelated JSON keys are preserved; malformed files are left untouched.
+pub fn remove_codex_project_hooks(dir: &str) {
+    let path = Path::new(dir).join(".codex/hooks.json");
+    let Ok(data) = fs::read(&path) else { return };
+    let Ok(mut root) = serde_json::from_slice::<Value>(&data) else {
+        return;
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(hooks) = obj.get_mut("hooks").and_then(Value::as_object_mut) {
+        hooks.retain(|_, entries| {
+            if let Some(array) = entries.as_array_mut() {
+                let before = array.len();
+                array.retain(|entry| !is_conduit_entry(entry));
+                changed |= array.len() != before;
+                !array.is_empty()
+            } else {
+                true
+            }
+        });
+        if hooks.is_empty() {
+            obj.remove("hooks");
+        }
+    }
+    if !changed {
+        return;
+    }
+    if obj.is_empty() {
+        let _ = fs::remove_file(path);
+    } else if let Ok(out) = serde_json::to_vec_pretty(&root) {
+        let _ = fs::write(path, out);
+    }
+}
+
 /// What a Claude `SessionStart` means for the session's tracked conversation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ClaudeConversationUpdate {
@@ -1370,15 +1472,16 @@ fn merged(existing: Option<&Value>, entries: Vec<Value>) -> Value {
 /// still recognizes entries written by older Conduit versions — which is what keeps
 /// `install` replacing them rather than stacking a second copy on upgrade.
 fn is_conduit_entry(entry: &Value) -> bool {
-    #[cfg(windows)]
-    const MARKERS: [&str; 2] = [
+    // Every shipped form, on every platform: a settings file can carry entries a
+    // different build wrote (a synced dotfile, the Codex PowerShell relay), and each must
+    // still be recognized as ours so an install replaces it instead of stacking a copy.
+    const MARKERS: [&str; 6] = [
         "/hook?session=%CONDUIT_SESSION_ID%",
         "/ask?session=%CONDUIT_SESSION_ID%",
-    ];
-    #[cfg(not(windows))]
-    const MARKERS: [&str; 2] = [
         "/hook?session=${CONDUIT_SESSION_ID",
         "/ask?session=${CONDUIT_SESSION_ID",
+        "/hook?session=$env:CONDUIT_SESSION_ID",
+        "/ask?session=$env:CONDUIT_SESSION_ID",
     ];
 
     entry
@@ -1398,8 +1501,158 @@ fn is_conduit_entry(entry: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ProviderAdapter;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn codex_overrides_are_per_launch_and_guard_missing_session() {
+        let rows = crate::agent::CodexAdapter.hooks_profile().unwrap().rows;
+        let flags = codex_hook_overrides(&rows);
+        let start = flags
+            .iter()
+            .find(|f| f.starts_with("hooks.SessionStart="))
+            .unwrap();
+        #[cfg(windows)]
+        assert!(start.contains("commandWindows="));
+        assert!(start.contains("CONDUIT_CODEX_HOOK_RELAY"));
+        #[cfg(windows)]
+        {
+            assert!(start.contains("& $env:CONDUIT_CODEX_HOOK_RELAY"));
+            assert!(!start.contains('"'), "cmd.exe splits quoted -c values");
+        }
+        assert!(!start.contains("8423"));
+        assert!(flags.iter().map(String::len).sum::<usize>() * 2 < 3_500);
+        let relay = codex_hook_relay_contents();
+        assert!(relay.contains("CONDUIT_SESSION_ID"));
+        #[cfg(windows)]
+        {
+            assert!(relay.contains("exit /b 0"));
+            assert!(relay.contains("curl.exe"));
+        }
+        #[cfg(not(windows))]
+        assert!(relay.contains("exit 0"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_windows_relay_runs_in_powershell_5_and_7() {
+        use std::process::{Command, Stdio};
+
+        let dir = fresh_test_dir("codex relay with spaces");
+        let relay = dir.join("codex-hook-relay.cmd");
+        fs::write(&relay, codex_hook_relay_contents()).unwrap();
+        let start = codex_hook_overrides(&crate::agent::CodexAdapter.hooks_profile().unwrap().rows)
+            .into_iter()
+            .find(|flag| flag.starts_with("hooks.SessionStart="))
+            .unwrap();
+        let windows = start.split_once("commandWindows=").unwrap().1;
+        let command = windows.split('\'').nth(1).unwrap();
+        for shell in ["pwsh", "powershell.exe"] {
+            let no_session = Command::new(shell)
+                .args(["-NoProfile", "-Command", command])
+                .env("CONDUIT_CODEX_HOOK_RELAY", &relay)
+                .env_remove("CONDUIT_SESSION_ID")
+                .env_remove("CONDUIT_HOOK_PORT")
+                .output()
+                .unwrap();
+            assert!(no_session.status.success(), "{no_session:?}");
+            let no_port = Command::new(shell)
+                .args(["-NoProfile", "-Command", command])
+                .env("CONDUIT_CODEX_HOOK_RELAY", &relay)
+                .env("CONDUIT_SESSION_ID", "session-1")
+                .env_remove("CONDUIT_HOOK_PORT")
+                .output()
+                .unwrap();
+            assert!(no_port.status.success(), "{no_port:?}");
+
+            let server = Server::http("127.0.0.1:0").unwrap();
+            let port = server.server_addr().to_ip().unwrap().port();
+            let receiver = thread::spawn(move || {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                let url = request.url().to_owned();
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                request.respond(Response::from_string("ok")).unwrap();
+                (url, body)
+            });
+            let mut sent = Command::new(shell)
+                .args(["-NoProfile", "-Command", command])
+                .env("CONDUIT_CODEX_HOOK_RELAY", &relay)
+                .env("CONDUIT_SESSION_ID", "session-1")
+                .env("CONDUIT_HOOK_PORT", port.to_string())
+                // Match Codex's hook runner: the parent keeps stdin open until the
+                // child exits. A relay that reads @- cannot finish in this setup.
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = sent.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = sent.kill();
+                    panic!("relay waited for stdin EOF");
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            assert!(status.success(), "{status:?}");
+            assert_eq!(
+                receiver.join().unwrap(),
+                (
+                    "/hook?session=session-1&event=sessionstart".to_string(),
+                    "{}".to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn codex_cleanup_preserves_foreign_hooks_and_keys() {
+        let dir = fresh_test_dir("codex_cleanup");
+        let path = dir.join(".codex/hooks.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&json!({
+            "description": "kept",
+            "hooks": {"Stop": [
+                {"hooks": [{"type": "command", "command": "curl http://127.0.0.1:8423/hook?session=%CONDUIT_SESSION_ID%&event=stop"}]},
+                {"hooks": [{"type": "command", "command": "echo foreign"}]}
+            ]}
+        })).unwrap()).unwrap();
+        remove_codex_project_hooks(dir.to_str().unwrap());
+        let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["description"], "kept");
+        assert_eq!(after["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        remove_codex_project_hooks(dir.to_str().unwrap());
+        assert_eq!(
+            after,
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_cleanup_removes_file_when_only_our_hooks_remain() {
+        let dir = fresh_test_dir("codex_cleanup_only_ours");
+        let path = dir.join(".codex/hooks.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "hooks": {"Stop": [{"hooks": [{"type": "command", "command":
+                    "curl http://127.0.0.1:8423/hook?session=%CONDUIT_SESSION_ID%&event=stop"}]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        remove_codex_project_hooks(dir.to_str().unwrap());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn publishes_event_to_bus() {

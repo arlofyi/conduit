@@ -558,6 +558,14 @@ impl PtyManager {
             for (k, v) in adapter.env_overrides() {
                 cmd.env(k, v);
             }
+            if adapter.id() == crate::agent::AgentId::Codex {
+                cmd.env(
+                    "CONDUIT_CODEX_HOOK_RELAY",
+                    crate::hooks::codex_hook_relay_path()
+                        .to_string_lossy()
+                        .as_ref(),
+                );
+            }
             // Route OpenCode to the configured local/self-hosted provider:
             // an inline config env var that outranks the user's opencode.json files, plus
             // the endpoint key in its own env var (referenced from the config as
@@ -1285,6 +1293,13 @@ fn build_script(
     ide_port: Option<u16>,
 ) -> String {
     let mut flags = String::new();
+    if adapter.id() == crate::agent::AgentId::Codex {
+        if let Some(profile) = adapter.hooks_profile() {
+            for config in crate::hooks::codex_hook_overrides(&profile.rows) {
+                flags.push_str(&format!(" -c {}", shell_quote(&config)));
+            }
+        }
+    }
     if let Some(name) = worktree {
         flags.push_str(&format!(" --worktree {}", shell_quote(name)));
     }
@@ -1342,9 +1357,17 @@ fn build_script(
         resume_token,
     );
     format!(
-        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}{ide}; cd {dir} && {invocation}; exec {shell} -i -l",
+        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}{relay}{ide}; cd {dir} && {invocation}; exec {shell} -i -l",
         sid = shell_quote(session_id),
         port = port,
+        relay = if adapter.id() == crate::agent::AgentId::Codex {
+            format!(
+                " CONDUIT_CODEX_HOOK_RELAY={}",
+                shell_quote(&crate::hooks::codex_hook_relay_path().to_string_lossy())
+            )
+        } else {
+            String::new()
+        },
         // CLAUDE_CODE_SSE_PORT is the 2.1.267 auto-connect trigger;
         // ENABLE_IDE_INTEGRATION covers older CLIs (harmless on new ones).
         ide = ide_port
@@ -1415,6 +1438,13 @@ fn build_script_win(
     strict_mcp: bool,
 ) -> String {
     let mut flags = String::new();
+    if adapter.id() == crate::agent::AgentId::Codex {
+        if let Some(profile) = adapter.hooks_profile() {
+            for config in crate::hooks::codex_hook_overrides(&profile.rows) {
+                flags.push_str(&format!(" -c {}", quote_arg(&config)));
+            }
+        }
+    }
     if let Some(name) = worktree {
         flags.push_str(&format!(" --worktree {}", quote_arg(name)));
     }

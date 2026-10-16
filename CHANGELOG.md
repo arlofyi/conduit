@@ -5,6 +5,11 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — Codex hooks no longer change your project.** Conduit passes hooks when it
+  starts Codex and removes its old project hook entries. Review the hooks in an
+  interactive Codex session; Codex silently skips untrusted fleet hooks.
+
+
 ## 0.42.0 — 2026-10-12
 
 - **Added — Continuity tables.** The Continuity view gains tabs for Decisions, Handoffs, Tasks, Files and Activity — everything your sessions record in Continuity, for this project only. Tasks shows a claim that has run past its expiry as expired rather than open. Files highlights a path two sessions are editing at once. Click any session's avatar to jump to it on the map.

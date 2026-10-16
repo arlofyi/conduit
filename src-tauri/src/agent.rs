@@ -2351,6 +2351,15 @@ mod tests {
         assert!(prompted.ends_with(&format!("codex{pinned} || codex{base}")));
     }
 
+    #[test]
+    fn codex_retry_keeps_inline_hooks() {
+        let flags = " -c hooks.SessionStart=[]";
+        assert_eq!(
+            CodexAdapter.build_invocation("sid", None, flags, None, None),
+            format!("codex{flags} || codex{flags}")
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn codex_with_prompt_chains_exec_then_interactive() {
