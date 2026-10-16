@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.44.0 — 2026-10-16
+
 - **Added — Settings → Sessions.** One place for when sessions start and stop by
   themselves: what happens when Conduit starts, idle auto-stop and its delay, whether
   sessions waiting on you or on screen are included, keeping Claude in the project folder,
