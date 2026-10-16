@@ -77,6 +77,9 @@ const TMUX_SCROLLBACK: u32 = 50_000;
 pub struct RingBuffer {
     cap: usize,
     inner: Mutex<VecDeque<u8>>,
+    /// Bumped on every push, so the scrollback timer can tell an idle terminal (nothing to
+    /// write) from one with new output without comparing 256 KB of bytes.
+    generation: AtomicU64,
 }
 
 impl RingBuffer {
@@ -84,15 +87,23 @@ impl RingBuffer {
         RingBuffer {
             cap,
             inner: Mutex::new(VecDeque::with_capacity(cap)),
+            generation: AtomicU64::new(0),
         }
     }
 
     pub fn push(&self, bytes: &[u8]) {
         let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         q.extend(bytes.iter().copied());
-        while q.len() > self.cap {
-            q.pop_front();
+        let excess = q.len().saturating_sub(self.cap);
+        if excess > 0 {
+            q.drain(..excess);
         }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many pushes this buffer has seen.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Last `max_bytes` of buffered output, lossy-UTF8 and ANSI-stripped.
@@ -223,6 +234,11 @@ pub struct PtyManager {
     /// reattach must not: tmux repaints the pane itself, and a replay on top of that prints
     /// the same screen twice.
     warm_spawns: DashMap<String, ()>,
+    /// The output-ring generation each session's snapshot was last written at. The 20 s
+    /// scrollback timer used to rewrite every live terminal's 256 KB unconditionally -- an
+    /// idle fleet still wrote ~1 GB/day per terminal into Roaming AppData, each write
+    /// scanned by real-time AV. Cleared on spawn, because a new ring restarts at zero.
+    saved_generation: DashMap<String, u64>,
     /// Serializes spawn against teardown. `pty_spawn` runs on a worker thread (so a slow
     /// process launch cannot freeze the UI), which turns its "already running? else create"
     /// into a check-then-insert other threads can interleave with: two spawns of one id
@@ -234,6 +250,10 @@ pub struct PtyManager {
     /// a RETIRE keeps both — the persisted port makes the resume spawn reuse them
     /// (`IdeHost::start_for_session` is idempotent).
     ide_host: std::sync::OnceLock<Arc<crate::ide_host::IdeHost>>,
+    /// Settings -> Sessions "Keep Claude in the project folder". Pushed down by
+    /// `set_keep_agents_in_project` like `persist`; read at spawn, so it applies to the
+    /// next session started rather than to one already running.
+    keep_in_project: AtomicBool,
 }
 
 /// Why a session's processes are being ended. The two verbs kill the same things; they
@@ -269,8 +289,32 @@ impl PtyManager {
             #[cfg(not(windows))]
             tmux: std::sync::OnceLock::new(),
             warm_spawns: DashMap::new(),
+            saved_generation: DashMap::new(),
             lifecycle: Mutex::new(()),
             ide_host: std::sync::OnceLock::new(),
+            keep_in_project: AtomicBool::new(true),
+        }
+    }
+
+    /// Mirror the frontend's "Keep Claude in the project folder" setting.
+    pub fn set_keep_in_project(&self, on: bool) {
+        self.keep_in_project.store(on, Ordering::SeqCst);
+    }
+
+    /// Env every spawn of `agent` gets from Conduit's own preferences.
+    ///
+    /// `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` makes Claude Code return its Bash tool to
+    /// the session's directory after every command. Without it a single `cd /` or `cd ~`
+    /// sticks for the rest of the session -- and in Git Bash `/` is the Git install folder
+    /// and `~` the profile folder -- which is how agents ended up working outside the project.
+    fn preference_env(&self, agent: crate::agent::AgentId) -> Vec<(String, String)> {
+        if agent == crate::agent::AgentId::Claude && self.keep_in_project.load(Ordering::SeqCst) {
+            vec![(
+                "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR".to_string(),
+                "1".to_string(),
+            )]
+        } else {
+            Vec::new()
         }
     }
 
@@ -453,12 +497,14 @@ impl PtyManager {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect();
                 if let Some(dir) = account_config_dir.as_deref() {
-                    session_env.extend(adapter.account_env(dir));
+                    session_env
+                        .extend(crate::agent::with_real_tool_homes(adapter.account_env(dir)));
                 }
                 // Continuity identity must ride the export line too: `cmd.env` below
                 // dies at the tmux server boundary, and continuity would fall back to
                 // an unsalted cwd-hash label.
                 session_env.extend(continuity_env(&session_id, plugin_dir.is_some()));
+                session_env.extend(self.preference_env(agent));
                 let script = build_script(
                     adapter.as_ref(),
                     &session_id,
@@ -558,6 +604,9 @@ impl PtyManager {
             for (k, v) in adapter.env_overrides() {
                 cmd.env(k, v);
             }
+            for (k, v) in self.preference_env(agent) {
+                cmd.env(k, v);
+            }
             if adapter.id() == crate::agent::AgentId::Codex {
                 cmd.env(
                     "CONDUIT_CODEX_HOOK_RELAY",
@@ -606,7 +655,7 @@ impl PtyManager {
             // every other adapter returns nothing. Behavior is byte-identical to the block
             // this replaced. Values are path-derived account identifiers -- never logged.
             if let Some(dir) = account_config_dir.as_deref() {
-                for (k, v) in adapter.account_env(dir) {
+                for (k, v) in crate::agent::with_real_tool_homes(adapter.account_env(dir)) {
                     cmd.env(k, v);
                 }
             }
@@ -638,6 +687,7 @@ impl PtyManager {
         let suppress_flag = Arc::new(AtomicBool::new(suppress_remote));
         let suppress_for_reader = suppress_flag.clone();
 
+        self.saved_generation.remove(&session_id);
         self.sessions.insert(
             session_id.clone(),
             Mutex::new(PtySession {
@@ -882,11 +932,17 @@ impl PtyManager {
             let Ok(session) = entry.value().lock() else {
                 continue;
             };
+            let generation = session.output.generation();
+            if self.saved_generation.get(entry.key()).map(|g| *g) == Some(generation) {
+                continue; // nothing new since the last write
+            }
             let bytes = session.output.tail_bytes(crate::scrollback::MAX_BYTES);
             if bytes.is_empty() {
                 continue;
             }
             crate::scrollback::save(entry.key(), &bytes);
+            self.saved_generation
+                .insert(entry.key().clone(), generation);
         }
     }
 
@@ -978,6 +1034,7 @@ impl PtyManager {
         // The next spawn must be COLD either way, so it replays rather than assuming tmux
         // will repaint a pane that no longer exists.
         self.warm_spawns.remove(session_id);
+        self.saved_generation.remove(session_id);
         if !how.keeps_snapshot() {
             crate::scrollback::remove(session_id);
             // DESTROY also ends the session's IDE server and removes its lock file —
@@ -1044,6 +1101,25 @@ impl PtyManager {
             }
         }
     }
+}
+
+/// End a `std::process::Child` and everything it started, then reap it.
+///
+/// On Windows `Child::kill` is TerminateProcess on the immediate child only. Conduit's
+/// headless `claude -p` children (titler, root chat) are `cmd.exe /C claude ...`, so a
+/// plain kill ends the cmd.exe and leaves the real `claude` running. `taskkill /T` walks
+/// the tree while the root is still alive to be found -- the same order `tear_down` uses.
+pub(crate) fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        use crate::NoWindow;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .no_window()
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// True if a transcript named `<session_id>.jsonl` exists under any project-slug
@@ -2254,11 +2330,16 @@ mod tests {
             None,
             false,
         );
+        // The per-launch hook overrides lead; the pin follows them. The retry after `||`
+        // keeps the hooks (structural) and drops only the model pin.
+        let (pinned, retry) = script.split_once(" || ").expect("a retry leg");
+        assert!(pinned.starts_with("codex -c \"hooks."), "{script}");
         assert!(
-            script.contains("codex -m gpt-6-sol -c model_reasoning_effort=high"),
+            pinned.ends_with(" -m gpt-6-sol -c model_reasoning_effort=high"),
             "{script}"
         );
-        assert!(script.ends_with(" || codex"), "{script}");
+        assert!(retry.starts_with("codex -c \"hooks."), "{script}");
+        assert!(!retry.contains("gpt-6-sol"), "{script}");
     }
 
     #[cfg(not(windows))]

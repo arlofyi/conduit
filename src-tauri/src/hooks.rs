@@ -258,9 +258,14 @@ pub fn start(
                 // to the "an agent is working" quit confirm. Runs on EVERY tick (even
                 // quota-less ones) so a working state registers before quota loads.
                 if let Some(sid) = session.as_deref() {
-                    fleet.set_running(
+                    let active =
+                        crate::agy_usage::agent_state_is_active(usage.agent_state.as_deref());
+                    fleet.set_running(sid, active);
+                    // Same persisted activity the Claude hooks write, so a relaunch resumes
+                    // an agy session only when it was working. No-op for an unknown id.
+                    store.set_session_agent_state(
                         sid,
-                        crate::agy_usage::agent_state_is_active(usage.agent_state.as_deref()),
+                        Some(if active { "running" } else { "idle" }),
                     );
                 }
                 let line = crate::agy_usage::format_status_line(&usage);
@@ -357,6 +362,11 @@ pub fn start(
 
             // Mirror status into the fleet map so the Conductor can read it (fleet_list).
             fleet.record(&session, &event, &parsed);
+            // Persist the resulting status so the next launch knows whether this agent
+            // was mid-turn (see `Session::agent_state`). No-op unless it changed.
+            if let Some(state) = fleet.status_of(&session) {
+                store.set_session_agent_state(&session, Some(&state));
+            }
 
             // Capture Command Code's own session id, once, so the next spawn can resume
             // this conversation with `--session <id>`. Command Code has no `--session-id`
@@ -1041,6 +1051,59 @@ fn codex_hook_relay_contents() -> &'static str {
     }
 }
 
+/// A relay path as it goes into a hook command: forward slashes. cmd.exe and Git Bash both
+/// run `"C:/x/conduit-hook.cmd"`, and unlike backslashes, forward slashes survive a shell
+/// that drops the quotes (bash then reads `\U` as an escape and the path collapses to
+/// `C:UsersX...`). Verified against both shells.
+#[cfg(windows)]
+fn relay_arg(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Windows: the relay every Claude-style status hook calls (see `command`).
+#[cfg(windows)]
+pub fn hook_relay_path() -> std::path::PathBuf {
+    crate::store::data_dir().join("conduit-hook.cmd")
+}
+
+/// Windows: the relay the blocking AskUserQuestion hook calls (see `ask_command`).
+#[cfg(windows)]
+pub fn ask_relay_path() -> std::path::PathBuf {
+    crate::store::data_dir().join("conduit-ask.cmd")
+}
+
+/// `conduit-hook.cmd <event> <fallback port>`. A `claude` that Conduit did not launch has
+/// no CONDUIT_SESSION_ID, so it posts nothing at all rather than a sessionless event.
+/// `-o NUL` keeps the server's reply out of the hook's stdout: for UserPromptSubmit and
+/// SessionStart, Claude adds a hook's stdout to the model's context.
+#[cfg(windows)]
+const HOOK_RELAY_CMD: &str = "@echo off\r\nsetlocal\r\nif not defined CONDUIT_SESSION_ID exit /b 0\r\nset \"CONDUIT_RELAY_PORT=%~2\"\r\nif defined CONDUIT_HOOK_PORT set \"CONDUIT_RELAY_PORT=%CONDUIT_HOOK_PORT%\"\r\ncurl.exe -s -m 2 -o NUL -X POST -H \"Content-Type: application/json\" --data-binary @- \"http://127.0.0.1:%CONDUIT_RELAY_PORT%/hook?session=%CONDUIT_SESSION_ID%&event=%~1\" 2>NUL\r\nexit /b 0\r\n";
+
+/// `conduit-ask.cmd <fallback port> <max seconds>`. Unlike the status relay its stdout
+/// is the hook's answer, so curl writes it through; `-f` keeps an HTTP error silent.
+#[cfg(windows)]
+const ASK_RELAY_CMD: &str = "@echo off\r\nsetlocal\r\nif not defined CONDUIT_SESSION_ID exit /b 0\r\nset \"CONDUIT_RELAY_PORT=%~1\"\r\nif defined CONDUIT_HOOK_PORT set \"CONDUIT_RELAY_PORT=%CONDUIT_HOOK_PORT%\"\r\ncurl.exe -s -f -m %~2 -X POST -H \"Content-Type: application/json\" --data-binary @- \"http://127.0.0.1:%CONDUIT_RELAY_PORT%/ask?session=%CONDUIT_SESSION_ID%\" 2>NUL\r\nexit /b 0\r\n";
+
+/// Write both Windows relays, skipping the write when the file already matches. Called
+/// before any hook settings that reference them are written, and once at startup.
+#[cfg(windows)]
+pub fn write_hook_relays() {
+    for (path, body) in [
+        (hook_relay_path(), HOOK_RELAY_CMD),
+        (ask_relay_path(), ASK_RELAY_CMD),
+    ] {
+        if fs::read(&path).ok().as_deref() == Some(body.as_bytes()) {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(&path, body) {
+            eprintln!("[hooks] could not write {}: {e}", path.display());
+        }
+    }
+}
+
 pub fn write_codex_hook_relay() -> std::io::Result<()> {
     let path = codex_hook_relay_path();
     if let Some(parent) = path.parent() {
@@ -1271,6 +1334,8 @@ pub fn install_profile(dir: &str, port: u16, profile: &HooksProfile) {
 /// `install_profile` with the home directory injected, so the user-settings guard can be
 /// tested against a temp dir rather than the real `$HOME`.
 fn install_profile_at(dir: &str, port: u16, profile: &HooksProfile, home: Option<&Path>) {
+    #[cfg(windows)]
+    write_hook_relays();
     if is_user_config_root(Path::new(dir), home) {
         // Refusing costs this project its status dots. Installing costs the whole machine:
         // every agent session anywhere starts firing Conduit's hooks. The receiver drops
@@ -1369,6 +1434,8 @@ pub fn write_settings_file(port: u16) -> Option<String> {
     // `store::data_dir()` rather than a hardcoded "ConduitTauri": this file used to
     // ignore CONDUIT_DATA_DIR_NAME, so a dev build wrote its settings over the installed
     // app's — the same data-dir isolation the endpoint file above depends on.
+    #[cfg(windows)]
+    write_hook_relays();
     let base = crate::store::data_dir();
     let path = base.join("conduit-hooks.json");
     let data = serde_json::to_vec_pretty(&settings_value(port)).ok()?;
@@ -1379,20 +1446,22 @@ pub fn write_settings_file(port: u16) -> Option<String> {
 /// A command hook that pipes the event JSON (stdin) to Conduit's server, tagged
 /// with this session via env vars resolved at run time.
 fn command(event: &str, port: u16) -> Value {
-    // On Windows, claude runs hook commands via cmd.exe, which cannot parse POSIX
-    // `${VAR:-default}` / `>/dev/null` / `|| true`. Emit a cmd-native equivalent: bake the
-    // live port (install_profile rewrites this file with the current port on every spawn),
-    // expand the session via `%CONDUIT_SESSION_ID%`, redirect to NUL, and swallow errors
-    // with `|| ver >NUL` (cmd's `|| true`). The literal substring CONDUIT_SESSION_ID keeps
-    // `is_conduit_entry` idempotency matching. Elsewhere keep the POSIX form.
+    // Windows: the command is only a call to a generated relay script (`hook_relay_path`).
+    //
+    // It used to be inline cmd syntax -- `curl ... "...?session=%CONDUIT_SESSION_ID%..."
+    // >NUL 2>&1 || ver >NUL` -- on the assumption that claude runs hook commands through
+    // cmd.exe. It runs them through Git Bash. Bash never expands `%VAR%`, so every event
+    // reached the listener as `session=%CONDUIT_SESSION_ID%`, which the provenance gate
+    // drops: no status, no to-dos, no conversation capture, and a quit guard that could not
+    // see a working agent. And bash's `>NUL` writes a FILE named NUL into the agent's cwd,
+    // which is where the stray `NUL` files (containing the server's `ok`) came from.
+    //
+    // A quoted path plus plain arguments is the one shape cmd.exe and bash parse alike,
+    // and inside the relay cmd's own rules apply again: `%VAR%` expands and `NUL` is the
+    // device. The baked port is the fallback; the relay prefers the session's
+    // CONDUIT_HOOK_PORT.
     #[cfg(windows)]
-    let cmd = {
-        let url =
-            format!("http://127.0.0.1:{port}/hook?session=%CONDUIT_SESSION_ID%&event={event}");
-        format!(
-            "curl -s -m 2 -X POST -H \"Content-Type: application/json\" --data-binary @- \"{url}\" >NUL 2>&1 || ver >NUL"
-        )
-    };
+    let cmd = format!("\"{}\" {event} {port}", relay_arg(&hook_relay_path()));
     // POSIX: source the endpoint file first, so the port is resolved at HOOK time rather
     // than at spawn time. Three layers, freshest first:
     //
@@ -1430,13 +1499,10 @@ fn command(event: &str, port: u16) -> Value {
 /// `timeout` are the outer two of the three ceilings `asks.rs` pins.
 fn ask_command(port: u16) -> Value {
     let max = crate::asks::ASK_CURL_MAX_SECS;
+    // Same reason as `command`: route through a relay so the shell running the hook
+    // (bash, in practice) cannot mangle `%VAR%` or turn a redirect into a file.
     #[cfg(windows)]
-    let cmd = {
-        let url = format!("http://127.0.0.1:{port}/ask?session=%CONDUIT_SESSION_ID%");
-        format!(
-            "curl -s -f -m {max} -X POST -H \"Content-Type: application/json\" --data-binary @- \"{url}\" 2>NUL || ver >NUL"
-        )
-    };
+    let cmd = format!("\"{}\" {port} {max}", relay_arg(&ask_relay_path()));
     #[cfg(not(windows))]
     let cmd = {
         let url = format!(
@@ -1475,7 +1541,9 @@ fn is_conduit_entry(entry: &Value) -> bool {
     // Every shipped form, on every platform: a settings file can carry entries a
     // different build wrote (a synced dotfile, the Codex PowerShell relay), and each must
     // still be recognized as ours so an install replaces it instead of stacking a copy.
-    const MARKERS: [&str; 6] = [
+    const MARKERS: [&str; 8] = [
+        "conduit-hook.cmd\"",
+        "conduit-ask.cmd\"",
         "/hook?session=%CONDUIT_SESSION_ID%",
         "/ask?session=%CONDUIT_SESSION_ID%",
         "/hook?session=${CONDUIT_SESSION_ID",
@@ -1504,6 +1572,62 @@ mod tests {
     use crate::agent::ProviderAdapter;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// What marks a status-hook command as Conduit's on this platform.
+    #[cfg(windows)]
+    const OUR_HOOK_MARK: &str = "conduit-hook.cmd";
+    #[cfg(not(windows))]
+    const OUR_HOOK_MARK: &str = "CONDUIT_SESSION_ID";
+
+    /// Whether a status-hook command routes `event` for the running session: inline URL
+    /// parameters on POSIX, relay arguments on Windows (the relay expands the session id).
+    fn carries_route(cmd: &str, event: &str) -> bool {
+        #[cfg(windows)]
+        {
+            cmd.contains(&format!("conduit-hook.cmd\" {event} "))
+        }
+        #[cfg(not(windows))]
+        {
+            cmd.contains(&format!("event={event}")) && cmd.contains("CONDUIT_SESSION_ID")
+        }
+    }
+
+    /// The bug the relay exists for: claude runs hooks through Git Bash, where `%VAR%` is
+    /// never expanded and `>NUL` creates a file. The command itself must carry neither, and
+    /// the relay must do both in cmd's own syntax.
+    #[cfg(windows)]
+    #[test]
+    fn windows_hook_commands_are_shell_neutral() {
+        for (_event, list) in entries_for(&claude_profile().rows, 8423) {
+            for e in list {
+                let cmd = e["hooks"][0]["command"].as_str().unwrap().to_string();
+                for forbidden in ["%CONDUIT", ">NUL", "2>NUL", "||", "\\"] {
+                    assert!(!cmd.contains(forbidden), "{forbidden:?} in {cmd}");
+                }
+                assert!(cmd.starts_with('"'), "relay path must be quoted: {cmd}");
+            }
+        }
+        assert!(HOOK_RELAY_CMD.contains("session=%CONDUIT_SESSION_ID%&event=%~1"));
+        assert!(
+            HOOK_RELAY_CMD.contains("-o NUL"),
+            "the reply must never reach the model"
+        );
+        assert!(HOOK_RELAY_CMD.contains("if not defined CONDUIT_SESSION_ID exit /b 0"));
+        assert!(HOOK_RELAY_CMD.ends_with("exit /b 0\r\n"));
+        assert!(ASK_RELAY_CMD.ends_with("exit /b 0\r\n"));
+    }
+
+    #[test]
+    fn relay_commands_are_recognized_as_ours() {
+        let ours = json!({"hooks": [{"type": "command",
+            "command": "\"C:/Users/x/AppData/Roaming/ConduitTauri/conduit-hook.cmd\" stop 8423"}]});
+        let ask = json!({"hooks": [{"type": "command",
+            "command": "\"C:/Users/x/AppData/Roaming/ConduitTauri/conduit-ask.cmd\" 8423 40"}]});
+        let foreign = json!({"hooks": [{"type": "command", "command": "my-hook.cmd stop"}]});
+        assert!(is_conduit_entry(&ours));
+        assert!(is_conduit_entry(&ask));
+        assert!(!is_conduit_entry(&foreign));
+    }
 
     #[test]
     fn codex_overrides_are_per_launch_and_guard_missing_session() {
@@ -1993,25 +2117,38 @@ mod tests {
                 if e["matcher"] == "AskUserQuestion" {
                     asks += 1;
                     assert_eq!(h["timeout"], json!(crate::asks::ASK_HOOK_TIMEOUT_SECS));
-                    assert!(cmd.contains(&format!("-m {}", crate::asks::ASK_CURL_MAX_SECS)));
-                    assert!(cmd.contains("/ask?session="));
-                    assert!(cmd.contains(" -f "), "an HTTP error must print nothing");
                     #[cfg(not(windows))]
-                    assert!(
-                        !cmd.contains(" >/dev/null"),
-                        "the response body IS the hook's stdout"
-                    );
-                    #[cfg(windows)]
                     {
+                        assert!(cmd.contains(&format!("-m {}", crate::asks::ASK_CURL_MAX_SECS)));
+                        assert!(cmd.contains("/ask?session="));
+                        assert!(cmd.contains(" -f "), "an HTTP error must print nothing");
                         assert!(
-                            !cmd.contains("\" >NUL"),
+                            !cmd.contains(" >/dev/null"),
                             "the response body IS the hook's stdout"
                         );
-                        assert!(cmd.contains("\" 2>NUL"));
+                    }
+                    // Windows: the command is the relay call; the curl lives in the relay.
+                    #[cfg(windows)]
+                    {
+                        assert!(cmd.contains("conduit-ask.cmd\""), "got {cmd}");
+                        assert!(cmd.ends_with(&format!(" {}", crate::asks::ASK_CURL_MAX_SECS)));
+                        assert!(ASK_RELAY_CMD.contains("-m %~2 "));
+                        assert!(ASK_RELAY_CMD.contains("/ask?session=%CONDUIT_SESSION_ID%"));
+                        assert!(
+                            ASK_RELAY_CMD.contains(" -f "),
+                            "an HTTP error must print nothing"
+                        );
+                        assert!(
+                            !ASK_RELAY_CMD.contains("-o NUL"),
+                            "the response body IS the hook's stdout"
+                        );
                     }
                 } else {
                     assert!(h.get("timeout").is_none(), "no other row grows a timeout");
+                    #[cfg(not(windows))]
                     assert!(cmd.contains("-m 2 "));
+                    #[cfg(windows)]
+                    assert!(cmd.contains("conduit-hook.cmd\"") && HOOK_RELAY_CMD.contains("-m 2 "));
                 }
             }
         }
@@ -2158,14 +2295,7 @@ mod tests {
         let cmd = hooks_obj(&v)["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .expect("SessionStart command string");
-        assert!(
-            cmd.contains("event=sessionstart"),
-            "event tag missing: {cmd}"
-        );
-        assert!(
-            cmd.contains("CONDUIT_SESSION_ID"),
-            "session routing missing: {cmd}"
-        );
+        assert!(carries_route(cmd, "sessionstart"), "routing missing: {cmd}");
         assert!(cmd.contains("8431"), "fallback port missing: {cmd}");
     }
 
@@ -2260,7 +2390,7 @@ mod tests {
             "a third-party Stop hook must survive install"
         );
         assert!(
-            has("CONDUIT_SESSION_ID"),
+            has(OUR_HOOK_MARK),
             "Conduit's own Stop hook must be added alongside"
         );
     }
@@ -2336,8 +2466,7 @@ mod tests {
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .expect("command string");
-        assert!(cmd.contains("event=sessionstart"));
-        assert!(cmd.contains("CONDUIT_SESSION_ID"));
+        assert!(carries_route(cmd, "sessionstart"), "got {cmd}");
         assert!(cmd.contains("8431"));
     }
 
@@ -2633,8 +2762,7 @@ mod tests {
         let cmd = hooks[0]["command"].as_str().unwrap();
         // SessionStart is how Command Code's own session id reaches Conduit, so this verb
         // is load-bearing for resume, not just for the status dot.
-        assert!(cmd.contains("event=sessionstart"), "got {cmd}");
-        assert!(cmd.contains("CONDUIT_SESSION_ID"), "got {cmd}");
+        assert!(carries_route(cmd, "sessionstart"), "got {cmd}");
     }
 
     /// The token must be minted in the same place the port is published, or a session

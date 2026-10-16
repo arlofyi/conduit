@@ -433,6 +433,15 @@ impl FleetState {
         apply_event(entry, event, body);
     }
 
+    /// One session's current status string, if it has ever reported.
+    pub fn status_of(&self, session: &str) -> Option<String> {
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .map(|s| s.status.clone())
+    }
+
     /// A clone of the whole status map (for fleet_list).
     pub fn snapshot(&self) -> HashMap<String, FleetStatus> {
         self.status

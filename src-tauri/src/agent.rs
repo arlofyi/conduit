@@ -208,6 +208,65 @@ pub fn claude_profile_env(config_dir: &str) -> Vec<(String, String)> {
     }
 }
 
+/// Add tool-home variables to an account redirect that moved HOME/USERPROFILE.
+///
+/// The redirect points `~` at the profile root, which is right for Claude and wrong for
+/// every other tool the agent then runs: rustup and cargo find no toolchain ("no default
+/// is configured"), and git loses the user's global identity. Each tool keeps its real
+/// home unless the profile has its own copy of that tool's state, and a variable the user
+/// already set is never overridden.
+pub fn with_real_tool_homes(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    let Some(root) = env
+        .iter()
+        .find(|(k, _)| k == "HOME")
+        .map(|(_, v)| PathBuf::from(v))
+    else {
+        return env;
+    };
+    let Some(real_home) = dirs::home_dir() else {
+        return env;
+    };
+    env.extend(tool_home_env(&real_home, &root, |var| {
+        std::env::var_os(var).is_some()
+    }));
+    env
+}
+
+/// The pure half of [`with_real_tool_homes`]: which variables to set, given the real home,
+/// the profile root and which variables are already set.
+pub fn tool_home_env(
+    real_home: &Path,
+    profile_root: &Path,
+    already_set: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    if real_home == profile_root {
+        return Vec::new();
+    }
+    // (variable, path under a home, what proves that home holds real state)
+    let tools: [(&str, &str, &str); 3] = [
+        ("RUSTUP_HOME", ".rustup", "toolchains"),
+        ("CARGO_HOME", ".cargo", "bin"),
+        ("GIT_CONFIG_GLOBAL", ".gitconfig", ""),
+    ];
+    tools
+        .iter()
+        .filter(|(var, _, _)| !already_set(var))
+        .filter_map(|(var, rel, marker)| {
+            let real = real_home.join(rel);
+            let has = |base: &Path| {
+                let path = base.join(rel);
+                if marker.is_empty() {
+                    path.exists()
+                } else {
+                    path.join(marker).exists()
+                }
+            };
+            (has(real_home) && !has(profile_root))
+                .then(|| (var.to_string(), real.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
 /// The home-relative directory whose presence means "this agent is set up for the ambient
 /// account", or None for an agent with no account concept.
 ///
@@ -1916,6 +1975,49 @@ fn probe_path<'a>(stdout: &'a str, binary: &str) -> &'a str {
                 .map(|(_, p)| p)
         })
         .unwrap_or("")
+}
+
+#[cfg(test)]
+mod tool_home_tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("conduit-toolhome-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn tools_keep_the_real_home_when_the_profile_has_none() {
+        let real = temp("real");
+        let profile = temp("profile");
+        std::fs::create_dir_all(real.join(".rustup/toolchains")).unwrap();
+        std::fs::create_dir_all(real.join(".cargo/bin")).unwrap();
+        std::fs::write(real.join(".gitconfig"), "[user]\n").unwrap();
+        // A stray settings file is not a toolchain: rustup wrote one into the profile root
+        // on a failed run, and that must not count as the profile having its own rustup.
+        std::fs::create_dir_all(profile.join(".rustup")).unwrap();
+        let env = tool_home_env(&real, &profile, |_| false);
+        let vars: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(vars, ["RUSTUP_HOME", "CARGO_HOME", "GIT_CONFIG_GLOBAL"]);
+        assert_eq!(env[0].1, real.join(".rustup").to_string_lossy());
+    }
+
+    #[test]
+    fn a_profile_with_its_own_state_and_user_set_vars_are_left_alone() {
+        let real = temp("real2");
+        let profile = temp("profile2");
+        std::fs::create_dir_all(real.join(".rustup/toolchains")).unwrap();
+        std::fs::create_dir_all(real.join(".cargo/bin")).unwrap();
+        std::fs::write(real.join(".gitconfig"), "").unwrap();
+        std::fs::write(profile.join(".gitconfig"), "").unwrap();
+        let env = tool_home_env(&real, &profile, |var| var == "CARGO_HOME");
+        let vars: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(vars, ["RUSTUP_HOME"]);
+        assert!(tool_home_env(&real, &real, |_| false).is_empty());
+    }
 }
 
 #[cfg(test)]

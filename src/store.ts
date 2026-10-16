@@ -65,6 +65,11 @@ import {
   type PrettierOptions,
 } from "./format/options";
 import { formatWithFallback } from "./format/fallback";
+import {
+  launchResumeTargets,
+  parseLifecycle,
+  type SessionLifecyclePrefs,
+} from "./sessionLifecycle";
 
 // ---- Types (mirror the Rust serde structs, rename_all = "camelCase") ----
 export type ToastKind = "info" | "error";
@@ -108,6 +113,9 @@ export interface Session {
   /** User stopped this session's processes without deleting it (persisted). Its terminal
    *  stays mounted and keeps its scrollback; starting it resumes the conversation. */
   stopped?: boolean;
+  /** The agent's last persisted activity (running | needsInput | done | idle), written by
+   *  the Rust hook listener on every change. Decides what resumes at launch. */
+  agentState?: string | null;
   /** MCP registry names this session may load; absent/null = inherit everything. */
   mcpServers?: string[] | null;
 }
@@ -647,6 +655,30 @@ export function readPlanConnected(): Record<string, boolean> {
 function writePlanConnected(v: Record<string, boolean>): void {
   try {
     localStorage.setItem(PLAN_CONNECTED_KEY, JSON.stringify(v));
+  } catch {
+    /* quota — non-fatal */
+  }
+}
+
+/** Whether this app run has applied the launch rule yet (see `load`). */
+let launchDecided = false;
+
+// Session lifecycle prefs (Settings → Sessions); the rules live in sessionLifecycle.ts.
+// The legacy restore switch below is read once, only to carry over an explicit opt-out.
+const SESSION_LIFECYCLE_KEY = "conduit.sessionLifecycle";
+function readSessionLifecycle(): SessionLifecyclePrefs {
+  try {
+    return parseLifecycle(
+      localStorage.getItem(SESSION_LIFECYCLE_KEY),
+      localStorage.getItem(RESTORE_SESSIONS_KEY),
+    );
+  } catch {
+    return parseLifecycle(null, null);
+  }
+}
+function writeSessionLifecycle(v: SessionLifecyclePrefs): void {
+  try {
+    localStorage.setItem(SESSION_LIFECYCLE_KEY, JSON.stringify(v));
   } catch {
     /* quota — non-fatal */
   }
@@ -1427,6 +1459,17 @@ interface AppState {
    *  resumes all its sessions instead of waiting for a click. */
   restoreSessionsOnOpen: boolean;
   setRestoreSessionsOnOpen: (v: boolean) => void;
+  /** Persisted (Settings → Sessions). When sessions start and stop on their own. */
+  sessionLifecycle: SessionLifecyclePrefs;
+  setSessionLifecycle: (patch: Partial<SessionLifecyclePrefs>) => void;
+  /** Sessions that came back from the last run and resume only when you ask (click,
+   *  key, or opening them). Runtime only; computed once at launch. */
+  parkedSessions: Record<string, true>;
+  /** Sessions the launch rule starts by itself (their agent was mid-task at exit). */
+  launchResume: Record<string, true>;
+  /** Session ids that existed at launch. Anything else was created this run. */
+  launchSessionIds: Record<string, true>;
+  unparkSession: (sessionId: string) => void;
   /** Persisted. When true (default), Claude sessions announce Conduit as their IDE:
    *  diff review lands in a Monaco overlay, editor selections reach the session. */
   announceAsIde: boolean;
@@ -1981,6 +2024,10 @@ export const useStore = create<AppState>((set, get) => {
     pendingDecisions: [],
     decisionRoutes: {},
     restoreSessionsOnOpen: readRestoreSessionsOnOpen(),
+    sessionLifecycle: readSessionLifecycle(),
+    parkedSessions: {},
+    launchResume: {},
+    launchSessionIds: {},
     announceAsIde: readAnnounceAsIde(),
     pendingDiffs: [],
     openBehavior: readOpenBehavior(),
@@ -2106,7 +2153,30 @@ export const useStore = create<AppState>((set, get) => {
       const selectedProjectId = wp.isMain
         ? initialProjectSelection(visibleIds, get().openBehavior, readLastProject())
         : (projects.find((p) => inProfile(p.profileId, wp.profileId, knownProfiles))?.id ?? null);
+      // The launch rule, decided ONCE per app run (a later load must not re-park a session
+      // the user has since opened). `working`: only agents that were mid-task when Conduit
+      // closed come back by themselves; every other session is parked until you ask for it.
+      const launchPatch: Partial<AppState> = {};
+      if (!launchDecided) {
+        launchDecided = true;
+        const all = projects.flatMap((p) => p.sessions);
+        const prefs = get().sessionLifecycle;
+        const resume = launchResumeTargets(all, prefs);
+        const launchResume: Record<string, true> = {};
+        const parkedSessions: Record<string, true> = {};
+        const launchSessionIds: Record<string, true> = {};
+        for (const s of all) {
+          launchSessionIds[s.id] = true;
+          if (resume.has(s.id)) launchResume[s.id] = true;
+          else if (prefs.launchRestore !== "project") parkedSessions[s.id] = true;
+        }
+        Object.assign(launchPatch, { launchResume, parkedSessions, launchSessionIds });
+        void invoke("set_keep_agents_in_project", { enabled: prefs.keepAgentsInProject }).catch(
+          () => {},
+        );
+      }
       set({
+        ...launchPatch,
         projects,
         homeDir: home,
         layouts,
@@ -3170,10 +3240,12 @@ export const useStore = create<AppState>((set, get) => {
       // this, the tab would reopen onto a terminal whose PTY was killed and never respawn.
       const session = findSession(get().projects, sessionId)?.session;
       if (session?.stopped) void get().startSession(projectId, sessionId);
+      get().unparkSession(sessionId);
     },
 
     openTab: (projectId, tab) => {
       set({ selectedRootChatId: null });
+      if (tab.kind === "session") get().unparkSession(tab.ref);
       applyLayout(projectId, (l) => rOpenTab(l, tab));
     },
     openToSide: (projectId, tab) => {
@@ -3184,6 +3256,7 @@ export const useStore = create<AppState>((set, get) => {
         // Same rule as selectSession: opening a stopped session resumes it.
         const session = findSession(get().projects, tab.ref)?.session;
         if (session?.stopped) void get().startSession(projectId, tab.ref);
+        get().unparkSession(tab.ref);
       }
     },
     openFile: (projectId, path, opts) => {
@@ -3705,7 +3778,10 @@ export const useStore = create<AppState>((set, get) => {
         }
         return l;
       });
-      if (isSession) clearNeeds(ref);
+      if (isSession) {
+        clearNeeds(ref);
+        get().unparkSession(ref);
+      }
     },
 
     setActiveGroup: (projectId, groupId) =>
@@ -3770,6 +3846,26 @@ export const useStore = create<AppState>((set, get) => {
     setRestoreSessionsOnOpen: (v) => {
       writeRestoreSessionsOnOpen(v);
       set({ restoreSessionsOnOpen: v });
+    },
+
+    setSessionLifecycle: (patch) => {
+      const next = { ...get().sessionLifecycle, ...patch };
+      writeSessionLifecycle(next);
+      set({ sessionLifecycle: next });
+      if (patch.keepAgentsInProject !== undefined) {
+        void invoke("set_keep_agents_in_project", { enabled: next.keepAgentsInProject }).catch(
+          () => {},
+        );
+      }
+    },
+
+    unparkSession: (sessionId) => {
+      if (!get().parkedSessions[sessionId]) return;
+      set((s) => {
+        const parkedSessions = { ...s.parkedSessions };
+        delete parkedSessions[sessionId];
+        return { parkedSessions };
+      });
     },
 
     setAnnounceAsIde: (v) => {
@@ -4055,7 +4151,12 @@ export const useStore = create<AppState>((set, get) => {
       try {
         let downloaded = 0;
         let total = 0;
-        await pendingUpdate.downloadAndInstall((ev) => {
+        // Download, THEN end the sessions, THEN install. On Windows `install()` runs the
+        // installer and exits the app on the spot (`std::process::exit`), so no quit path
+        // ever runs and nothing would tree-kill the agents and their MCP servers.
+        // `prepare_for_update` does it first. Ending sessions before the download would cost
+        // them if the download failed, which is why this is not `downloadAndInstall`.
+        await pendingUpdate.download((ev) => {
           switch (ev.event) {
             case "Started":
               total = ev.data.contentLength ?? 0;
@@ -4069,8 +4170,10 @@ export const useStore = create<AppState>((set, get) => {
               break;
           }
         });
-        // Installed to disk; restart into the new version. This tears down PTYs —
-        // the notice copy warns about that before the user clicks Install.
+        await invoke("prepare_for_update").catch(() => {});
+        await pendingUpdate.install();
+        // Installed to disk; restart into the new version (on Windows the installer has
+        // already closed the app by now). The notice copy warns before the user clicks.
         await relaunch();
       } catch (e) {
         set({ updatePhase: "error", updateError: String(e) });

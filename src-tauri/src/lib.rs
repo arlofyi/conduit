@@ -57,6 +57,7 @@ mod scrollback;
 mod search;
 #[cfg_attr(windows, allow(dead_code))]
 mod session_budget;
+mod session_files;
 mod status_rules;
 mod store;
 mod subagents;
@@ -811,6 +812,30 @@ fn tmux_available(pty: State<Arc<PtyManager>>) -> TmuxInfo {
             install: None,
         }
     }
+}
+
+/// Settings -> Sessions "Remove stray NUL files": sweep every project folder for the
+/// `NUL` files the old Windows hook command created. Returns how many were removed;
+/// always 0 elsewhere (on macOS and Linux `NUL` is an ordinary name and is never touched).
+#[tauri::command(async)]
+fn remove_stray_nul_files(store: State<Arc<Store>>) -> usize {
+    #[cfg(windows)]
+    {
+        let roots: Vec<String> = store.list().into_iter().map(|p| p.path).collect();
+        crate::session_files::remove_stray_nul_files(&roots)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = store;
+        0
+    }
+}
+
+/// Push Settings -> Sessions "Keep Claude in the project folder" down to the PTY manager.
+/// Called at boot and on toggle; applies to sessions started afterwards.
+#[tauri::command]
+fn set_keep_agents_in_project(enabled: bool, pty: State<Arc<PtyManager>>) {
+    pty.set_keep_in_project(enabled);
 }
 
 /// Push the frontend's `persistSessions` setting down to the PTY manager. Called at boot
@@ -2362,6 +2387,7 @@ fn remove_session(
     // session without it would leave one directory per session ever created. Unconditional
     // (and ignoring failure) because it is a cheap no-op for every other agent.
     crate::hermes::remove_managed_config(&session_id);
+    crate::session_files::remove_for(&session_id);
     store.remove_session(&project_id, &session_id);
 }
 
@@ -2406,6 +2432,7 @@ fn stop_session(
     // The status mirror is hook-driven; with the agent gone no hook will ever clear a
     // stale "running", which would keep the quit guard warning about a dead process.
     fleet.set_running(&session_id, false);
+    store.set_session_agent_state(&session_id, Some("idle"));
     store.set_session_stopped(&session_id, true);
 }
 
@@ -2439,6 +2466,7 @@ fn stop_idle_sessions(
         pty.retire(id);
         pty.retire(&format!("{id}::term"));
         fleet.set_running(id, false);
+        store.set_session_agent_state(id, Some("idle"));
         store.set_session_stopped(id, true);
     }
     targets
@@ -2484,6 +2512,16 @@ fn heuristic_name(prompt: &str) -> String {
     }
 }
 
+/// The titler's `claude` invocation. A title needs no tools and leaves nothing behind:
+/// `--strict-mcp-config` with no `--mcp-config` starts ZERO MCP servers (without it every
+/// title launched the user's whole stdio fleet, measured at 9 processes on one machine),
+/// and `--no-session-persistence` keeps one throwaway transcript per title out of the
+/// transcript store.
+const TITLER_COMMAND: &str = "claude -p --model haiku --strict-mcp-config --no-session-persistence";
+
+/// A title arrives in seconds; past this the attempt is abandoned and its tree killed.
+const TITLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// Pipe an instruction to `claude -p --model haiku` and sanitize the title.
 /// Returns None on spawn failure / non-zero exit / empty output.
 fn claude_title(prompt: &str) -> Option<String> {
@@ -2508,16 +2546,22 @@ fn claude_title(prompt: &str) -> Option<String> {
     let mut builder = {
         let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
         let mut c = Command::new(shell);
-        c.args(["/C", "claude -p --model haiku"]);
+        c.args(["/C", TITLER_COMMAND]);
         c
     };
     #[cfg(not(windows))]
     let mut builder = {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let mut c = Command::new(shell);
-        c.args(["-i", "-l", "-c", "claude -p --model haiku"]);
+        c.args(["-i", "-l", "-c", TITLER_COMMAND]);
         c
     };
+    // Its own scratch directory, never Conduit's working directory: that is
+    // `C:\Program Files\Conduit` for an installed app (or System32 after an MSI relaunch),
+    // and a `claude` started there reads that folder as its project.
+    let scratch = crate::store::data_dir().join("titler");
+    let _ = std::fs::create_dir_all(&scratch);
+    builder.current_dir(&scratch);
     // See pty.rs: strip the package-manager-injected `npm_config_prefix` so nvm
     // initializes and `claude` is on PATH even when Conduit was launched via pnpm.
     // `user_path` covers the Windows half of the same problem: cmd.exe has no rc file to
@@ -2543,12 +2587,37 @@ fn claude_title(prompt: &str) -> Option<String> {
         // stdin dropped here → EOF, so `claude -p` reads the full prompt.
     }
 
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
+    // Read stdout on a thread and wait with a deadline. The old unbounded
+    // `wait_with_output` meant a `claude` stuck on startup (auth, network) kept its
+    // process alive for as long as Conduit ran.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + TITLER_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            _ => {
+                // Over time (or unwaitable): end the whole tree and give up on the title. The
+                // reader is not joined -- if a straggler still holds the pipe it would block.
+                crate::pty::kill_process_tree(&mut child);
+                return None;
+            }
+        }
+    };
+    let output = reader.join().ok()?;
+    if !status.success() {
         return None;
     }
 
-    let title = sanitize_title(&String::from_utf8_lossy(&output.stdout));
+    let title = sanitize_title(&String::from_utf8_lossy(&output));
     if title.is_empty() {
         None
     } else {
@@ -2798,7 +2867,19 @@ fn set_dirty_count(window: tauri::Window, count: usize, dirty: State<DirtyGuard>
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle, pty: State<Arc<PtyManager>>) {
     pty.kill_all();
+    app.state::<Arc<root_chat::RootChatState>>().kill_all();
     app.exit(0);
+}
+
+/// End every session cleanly before an update installer takes over. On Windows the
+/// updater exits the app itself the moment `install()` runs (`std::process::exit`), so
+/// neither `ExitRequested` nor `quit_app` ever fires and nothing tree-kills the agents. The
+/// frontend calls this between `download()` and `install()`. Activity was persisted as it
+/// happened, so the sessions that were working come back on the next launch.
+#[tauri::command(async)]
+fn prepare_for_update(app: tauri::AppHandle, pty: State<Arc<PtyManager>>) {
+    pty.kill_all();
+    app.state::<Arc<root_chat::RootChatState>>().kill_all();
 }
 
 // ---- Notifications -----------------------------------------------------------
@@ -3163,6 +3244,17 @@ pub fn run() {
             let store = app.state::<Arc<Store>>().inner().clone();
             let tasks = app.state::<Arc<TaskBoard>>().inner().clone();
 
+            // Windows: never let a child inherit Conduit's own working directory. For the
+            // installed app that is `C:\Program Files\Conduit`, and after an MSI update it can
+            // be System32; any spawn that forgets `current_dir` would otherwise start an agent
+            // there and it would treat that folder as its project. The data dir is ours.
+            // Also write the hook relays before the first session installs hooks that call them.
+            #[cfg(windows)]
+            {
+                let _ = std::env::set_current_dir(crate::store::data_dir());
+                crate::hooks::write_hook_relays();
+            }
+
             // Wire the store-saved broadcast. Fires after every persisted store write.
             let gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let handle = app.handle().clone();
@@ -3315,6 +3407,7 @@ pub fn run() {
                         .flat_map(|s| [format!("{}::term", s.id), s.id])
                         .collect();
                     crate::scrollback::sweep(&live);
+                    crate::session_files::sweep(&live);
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(20));
                         pty_for_sb.save_scrollback();
@@ -3330,9 +3423,15 @@ pub fn run() {
             {
                 let fleet_for_sweep = fleet.clone();
                 let app_for_sweep = app.handle().clone();
+                let store_for_stale = store.clone();
                 std::thread::spawn(move || loop {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                     let swept = fleet_for_sweep.sweep_stale_working();
+                    // A stale "running" must not survive into state.json either, or the next
+                    // launch would resume a session nothing was happening in.
+                    for id in &swept {
+                        store_for_stale.set_session_agent_state(id, Some("idle"));
+                    }
                     if !swept.is_empty() {
                         let _ = app_for_sweep.emit("session-stale", swept);
                     }
@@ -3380,6 +3479,8 @@ pub fn run() {
             claude_conversation_drift,
             adopt_claude_conversation,
             set_session_persistence,
+            set_keep_agents_in_project,
+            remove_stray_nul_files,
             any_agent_running,
             load_projects,
             add_project,
@@ -3501,6 +3602,7 @@ pub fn run() {
             read_file_base64,
             set_dirty_count,
             quit_app,
+            prepare_for_update,
             resolve_terminal_path,
             notify_user,
             open_in_vscode,
@@ -3543,6 +3645,9 @@ pub fn run() {
         .run(|app_handle, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 app_handle.state::<Arc<PtyManager>>().kill_all();
+                app_handle
+                    .state::<Arc<root_chat::RootChatState>>()
+                    .kill_all();
             }
         });
 }

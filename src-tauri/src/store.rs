@@ -195,6 +195,15 @@ pub struct Session {
     /// state.json files byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ide_port: Option<u16>,
+    /// The agent's last reported activity -- `running`, `needsInput`, `done` or `idle` --
+    /// persisted so a relaunch can tell a session that was mid-turn when Conduit closed
+    /// (the only kind that resumes on its own) from one that had finished. Written by the
+    /// hook listener on every status CHANGE rather than once at quit: a crash, an End task
+    /// and a Windows update install all exit without running any cleanup, and the last
+    /// write before them is then already the right answer. Absent until the first event,
+    /// and skip_serializing_if keeps older state.json files byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<String>,
 }
 
 /// Directed READ policy: may `caller` read `target`'s output? The single source of truth for
@@ -1971,6 +1980,26 @@ impl Store {
         }
     }
 
+    /// Record the agent's latest activity (see `Session::agent_state`). Saves only on an
+    /// actual change: tool hooks repeat `running` many times a turn, and each save rewrites
+    /// and fsyncs state.json.
+    pub fn set_session_agent_state(&self, session_id: &str, state: Option<&str>) {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
+        for p in projects.iter_mut() {
+            if let Some(s) = p.sessions.iter_mut().find(|s| s.id == session_id) {
+                if s.agent_state.as_deref() != state {
+                    s.agent_state = state.map(str::to_string);
+                    changed = true;
+                }
+                break;
+            }
+        }
+        if changed {
+            self.save(&projects);
+        }
+    }
+
     /// Replace a session's MCP allowlist. None restores inherit-everything.
     pub fn set_session_mcp_servers(&self, session_id: &str, servers: Option<Vec<String>>) {
         let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
@@ -3467,6 +3496,21 @@ mod tests {
             name: id.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn agent_state_is_absent_until_reported_and_survives_a_round_trip() {
+        // A session that never reported must serialize exactly as before the field existed.
+        let v = serde_json::to_value(mk("quiet")).unwrap();
+        assert!(v.get("agentState").is_none(), "{v}");
+        let mut s = mk("busy");
+        s.agent_state = Some("running".into());
+        let back: Session = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back.agent_state.as_deref(), Some("running"));
+        // An older file (no key) still loads.
+        let old: Session =
+            serde_json::from_value(serde_json::json!({"id": "x", "name": "x"})).unwrap();
+        assert_eq!(old.agent_state, None);
     }
 
     #[test]

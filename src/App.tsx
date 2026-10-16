@@ -33,6 +33,7 @@ import { type PendingDecision } from "./rootProposals";
 import { holdsOffWorking, notificationStatus } from "./statusRules";
 import { type ThemePref } from "./themes";
 import { useClaudeAmbient } from "./hooks/useClaudeAmbient";
+import { useAutoStopIdle } from "./hooks/useAutoStopIdle";
 import { useSessionDirs } from "./hooks/useSessionDirs";
 import { useSessionContext } from "./hooks/useSessionContext";
 import { getLastFocusedEditor } from "./monaco/setup";
@@ -204,6 +205,7 @@ export default function App() {
   // which agent is selected or whether the sidebar is collapsed (both would unmount a
   // sidebar-hosted poller).
   useClaudeAmbient();
+  useAutoStopIdle();
   useSessionDirs();
   useSessionContext();
   const projects = useStore((s) => s.projects);

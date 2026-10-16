@@ -7,6 +7,7 @@ import { AccountList } from "./AccountList";
 import { UsagePrefsPanel } from "./UsagePrefsPanel";
 import { FormatPrefsPanel } from "./FormatPrefsPanel";
 import { GeneralSettings } from "./GeneralSettings";
+import { SessionSettings } from "./SessionSettings";
 import { TerminalSettings } from "./TerminalSettings";
 import { TrustPanel } from "./TrustPanel";
 import { OpenCodePanel } from "./OpenCodePanel";
@@ -19,6 +20,7 @@ import { PluginsPanel } from "./PluginsPanel";
 // Exported for the native menu integration (menu → open Settings at a specific tab).
 export type SettingsTab =
   | "general"
+  | "sessions"
   | "terminal"
   | "agents"
   | "accounts"
@@ -41,6 +43,7 @@ const NAV: Array<{ group: string; items: Array<{ id: SettingsTab; label: string 
     group: "",
     items: [
       { id: "general", label: "General" },
+      { id: "sessions", label: "Sessions" },
       { id: "terminal", label: "Terminal" },
     ],
   },
@@ -132,6 +135,16 @@ export function Settings({
                 <>
                   <p className="settings-intro">Startup and session behavior.</p>
                   <GeneralSettings />
+                </>
+              )}
+              {tab === "sessions" && (
+                <>
+                  <p className="settings-intro">
+                    When sessions start and stop on their own. A stopped session keeps its
+                    conversation and scrollback; opening it, clicking into it or pressing a key
+                    there resumes it where it left off.
+                  </p>
+                  <SessionSettings />
                 </>
               )}
               {tab === "terminal" && (
