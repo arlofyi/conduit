@@ -431,6 +431,47 @@ a prompt (or a spaced path) on the command line, not one of them.
   locally; it is still needed for its own reasons, but new code should not hand-roll another
   one -- put it in the spawn script.
 
+## Where the Windows hook relay lives
+
+Claude Code runs hook commands through **Git Bash** on Windows, not cmd.exe. Bash never
+expands `%VAR%` and turns `>NUL` into a FILE, so the old inline cmd-syntax hook sent
+`session=%CONDUIT_SESSION_ID%` (every event dropped by the provenance gate) and left
+`NUL` files in agents' working dirs.
+
+- `hooks::command` / `ask_command` emit only `"<dataDir>/conduit-hook.cmd" <event> <port>`
+  (forward slashes: they survive a shell that drops quotes, backslashes do not). The
+  relays (`HOOK_RELAY_CMD`, `ASK_RELAY_CMD`, written by `write_hook_relays`) run under
+  cmd's own rules, prefer the session's `CONDUIT_HOOK_PORT`, post nothing without
+  `CONDUIT_SESSION_ID`, and keep the reply off stdout (`-o NUL`) except for `/ask`.
+- **Never put `%VAR%`, a redirect or `||` back into a Windows hook command string.** A
+  test (`windows_hook_commands_are_shell_neutral`) pins it.
+- `session_files::remove_stray_nul_files` cleans up the old files; it needs `\\?\`
+  paths because `NUL` is a device name.
+
+## Where the session lifecycle lives
+
+`src/sessionLifecycle.ts` (pure, tested) decides which sessions start and stop by
+themselves; prefs are Settings → Sessions (`SessionSettings.tsx`, stored as
+`conduit.sessionLifecycle`).
+
+- **Launch:** `store.load` applies the rule once per run. Default `working`: only a session
+  whose persisted `Session.agentState` is `running` resumes by itself; every other session
+  is PARKED (`parkedSessions`) and its reveal path shows a hint instead of spawning. Opening
+  it (selectSession/openTab/setActiveTab/openToSide), a click or a key in the pane unparks
+  it. Sessions created during the run (incl. fleet workers) are never parked.
+- **`agentState` is written by the Rust hook listener on every status change**
+  (`store.set_session_agent_state`), not at quit -- a crash, End task or a Windows update
+  install runs no cleanup, so the last write must already be right. Stop paths and the
+  stale sweep write `idle`.
+- **Idle auto-stop** (`useAutoStopIdle`) calls the normal `stopSession` (RETIRE). Never a
+  `running` agent or a Conductor.
+- **Terminals mount lazily** in `WorkspaceCenter` (`mountedTerminals`): first shown,
+  launch-resumed, created this run, or the old `project` mode. Once mounted, never
+  unmounted -- the keep-alive rule is unchanged.
+- **Updates:** `installUpdate` is `download()` → `prepare_for_update` (kill_all) →
+  `install()`, because on Windows `install()` exits the process with no quit path.
+- Design: `docs/superpowers/specs/2026-10-16-session-lifecycle-and-hygiene-design.md`.
+
 ## Where the terminal renderer choice lives
 
 Panes draw through WebGL by default, canvas on request (Settings → Terminal). The tier ladder

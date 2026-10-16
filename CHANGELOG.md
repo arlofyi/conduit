@@ -5,6 +5,57 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Settings → Sessions.** One place for when sessions start and stop by
+  themselves: what happens when Conduit starts, idle auto-stop and its delay, whether
+  sessions waiting on you or on screen are included, keeping Claude in the project folder,
+  and (Windows) cleaning up stray NUL files.
+- **Changed — Conduit starts only the agents that were still working.** Closing or
+  restarting Conduit stops every session; on the next launch only a session whose agent
+  was mid-task comes back by itself, in whichever project it lives. Every other session
+  waits, showing where it left off, until you open it. This holds after a crash or an
+  update too, because Conduit records each agent's activity as it happens. The old "start
+  every session of the project I open" behaviour is still available in Settings →
+  Sessions.
+- **Added — idle sessions stop themselves.** Five minutes (configurable) after an agent
+  finishes, its session is stopped to free memory: the agent and its MCP servers exit,
+  the conversation and scrollback are kept. A working agent and a Conductor are never
+  stopped; sessions on screen and sessions waiting on you are left alone unless you opt
+  in.
+- **Added — click or type to resume.** A stopped or not-yet-resumed session's pane now
+  resumes when you click into it or press a key there, as well as when you open it.
+- **Changed — terminals load when you first need them.** A session's terminal is created
+  the first time it is shown or started, instead of one for every session in the sidebar
+  at launch, which cuts Conduit's own memory with a long session list.
+- **Fixed — Windows: Conduit could not see Claude working.** Claude runs its hooks through
+  Git Bash, which never filled in the session id Conduit's hooks relied on, so every
+  status update was discarded: status dots never moved, the quit warning and "Stop idle
+  sessions" could not tell a working agent from an idle one, and conversations continued
+  after `/clear` were not followed. Hooks now go through a small relay script that works
+  under either shell.
+- **Fixed — Windows: no more stray NUL files.** The same bug left an empty file named
+  `NUL` in whatever folder an agent was working in. Settings → Sessions can remove the
+  leftovers from every project.
+- **Changed — Claude stays in the project folder.** Claude's shell now returns to the
+  session's folder after every command, so a stray `cd /` or `cd ~` no longer moves the
+  rest of the session outside the project. On by default; Settings → Sessions.
+- **Fixed — session titles no longer start your MCP servers.** Naming a new session ran a
+  full Claude with every MCP server you have configured, from Conduit's install folder,
+  and could wait forever. It now loads no servers, leaves no transcript behind, runs in
+  Conduit's own folder and gives up after 45 seconds.
+- **Fixed — Windows: installing an update stops sessions cleanly.** The installer closes
+  Conduit without running its normal shutdown, which could leave agents and MCP servers
+  running in the background. Conduit now ends them itself before the installer starts.
+- **Fixed — stopping a root chat stops it.** On Windows the Stop button ended only a
+  wrapper process and the reply kept running to the end; quitting Conduit also left a
+  replying chat running. Both now end the whole process tree.
+- **Fixed — account-pinned sessions keep your developer tools.** Pinning a session to an
+  account moves its home folder to that account's profile, which hid rustup, cargo and
+  your global git identity from the agent. Those now keep pointing at your real home
+  unless the profile has its own copy.
+- **Fixed — Conduit's data folder no longer fills with leftovers.** Per-session files
+  (spawn scripts, Conductor briefs, MCP configs) are removed with their session and swept
+  at startup, and terminal snapshots are rewritten only when the output changed rather
+  than every 20 seconds.
 - **Fixed — Codex hooks no longer change your project.** Conduit passes hooks when it
   starts Codex and removes its old project hook entries. Review the hooks in an
   interactive Codex session; Codex silently skips untrusted fleet hooks.
