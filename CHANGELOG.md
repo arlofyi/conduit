@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.45.0 — 2026-10-17
+
 - **Fixed — idle auto-stop no longer stops an agent that is still working in the
   background.** An agent that started a background command (a dev server, a watcher, a CI
   watch it will be woken by) reports its turn as finished and waits; auto-stop took that
