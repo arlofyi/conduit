@@ -10,8 +10,10 @@ import { Dropdown } from "./Dropdown";
  *  The bar for membership is a working `account_env` on the Rust adapter, i.e. the agent
  *  can actually be pointed at a different profile. Claude and agy redirect HOME to a
  *  profile root; Command Code does the same, because it resolves its config root from
- *  HOME/USERPROFILE and ships no config-dir override to use instead. */
-const MANAGED_AGENTS: AgentId[] = ["claude", "antigravity", "commandcode"];
+ *  HOME/USERPROFILE and ships no config-dir override to use instead. Hermes qualifies for
+ *  the opposite reason: it DOES ship one (`HERMES_HOME`), so it is pointed at a profile
+ *  without touching HOME at all. */
+const MANAGED_AGENTS: AgentId[] = ["claude", "antigravity", "commandcode", "hermes"];
 
 /** Turn a picked path into a short label ("...\.claude-personal\.claude" -> "Personal"). */
 function labelFromPath(picked: string): string {
@@ -21,7 +23,7 @@ function labelFromPath(picked: string): string {
   // A profile is named by the directory ABOVE its config dir, so step up out of any of
   // them. Without `.commandcode` here every Command Code account would be labelled
   // "Commandcode" instead of the profile it belongs to.
-  if (base === ".claude" || base === ".commandcode") {
+  if (base === ".claude" || base === ".commandcode" || base === ".hermes") {
     base = parts[parts.length - 2] || "Account";
   }
   base = base.replace(/^\./, "").replace(/^claude-?/, "") || "Account";

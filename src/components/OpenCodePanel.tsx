@@ -25,6 +25,16 @@ const PRESET_FALLBACK: Array<Pick<LocalProviderStatus, "preset" | "label" | "bas
   { preset: "llamacpp", label: "llama.cpp", baseUrl: "http://127.0.0.1:8080/v1" },
   { preset: "openwebui", label: "OpenWebUI", baseUrl: "http://127.0.0.1:3000/api" },
 ];
+
+/** OpenRouter is the one endpoint here that is NOT local inference, so it sits outside
+ *  `PRESET_FALLBACK`: the auto-pick chain below scans and ranks LOCAL servers, and a cloud
+ *  aggregator must never be something a scan silently selects for you. It is offered as an
+ *  explicit chip, and choosing it needs a key. */
+const OPENROUTER = {
+  preset: "openrouter",
+  label: "OpenRouter",
+  baseUrl: "https://openrouter.ai/api/v1",
+};
 const CUSTOM = { preset: "custom", label: "Custom", baseUrl: "http://127.0.0.1:8000/v1" };
 
 /** Rank for auto-pick: tool-calling first (an agent is crippled without it), then the
@@ -217,9 +227,10 @@ export function OpenCodePanel() {
     return Number.isFinite(n) && n > 0 ? n : null;
   };
 
-  const presetRows = (statuses ?? PRESET_FALLBACK).concat([CUSTOM]);
+  const presetRows = (statuses ?? PRESET_FALLBACK).concat([OPENROUTER, CUSTOM]);
   const statusOf = (preset: string) => statuses?.find((s) => s.preset === preset);
-  const needsKey = statusOf(oc.preset)?.needsKey ?? oc.preset === "openwebui";
+  const needsKey =
+    oc.preset === "openrouter" || (statusOf(oc.preset)?.needsKey ?? oc.preset === "openwebui");
   const showKeyRow = needsKey || keySet || oc.preset === "custom" || oc.preset === "vllm";
   const insecureRemote =
     keySet &&
@@ -235,7 +246,7 @@ export function OpenCodePanel() {
           checked={oc.enabled}
           onChange={(e) => onMasterToggle(e.target.checked)}
         />
-        <span>Use a local model for OpenCode sessions</span>
+        <span>Route OpenCode sessions at a chosen endpoint</span>
       </label>
 
       {(busy || note) && (
@@ -258,12 +269,25 @@ export function OpenCodePanel() {
               <button
                 key={p.preset}
                 className={`oc-preset${(oc.preset || "") === p.preset ? " on" : ""}`}
-                onClick={() =>
-                  p.preset === "custom"
-                    ? save({ preset: "custom", baseUrl: oc.baseUrl || CUSTOM.baseUrl })
-                    : void autoConfigure({ presetHint: p.preset })
+                onClick={() => {
+                  // Neither of these two goes through `autoConfigure`: that chain SCANS
+                  // local servers and picks the strongest model it finds, which is
+                  // meaningless for a URL the user types and wrong for a cloud aggregator
+                  // (it would pick nothing, having probed no local server). Both are set
+                  // directly and leave the model to the user.
+                  if (p.preset === "custom") {
+                    save({ preset: "custom", baseUrl: oc.baseUrl || CUSTOM.baseUrl });
+                  } else if (p.preset === "openrouter") {
+                    save({ preset: "openrouter", baseUrl: OPENROUTER.baseUrl, model: "" });
+                  } else {
+                    void autoConfigure({ presetHint: p.preset });
+                  }
+                }}
+                title={
+                  p.preset === "openrouter"
+                    ? `${p.baseUrl} — cloud aggregator, needs an API key (not local inference)`
+                    : `${p.baseUrl}${st?.running ? " — running" : ""}`
                 }
-                title={`${p.baseUrl}${st?.running ? " — running" : ""}`}
                 disabled={!!busy}
               >
                 <span className={`oc-dot${st?.running ? " up" : ""}`} />

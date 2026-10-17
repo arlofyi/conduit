@@ -148,6 +148,17 @@ pub struct Session {
     /// Seeded / "prefixed" memory injected at spawn as an appended system prompt. Phase 5.
     #[serde(default)]
     pub seed_memory: Option<String>,
+    /// The ENDPOINT this session is on, as the agent's own provider slug
+    /// (`custom:conduit-openrouter`, or a first-class name like `openrouter`).
+    ///
+    /// Set when the user moves a running session to another endpoint. Without it the live
+    /// switch would be a half-truth: `/model --provider` moves the running process, but the
+    /// next start reads the AGENT's active endpoint and would silently put the session back
+    /// where it came from -- with a model pinned that the original endpoint may not even
+    /// serve. `None` = follow the agent's active endpoint, which is every session that has
+    /// never been switched.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Effort level: "low" | "medium" | "high" | "xhigh" | "max" (SPEC-B, §7.2). Only
     /// Claude has a per-invocation effort control today (verified: `claude --help` lists
     /// `--effort <level>` with exactly these five values) -- other adapters record this
@@ -184,6 +195,15 @@ pub struct Session {
     /// state.json files byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ide_port: Option<u16>,
+    /// The agent's last reported activity -- `running`, `needsInput`, `done` or `idle` --
+    /// persisted so a relaunch can tell a session that was mid-turn when Conduit closed
+    /// (the only kind that resumes on its own) from one that had finished. Written by the
+    /// hook listener on every status CHANGE rather than once at quit: a crash, an End task
+    /// and a Windows update install all exit without running any cleanup, and the last
+    /// write before them is then already the right answer. Absent until the first event,
+    /// and skip_serializing_if keeps older state.json files byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<String>,
 }
 
 /// Directed READ policy: may `caller` read `target`'s output? The single source of truth for
@@ -458,19 +478,24 @@ pub struct TrustSettings {
     pub private_mode: bool,
 }
 
-/// OpenCode local-provider settings: route `opencode` sessions to a
-/// local/self-hosted OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, llama.cpp,
-/// OpenWebUI, or a custom URL). Non-secret and persisted in state.json; the API key is
-/// deliberately NOT here — it lives only in `Store::opencode_key` (in memory) and reaches
-/// the child solely through its process env at spawn.
+/// Endpoint settings for ONE agent: route its sessions at a chosen OpenAI-compatible
+/// endpoint — a local/self-hosted server (Ollama, LM Studio, vLLM, llama.cpp, OpenWebUI),
+/// a cloud aggregator (OpenRouter), or a custom URL. Non-secret and persisted in
+/// state.json; the API key is deliberately NOT here — it lives only in
+/// `Store::provider_key` and reaches the child solely through its process env at spawn.
+///
+/// This was `OpenCodeSettings`, one global slot for one agent. The shape is byte-identical
+/// on the wire so existing `state.json` files keep parsing (see `PersistState::opencode`),
+/// and the alias below keeps the old name working for OpenCode's own call sites.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct OpenCodeSettings {
-    /// Master switch. Off = OpenCode spawns untouched (its own config applies).
+pub struct ProviderSettings {
+    /// Master switch. Off = the agent spawns untouched (its own config applies).
     #[serde(default)]
     pub enabled: bool,
-    /// Preset id: "ollama" | "lmstudio" | "vllm" | "llamacpp" | "openwebui" | "custom".
-    /// Only affects labels and how models are listed; the spawn config is uniform.
+    /// Preset id: "ollama" | "lmstudio" | "vllm" | "llamacpp" | "openwebui" |
+    /// "openrouter" | "custom". Only affects labels and how models are listed; the spawn
+    /// config is uniform.
     #[serde(default)]
     pub preset: String,
     /// Full OpenAI-compatible base URL (e.g. http://localhost:11434/v1).
@@ -484,10 +509,39 @@ pub struct OpenCodeSettings {
     pub context_limit: Option<u32>,
     #[serde(default)]
     pub output_limit: Option<u32>,
-    /// Allowlist the injected provider (`enabled_providers: ["conduit"]`) so OpenCode
-    /// cannot fall back to cloud providers even if the user has credentials for them.
+    /// Allowlist the injected provider (`enabled_providers: ["conduit"]`) so the agent
+    /// cannot fall back to other providers even if it has credentials for them.
+    ///
+    /// The wire name stays `pinLocal` although the meaning widened to "use only this
+    /// endpoint" (under OpenRouter it pins a cloud aggregator, not a local server).
+    /// Renaming the key would silently reset the setting for everyone who had it on.
     #[serde(default)]
     pub pin_local: bool,
+}
+
+/// The old name, kept so OpenCode's own call sites read as they did.
+pub type OpenCodeSettings = ProviderSettings;
+
+/// Presets that are genuinely LOCAL inference, i.e. no request leaves the machine.
+/// `openrouter` and `custom` are deliberately absent: a custom URL may point anywhere,
+/// and treating "the user typed a URL" as local is how a siloed session would get
+/// quietly routed through a cloud aggregator.
+pub const LOCAL_PRESETS: &[&str] = &["ollama", "lmstudio", "vllm", "llamacpp", "openwebui"];
+
+impl ProviderSettings {
+    /// Whether this endpoint keeps inference on the machine. This is what a `local_only`
+    /// session under private mode checks — NOT `enabled`, and NOT `pin_local`, which only
+    /// says "don't fall back elsewhere" and is equally true of a cloud aggregator.
+    pub fn is_local(&self) -> bool {
+        LOCAL_PRESETS.contains(&self.preset.as_str())
+    }
+
+    /// Enough to build a spawn config from: a switch that is on, and both halves of the
+    /// route present. An `enabled` block with no model is not a half-configured route to
+    /// guess at — the agent spawns untouched instead.
+    pub fn is_ready(&self) -> bool {
+        self.enabled && !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
+    }
 }
 
 /// Root of state.json. Was a bare `Vec<Project>`; promoted to an object so the account
@@ -509,8 +563,27 @@ pub struct PersistState {
     pub default_accounts: HashMap<AgentId, String>,
     #[serde(default)]
     pub trust: TrustSettings,
+    /// Legacy single slot (pre-multi-agent providers). Kept so an older Conduit still
+    /// finds OpenCode's endpoint where it left it, and so new state migrates it into
+    /// `agent_providers[OpenCode]` on load. On save it mirrors that entry -- the same
+    /// contract `default_account` has with `default_accounts[Claude]`.
     #[serde(default)]
     pub opencode: OpenCodeSettings,
+    /// Per-agent ACTIVE endpoint (agent -> settings): what a new session spawns on.
+    #[serde(default)]
+    pub agent_providers: HashMap<AgentId, ProviderSettings>,
+    /// Every endpoint configured for an agent, the active one included.
+    ///
+    /// One active endpoint was not enough to switch PROVIDER mid-session: an agent's own
+    /// `/model --provider` can only reach providers already present in its config, so a
+    /// session that launched against Ollama could never be moved to OpenRouter without a
+    /// restart -- which is exactly the context loss live switching exists to avoid. The
+    /// pool is what Conduit writes into the agent's config so every one of them resolves.
+    ///
+    /// `#[serde(default)]`, and seeded from `agent_providers` on load, so a state.json
+    /// written before the pool existed keeps working and gains a one-entry pool.
+    #[serde(default)]
+    pub agent_endpoints: HashMap<AgentId, Vec<ProviderSettings>>,
     #[serde(default)]
     pub plugins: Vec<crate::plugins::PluginRecord>,
     #[serde(default)]
@@ -518,6 +591,11 @@ pub struct PersistState {
     /// Global routing overrides, layered over the built-in defaults and under any project's.
     #[serde(default)]
     pub routes: crate::routing::AgentRoutes,
+    #[serde(
+        default,
+        deserialize_with = "crate::orchestration_policy::deserialize_persisted_safe"
+    )]
+    pub orchestration_policy: crate::orchestration_policy::PolicyDocument,
     #[serde(default)]
     pub profiles: Vec<Profile>,
     /// The profile the sidebar was last filtered to; restored on launch. None = Default.
@@ -532,15 +610,23 @@ pub struct Store {
     /// field is migrated in on load and mirrored out (as the Claude slot) on save.
     default_accounts: Mutex<HashMap<AgentId, String>>,
     trust: Mutex<TrustSettings>,
-    opencode: Mutex<OpenCodeSettings>,
+    agent_providers: Mutex<HashMap<AgentId, ProviderSettings>>,
+    agent_endpoints: Mutex<HashMap<AgentId, Vec<ProviderSettings>>>,
     plugins: Mutex<Vec<crate::plugins::PluginRecord>>,
     root_chats: Mutex<Vec<RootChat>>,
     routes: Mutex<crate::routing::AgentRoutes>,
+    orchestration_policy: Mutex<crate::orchestration_policy::PolicyDocument>,
+    policy_write: Mutex<()>,
     profiles: Mutex<Vec<Profile>>,
     active_profile_id: Mutex<Option<String>>,
     /// The local-endpoint API key, held in memory for the app's lifetime only. Never part
-    /// of `PersistState`/`save()`, never logged; injected into an `opencode` child's env.
-    opencode_key: Mutex<Option<String>>,
+    /// of `PersistState`/`save()`, never logged; injected into the child's env at spawn.
+    /// Keyed per (agent, BASE URL) via `key_slot`, not per agent. An agent's pool routinely
+    /// holds a keyed cloud endpoint beside a keyless local one, and may hold two cloud
+    /// endpoints with two different keys; collapsing them onto the agent would hand one
+    /// endpoint's key to another, which surfaces as an unexplainable 401. The URL is the
+    /// identity because an endpoint IS its URL -- the preset is only a label.
+    provider_keys: Mutex<HashMap<(AgentId, String), String>>,
     save_path: PathBuf,
     /// Callback fired after every successful persisted store write. Used to emit broadcast
     /// events to all windows (e.g., `store-saved`). Never persisted, only set at startup.
@@ -714,6 +800,59 @@ fn rotate_backup(save_path: &std::path::Path) {
     }
 }
 
+/// Give every agent that has an ACTIVE endpoint at least that one endpoint in its pool.
+///
+/// A `state.json` written before the pool existed carries a configured active endpoint and
+/// no pool at all. Without this the endpoints list would render empty beside a session that
+/// is demonstrably talking to something, and the first pool write would drop the endpoint
+/// the user is actually on.
+///
+/// An agent that already HAS a pool is left alone -- newer state wins, exactly as
+/// `adopt_legacy_opencode` below does and for the same reason: a migration that overwrites
+/// is a migration that silently unconfigures someone.
+///
+/// Pure so it can be tested; `Store::new` reads `data_dir()` and cannot be pointed at a
+/// fixture.
+fn seed_endpoint_pool(
+    mut pool: HashMap<AgentId, Vec<ProviderSettings>>,
+    active: &HashMap<AgentId, ProviderSettings>,
+) -> HashMap<AgentId, Vec<ProviderSettings>> {
+    for (agent, settings) in active {
+        // An unconfigured slot is not an endpoint. Seeding it would put a blank row in the
+        // list for every agent the user has never set up.
+        if settings.base_url.trim().is_empty() {
+            continue;
+        }
+        pool.entry(*agent).or_insert_with(|| vec![settings.clone()]);
+    }
+    pool
+}
+
+/// The `provider_keys` map key: an endpoint is identified by its agent AND its URL.
+/// See that field's own comment for why neither half alone will do. The URL is trimmed so
+/// a key stored from a padded paste and a later lookup agree.
+fn key_slot(agent: AgentId, base_url: &str) -> (AgentId, String) {
+    (agent, base_url.trim().to_string())
+}
+
+/// Fold the legacy single `opencode` slot into the per-agent endpoint map.
+///
+/// A `state.json` written before per-agent endpoints carries only `opencode`. Dropping it
+/// would silently unconfigure the user's endpoint on upgrade -- their OpenCode sessions
+/// would quietly go back to whatever the cloud default is, with no message. Newer state
+/// wins: an `agent_providers` that already names OpenCode is left alone, exactly as the
+/// `default_account` -> `default_accounts[Claude]` migration beside it does.
+///
+/// Pure so it can be tested; `Store::new` reads `data_dir()` and cannot be pointed at a
+/// fixture.
+fn adopt_legacy_opencode(
+    mut per_agent: HashMap<AgentId, ProviderSettings>,
+    legacy: ProviderSettings,
+) -> HashMap<AgentId, ProviderSettings> {
+    per_agent.entry(AgentId::OpenCode).or_insert(legacy);
+    per_agent
+}
+
 /// Windows paths are case-insensitive and may use either separator. Mirrors
 /// `WINDOWS_PATH` in `src/cliOpen.ts`.
 fn is_windows_path(p: &str) -> bool {
@@ -768,13 +907,22 @@ impl Store {
             accounts: Mutex::new(accounts),
             default_accounts: Mutex::new(default_accounts),
             trust: Mutex::new(state.trust),
-            opencode: Mutex::new(state.opencode),
+            agent_providers: Mutex::new(adopt_legacy_opencode(
+                state.agent_providers.clone(),
+                state.opencode.clone(),
+            )),
+            agent_endpoints: Mutex::new(seed_endpoint_pool(
+                state.agent_endpoints,
+                &adopt_legacy_opencode(state.agent_providers, state.opencode),
+            )),
             plugins: Mutex::new(state.plugins),
             root_chats: Mutex::new(state.root_chats),
             routes: Mutex::new(state.routes),
+            orchestration_policy: Mutex::new(state.orchestration_policy),
+            policy_write: Mutex::new(()),
             profiles: Mutex::new(state.profiles),
             active_profile_id: Mutex::new(state.active_profile_id),
-            opencode_key: Mutex::new(None),
+            provider_keys: Mutex::new(HashMap::new()),
             save_path,
             on_save: OnceLock::new(),
         }
@@ -784,13 +932,29 @@ impl Store {
         let _ = self.on_save.set(f);
     }
 
-    fn save(&self, projects: &[Project]) {
+    fn save(&self, projects: &[Project]) -> bool {
         // Atomic write: serialize, write a temp file, then rename over the target so
         // a crash mid-write can't corrupt state.json. Errors are surfaced to stderr.
         // Assemble the full persisted object (projects + account registry); the caller
         // already holds the projects lock, so lock only the other two mutexes here.
         let default_accounts = self
             .default_accounts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // ONE lock, read once. Locking `agent_providers` twice inside the struct literal
+        // below would SELF-DEADLOCK: a `MutexGuard` temporary lives until the end of the
+        // enclosing statement, so the first guard is still held when the second `.lock()`
+        // runs, and `std::sync::Mutex` is not reentrant. That hung every test that saves.
+        let agent_providers = self
+            .agent_providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // Read into a local for the reason given just above: a `.lock()` inside the struct
+        // literal would still be held when the next one runs.
+        let agent_endpoints = self
+            .agent_endpoints
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
@@ -811,8 +975,17 @@ impl Store {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            opencode: self
-                .opencode
+            // Mirror OpenCode's entry into the legacy slot so an older Conduit still
+            // finds its endpoint; `agent_providers` is the source of truth. Written first
+            // so the borrow ends before the move on the next line.
+            opencode: agent_providers
+                .get(&AgentId::OpenCode)
+                .cloned()
+                .unwrap_or_default(),
+            agent_providers,
+            agent_endpoints,
+            orchestration_policy: self
+                .orchestration_policy
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
@@ -841,7 +1014,7 @@ impl Store {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("conduit: failed to serialize state: {e}");
-                return;
+                return false;
             }
         };
         let tmp = self.save_path.with_extension("json.tmp");
@@ -849,7 +1022,7 @@ impl Store {
         // can land the rename ahead of the data and leave a zero-length state.json.
         if let Err(e) = write_synced(&tmp, &data) {
             eprintln!("conduit: failed to write state: {e}");
-            return;
+            return false;
         }
         rotate_backup(&self.save_path);
         // Rename over the target. On Windows a transient lock (AV scan / Search indexer /
@@ -889,6 +1062,7 @@ impl Store {
                 f();
             }
         }
+        success
     }
 
     pub fn list(&self) -> Vec<Project> {
@@ -1273,6 +1447,52 @@ impl Store {
     ///
     /// `None` clears the pin and the session falls back to its tier, then to the agent's own
     /// configured model.
+    /// Pin (Some) or clear (None) this session's reasoning effort. Only acted on at
+    /// spawn, and only for an adapter whose `supports_model_flags()` is true -- the flag's
+    /// spelling is the adapter's (`ProviderAdapter::effort_flag`).
+    pub fn set_session_effort(&self, session_id: &str, effort: Option<String>) {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        for p in projects.iter_mut() {
+            if let Some(s) = p.sessions.iter_mut().find(|s| s.id == session_id) {
+                s.effort = effort
+                    .map(|e| e.trim().to_string())
+                    .filter(|e| !e.is_empty());
+                break;
+            }
+        }
+        let snapshot = projects.clone();
+        drop(projects);
+        self.save(&snapshot);
+    }
+
+    /// Pin the endpoint a session is on. See `Session::provider` for why a live switch is
+    /// incomplete without this.
+    pub fn set_session_provider(&self, session_id: &str, provider: Option<String>) {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        for p in projects.iter_mut() {
+            if let Some(s) = p.sessions.iter_mut().find(|s| s.id == session_id) {
+                s.provider = provider
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                break;
+            }
+        }
+        let snapshot = projects.clone();
+        drop(projects);
+        self.save(&snapshot);
+    }
+
+    /// The endpoint slug pinned on a session, if any.
+    pub fn session_provider(&self, session_id: &str) -> Option<String> {
+        self.projects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|p| &p.sessions)
+            .find(|s| s.id == session_id)
+            .and_then(|s| s.provider.clone())
+    }
+
     pub fn set_session_model(&self, session_id: &str, model: Option<String>) {
         {
             let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
@@ -1375,9 +1595,74 @@ impl Store {
 
     /// Re-serialize the full state to disk after an account/default change. Callers must
     /// NOT hold the accounts / default_account locks (save() re-locks them).
-    fn persist(&self) {
+    fn persist(&self) -> bool {
         let projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
-        self.save(&projects);
+        self.save(&projects)
+    }
+
+    pub fn orchestration_policy(&self) -> crate::orchestration_policy::PolicyDocument {
+        self.orchestration_policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Validate before replacing memory, and restore the prior value if the atomic save fails.
+    pub fn set_orchestration_policy(
+        &self,
+        next: crate::orchestration_policy::PolicyDocument,
+    ) -> Result<(), String> {
+        next.validate()?;
+        let _write = self.policy_write.lock().unwrap_or_else(|e| e.into_inner());
+        self.replace_policy_locked(next)
+    }
+
+    /// Change exactly one scope while serializing policy writes, preserving other projects.
+    pub fn set_orchestration_overlay(
+        &self,
+        project_id: Option<&str>,
+        overlay: crate::orchestration_policy::PolicyOverlay,
+    ) -> Result<crate::orchestration_policy::PolicyDocument, String> {
+        overlay.validate()?;
+        let _write = self.policy_write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = self.orchestration_policy();
+        match project_id {
+            Some(id) => {
+                if !self.list().iter().any(|p| p.id == id) {
+                    return Err("Project not found".into());
+                }
+                if overlay == Default::default() {
+                    next.projects.remove(id);
+                } else {
+                    next.projects.insert(id.to_string(), overlay);
+                }
+            }
+            None => next.global = overlay,
+        }
+        next.validate()?;
+        self.replace_policy_locked(next.clone())?;
+        Ok(next)
+    }
+
+    fn replace_policy_locked(
+        &self,
+        next: crate::orchestration_policy::PolicyDocument,
+    ) -> Result<(), String> {
+        let previous = {
+            let mut current = self
+                .orchestration_policy
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *current, next)
+        };
+        if !self.persist() {
+            *self
+                .orchestration_policy
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = previous;
+            return Err("Could not save policy; prior policy restored".into());
+        }
+        Ok(())
     }
 
     /// Resolve a session's account config dir along the chain
@@ -1685,6 +1970,26 @@ impl Store {
             if let Some(s) = p.sessions.iter_mut().find(|s| s.id == session_id) {
                 if s.stopped != stopped {
                     s.stopped = stopped;
+                    changed = true;
+                }
+                break;
+            }
+        }
+        if changed {
+            self.save(&projects);
+        }
+    }
+
+    /// Record the agent's latest activity (see `Session::agent_state`). Saves only on an
+    /// actual change: tool hooks repeat `running` many times a turn, and each save rewrites
+    /// and fsyncs state.json.
+    pub fn set_session_agent_state(&self, session_id: &str, state: Option<&str>) {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
+        for p in projects.iter_mut() {
+            if let Some(s) = p.sessions.iter_mut().find(|s| s.id == session_id) {
+                if s.agent_state.as_deref() != state {
+                    s.agent_state = state.map(str::to_string);
                     changed = true;
                 }
                 break;
@@ -2017,37 +2322,207 @@ impl Store {
             .unwrap_or(false)
     }
 
-    // ---- OpenCode local provider ---------------------------------------------------
+    // ---- Per-agent endpoint providers ------------------------------------------------
 
-    pub fn opencode_settings(&self) -> OpenCodeSettings {
-        self.opencode
+    /// This agent's endpoint settings, or the default (disabled) when it has none.
+    pub fn provider_settings(&self, agent: AgentId) -> ProviderSettings {
+        self.agent_providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&agent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Every configured agent endpoint, for the settings UI.
+    pub fn all_provider_settings(&self) -> HashMap<AgentId, ProviderSettings> {
+        self.agent_providers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
-    pub fn set_opencode_settings(&self, settings: OpenCodeSettings) {
+    pub fn set_provider_settings(&self, agent: AgentId, settings: ProviderSettings) {
+        let url = settings.base_url.trim().to_string();
+        let previous = {
+            let mut m = self
+                .agent_providers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            m.insert(agent, settings.clone())
+        };
+        // Keep the pool in step with the edit. Without this, editing the active endpoint
+        // forks it: the pool keeps the OLD values and `endpoint_pool` appends the new ones
+        // beside them, so one endpoint appears twice and the stale copy is still offered as
+        // somewhere to switch to. The entry rewritten is the one that WAS active -- matching
+        // on the new URL instead would leave a renamed endpoint behind as a ghost.
+        let was = previous
+            .map(|p| p.base_url.trim().to_string())
+            .unwrap_or_default();
         {
-            let mut s = self.opencode.lock().unwrap_or_else(|e| e.into_inner());
-            *s = settings;
+            let mut pools = self
+                .agent_endpoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let pool = pools.entry(agent).or_default();
+            let slot = pool
+                .iter()
+                .position(|e| !was.is_empty() && e.base_url.trim() == was)
+                .or_else(|| pool.iter().position(|e| e.base_url.trim() == url));
+            match slot {
+                Some(i) if !url.is_empty() => pool[i] = settings,
+                // A cleared endpoint (no URL) drops out of the pool rather than sitting in
+                // the list as an unaddressable row.
+                Some(i) => {
+                    pool.remove(i);
+                }
+                None if !url.is_empty() => pool.push(settings),
+                None => {}
+            }
+            if pool.is_empty() {
+                pools.remove(&agent);
+            }
+        }
+        self.promote_unbound_key(agent, &url);
+        self.persist();
+    }
+
+    /// Move a key that was set while this agent had NO endpoint onto the endpoint it just
+    /// got. Keys are per (agent, URL), so a key typed before the URL lands in the agent's
+    /// empty slot and would otherwise belong to nothing -- and the form that asks for a key
+    /// before a URL is a perfectly reasonable one to fill in that order.
+    ///
+    /// Deliberately NOT a general "follow the active endpoint" rule. Moving a key whenever
+    /// the active endpoint changes would carry a cloud key onto a local server the moment
+    /// the user switched preset, which is the exact confusion per-endpoint keys exist to
+    /// prevent. Only the empty slot is promoted, and only when the target has no key of its
+    /// own, so this can fire at most once per agent.
+    fn promote_unbound_key(&self, agent: AgentId, base_url: &str) {
+        if base_url.is_empty() {
+            return;
+        }
+        let mut m = self.provider_keys.lock().unwrap_or_else(|e| e.into_inner());
+        let target = key_slot(agent, base_url);
+        if m.contains_key(&target) {
+            return;
+        }
+        if let Some(k) = m.remove(&key_slot(agent, "")) {
+            m.insert(target, k);
+        }
+    }
+
+    /// Every endpoint configured for this agent. Always contains the active one, so a caller
+    /// can write the whole pool into an agent's config and know the session's own endpoint
+    /// is among them.
+    pub fn endpoint_pool(&self, agent: AgentId) -> Vec<ProviderSettings> {
+        let mut pool = self
+            .agent_endpoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&agent)
+            .cloned()
+            .unwrap_or_default();
+        let active = self.provider_settings(agent);
+        let url = active.base_url.trim().to_string();
+        // The active endpoint is authoritative even if the pool has drifted. Including it
+        // anyway beats writing a config that omits the very endpoint the session runs on.
+        if !url.is_empty() && !pool.iter().any(|e| e.base_url.trim() == url) {
+            pool.push(active);
+        }
+        pool
+    }
+
+    /// Every agent's pool, for the settings UI.
+    pub fn all_endpoint_pools(&self) -> HashMap<AgentId, Vec<ProviderSettings>> {
+        self.agent_endpoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Replace this agent's pool wholesale. The UI edits a list, so a list is what it sends;
+    /// per-entry add/remove commands would need an entry identity that `ProviderSettings`
+    /// does not carry.
+    pub fn set_endpoint_pool(&self, agent: AgentId, endpoints: Vec<ProviderSettings>) {
+        {
+            let mut m = self
+                .agent_endpoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if endpoints.is_empty() {
+                m.remove(&agent);
+            } else {
+                m.insert(agent, endpoints);
+            }
         }
         self.persist();
     }
 
-    /// Set (Some) or clear (None) the in-memory endpoint API key. Never persisted.
-    /// Trimmed on the way in — a paste with padding would otherwise ride into the
-    /// Authorization header verbatim and 401 with no way to inspect the held value.
-    pub fn set_opencode_key(&self, key: Option<String>) {
-        let mut k = self.opencode_key.lock().unwrap_or_else(|e| e.into_inner());
-        *k = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    pub fn opencode_settings(&self) -> OpenCodeSettings {
+        self.provider_settings(AgentId::OpenCode)
     }
 
-    /// The in-memory endpoint API key, if one was set this run.
-    pub fn opencode_key(&self) -> Option<String> {
-        self.opencode_key
+    pub fn set_opencode_settings(&self, settings: OpenCodeSettings) {
+        self.set_provider_settings(AgentId::OpenCode, settings);
+    }
+
+    /// Set (Some) or clear (None) the in-memory API key for ONE endpoint. Never persisted.
+    /// Trimmed on the way in — a paste with padding would otherwise ride into the
+    /// Authorization header verbatim and 401 with no way to inspect the held value.
+    pub fn set_provider_key_for(&self, agent: AgentId, base_url: &str, key: Option<String>) {
+        let slot = key_slot(agent, base_url);
+        let mut m = self.provider_keys.lock().unwrap_or_else(|e| e.into_inner());
+        match key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
+            Some(k) => {
+                m.insert(slot, k);
+            }
+            None => {
+                m.remove(&slot);
+            }
+        }
+    }
+
+    /// The key held for ONE endpoint, if one was set this run.
+    pub fn provider_key_for(&self, agent: AgentId, base_url: &str) -> Option<String> {
+        self.provider_keys
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .get(&key_slot(agent, base_url))
+            .cloned()
+    }
+
+    /// Set the key for this agent's ACTIVE endpoint. The agent-scoped form callers used
+    /// before the pool existed, kept so one that only knows the agent still lands on the
+    /// endpoint that agent is actually using.
+    pub fn set_provider_key(&self, agent: AgentId, key: Option<String>) {
+        let url = self.provider_settings(agent).base_url;
+        self.set_provider_key_for(agent, &url, key);
+    }
+
+    /// The key for this agent's ACTIVE endpoint, if one was set this run.
+    pub fn provider_key(&self, agent: AgentId) -> Option<String> {
+        self.provider_key_for(agent, &self.provider_settings(agent).base_url)
+    }
+
+    /// Every pooled endpoint of this agent that has a key held for it, as (base_url, key).
+    /// What the spawn path needs: the whole pool is written into the agent's config, so
+    /// every provider in it needs its own credential or switching to it 401s.
+    pub fn provider_keys_for_pool(&self, agent: AgentId) -> Vec<(String, String)> {
+        self.endpoint_pool(agent)
+            .into_iter()
+            .filter_map(|e| {
+                self.provider_key_for(agent, &e.base_url)
+                    .map(|k| (e.base_url, k))
+            })
+            .collect()
+    }
+
+    pub fn set_opencode_key(&self, key: Option<String>) {
+        self.set_provider_key(AgentId::OpenCode, key);
+    }
+
+    pub fn opencode_key(&self) -> Option<String> {
+        self.provider_key(AgentId::OpenCode)
     }
 
     /// Auto-detect candidate Claude account dirs to prefill the accounts manager (does not
@@ -2173,13 +2648,16 @@ mod tests {
                 accounts: Mutex::new(Vec::new()),
                 default_accounts: Mutex::new(HashMap::new()),
                 trust: Mutex::new(TrustSettings::default()),
-                opencode: Mutex::new(OpenCodeSettings::default()),
+                agent_providers: Mutex::new(HashMap::new()),
+                agent_endpoints: Mutex::new(HashMap::new()),
                 plugins: Mutex::new(Vec::new()),
                 root_chats: Mutex::new(Vec::new()),
                 routes: Mutex::new(Default::default()),
+                orchestration_policy: Mutex::new(Default::default()),
+                policy_write: Mutex::new(()),
                 profiles: Mutex::new(Vec::new()),
                 active_profile_id: Mutex::new(None),
-                opencode_key: Mutex::new(None),
+                provider_keys: Mutex::new(HashMap::new()),
                 save_path: dir.join("state.json"),
                 on_save: OnceLock::new(),
             }
@@ -2191,6 +2669,75 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn old_state_has_inert_policy_and_invalid_write_preserves_state() {
+        let old = br#"{"projects":[],"accounts":[],"routes":{}}"#;
+        let parsed = parse_state(old).expect("legacy state parses");
+        assert_eq!(
+            parsed.orchestration_policy,
+            crate::orchestration_policy::PolicyDocument::default()
+        );
+        let future = br#"{"projects":[],"orchestrationPolicy":{"version":2,"futureKey":true}}"#;
+        assert!(
+            parse_state(future).is_some(),
+            "unsupported policy cannot erase sessions"
+        );
+
+        let dir = temp_dir("policy_rollback");
+        let store = Store::for_test(&dir);
+        let project = store.add_project("/repo".into(), None);
+        let before = fs::read(dir.join("state.json")).unwrap();
+        let mut invalid = store.orchestration_policy();
+        invalid.projects.insert(
+            project.id,
+            crate::orchestration_policy::PolicyOverlay {
+                quota_pause_percent: Some(101),
+                ..Default::default()
+            },
+        );
+        assert!(store.set_orchestration_policy(invalid).is_err());
+        assert_eq!(fs::read(dir.join("state.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn policy_project_write_preserves_other_scope_and_round_trips() {
+        let dir = temp_dir("policy_scopes");
+        let store = Store::for_test(&dir);
+        let a = store.add_project("/a".into(), None);
+        let b = store.add_project("/b".into(), None);
+        let overlay = crate::orchestration_policy::PolicyOverlay {
+            context_display: Some(true),
+            ..Default::default()
+        };
+        store
+            .set_orchestration_overlay(Some(&a.id), overlay.clone())
+            .unwrap();
+        store
+            .set_orchestration_overlay(Some(&b.id), overlay)
+            .unwrap();
+        store
+            .set_orchestration_overlay(Some(&a.id), Default::default())
+            .unwrap();
+        let state = load_state(&dir.join("state.json"));
+        assert!(!state.orchestration_policy.projects.contains_key(&a.id));
+        assert_eq!(
+            state.orchestration_policy.projects[&b.id].context_display,
+            Some(true)
+        );
+        assert_eq!(state.projects.len(), 2);
+    }
+
+    #[test]
+    fn policy_save_failure_rolls_back_memory() {
+        let dir = temp_dir("policy_io_failure").join("missing_parent");
+        let store = Store::for_test(&dir);
+        let mut next = store.orchestration_policy();
+        next.global.context_display = Some(true);
+        assert!(store.set_orchestration_policy(next).is_err());
+        assert_eq!(store.orchestration_policy(), Default::default());
+        assert!(!dir.join("state.json").exists());
     }
 
     #[test]
@@ -2952,6 +3499,21 @@ mod tests {
     }
 
     #[test]
+    fn agent_state_is_absent_until_reported_and_survives_a_round_trip() {
+        // A session that never reported must serialize exactly as before the field existed.
+        let v = serde_json::to_value(mk("quiet")).unwrap();
+        assert!(v.get("agentState").is_none(), "{v}");
+        let mut s = mk("busy");
+        s.agent_state = Some("running".into());
+        let back: Session = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back.agent_state.as_deref(), Some("running"));
+        // An older file (no key) still loads.
+        let old: Session =
+            serde_json::from_value(serde_json::json!({"id": "x", "name": "x"})).unwrap();
+        assert_eq!(old.agent_state, None);
+    }
+
+    #[test]
     fn can_read_allows_self_and_equal_public_clearance() {
         let a = mk("a");
         let b = mk("b");
@@ -3073,6 +3635,215 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_pool_seeds_from_the_active_endpoint_and_never_overwrites_one() {
+        // A state.json written before the pool existed: an active endpoint, no pool.
+        let mut active = HashMap::new();
+        active.insert(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "anthropic/claude-sonnet-5".into(),
+                ..Default::default()
+            },
+        );
+        // An agent the user never configured must NOT gain a blank row.
+        active.insert(AgentId::OpenCode, ProviderSettings::default());
+
+        let seeded = seed_endpoint_pool(HashMap::new(), &active);
+        assert_eq!(seeded.len(), 1, "only the configured agent is seeded");
+        assert_eq!(seeded[&AgentId::Hermes].len(), 1);
+        assert_eq!(
+            seeded[&AgentId::Hermes][0].base_url,
+            "https://openrouter.ai/api/v1"
+        );
+
+        // Newer state wins: an agent that already has a pool is left exactly as it is,
+        // even though its active endpoint is not the first entry.
+        let mut existing = HashMap::new();
+        existing.insert(
+            AgentId::Hermes,
+            vec![ProviderSettings {
+                preset: "ollama".into(),
+                base_url: "http://localhost:11434/v1".into(),
+                ..Default::default()
+            }],
+        );
+        let kept = seed_endpoint_pool(existing, &active);
+        assert_eq!(kept[&AgentId::Hermes].len(), 1);
+        assert_eq!(kept[&AgentId::Hermes][0].preset, "ollama");
+    }
+
+    #[test]
+    fn endpoint_keys_are_per_endpoint_not_per_agent() {
+        let dir = temp_dir("ep_keys");
+        let store = Store::for_test(&dir);
+        let cloud = "https://openrouter.ai/api/v1";
+        let local = "http://localhost:11434/v1";
+
+        store.set_provider_key_for(AgentId::Hermes, cloud, Some("  sk-or-CLOUD \n".into()));
+        store.set_provider_key_for(AgentId::Hermes, local, Some("local-KEY".into()));
+
+        // Padding trimmed, and neither endpoint can see the other's key.
+        assert_eq!(
+            store.provider_key_for(AgentId::Hermes, cloud).as_deref(),
+            Some("sk-or-CLOUD")
+        );
+        assert_eq!(
+            store.provider_key_for(AgentId::Hermes, local).as_deref(),
+            Some("local-KEY")
+        );
+        // The same URL under a DIFFERENT agent is a different slot: two agents may sit
+        // behind one aggregator with two keys.
+        assert_eq!(store.provider_key_for(AgentId::OpenCode, cloud), None);
+
+        store.set_provider_key_for(AgentId::Hermes, cloud, None);
+        assert_eq!(store.provider_key_for(AgentId::Hermes, cloud), None);
+        assert_eq!(
+            store.provider_key_for(AgentId::Hermes, local).as_deref(),
+            Some("local-KEY"),
+            "clearing one endpoint must not clear another"
+        );
+    }
+
+    #[test]
+    fn a_key_set_before_the_url_is_promoted_onto_it_once() {
+        let dir = temp_dir("ep_promote");
+        let store = Store::for_test(&dir);
+        // The order a form is filled in: key first, endpoint second.
+        store.set_provider_key(AgentId::Hermes, Some("sk-or-FIRST".into()));
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "anthropic/claude-sonnet-5".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            store
+                .provider_key_for(AgentId::Hermes, "https://openrouter.ai/api/v1")
+                .as_deref(),
+            Some("sk-or-FIRST"),
+            "a key with no endpoint yet follows the endpoint the agent then gets"
+        );
+
+        // Once promoted the empty slot is gone, so a LATER endpoint change cannot pick the
+        // same key up again -- the promotion fires at most once per agent.
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "ollama".into(),
+                base_url: "http://localhost:11434/v1".into(),
+                model: "qwen3:30b-a3b".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            store.provider_key_for(AgentId::Hermes, "http://localhost:11434/v1"),
+            None
+        );
+    }
+
+    #[test]
+    fn switching_the_active_endpoint_never_carries_a_key_across() {
+        let dir = temp_dir("ep_noswap");
+        let store = Store::for_test(&dir);
+        let local = ProviderSettings {
+            enabled: true,
+            preset: "ollama".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "qwen3:30b-a3b".into(),
+            ..Default::default()
+        };
+        store.set_provider_settings(AgentId::Hermes, local.clone());
+        store.set_provider_key(AgentId::Hermes, Some("local-KEY".into()));
+
+        // Swap the active endpoint to a cloud aggregator. The local key must NOT follow --
+        // that is the confusion per-endpoint keys exist to prevent.
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "anthropic/claude-sonnet-5".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(store.provider_key(AgentId::Hermes), None, "no key carried");
+        // ...and the local endpoint kept its own.
+        assert_eq!(
+            store
+                .provider_key_for(AgentId::Hermes, "http://localhost:11434/v1")
+                .as_deref(),
+            Some("local-KEY")
+        );
+    }
+
+    #[test]
+    fn the_pool_always_contains_the_active_endpoint() {
+        let dir = temp_dir("ep_pool_active");
+        let store = Store::for_test(&dir);
+        store.set_endpoint_pool(
+            AgentId::Hermes,
+            vec![ProviderSettings {
+                preset: "ollama".into(),
+                base_url: "http://localhost:11434/v1".into(),
+                ..Default::default()
+            }],
+        );
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "anthropic/claude-sonnet-5".into(),
+                ..Default::default()
+            },
+        );
+        let pool = store.endpoint_pool(AgentId::Hermes);
+        assert_eq!(pool.len(), 2, "the new active endpoint joined the pool");
+        assert!(pool.iter().any(|e| e.preset == "openrouter"));
+        assert!(
+            pool.iter().any(|e| e.preset == "ollama"),
+            "and the old one stayed"
+        );
+
+        // Editing the ACTIVE endpoint rewrites its pool entry instead of forking it. A fork
+        // would offer the stale copy as somewhere to switch to.
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "openai/gpt-5".into(),
+                ..Default::default()
+            },
+        );
+        let pool = store.endpoint_pool(AgentId::Hermes);
+        assert_eq!(pool.len(), 2, "an edit is not a new endpoint");
+        assert_eq!(
+            pool.iter()
+                .find(|e| e.preset == "openrouter")
+                .unwrap()
+                .model,
+            "openai/gpt-5"
+        );
+
+        // And the pool survives a save/load round trip.
+        let raw = fs::read_to_string(dir.join("state.json")).unwrap();
+        let ps: PersistState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ps.agent_endpoints[&AgentId::Hermes].len(), 2);
+    }
+
+    #[test]
     fn opencode_settings_persist_but_key_never_touches_disk() {
         let dir = temp_dir("oc_settings");
         let store = Store::for_test(&dir);
@@ -3106,6 +3877,147 @@ mod tests {
         // Clearing (or setting a blank) key empties the holder.
         store.set_opencode_key(Some("   ".into()));
         assert!(store.opencode_key().is_none());
+    }
+
+    #[test]
+    fn a_legacy_opencode_block_migrates_into_the_per_agent_map() {
+        // A state.json written before per-agent endpoints has only the legacy slot. It
+        // must be ADOPTED, not dropped -- otherwise upgrading silently unconfigures the
+        // user's endpoint and their OpenCode sessions quietly go back to the cloud.
+        let raw = r#"{"projects":[],"opencode":{"enabled":true,"preset":"ollama",
+            "baseUrl":"http://localhost:11434/v1","model":"qwen3:30b","pinLocal":true}}"#;
+        let ps: PersistState = serde_json::from_str(raw).unwrap();
+        assert!(
+            ps.agent_providers.is_empty(),
+            "the legacy file has no per-agent map at all"
+        );
+
+        let adopted = adopt_legacy_opencode(ps.agent_providers, ps.opencode);
+        let oc = adopted
+            .get(&AgentId::OpenCode)
+            .expect("legacy block adopted");
+        assert!(oc.enabled);
+        assert_eq!(oc.model, "qwen3:30b");
+        assert!(oc.pin_local);
+    }
+
+    #[test]
+    fn newer_per_agent_state_wins_over_the_legacy_slot() {
+        // Both present means the file was written by a version that knows both. The new
+        // map is the source of truth; adopting the legacy block over it would resurrect a
+        // stale endpoint the user has already replaced.
+        let mut per_agent = HashMap::new();
+        per_agent.insert(
+            AgentId::OpenCode,
+            ProviderSettings {
+                model: "current".into(),
+                ..Default::default()
+            },
+        );
+        let adopted = adopt_legacy_opencode(
+            per_agent,
+            ProviderSettings {
+                model: "stale".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(adopted[&AgentId::OpenCode].model, "current");
+    }
+
+    #[test]
+    fn opencode_is_mirrored_back_into_the_legacy_slot_on_save() {
+        // An older Conduit reads `opencode`, not `agent_providers`. A downgrade must still
+        // find the endpoint where it left it.
+        let dir = temp_dir("provider_mirror");
+        let store = Store::for_test(&dir);
+        store.set_provider_settings(
+            AgentId::OpenCode,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "anthropic/claude-sonnet-5".into(),
+                ..Default::default()
+            },
+        );
+        let ps: PersistState =
+            serde_json::from_str(&fs::read_to_string(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(ps.opencode.model, "anthropic/claude-sonnet-5");
+        assert_eq!(
+            ps.agent_providers.get(&AgentId::OpenCode).unwrap().model,
+            "anthropic/claude-sonnet-5",
+            "and the per-agent map is the source of truth"
+        );
+    }
+
+    #[test]
+    fn a_second_agents_endpoint_does_not_disturb_opencodes() {
+        let dir = temp_dir("provider_two");
+        let store = Store::for_test(&dir);
+        store.set_provider_settings(
+            AgentId::OpenCode,
+            ProviderSettings {
+                enabled: true,
+                preset: "ollama".into(),
+                base_url: "http://127.0.0.1:11434/v1".into(),
+                model: "qwen3:30b".into(),
+                ..Default::default()
+            },
+        );
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ProviderSettings {
+                enabled: true,
+                preset: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model: "x-ai/grok-4".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            store.provider_settings(AgentId::OpenCode).model,
+            "qwen3:30b"
+        );
+        assert_eq!(
+            store.provider_settings(AgentId::Hermes).model,
+            "x-ai/grok-4"
+        );
+        // Keys are per agent too -- two agents behind two endpoints need two credentials.
+        store.set_provider_key(AgentId::Hermes, Some("sk-or-hermes".into()));
+        assert_eq!(
+            store.provider_key(AgentId::Hermes).as_deref(),
+            Some("sk-or-hermes")
+        );
+        assert!(store.provider_key(AgentId::OpenCode).is_none());
+    }
+
+    #[test]
+    fn is_local_is_the_silo_test_and_pin_local_is_not() {
+        // `pin_local` means "don't fall back elsewhere", which a cloud aggregator satisfies
+        // completely. Reading it as containment is the bug this distinction prevents.
+        let cloud = ProviderSettings {
+            enabled: true,
+            preset: "openrouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "anthropic/claude-sonnet-5".into(),
+            pin_local: true,
+            ..Default::default()
+        };
+        assert!(cloud.is_ready());
+        assert!(!cloud.is_local(), "pinned, but not local");
+
+        let local = ProviderSettings {
+            preset: "ollama".into(),
+            ..cloud.clone()
+        };
+        assert!(local.is_local());
+
+        // Enabled but half-configured is not a route to guess at.
+        let half = ProviderSettings {
+            model: String::new(),
+            ..cloud
+        };
+        assert!(!half.is_ready());
     }
 
     #[test]

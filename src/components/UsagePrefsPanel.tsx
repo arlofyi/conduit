@@ -30,6 +30,7 @@ const WINDOWS: Array<{ id: keyof UsagePrefs["windows"]; label: string }> = [
   { id: "weekly", label: "Weekly" },
   { id: "weeklyOpus", label: "Weekly · Opus — Claude only" },
   { id: "context", label: "Context — agy only" },
+  { id: "credit", label: "Credit — OpenRouter only" },
 ];
 
 /** Settings → Usage display: how the bottom-left usage bar renders. Purely cosmetic. */

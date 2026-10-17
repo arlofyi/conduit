@@ -5,6 +5,8 @@
 //! and exposes them to the React frontend as Tauri commands.
 
 mod agent;
+mod agent_activity;
+mod agent_profile;
 mod agy_usage;
 mod asks;
 mod board;
@@ -16,6 +18,7 @@ mod claude_usage;
 pub mod cli_open;
 pub mod cli_shim;
 mod clipboard;
+mod codex_usage;
 mod commandcode_config;
 mod commandcode_usage;
 mod context_window;
@@ -34,6 +37,7 @@ mod format;
 mod fsops;
 mod git;
 mod git_mut;
+mod hermes;
 mod hookbus;
 mod hooks;
 mod hotexit;
@@ -41,6 +45,8 @@ pub mod ide_host;
 mod local_llm;
 mod menu;
 mod notify;
+mod openrouter_usage;
+mod orchestration_policy;
 mod plugins;
 mod project_new;
 mod proposals;
@@ -52,6 +58,7 @@ mod scrollback;
 mod search;
 #[cfg_attr(windows, allow(dead_code))]
 mod session_budget;
+mod session_files;
 mod status_rules;
 mod store;
 mod subagents;
@@ -129,7 +136,18 @@ fn opts_into_mailbox(has_mission: bool, channels: &[String]) -> bool {
 
 // ---- Terminal / PTY commands -------------------------------------------------
 
-#[tauri::command]
+/// One `pty_spawn` at a time.
+///
+/// `pty_spawn` runs on the thread pool (`(async)`) so launching an agent -- a process spawn,
+/// plus the hook, MCP and account files it writes first -- never stalls the UI thread that
+/// also delivers keystrokes. As a plain sync command it was serialized for free, and its
+/// preparation still depends on that: several steps read-modify-write files that sessions
+/// SHARE (a project's hook settings, an account's agy home, an agent's config), and opening a
+/// project fires one spawn per session at once. Two of those interleaving would lose one
+/// write. This keeps the old one-at-a-time order, just off the UI thread.
+static SPAWN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn pty_spawn(
     app: tauri::AppHandle,
@@ -158,6 +176,7 @@ fn pty_spawn(
     store: State<Arc<Store>>,
     agy_resume: State<Arc<crate::agy_usage::AgyResumeState>>,
 ) -> Result<(), String> {
+    let _gate = SPAWN_GATE.lock().unwrap_or_else(|e| e.into_inner());
     let port = hook_state.port.load(Ordering::SeqCst);
     let agent = if shell_only {
         crate::agent::AgentId::Claude // shell companion: agent is irrelevant
@@ -387,15 +406,74 @@ fn pty_spawn(
     let suppress_remote =
         !shell_only && store.is_private_mode() && store.is_session_siloed(&session_id);
 
+    // Hermes: always write the per-session overlay for a real Hermes session -- the
+    // status hooks are not optional, and the endpoint block rides along only when the
+    // user enabled routing for Hermes. A local-only session under private mode refuses a
+    // non-local endpoint outright rather than silently routing sensitive work at a cloud
+    // aggregator: `is_local()` is the check, not `enabled`, because OpenRouter is a
+    // perfectly valid endpoint that happens not to be local.
+    let hermes_cfg = if !shell_only && agent == crate::agent::AgentId::Hermes {
+        // A session that was switched to another endpoint comes back on THAT endpoint, not
+        // on the agent's current default. Falls back to the default when the pinned slug no
+        // longer names anything -- an endpoint the user has since deleted must degrade to
+        // "the normal one", never to "no endpoint at all".
+        let settings = session_endpoint(&store, crate::agent::AgentId::Hermes, &session_id);
+        let must_be_local = store.is_private_mode() && store.is_session_local_only(&session_id);
+        let usable = settings.is_ready() && (!must_be_local || settings.is_local());
+        if settings.is_ready() && !usable {
+            eprintln!(
+                "conduit: a hermes session is local-only, but its configured \
+                 endpoint is not local -- routing skipped, the session runs on its own config."
+            );
+        }
+        // The pool is what `/model --provider` can reach mid-session, so the silo has to
+        // filter it too. Writing a cloud endpoint into a local-only session's config would
+        // leave the agent one slash command away from routing siloed work through
+        // OpenRouter -- the launch-time `usable` check above would have been decoration.
+        let keys = store.provider_keys_for_pool(crate::agent::AgentId::Hermes);
+        let pool: Vec<(crate::store::ProviderSettings, Option<String>)> = store
+            .endpoint_pool(crate::agent::AgentId::Hermes)
+            .into_iter()
+            .filter(|e| !must_be_local || e.is_local())
+            .map(|e| {
+                let key = keys
+                    .iter()
+                    .find(|(url, _)| url.trim() == e.base_url.trim())
+                    .map(|(_, k)| k.clone());
+                (e, key)
+            })
+            .collect();
+        crate::hermes::build_spawn_config(
+            &session_id,
+            port,
+            usable.then_some(&settings),
+            store.provider_key(crate::agent::AgentId::Hermes).as_deref(),
+            &pool,
+        )
+    } else {
+        None
+    };
+
     // OpenCode local provider: route the session to the configured local/self-hosted
     // endpoint. None (feature off / not an OpenCode session / settings incomplete) spawns
     // untouched. Pinning (`enabled_providers: ["conduit"]`) applies globally by user
     // choice, or is forced for a local-only (siloed) session under private mode — the
     // "guaranteed local model" half of the trust-boundary silo.
     let opencode = if !shell_only && agent == crate::agent::AgentId::OpenCode {
-        let settings = store.opencode_settings();
-        let pin = settings.pin_local
-            || (store.is_private_mode() && store.is_session_local_only(&session_id));
+        let mut settings = store.opencode_settings();
+        // A local-only session under private mode must reach a LOCAL endpoint or none.
+        // `pin_local` is not the test: it only says "don't fall back elsewhere", which is
+        // equally true of OpenRouter, so pinning a cloud aggregator would satisfy the flag
+        // while defeating the silo. Drop the routing instead of honouring it.
+        let must_be_local = store.is_private_mode() && store.is_session_local_only(&session_id);
+        if must_be_local && settings.is_ready() && !settings.is_local() {
+            eprintln!(
+                "conduit: an opencode session is local-only, but its configured \
+                 endpoint is not local -- routing skipped, the session runs on its own config."
+            );
+            settings.enabled = false;
+        }
+        let pin = settings.pin_local || must_be_local;
         let base =
             crate::agent::build_opencode_config(&settings, store.opencode_key().as_deref(), pin);
         if gets_fleet_mcp {
@@ -443,9 +521,11 @@ fn pty_spawn(
                 return Err(format!("worktree setup failed: {e}"));
             }
         }
-        // Install this adapter's status/result/note channel INTO the worktree, not the
-        // repo root -- routing must be scoped to the worker's own tree.
-        if let Some(profile) = adapter.hooks_profile() {
+        // Install file-based adapters into the worktree. Codex receives its hooks
+        // through CLI overrides and only needs old project entries cleaned up.
+        if agent == crate::agent::AgentId::Codex {
+            hooks::remove_codex_project_hooks(&wt_path);
+        } else if let Some(profile) = adapter.hooks_profile() {
             hooks::install_profile(&wt_path, port, &profile);
         }
         if let Some(plugin) = adapter.plugin_profile() {
@@ -494,10 +574,11 @@ fn pty_spawn(
         }
         (wt_path, None, None)
     } else {
-        // Normal session: install this agent's status integration. Hook-based agents
-        // (Claude/Codex/Gemini) write a settings/hooks file; OpenCode installs a JS
-        // status plugin instead. An agent has one or the other, never both.
-        if let Some(profile) = adapter.hooks_profile() {
+        // Normal session: file-based agents install status hooks, while Codex gets
+        // per-launch hooks in pty.rs. OpenCode installs a JS status plugin.
+        if agent == crate::agent::AgentId::Codex {
+            hooks::remove_codex_project_hooks(&working_directory);
+        } else if let Some(profile) = adapter.hooks_profile() {
             hooks::install_profile(&working_directory, port, &profile);
         }
         if let Some(plugin) = adapter.plugin_profile() {
@@ -546,6 +627,11 @@ fn pty_spawn(
         } else {
             None
         };
+    if agent == crate::agent::AgentId::Codex {
+        if let Err(e) = hooks::write_codex_hook_relay() {
+            eprintln!("conduit: failed to write codex hook relay: {e}");
+        }
+    }
     pty.spawn(
         session_id,
         cwd,
@@ -563,6 +649,7 @@ fn pty_spawn(
         agent,
         suppress_remote,
         opencode,
+        hermes_cfg,
         is_conductor,
         agent_model,
         agent_effort.map(str::to_string),
@@ -698,7 +785,7 @@ struct TmuxInfo {
     install: Option<tmux::InstallHint>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn tmux_available(pty: State<Arc<PtyManager>>) -> TmuxInfo {
     #[cfg(not(windows))]
     {
@@ -728,6 +815,49 @@ fn tmux_available(pty: State<Arc<PtyManager>>) -> TmuxInfo {
     }
 }
 
+/// Which of `session_ids` still have background work running under their agent (a shell
+/// left by a background command, a dev server, a watcher). The idle auto-stop asks this
+/// before retiring a session whose hooks say "done": a finished TURN is not a finished
+/// agent. One process-table snapshot answers the whole batch. See `agent_activity`.
+#[tauri::command(async)]
+fn busy_sessions(session_ids: Vec<String>, pty: State<Arc<PtyManager>>) -> Vec<String> {
+    if session_ids.is_empty() {
+        return Vec::new();
+    }
+    let procs = crate::agent_activity::process_table();
+    session_ids
+        .into_iter()
+        .filter(|id| {
+            pty.session_root_pid(id)
+                .is_some_and(|root| crate::agent_activity::has_background_work(&procs, root))
+        })
+        .collect()
+}
+
+/// Settings -> Sessions "Remove stray NUL files": sweep every project folder for the
+/// `NUL` files the old Windows hook command created. Returns how many were removed;
+/// always 0 elsewhere (on macOS and Linux `NUL` is an ordinary name and is never touched).
+#[tauri::command(async)]
+fn remove_stray_nul_files(store: State<Arc<Store>>) -> usize {
+    #[cfg(windows)]
+    {
+        let roots: Vec<String> = store.list().into_iter().map(|p| p.path).collect();
+        crate::session_files::remove_stray_nul_files(&roots)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = store;
+        0
+    }
+}
+
+/// Push Settings -> Sessions "Keep Claude in the project folder" down to the PTY manager.
+/// Called at boot and on toggle; applies to sessions started afterwards.
+#[tauri::command]
+fn set_keep_agents_in_project(enabled: bool, pty: State<Arc<PtyManager>>) {
+    pty.set_keep_in_project(enabled);
+}
+
 /// Push the frontend's `persistSessions` setting down to the PTY manager. Called at boot
 /// and whenever the toggle changes. Turning it off never kills a running session — see
 /// the field note on `PtyManager::persist`.
@@ -750,11 +880,21 @@ fn set_session_persistence(enabled: bool, pty: State<Arc<PtyManager>>) {
 /// The transcript store is resolved per session rather than from the app's own environment,
 /// since a session assigned to a non-default account writes under that account's
 /// `CLAUDE_CONFIG_DIR` and its transcript is simply not in the default tree.
-#[tauri::command]
+#[tauri::command(async)]
 fn session_context(
     session_id: String,
     store: State<Arc<store::Store>>,
+    agy_context: State<Arc<agy_usage::AgyContextState>>,
 ) -> Option<context_window::ContextUsage> {
+    if !store.has_session(&session_id) {
+        return None;
+    }
+    if store.session_agent(&session_id) == crate::agent::AgentId::Antigravity {
+        return agy_context.get(&session_id);
+    }
+    if store.session_agent(&session_id) != crate::agent::AgentId::Claude {
+        return None;
+    }
     let projects = pty::session_projects_dir(&store, &session_id)?;
     let path = pty::transcript_path(&store.claude_conversation_id(&session_id), &projects)?;
     context_window::for_transcript(&path)
@@ -764,7 +904,7 @@ fn session_context(
 ///
 /// Empty for the overwhelmingly common case of a session that has not fanned out. Resolved
 /// against the session's own account config dir for the same reason `session_context` is.
-#[tauri::command]
+#[tauri::command(async)]
 fn session_subagents(
     session_id: String,
     store: State<Arc<store::Store>>,
@@ -780,7 +920,7 @@ fn session_subagents(
 /// Searches the DEFAULT transcript store plus every registered account's, deduplicated by
 /// session id — a session's transcript lives under whichever account ran it, and someone
 /// searching their own history does not think in accounts.
-#[tauri::command]
+#[tauri::command(async)]
 fn search_transcripts(
     query: String,
     limit: usize,
@@ -906,17 +1046,17 @@ fn add_project(path: String, profile_id: Option<String>, store: State<Arc<Store>
 
 // ---- CLI launcher --------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn cli_shim_status() -> cli_shim::ShimStatus {
     cli_shim::status()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn install_cli_shim() -> Result<cli_shim::ShimStatus, String> {
     cli_shim::install()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_cli_shim() -> Result<cli_shim::ShimStatus, String> {
     cli_shim::remove()
 }
@@ -1309,7 +1449,11 @@ pub(crate) fn open_or_focus_profile_window(
     }
 }
 
-#[tauri::command]
+// `(async)` is required, not a speed-up: `WebviewWindowBuilder::build` deadlocks on Windows
+// when called from a synchronous command (WebView2 creation waits on the UI thread the
+// command is blocking) -- documented on the builder itself. `claim` already makes two
+// concurrent opens of one profile safe, which is what running off-thread needs.
+#[tauri::command(async)]
 fn open_profile_window(
     app: tauri::AppHandle,
     profile_id: Option<String>,
@@ -1536,7 +1680,7 @@ fn board_resolve_gate(
 /// Read-only continuity view for a project's board: which of its sessions are present
 /// (per continuity, matched by agent_label == Conduit session id) and pending handoffs
 /// scoped to any of its cards. Best-effort -- see `continuity_read::view_for_project`.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_continuity(
     store: State<Arc<Store>>,
     project_id: String,
@@ -1693,7 +1837,7 @@ async fn continuity_tables(
 /// sessions that belong to it. Scoped by Conduit session id (exact) plus the git toplevel
 /// of the project and each of its worktrees (for sessions started outside Conduit).
 /// Best-effort -- see `continuity_feed::feed_for_project`.
-#[tauri::command]
+#[tauri::command(async)]
 fn continuity_feed(
     store: State<Arc<Store>>,
     project_id: String,
@@ -1735,6 +1879,9 @@ fn add_session(
     // (today's behavior). See `Session::mcp_servers` for why None != Some(<everything>).
     mcp_servers: Option<Vec<String>>,
     model: Option<String>,
+    // The endpoint the new session should run on, as a provider slug or a preset name.
+    // Resolved to a slug here so what is stored is the same spelling a live switch writes.
+    provider: Option<String>,
     store: State<Arc<Store>>,
 ) -> Option<Session> {
     let mut session = store.add_session(
@@ -1757,7 +1904,40 @@ fn add_session(
         store.set_session_model(&session.id, model.clone());
         session.model = model;
     }
+    // Same reason as the model: this is what lets ONE agent start another under conditions
+    // it chose -- a Hermes session on a local model launching a worker on OpenRouter -- and
+    // a session persisted even briefly without it would spawn on the wrong endpoint first.
+    if let Some(p) = provider.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        let slug = resolve_provider_slug(&store, agent, p);
+        store.set_session_provider(&session.id, Some(slug.clone()));
+        session.provider = Some(slug);
+    }
     Some(session)
+}
+
+/// Turn what a caller NAMED into the slug this agent's switcher speaks.
+///
+/// A caller types what they know -- `openrouter`, `ollama`, a preset. The pinned value has
+/// to be what `pooled_provider_slugs` produces, or `session_endpoint` will never match it
+/// and the session silently spawns on the agent's default instead. Matching on the preset
+/// first and the slug second means both spellings work; an unrecognized name is passed
+/// through rather than dropped, so a first-class provider the agent knows but Conduit does
+/// not still reaches it.
+fn resolve_provider_slug(store: &Arc<Store>, agent: crate::agent::AgentId, named: &str) -> String {
+    let pool = store.endpoint_pool(agent);
+    let slugs = crate::agent::adapter_for(agent).pooled_provider_slugs(&pool);
+    for (e, slug) in pool.iter().zip(slugs.iter()) {
+        let hit = e.preset.eq_ignore_ascii_case(named)
+            || slug
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(named));
+        if hit {
+            if let Some(s) = slug {
+                return s.clone();
+            }
+        }
+    }
+    named.to_string()
 }
 
 #[tauri::command]
@@ -1823,7 +2003,7 @@ fn get_default_accounts(
 }
 
 /// Auto-detected candidate accounts (not yet registered), for the "Detect" button.
-#[tauri::command]
+#[tauri::command(async)]
 fn discover_accounts(store: State<Arc<Store>>) -> Vec<crate::store::Account> {
     store.discover_accounts()
 }
@@ -1881,6 +2061,111 @@ fn set_account_agents(
 #[tauri::command]
 fn set_session_account(session_id: String, account_id: Option<String>, store: State<Arc<Store>>) {
     store.set_session_account(&session_id, account_id);
+}
+
+/// Pin or clear one session's model. `None` clears it, which is how a session goes back to
+/// whatever its agent would pick on its own -- distinct from pinning an empty string.
+/// Takes effect at the session's NEXT spawn: the model rides on the command line, so a
+/// running agent keeps the one it launched with.
+#[tauri::command]
+fn set_session_model(session_id: String, model: Option<String>, store: State<Arc<Store>>) {
+    store.set_session_model(&session_id, model);
+}
+
+/// Pin or clear one session's reasoning effort. Same next-spawn semantics as the model.
+#[tauri::command]
+fn set_session_effort(session_id: String, effort: Option<String>, store: State<Arc<Store>>) {
+    store.set_session_effort(&session_id, effort);
+}
+
+/// What `switch_session_model` did, so the UI can say so honestly rather than claiming a
+/// live switch it did not perform.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSwitch {
+    /// True when the agent's own in-session command was sent, so the conversation continues.
+    pub live: bool,
+    /// The command sent, for the UI to echo. Empty when nothing was sent.
+    pub command: String,
+    /// Why it could not be live. Empty when it was.
+    pub reason: String,
+}
+
+/// Change a running session's model WITHOUT losing its conversation.
+///
+/// The model, endpoint and credentials are read once at process start, so Conduit cannot
+/// push a change into a live agent. But every mature TUI here already solves that for
+/// itself -- `/model` -- and driving the agent's own command preserves context by
+/// construction instead of by us trying to reproduce it. Restarting is the FALLBACK, and a
+/// poor one for this purpose: it is exactly the thing a mid-task "drop to a cheap model"
+/// must not do.
+///
+/// The choice is persisted either way, so a later restart (or a reap) comes back on the
+/// model the user picked rather than reverting to the one it launched with.
+///
+/// `live: false` is returned rather than silently restarting: tearing down a running agent
+/// is the caller's decision to make, not a side effect of asking to change model.
+#[tauri::command]
+fn switch_session_model(
+    session_id: String,
+    model: String,
+    provider: Option<String>,
+    effort: Option<String>,
+    store: State<Arc<Store>>,
+    pty: State<Arc<PtyManager>>,
+) -> ModelSwitch {
+    let model = model.trim().to_string();
+    // Persist first: whatever happens to the live process, the next spawn must agree with
+    // what the user just chose.
+    store.set_session_model(&session_id, (!model.is_empty()).then(|| model.clone()));
+    // The endpoint is persisted too, or the next start would quietly move the session back
+    // to the agent's active endpoint with a model that endpoint may not serve.
+    if let Some(p) = provider.as_deref() {
+        store.set_session_provider(&session_id, (!p.trim().is_empty()).then(|| p.to_string()));
+    }
+    if let Some(e) = effort.as_deref() {
+        store.set_session_effort(&session_id, (!e.trim().is_empty()).then(|| e.to_string()));
+    }
+    if model.is_empty() {
+        return ModelSwitch {
+            live: false,
+            command: String::new(),
+            reason: "Cleared — the agent's default applies at the next start.".into(),
+        };
+    }
+    let agent = store.session_agent(&session_id);
+    let Some(cmd) = crate::agent::adapter_for(agent).model_switch_command(
+        &model,
+        provider.as_deref(),
+        effort.as_deref(),
+    ) else {
+        return ModelSwitch {
+            live: false,
+            command: String::new(),
+            reason: "This agent has no in-session model command; restart to apply.".into(),
+        };
+    };
+    // A session with no live PTY has nothing to send to -- and that is not an error: the
+    // stored pin is all a stopped session needs.
+    if !pty.has(&session_id) {
+        return ModelSwitch {
+            live: false,
+            command: cmd,
+            reason: "Not running — applies when the session starts.".into(),
+        };
+    }
+    match pty.write(&session_id, &crate::pty::paste_and_submit(&cmd)) {
+        Ok(()) => ModelSwitch {
+            live: true,
+            command: cmd,
+            reason: String::new(),
+        },
+        Err(e) => ModelSwitch {
+            live: false,
+            command: cmd,
+            reason: e,
+        },
+    }
 }
 
 // ---- Trust boundaries (Feature 4: multi-agent silo / controlled sharing) ------
@@ -1947,6 +2232,163 @@ fn opencode_key_set(store: State<Arc<Store>>) -> bool {
     store.opencode_key().is_some()
 }
 
+// ---- Per-agent endpoints (the generalization of the four commands above) ----------
+
+#[tauri::command]
+fn get_provider_settings(
+    agent: crate::agent::AgentId,
+    store: State<Arc<Store>>,
+) -> crate::store::ProviderSettings {
+    store.provider_settings(agent)
+}
+
+/// Every agent's endpoint settings at once, so the settings UI and the per-session Model
+/// tab render from ONE read rather than one round trip per agent.
+#[tauri::command]
+fn get_all_provider_settings(
+    store: State<Arc<Store>>,
+) -> std::collections::HashMap<crate::agent::AgentId, crate::store::ProviderSettings> {
+    store.all_provider_settings()
+}
+
+#[tauri::command]
+fn set_provider_settings(
+    agent: crate::agent::AgentId,
+    settings: crate::store::ProviderSettings,
+    store: State<Arc<Store>>,
+) {
+    store.set_provider_settings(agent, settings);
+}
+
+/// Hold one agent's endpoint API key in memory for this app run. A blank key clears it.
+/// Deliberately NOT persisted anywhere; it reaches a child only via its process env.
+#[tauri::command]
+fn set_provider_key(agent: crate::agent::AgentId, key: String, store: State<Arc<Store>>) {
+    store.set_provider_key(agent, Some(key));
+}
+
+#[tauri::command]
+fn clear_provider_key(agent: crate::agent::AgentId, store: State<Arc<Store>>) {
+    store.set_provider_key(agent, None);
+}
+
+/// Which agents currently hold a key. Set membership only -- never a key itself.
+#[tauri::command]
+fn provider_keys_set(store: State<Arc<Store>>) -> Vec<crate::agent::AgentId> {
+    crate::agent::all_adapters()
+        .iter()
+        .map(|a| a.id())
+        .filter(|id| store.provider_key(*id).is_some())
+        .collect()
+}
+
+/// The endpoint one session should spawn on: the one it was switched to, else the agent's
+/// active default.
+///
+/// The pin is stored as the agent's own provider SLUG, because that is what the live switch
+/// sends and storing two different spellings of the same choice is how they drift.
+fn session_endpoint(
+    store: &Arc<Store>,
+    agent: crate::agent::AgentId,
+    session_id: &str,
+) -> crate::store::ProviderSettings {
+    let active = store.provider_settings(agent);
+    let Some(pinned) = store.session_provider(session_id) else {
+        return active;
+    };
+    let pool = store.endpoint_pool(agent);
+    let slugs = crate::agent::adapter_for(agent).pooled_provider_slugs(&pool);
+    pool.into_iter()
+        .zip(slugs)
+        .find(|(_, slug)| slug.as_deref() == Some(pinned.as_str()))
+        .map(|(e, _)| e)
+        .unwrap_or(active)
+}
+
+/// One pooled endpoint as the UI renders it. Never carries a key -- only whether one is
+/// held, which is all a form needs to decide between "Add key" and "Replace key".
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointView {
+    /// The whole endpoint, not a projection of it. The UI activates a pooled endpoint by
+    /// sending this back as the agent's settings, so anything dropped here (`enabled`,
+    /// `pinLocal`, `outputLimit`) would be silently reset the moment a row was clicked.
+    pub settings: crate::store::ProviderSettings,
+    /// True for the endpoint a new session of this agent spawns on.
+    pub active: bool,
+    pub has_key: bool,
+    /// What `/model --provider <slug>` accepts for this endpoint, or None when this agent
+    /// cannot be moved to it without a restart. The UI renders a chip for Some and a
+    /// "restart to apply" row for None -- see `ProviderAdapter::pooled_provider_slugs`.
+    pub provider_slug: Option<String>,
+}
+
+/// Every endpoint configured for one agent, with the slug each can be switched to live.
+#[tauri::command]
+fn endpoint_pool(agent: crate::agent::AgentId, store: State<Arc<Store>>) -> Vec<EndpointView> {
+    endpoint_pool_for(&store, agent)
+}
+
+fn endpoint_pool_for(store: &Arc<Store>, agent: crate::agent::AgentId) -> Vec<EndpointView> {
+    let pool = store.endpoint_pool(agent);
+    let active = store.provider_settings(agent).base_url.trim().to_string();
+    let slugs = crate::agent::adapter_for(agent).pooled_provider_slugs(&pool);
+    pool.into_iter()
+        .enumerate()
+        .map(|(i, e)| EndpointView {
+            active: !active.is_empty() && e.base_url.trim() == active,
+            has_key: store.provider_key_for(agent, &e.base_url).is_some(),
+            provider_slug: slugs.get(i).cloned().flatten(),
+            settings: e,
+        })
+        .collect()
+}
+
+/// Every agent's pool at once, so the settings tab renders from ONE read rather than one
+/// round trip per agent -- the same shape `get_all_provider_settings` has.
+#[tauri::command]
+fn all_endpoint_pools(
+    store: State<Arc<Store>>,
+) -> std::collections::HashMap<crate::agent::AgentId, Vec<EndpointView>> {
+    store
+        .all_endpoint_pools()
+        .into_keys()
+        .map(|agent| {
+            let views = endpoint_pool_for(&store, agent);
+            (agent, views)
+        })
+        .collect()
+}
+
+/// Replace one agent's endpoint pool. The UI edits a list and sends the list back; see
+/// `Store::set_endpoint_pool` for why there is no per-entry add/remove.
+#[tauri::command]
+fn set_endpoint_pool(
+    agent: crate::agent::AgentId,
+    endpoints: Vec<crate::store::ProviderSettings>,
+    store: State<Arc<Store>>,
+) {
+    store.set_endpoint_pool(agent, endpoints);
+}
+
+/// Hold the key for ONE endpoint in memory for this app run. A blank key clears it.
+/// Per endpoint rather than per agent because a pool routinely holds a keyed cloud endpoint
+/// beside a keyless local one. Never persisted; reaches a child only via its process env.
+#[tauri::command]
+fn set_endpoint_key(
+    agent: crate::agent::AgentId,
+    base_url: String,
+    key: String,
+    store: State<Arc<Store>>,
+) {
+    store.set_provider_key_for(agent, &base_url, Some(key));
+}
+
+#[tauri::command]
+fn clear_endpoint_key(agent: crate::agent::AgentId, base_url: String, store: State<Arc<Store>>) {
+    store.set_provider_key_for(agent, &base_url, None);
+}
+
 // `(async)` on a sync fn: run it on the thread pool instead of inline on the IPC (main)
 // thread. Destroying a session SIGKILLs a child, reaps it, tears down its tmux session and
 // rewrites state.json -- seconds of work in the worst case, and every one of them a frozen
@@ -1961,6 +2403,11 @@ fn remove_session(
 ) {
     pty.kill(&session_id);
     pty.kill(&format!("{session_id}::term"));
+    // A Hermes session owns a generated overlay directory under the data dir. Deleting the
+    // session without it would leave one directory per session ever created. Unconditional
+    // (and ignoring failure) because it is a cheap no-op for every other agent.
+    crate::hermes::remove_managed_config(&session_id);
+    crate::session_files::remove_for(&session_id);
     store.remove_session(&project_id, &session_id);
 }
 
@@ -2005,6 +2452,7 @@ fn stop_session(
     // The status mirror is hook-driven; with the agent gone no hook will ever clear a
     // stale "running", which would keep the quit guard warning about a dead process.
     fleet.set_running(&session_id, false);
+    store.set_session_agent_state(&session_id, Some("idle"));
     store.set_session_stopped(&session_id, true);
 }
 
@@ -2038,6 +2486,7 @@ fn stop_idle_sessions(
         pty.retire(id);
         pty.retire(&format!("{id}::term"));
         fleet.set_running(id, false);
+        store.set_session_agent_state(id, Some("idle"));
         store.set_session_stopped(id, true);
     }
     targets
@@ -2083,6 +2532,16 @@ fn heuristic_name(prompt: &str) -> String {
     }
 }
 
+/// The titler's `claude` invocation. A title needs no tools and leaves nothing behind:
+/// `--strict-mcp-config` with no `--mcp-config` starts ZERO MCP servers (without it every
+/// title launched the user's whole stdio fleet, measured at 9 processes on one machine),
+/// and `--no-session-persistence` keeps one throwaway transcript per title out of the
+/// transcript store.
+const TITLER_COMMAND: &str = "claude -p --model haiku --strict-mcp-config --no-session-persistence";
+
+/// A title arrives in seconds; past this the attempt is abandoned and its tree killed.
+const TITLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// Pipe an instruction to `claude -p --model haiku` and sanitize the title.
 /// Returns None on spawn failure / non-zero exit / empty output.
 fn claude_title(prompt: &str) -> Option<String> {
@@ -2107,16 +2566,22 @@ fn claude_title(prompt: &str) -> Option<String> {
     let mut builder = {
         let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
         let mut c = Command::new(shell);
-        c.args(["/C", "claude -p --model haiku"]);
+        c.args(["/C", TITLER_COMMAND]);
         c
     };
     #[cfg(not(windows))]
     let mut builder = {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let mut c = Command::new(shell);
-        c.args(["-i", "-l", "-c", "claude -p --model haiku"]);
+        c.args(["-i", "-l", "-c", TITLER_COMMAND]);
         c
     };
+    // Its own scratch directory, never Conduit's working directory: that is
+    // `C:\Program Files\Conduit` for an installed app (or System32 after an MSI relaunch),
+    // and a `claude` started there reads that folder as its project.
+    let scratch = crate::store::data_dir().join("titler");
+    let _ = std::fs::create_dir_all(&scratch);
+    builder.current_dir(&scratch);
     // See pty.rs: strip the package-manager-injected `npm_config_prefix` so nvm
     // initializes and `claude` is on PATH even when Conduit was launched via pnpm.
     // `user_path` covers the Windows half of the same problem: cmd.exe has no rc file to
@@ -2142,12 +2607,37 @@ fn claude_title(prompt: &str) -> Option<String> {
         // stdin dropped here → EOF, so `claude -p` reads the full prompt.
     }
 
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
+    // Read stdout on a thread and wait with a deadline. The old unbounded
+    // `wait_with_output` meant a `claude` stuck on startup (auth, network) kept its
+    // process alive for as long as Conduit ran.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + TITLER_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            _ => {
+                // Over time (or unwaitable): end the whole tree and give up on the title. The
+                // reader is not joined -- if a straggler still holds the pipe it would block.
+                crate::pty::kill_process_tree(&mut child);
+                return None;
+            }
+        }
+    };
+    let output = reader.join().ok()?;
+    if !status.success() {
         return None;
     }
 
-    let title = sanitize_title(&String::from_utf8_lossy(&output.stdout));
+    let title = sanitize_title(&String::from_utf8_lossy(&output));
     if title.is_empty() {
         None
     } else {
@@ -2182,22 +2672,22 @@ fn sanitize_title(raw: &str) -> String {
 
 // ---- Git (read-only) ---------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_branch(dir: String) -> Option<String> {
     git::current_branch(&dir)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_changes(dir: String) -> Vec<git::Change> {
     git::changes(&dir)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_commits(dir: String) -> Vec<git::Commit> {
     git::commits(&dir, 8)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn git_graph(dir: String) -> Vec<git::GraphCommit> {
     git::graph(&dir, 80)
 }
@@ -2293,7 +2783,7 @@ fn format_content(
     format::format_content(&dir, &path, &content)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resolve_prettier_options(path: String) -> Option<format::PrettierConfig> {
     format::resolve_prettier_config(std::path::Path::new(&path))
 }
@@ -2309,7 +2799,7 @@ fn hotexit_save(
     state.save_for(window.label(), &entries)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn hotexit_load() -> Vec<hotexit::HotExitEntry> {
     hotexit::load()
 }
@@ -2330,17 +2820,17 @@ fn worktree_remove(repo_path: String, worktree_path: String, force: bool) -> Res
 
 // ---- Read-only filesystem (Files tab + viewer) ------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_dir(dir: String) -> Vec<fsops::DirEntry> {
     fsops::list_dir(&dir)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn dir_exists(path: String) -> bool {
     fsops::dir_exists(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_file(path: String) -> fsops::FileContent {
     fsops::read_file(&path)
 }
@@ -2350,7 +2840,7 @@ fn write_file(path: String, content: String) -> Result<fsops::FileStat, String> 
     fsops::write_file(&path, &content)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn stat_file(path: String) -> fsops::FileStat {
     fsops::stat_file(&path)
 }
@@ -2375,12 +2865,12 @@ fn delete_path(path: String) -> Result<(), String> {
     fsops::delete_path(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_file_base64(path: String) -> Result<fsops::FileBase64, String> {
     fsops::read_file_base64(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resolve_terminal_path(base: String, token: String) -> Option<fsops::ResolvedPath> {
     fsops::resolve_terminal_path(&base, &token)
 }
@@ -2397,7 +2887,19 @@ fn set_dirty_count(window: tauri::Window, count: usize, dirty: State<DirtyGuard>
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle, pty: State<Arc<PtyManager>>) {
     pty.kill_all();
+    app.state::<Arc<root_chat::RootChatState>>().kill_all();
     app.exit(0);
+}
+
+/// End every session cleanly before an update installer takes over. On Windows the
+/// updater exits the app itself the moment `install()` runs (`std::process::exit`), so
+/// neither `ExitRequested` nor `quit_app` ever fires and nothing tree-kills the agents. The
+/// frontend calls this between `download()` and `install()`. Activity was persisted as it
+/// happened, so the sessions that were working come back on the next launch.
+#[tauri::command(async)]
+fn prepare_for_update(app: tauri::AppHandle, pty: State<Arc<PtyManager>>) {
+    pty.kill_all();
+    app.state::<Arc<root_chat::RootChatState>>().kill_all();
 }
 
 // ---- Notifications -----------------------------------------------------------
@@ -2519,7 +3021,7 @@ fn install_agent(agent: crate::agent::AgentId) -> Result<String, String> {
 /// Open a directory in VS Code. Tries the `code` CLI first (cross-platform), then
 /// falls back to launching by macOS bundle id / app name so it still works when the
 /// `code` shell command isn't installed.
-#[tauri::command]
+#[tauri::command(async)]
 fn open_in_vscode(dir: String) -> Result<(), String> {
     use std::process::Command;
 
@@ -2574,7 +3076,7 @@ fn open_in_vscode(dir: String) -> Result<(), String> {
 /// shell-out approach (no `tauri-plugin-opener`/`shell` dependency): Windows via cmd's
 /// `start`, macOS via `open`, Linux via `xdg-open`. Only http(s) URLs are ever passed
 /// to the shell.
-#[tauri::command]
+#[tauri::command(async)]
 fn open_external(url: String) -> Result<(), String> {
     use std::process::Command;
 
@@ -2608,7 +3110,7 @@ fn open_external(url: String) -> Result<(), String> {
 /// platform supports selection (Finder `open -R`, Explorer `/select,`). Same
 /// shell-out doctrine as `open_external`: args passed positionally, never through
 /// a shell.
-#[tauri::command]
+#[tauri::command(async)]
 fn reveal_path(path: String) -> Result<(), String> {
     use std::process::Command;
 
@@ -2685,6 +3187,7 @@ pub fn run() {
         .manage(Arc::new(TaskBoard::default()))
         .manage(Arc::new(claude_usage::ClaudeAuth::default()))
         .manage(Arc::new(agy_usage::AgyUsageState::default()))
+        .manage(Arc::new(agy_usage::AgyContextState::default()))
         .manage(Arc::new(agy_usage::AgyResumeState::default()))
         .manage(Arc::new(root_chat::RootChatState::default()))
         .manage(Arc::new(hookbus::HookBus::default()))
@@ -2761,6 +3264,17 @@ pub fn run() {
             let store = app.state::<Arc<Store>>().inner().clone();
             let tasks = app.state::<Arc<TaskBoard>>().inner().clone();
 
+            // Windows: never let a child inherit Conduit's own working directory. For the
+            // installed app that is `C:\Program Files\Conduit`, and after an MSI update it can
+            // be System32; any spawn that forgets `current_dir` would otherwise start an agent
+            // there and it would treat that folder as its project. The data dir is ours.
+            // Also write the hook relays before the first session installs hooks that call them.
+            #[cfg(windows)]
+            {
+                let _ = std::env::set_current_dir(crate::store::data_dir());
+                crate::hooks::write_hook_relays();
+            }
+
             // Wire the store-saved broadcast. Fires after every persisted store write.
             let gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let handle = app.handle().clone();
@@ -2772,6 +3286,10 @@ pub fn run() {
             }));
             let agy_usage = app
                 .state::<Arc<crate::agy_usage::AgyUsageState>>()
+                .inner()
+                .clone();
+            let agy_context = app
+                .state::<Arc<crate::agy_usage::AgyContextState>>()
                 .inner()
                 .clone();
             let agy_resume = app
@@ -2804,6 +3322,7 @@ pub fn run() {
                 pty.clone(),
                 board.clone(),
                 agy_usage,
+                agy_context,
                 agy_resume,
                 reg,
                 pending_opens,
@@ -2908,6 +3427,7 @@ pub fn run() {
                         .flat_map(|s| [format!("{}::term", s.id), s.id])
                         .collect();
                     crate::scrollback::sweep(&live);
+                    crate::session_files::sweep(&live);
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(20));
                         pty_for_sb.save_scrollback();
@@ -2923,9 +3443,15 @@ pub fn run() {
             {
                 let fleet_for_sweep = fleet.clone();
                 let app_for_sweep = app.handle().clone();
+                let store_for_stale = store.clone();
                 std::thread::spawn(move || loop {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                     let swept = fleet_for_sweep.sweep_stale_working();
+                    // A stale "running" must not survive into state.json either, or the next
+                    // launch would resume a session nothing was happening in.
+                    for id in &swept {
+                        store_for_stale.set_session_agent_state(id, Some("idle"));
+                    }
                     if !swept.is_empty() {
                         let _ = app_for_sweep.emit("session-stale", swept);
                     }
@@ -2973,6 +3499,9 @@ pub fn run() {
             claude_conversation_drift,
             adopt_claude_conversation,
             set_session_persistence,
+            set_keep_agents_in_project,
+            remove_stray_nul_files,
+            busy_sessions,
             any_agent_running,
             load_projects,
             add_project,
@@ -3033,6 +3562,9 @@ pub fn run() {
             set_project_default_account,
             set_account_agents,
             set_session_account,
+            set_session_model,
+            set_session_effort,
+            switch_session_model,
             get_trust_settings,
             set_trust_settings,
             set_session_trust,
@@ -3042,6 +3574,21 @@ pub fn run() {
             set_opencode_key,
             clear_opencode_key,
             opencode_key_set,
+            get_provider_settings,
+            get_all_provider_settings,
+            set_provider_settings,
+            set_provider_key,
+            clear_provider_key,
+            provider_keys_set,
+            endpoint_pool,
+            all_endpoint_pools,
+            set_endpoint_pool,
+            set_endpoint_key,
+            clear_endpoint_key,
+            openrouter_usage::openrouter_usage,
+            agent_profile::agent_profile,
+            agent_profile::write_agent_memory,
+            agent_profile::write_agent_skill,
             local_llm::detect_local_providers,
             local_llm::list_local_models,
             local_llm::probe_tool_call,
@@ -3076,6 +3623,7 @@ pub fn run() {
             read_file_base64,
             set_dirty_count,
             quit_app,
+            prepare_for_update,
             resolve_terminal_path,
             notify_user,
             open_in_vscode,
@@ -3087,10 +3635,16 @@ pub fn run() {
             routing::agent_routes,
             routing::set_agent_route,
             routing::task_kinds,
+            orchestration_policy::orchestration_policy_view,
+            orchestration_policy::set_orchestration_overlay,
+            orchestration_policy::export_orchestration_policy,
+            orchestration_policy::preview_orchestration_import,
+            orchestration_policy::import_orchestration_policy,
             commandcode_config::command_code_config,
             commandcode_config::set_command_code_config,
             commandcode_config::command_code_models,
             commandcode_usage::fetch_command_code_usage,
+            codex_usage::fetch_codex_usage,
             claude_usage::connect_claude_plan_usage,
             agy_usage::fetch_agy_usage,
             agy_usage::agy_usage_tracking_enabled,
@@ -3112,8 +3666,125 @@ pub fn run() {
         .run(|app_handle, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 app_handle.state::<Arc<PtyManager>>().kill_all();
+                app_handle
+                    .state::<Arc<root_chat::RootChatState>>()
+                    .kill_all();
             }
         });
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use crate::agent::AgentId;
+    use crate::store::ProviderSettings;
+
+    fn ep(preset: &str, url: &str, model: &str) -> ProviderSettings {
+        ProviderSettings {
+            enabled: true,
+            preset: preset.into(),
+            base_url: url.into(),
+            model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A real `Store` on a throwaway directory. Mirrors `store::tests::temp_dir` rather
+    /// than sharing it: that helper lives inside store.rs's own `mod tests`.
+    fn store_with_pool() -> Arc<Store> {
+        let dir = std::env::temp_dir().join(format!(
+            "conduit_ep_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::for_test(&dir));
+        store.set_endpoint_pool(
+            AgentId::Hermes,
+            vec![
+                ep("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-5"),
+                ep("ollama", "http://127.0.0.1:11434/v1", "qwen3:30b-a3b"),
+            ],
+        );
+        store
+    }
+
+    /// A caller types what it knows. Both the preset name a human would write on the CLI
+    /// and the slug a live switch produces must land on the SAME stored value -- otherwise
+    /// `session_endpoint` never matches it and the session quietly spawns on the default.
+    #[test]
+    fn a_named_provider_resolves_to_the_agents_own_slug() {
+        let store = store_with_pool();
+        assert_eq!(
+            resolve_provider_slug(&store, AgentId::Hermes, "openrouter"),
+            "custom:conduit-openrouter"
+        );
+        assert_eq!(
+            resolve_provider_slug(&store, AgentId::Hermes, "custom:conduit-ollama"),
+            "custom:conduit-ollama"
+        );
+        // Unknown names pass through rather than being dropped: a first-class provider the
+        // agent knows and Conduit does not should still reach it.
+        assert_eq!(
+            resolve_provider_slug(&store, AgentId::Hermes, "anthropic"),
+            "anthropic"
+        );
+        // An agent that cannot be switched has no slugs, so nothing is rewritten.
+        assert_eq!(
+            resolve_provider_slug(&store, AgentId::OpenCode, "openrouter"),
+            "openrouter"
+        );
+    }
+
+    /// The other half of the live switch: a session that was moved comes back on the
+    /// endpoint it was moved TO, not on the agent's current default.
+    #[test]
+    fn a_switched_session_respawns_on_its_own_endpoint() {
+        let store = store_with_pool();
+        store.set_provider_settings(
+            AgentId::Hermes,
+            ep("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-5"),
+        );
+        let p = store.add_project("/tmp/proj".to_string(), None);
+        let sess = store
+            .add_session(
+                &p.id,
+                "s".into(),
+                false,
+                AgentId::Hermes,
+                Default::default(),
+            )
+            .expect("session");
+
+        // Never switched -> the agent's active endpoint.
+        assert_eq!(
+            session_endpoint(&store, AgentId::Hermes, &sess.id).preset,
+            "openrouter"
+        );
+
+        store.set_session_provider(&sess.id, Some("custom:conduit-ollama".into()));
+        assert_eq!(
+            session_endpoint(&store, AgentId::Hermes, &sess.id).preset,
+            "ollama",
+            "a switched session keeps its endpoint across a restart"
+        );
+
+        // An endpoint deleted since the switch degrades to the default, never to nothing:
+        // a session with no endpoint at all would silently lose its routing.
+        store.set_endpoint_pool(
+            AgentId::Hermes,
+            vec![ep(
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "openai/gpt-5",
+            )],
+        );
+        assert_eq!(
+            session_endpoint(&store, AgentId::Hermes, &sess.id).preset,
+            "openrouter"
+        );
+    }
 }
 
 #[cfg(test)]

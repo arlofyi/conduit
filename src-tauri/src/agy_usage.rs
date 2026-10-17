@@ -79,6 +79,55 @@ pub struct AgyContext {
 #[derive(Default)]
 pub struct AgyUsageState(pub Mutex<HashMap<String, AgyUsage>>);
 
+/// Context is conversation-specific, unlike account-wide quota. The posting hook identifies
+/// the exact Conduit session; never reuse an account snapshot for another session.
+#[derive(Default)]
+pub struct AgyContextState(pub Mutex<HashMap<String, crate::context_window::ContextUsage>>);
+
+impl AgyContextState {
+    pub fn set(&self, session_id: &str, context: &AgyContext) {
+        let (Ok(window), true) = (
+            u64::try_from(context.context_window_size),
+            context.used_percentage.is_finite() && (0.0..=100.0).contains(&context.used_percentage),
+        ) else {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(session_id);
+            return;
+        };
+        if window == 0 {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(session_id);
+            return;
+        }
+        let used = (window as f64 * context.used_percentage / 100.0).round() as u64;
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            session_id.into(),
+            crate::context_window::ContextUsage {
+                used,
+                window,
+                fraction: used as f64 / window as f64,
+                model: None,
+                source: "agy-status-line".into(),
+                observed_at: crate::context_window::now_ms(),
+            },
+        );
+    }
+
+    pub fn get(&self, session_id: &str) -> Option<crate::context_window::ContextUsage> {
+        let reading = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()?;
+        (crate::context_window::now_ms() - reading.observed_at < 120_000).then_some(reading)
+    }
+}
+
 impl AgyUsageState {
     /// Replace the snapshot for `key` (the resolved account, or "default").
     pub fn set(&self, key: String, u: AgyUsage) {
@@ -778,6 +827,26 @@ mod tests {
         a2.account_id = Some("acc-a".into());
         state.set("acc-a".into(), a2);
         assert_eq!(state.all().len(), 2, "same key replaces in place");
+    }
+
+    #[test]
+    fn context_is_per_session_and_rejects_bad_denominator() {
+        let state = AgyContextState::default();
+        let mut context = AgyContext {
+            used_percentage: 25.0,
+            context_window_size: 100_000,
+            ..Default::default()
+        };
+        state.set("first", &context);
+        assert_eq!(state.get("first").unwrap().used, 25_000);
+        assert!(state.get("second").is_none());
+        context.context_window_size = 0;
+        state.set("second", &context);
+        assert!(state.get("second").is_none());
+        context.context_window_size = 100_000;
+        context.used_percentage = f64::NAN;
+        state.set("second", &context);
+        assert!(state.get("second").is_none());
     }
 
     #[test]

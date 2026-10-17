@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useStore } from "../store";
 
 /**
- * Keeps `sessionContext` fed for the open project's sessions.
+ * Keeps `sessionContext` fed for every project's sessions, including global canvas cards.
  *
  * The number lives in each session's Claude transcript, which is a file on disk — so this
  * is a read, not a subscription, and the interesting question is only *when* to read.
@@ -22,16 +22,12 @@ const RUNNING_POLL_MS = 15_000;
 
 export function useSessionContext(): void {
   const projects = useStore((s) => s.projects);
-  const selectedProjectId = useStore((s) => s.selectedProjectId);
-
-  // Session ids of the open project, as a stable string so the effects below re-run when
+  // Session ids, as a stable string so the effects below re-run when
   // the membership changes rather than on every store write.
-  const project = projects.find((p) => p.id === selectedProjectId);
-  const ids = (project?.sessions ?? []).map((s) => s.id);
+  const ids = projects.flatMap((p) => p.sessions.map((s) => s.id));
   const idsKey = ids.join(",");
 
-  // Read once whenever the open project's session list changes — covers app start, opening
-  // a project, and creating a session.
+  // Read once whenever session membership changes — covers app start and new sessions.
   useEffect(() => {
     if (!idsKey) return;
     const { refreshSessionContext } = useStore.getState();
@@ -54,13 +50,24 @@ export function useSessionContext(): void {
     };
   }, []);
 
+  useEffect(() => {
+    const unlisten = listen<string>("agycontext", ({ payload }) => {
+      void useStore.getState().refreshSessionContext(payload);
+    });
+    return () => { void unlisten.then((f) => f()); };
+  }, []);
+
   // Creep the meter up during a long turn.
   useEffect(() => {
     if (!idsKey) return;
     const t = setInterval(() => {
       const st = useStore.getState();
       for (const id of idsRef.current.split(",")) {
-        if (st.live[id]?.status === "running") void st.refreshSessionContext(id);
+        const reading = st.sessionContext[id];
+        const staleAfter = reading?.source === "agy-status-line" ? 110_000 : 29 * 60_000;
+        if (st.live[id]?.status === "running" || (reading?.observedAt && Date.now() - reading.observedAt > staleAfter)) {
+          void st.refreshSessionContext(id);
+        }
       }
     }, RUNNING_POLL_MS);
     return () => clearInterval(t);

@@ -22,7 +22,7 @@ type ShimStatus = {
  * The (i) button lives OUTSIDE the <label> on purpose: inside it, expanding the
  * explanation would also flip the checkbox.
  */
-function SettingRow({
+export function SettingRow({
   id,
   title,
   detail,
@@ -86,8 +86,6 @@ function SettingRow({
 export function GeneralSettings() {
   const openBehavior = useStore((s) => s.openBehavior);
   const setOpenBehavior = useStore((s) => s.setOpenBehavior);
-  const restoreSessionsOnOpen = useStore((s) => s.restoreSessionsOnOpen);
-  const setRestoreSessionsOnOpen = useStore((s) => s.setRestoreSessionsOnOpen);
   const announceAsIde = useStore((s) => s.announceAsIde);
   const setAnnounceAsIde = useStore((s) => s.setAnnounceAsIde);
   const persistSessions = useStore((s) => s.persistSessions);
@@ -173,14 +171,6 @@ export function GeneralSettings() {
         checked={openBehavior === "last"}
         onChange={(on) => setOpenBehavior(on ? "last" : "none")}
         detail="Come back to whichever project you were in when you quit. Off = Conduit opens with nothing selected and waits for you to pick. Either way it never opens the topmost project just for being topmost, and the first launch after an update has nothing to remember yet, so it starts empty once."
-      />
-
-      <SettingRow
-        id="restore-sessions"
-        title="Restore sessions when opening a project"
-        checked={restoreSessionsOnOpen}
-        onChange={setRestoreSessionsOnOpen}
-        detail="Relaunch and resume every session of a project the moment you open it — Claude and agy reopen the conversation where you left off — instead of waiting for a click. Off = sessions spawn only when you click their tab."
       />
 
       <SettingRow

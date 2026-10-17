@@ -20,6 +20,15 @@ pub struct RootChatState {
 impl RootChatState {
     /// True if any turn is mid-stream. Reaps exited children first so a finished child
     /// can't hold the quit guard open.
+    /// End every streaming turn. Called on app exit: these children live outside the PTY
+    /// manager, so `kill_all` never reached them and a mid-turn chat outlived the app.
+    pub fn kill_all(&self) {
+        let mut map = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, mut child) in map.drain() {
+            crate::pty::kill_process_tree(&mut child);
+        }
+    }
+
     pub fn any_running(&self) -> bool {
         let mut map = self.children.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, c| matches!(c.try_wait(), Ok(None)));
@@ -202,7 +211,9 @@ pub fn root_chat_stop(chat_id: String, state: State<Arc<RootChatState>>) {
         .unwrap_or_else(|e| e.into_inner())
         .get_mut(&chat_id)
     {
-        let _ = c.kill();
+        // A tree kill: `c` is the `cmd.exe /C` wrapper, and killing only it on Windows left
+        // the real `claude -p` running the turn to the end.
+        crate::pty::kill_process_tree(c);
     }
 }
 
@@ -232,7 +243,7 @@ pub fn history_items(store: &crate::store::Store, chat_id: &str) -> Vec<Value> {
 /// Replay a chat's history from its transcript on disk — the same parser the live
 /// stream uses, so reopen renders exactly what streaming rendered. Missing transcript
 /// (fresh chat, deleted store) degrades to empty, per the transcript-consumer rule.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn root_chat_history(chat_id: String, store: State<Arc<crate::store::Store>>) -> Vec<Value> {
     history_items(&store, &chat_id)
 }

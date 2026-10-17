@@ -843,6 +843,8 @@ function SessionContextMenu() {
   const accounts = useStore((s) => s.accounts);
   const setSessionAccount = useStore((s) => s.setSessionAccount);
   const stopSession = useStore((s) => s.stopSession);
+  const keepRunning = useStore((s) => s.keepRunning);
+  const toggleKeepRunning = useStore((s) => s.toggleKeepRunning);
   const startSession = useStore((s) => s.startSession);
   const stopIdleSessions = useStore((s) => s.stopIdleSessions);
   const pushToast = useStore((s) => s.pushToast);
@@ -1126,6 +1128,17 @@ function SessionContextMenu() {
       >
         {menuSession?.stopped ? "Start session" : "Stop session"}
       </button>
+      {menuSession && (
+        <button
+          onClick={() => {
+            toggleKeepRunning(menuSession.id);
+            closeMenu();
+          }}
+          title="Never stop this session automatically after its agent finishes. Use it for an agent waiting on something Conduit cannot see, like a remote job."
+        >
+          {keepRunning[menuSession.id] ? "✓ Keep running (no auto-stop)" : "Keep running (no auto-stop)"}
+        </button>
+      )}
       <button onClick={toggleSensitive} title="Silo this session: no other agent can read it">
         {siloed ? "Clear sensitive mark" : "Mark sensitive (silo)"}
       </button>

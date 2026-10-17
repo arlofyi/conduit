@@ -99,31 +99,58 @@ grep -E '"?version"?\s*[:=]\s*"[0-9]' package.json src-tauri/tauri.conf.json; se
 
 ### When to bump (SemVer, pre-1.0)
 
-Conduit is `0.MINOR.PATCH` until its first stable public release. Bump **once per release
-that reaches a user** (one bump covers every change in that release), not per commit:
+**A version marks an INSTALLABLE ARTIFACT, never a commit.** The trigger is building an
+installer someone will actually run — not finishing a feature, not passing the gate, not
+landing a branch. Work that is merged but never built is not a release and must not consume
+a number.
 
-- **MINOR** (`0.X.0`) — a shipped, user-facing **feature or feature set** (e.g. multi-account
-  accounts, the usage bar). Reset PATCH to `0`.
+This is the rule most easily broken while working fast. On 2026-09-19 six versions
+(`0.37.1` → `0.41.0`) were cut in one day, one per feature batch, and at least two of them
+were never installed by anyone — numbers spent on artifacts that never existed. The fix is
+mechanical and lives below: **features accumulate under `## Unreleased`, and the number is
+stamped at build time.**
+
+Conduit is `0.MINOR.PATCH` until its first stable public release. Size is decided by the
+*largest* change in the release:
+
+- **MINOR** (`0.X.0`) — the release contains any user-facing **new capability**. Reset PATCH
+  to `0`. One MINOR covers every change in that release, however many features it carries.
 - **PATCH** (`0.x.Y`) — bug fixes, polish, perf, refactors, docs: **no** new user-facing
-  capability.
+  capability anywhere in the release.
 - **MAJOR** stays `0` until the first stable public release, which is `1.0.0`; after that,
   breaking changes bump MAJOR.
 
+**Never number a feature as a PATCH to keep the minor number small.** Pre-1.0 the
+MINOR-vs-PATCH split is the only signal the scheme carries, and a feature filed as a patch
+is invisible to anyone scanning for what is new. There is no such thing as too many minors;
+a high minor number costs nothing, a dishonest one costs the reader. (The `0.x.y` =
+"x breaking / y everything else" convention some pre-1.0 *libraries* use does not apply
+here: it exists to warn downstream code about API breakage, and Conduit has no API
+consumers — only users asking "what can I do now that I couldn't before".)
+
 A `-N` build suffix (e.g. `0.5.0-3`) is only for iterating installers of the *same* target
-during testing — a real feature release gets a clean `0.x.0`. Don't bump as a side effect of
-an unrelated change; do bump when the release adds or fixes something a user would notice.
+during testing — a real feature release gets a clean `0.x.0`.
 
-### Keeping the changelog (do this every version bump)
+### Keeping the changelog
 
-`CHANGELOG.md` is the source of truth for what shipped when, and **every version bump must
-add a matching entry in the same change** — never bump the three version files without one.
-The top entry's version must equal the version in the three files above; a bump that leaves
-the changelog behind is incomplete work.
+`CHANGELOG.md` is the source of truth for what shipped when. It is written in TWO steps, and
+separating them is what stops a version being spent on an artifact nobody installs.
 
-- **One entry per increment, granular.** Each user-facing feature or feature set gets its own
-  **MINOR** entry; each fix/polish batch gets its own **PATCH** entry. Do **not** bucket
-  several people's unrelated features under one version — split them into separate increments
-  so the log reads as a logical timeline.
+**1. Every change lands under `## Unreleased`, immediately.** A feature is not done until its
+bullets are there. No version number is chosen, and the three version files are NOT touched.
+
+**2. At installer build time, stamp it.** Rename `## Unreleased` to `## X.Y.Z — YYYY-MM-DD`,
+bump the three version files to match, run `cargo build` so `Cargo.lock` follows, and build.
+That single commit is the release. Then add a fresh empty `## Unreleased` above it.
+
+A version bump with no matching changelog entry — or a stamped entry whose version disagrees
+with the three files — is incomplete work.
+
+- **Bullets stay granular; the RELEASE does not.** Each user-facing feature gets its own
+  bullet, and unrelated features are never merged into one vague line. But many bullets
+  belong under one version — that is what a release *is*. (This used to read "one entry per
+  increment", which was about keeping bullets distinct and was misread as "one version per
+  feature". That misreading is what produced six versions in a day.)
 - **Header format:** `## X.Y.Z — YYYY-MM-DD`, newest first. **No contributor names**, no
   author attribution — describe the change, not who made it.
 - **Bullets:** `- **Added|Changed|Fixed — short title.** user-facing description.` Write for
@@ -163,6 +190,21 @@ the changelog behind is incomplete work.
   login shell and `claude` falls off `PATH`. Both spawn sites — `pty.rs` and the
   `claude -p` titler in `lib.rs` — call `env_remove("npm_config_prefix")`. Keep that when
   editing spawn code.
+- **A command that spawns a process or reads more than a small file must be
+  `#[tauri::command(async)]`.** A plain sync Tauri command runs on the main (UI) thread on
+  every platform, and that thread also carries `pty_write` and every terminal-output
+  `Channel` delivery — so a polled `git` call there makes typed text appear late, and a
+  slow repo (seconds, e.g. cloud-synced) makes the whole app stall. `(async)` on a sync fn
+  runs it on the thread pool with no signature change. `pty_write` / `pty_resize` stay sync
+  on purpose: they are cheap, and their ORDER is the keystroke order. `pty_spawn` is
+  off-thread under two locks — `SPAWN_GATE` (lib.rs) keeps spawns one-at-a-time because
+  their setup read-modify-writes files sessions share, and `PtyManager`'s `lifecycle` keeps
+  a spawn and a teardown of the same session from interleaving — and `Terminal.tsx` holds
+  keystrokes until its spawn resolves.
+- **Terminal output is coalesced, not sent per read** (`pty::next_output_batch`,
+  `OUTPUT_FRAME`). Each send is one script evaluation on the UI thread, and TUI agents repaint
+  in many small writes. The first chunk after a quiet spell is never held, so keystroke echo
+  stays immediate; only a stream is merged into ≤ one frame per `OUTPUT_FRAME`.
 - **Secrets.** The plan-usage path reads Claude Code's OAuth token from the macOS Keychain
   (`security find-generic-password`) only on explicit user action, holds it in memory, and
   never writes it to disk. Don't log the token or persist it.
@@ -388,6 +430,53 @@ a prompt (or a spaced path) on the command line, not one of them.
 - `hooks::write_codex_result_script` predates this and works around the same re-parse
   locally; it is still needed for its own reasons, but new code should not hand-roll another
   one -- put it in the spawn script.
+
+## Where the Windows hook relay lives
+
+Claude Code runs hook commands through **Git Bash** on Windows, not cmd.exe. Bash never
+expands `%VAR%` and turns `>NUL` into a FILE, so the old inline cmd-syntax hook sent
+`session=%CONDUIT_SESSION_ID%` (every event dropped by the provenance gate) and left
+`NUL` files in agents' working dirs.
+
+- `hooks::command` / `ask_command` emit only `"<dataDir>/conduit-hook.cmd" <event> <port>`
+  (forward slashes: they survive a shell that drops quotes, backslashes do not). The
+  relays (`HOOK_RELAY_CMD`, `ASK_RELAY_CMD`, written by `write_hook_relays`) run under
+  cmd's own rules, prefer the session's `CONDUIT_HOOK_PORT`, post nothing without
+  `CONDUIT_SESSION_ID`, and keep the reply off stdout (`-o NUL`) except for `/ask`.
+- **Never put `%VAR%`, a redirect or `||` back into a Windows hook command string.** A
+  test (`windows_hook_commands_are_shell_neutral`) pins it.
+- `session_files::remove_stray_nul_files` cleans up the old files; it needs `\\?\`
+  paths because `NUL` is a device name.
+
+## Where the session lifecycle lives
+
+`src/sessionLifecycle.ts` (pure, tested) decides which sessions start and stop by
+themselves; prefs are Settings → Sessions (`SessionSettings.tsx`, stored as
+`conduit.sessionLifecycle`).
+
+- **Launch:** `store.load` applies the rule once per run. Default `working`: only a session
+  whose persisted `Session.agentState` is `running` resumes by itself; every other session
+  is PARKED (`parkedSessions`) and its reveal path shows a hint instead of spawning. Opening
+  it (selectSession/openTab/setActiveTab/openToSide), a click or a key in the pane unparks
+  it. Sessions created during the run (incl. fleet workers) are never parked.
+- **`agentState` is written by the Rust hook listener on every status change**
+  (`store.set_session_agent_state`), not at quit -- a crash, End task or a Windows update
+  install runs no cleanup, so the last write must already be right. Stop paths and the
+  stale sweep write `idle`.
+- **Idle auto-stop** (`useAutoStopIdle`) calls the normal `stopSession` (RETIRE). Never a
+  `running` agent, a Conductor, or a session pinned "keep running" (`keepRunning`,
+  localStorage). **A hook `done` means the TURN ended, not the agent**: one that started a
+  background command waits after `Stop`, and stopping it killed that work (it killed the
+  agent that wrote this feature, mid CI-watch). So every candidate is checked first with
+  `busy_sessions` (`agent_activity.rs`): a shell at depth >= 2 under the session root is a
+  running command. MCP servers are spawned directly, never through a shell, so they never
+  count. If the check fails, nothing is stopped.
+- **Terminals mount lazily** in `WorkspaceCenter` (`mountedTerminals`): first shown,
+  launch-resumed, created this run, or the old `project` mode. Once mounted, never
+  unmounted -- the keep-alive rule is unchanged.
+- **Updates:** `installUpdate` is `download()` → `prepare_for_update` (kill_all) →
+  `install()`, because on Windows `install()` exits the process with no quit path.
+- Design: `docs/superpowers/specs/2026-10-16-session-lifecycle-and-hygiene-design.md`.
 
 ## Where the terminal renderer choice lives
 
@@ -766,6 +855,290 @@ A sixth agent (`npm i -g command-code`), fronting ~58 models from one subscripti
   It never writes `settings.json` (team-committed, and its `hooks` key belongs to the hook
   installer).
 - Design: `docs/superpowers/specs/2026-08-23-command-code-agent-design.md`.
+
+## Where Hermes Agent lives
+
+A seventh adapter (Nous Research, `hermes`), and the first one that arrived with a SUPERSET
+of what Conduit needs rather than a subset. Every flag below was verified against the
+installed CLI (`hermes --help`, `hermes chat --help`) and its own source, not from docs.
+
+- **Resume is PINNED, not captured.** `hermes chat -c <session-id> --create-if-missing`
+  means "resume the session titled `<id>`, creating it if absent", so the first spawn and
+  every later one are the SAME command. agy and Command Code both need their chosen id
+  scraped back after the fact; Hermes needs nothing, so **`Session.agent_conversation_id`
+  is deliberately unused by this adapter**. Do not wire it in later "for consistency" --
+  having nothing to capture is the feature.
+- **Its config arrives as a MANAGED-SCOPE OVERLAY, never by editing the user's files.**
+  Hermes has no project-scoped config; `hooks:` is read only from the profile's
+  `config.yaml`, which is machine-wide -- writing there is the exact failure
+  `hook_target_is_user_level` prevents for Claude. `HERMES_MANAGED_DIR` names a directory
+  whose `config.yaml` is deep-merged PER LEAF on top of the user's, is read from the
+  PROCESS env (so it is per-spawn), and is fail-open. `hermes.rs` writes
+  `<dataDir>/hermes/<session_id>/config.yaml`; `remove_managed_config` reaps it with the
+  session.
+- **`on_session_end` is NOT the end of the session.** It is fired by
+  `agent/turn_finalizer.py` ("run_conversation() runs once per message") and is the analogue
+  of Claude's `Stop` -> verb `stop`. The real session boundary is `on_session_finalize`
+  (`cli_session_mixin.py`) -> verb `sessionend`. Hermes' own telemetry agrees
+  (`finish_task` vs `close_session`). Swapping them leaves every session reading `running`
+  until the 20-minute stale watchdog, and fires `sessionend` after every turn.
+- **Hooks run with `shell=False`** (`shlex.split`), so the POSIX and cmd.exe hook command
+  forms are both wrong here -- no `${VAR}`, no redirection, no `|| true`. It is bare argv,
+  and the session id is BAKED IN rather than read from the env. Consequence: no equivalent
+  of Claude's endpoint-file layer that re-reads the live port at hook time.
+- **The API key MUST ride the provider's OWN env var**, never a Conduit-private one.
+  `hermes::key_env_var` maps preset -> `OPENROUTER_API_KEY` / `LM_API_KEY` /
+  `OPENAI_API_KEY`. The first cut wrote `api_key: "${CONDUIT_HERMES_APIKEY}"` into the
+  overlay, trusting its documented `${VAR}` expansion. The overlay IS applied (provider and
+  base URL resolve from it), but Hermes' credential resolver never reads `model.api_key`
+  from process env, so `resolve_runtime_provider` returned `api_key: ''` and the interactive
+  startup gate offered its "no inference provider is configured" wizard over a fully
+  configured endpoint. Measured: `CONDUIT_HERMES_APIKEY` -> `READY: False`,
+  `OPENROUTER_API_KEY` -> `READY: True`. Do NOT set `OPENAI_BASE_URL` alongside it --
+  `hermes_cli/main.py` reclassifies a resolved `openrouter` as `custom` when it is present.
+- **A key is handed over ONLY when an endpoint is configured.** Hermes INGESTS an env key
+  into its credential pool (`auth.json`), so a key passed to a session with no endpoint
+  would register a credential for a provider the user never picked. It stores a
+  `secret_fingerprint` + `source: env:<VAR>`, never the secret itself.
+- **`pre_approval_request` is what buys the `needsInput` badge** Command Code never got:
+  its payload carries no `notification_type`, and `status_rules::notification_status` reads
+  an absent type as the legacy `needsInput`. `post_approval_response` -> `pretool` clears it.
+- **`hooks_auto_accept: true` lives in the overlay, not in a flag.** Hermes prompts for
+  consent per `(event, command)` and a spawn has no TTY to answer. `--accept-hooks` /
+  `HERMES_ACCEPT_HOOKS=1` would auto-approve every hook in the MERGED config, including the
+  user's own; scoping it to the overlay keeps the widening in a file Conduit owns.
+- **Effort is spelled `--reasoning`.** That is why `ProviderAdapter::effort_flag` exists --
+  an unknown flag does not degrade, it makes argparse exit and the session fall through to
+  its bare `|| hermes chat` with the effort silently lost.
+- **Accounts redirect `HERMES_HOME` only**, not `HOME` -- Hermes documents a config-root
+  override, so the blast radius is one variable instead of the whole home. `hermes_home_dir`
+  is the ONE place a `.claude`-rooted account resolves to a Hermes home (the Command Code
+  trap: spawn and meter disagreed once and silently emptied the usage bar).
+- Tier 2 on arrival, and the card says so: `hermes mcp add` works, but nothing has verified
+  a Hermes worker against Conduit's fleet MCP server the way OpenCode's spike did, so
+  `structuredResult`/`mailbox` stay false rather than lying to the router.
+- Design: `docs/superpowers/specs/2026-09-19-hermes-agent-and-provider-routing-design.md`.
+
+## Where per-agent model endpoints live
+
+One agent, one endpoint: `ProviderSettings` (`store.rs`), stored as
+`agent_providers: HashMap<AgentId, ProviderSettings>`. This generalizes the single
+`OpenCodeSettings` slot, and OpenRouter joins the local servers as just another preset --
+the same `@ai-sdk/openai-compatible` provider serves `https://openrouter.ai/api/v1` exactly
+as it serves Ollama.
+
+- **`PersistState.opencode` is KEPT and mirrors `agent_providers[OpenCode]`**, the same
+  contract `default_account` has with `default_accounts[Claude]`. On load an
+  `agent_providers` with no OpenCode entry adopts the legacy block. This is not tidiness:
+  an unreadable `state.json` costs every running session (see the orphan sweep), so a
+  downgrade must still find OpenCode's endpoint where it left it.
+- **`pin_local` kept its wire name and lost its guarantee.** It emits
+  `enabled_providers: ["conduit"]` -- "use only this endpoint", which under a local preset
+  also means "nothing leaves the machine" and under OpenRouter does not. So it is NO LONGER
+  the trust-boundary test: `ProviderSettings::is_local()` is, and a private-mode
+  `local_only` session with a non-local endpoint has its routing DROPPED rather than
+  honoured (both the Hermes and OpenCode spawn branches in `lib.rs`). Renaming the key
+  would have silently reset the setting for everyone who had it on.
+- The same rules exist in TypeScript in `src/providers.ts` -- standalone because `store.ts`
+  cannot be imported under the node-env vitest, re-exported from the store so call sites
+  keep one import path. `providers.test.ts` pins them. They must not fork from Rust's.
+- **An agent reads its endpoint ONCE, at process start**, so "apply without restarting"
+  can only mean Conduit restarts the session for you. `ModelPanel` does that when the
+  session is IDLE and waits when it is mid-turn -- restarting a running agent throws away
+  the work in flight, which is a worse surprise than a button.
+- **`key_for_endpoint` is scoped by AGENT first, then URL.** Two agents may legitimately sit
+  behind the same base URL (OpenRouter on both OpenCode and Hermes) with different keys; a
+  URL-only match returned whichever the hash map yielded, which surfaces as an
+  unexplainable invalid-credentials error.
+- **`parse_openai_models` speaks three dialects**: vLLM's `max_model_len`, OpenRouter's
+  `context_length`, and neither. Reading only vLLM's left all 400+ OpenRouter models with no
+  context, price or tool flag -- exactly what the picker ranks on. `tools` comes from
+  `supported_parameters`; its ABSENCE stays `None` ("unknown"), never `Some(false)`, because
+  `pickable` treats an explicit false as disqualifying.
+- **UI: one editor, two scopes.** `EndpointEditor.tsx` is the per-AGENT form, used by both
+  Settings -> Model endpoints (`EndpointsPanel.tsx`) and the per-SESSION Model tab
+  (`ModelPanel.tsx`), so the two cannot drift. The Model tab is session-scoped by
+  construction and renders only controls the selected agent actually supports; with no
+  session selected it shows a placeholder, never the global defaults -- it answers "what is
+  THIS session running", and defaults there would make the answer a guess.
+- `key_for_endpoint` (`local_llm.rs`) now searches every configured agent endpoint instead
+  of only OpenCode's. The anti-oracle property is unchanged (an unrecognized URL still gets
+  no key); hard-coding OpenCode's slot would have sent no key at all once a second agent
+  had an endpoint.
+
+## Where the money meter lives
+
+`openrouter_usage.rs` + `usageRows::openRouterRow`. Every other meter measures a
+SUBSCRIPTION -- a rolling window with a cap, where the number is "what fraction have I
+burned". OpenRouter is prepaid credit, and that difference is structural, not cosmetic.
+
+- **`UWindow.money` exists because a fraction cannot express it.** `GET /api/v1/key` reports
+  `usage` plus a `limit`/`limit_remaining` that are **null for an uncapped key -- the normal
+  state on a funded account**. With no cap there is no denominator, so the row sets
+  `used: 0`, the panel draws NO bar, and the label reads "$12.40 spent". Never invent a
+  ceiling to get a percentage: the provider explicitly declined to give one.
+- **`quota` is `limit != null`.** An uncapped key gates nothing, so `rowHealth` reports
+  `remaining: null` (unknown) rather than a confident 100% -- the same rule agents with no
+  usage API already follow. Treating it as full would route work at an account with no
+  money in it; treating it as empty would stop routing at one that has.
+- **Keyed per AGENT** (`openrouter:<agent>`), not per account: two agents may hold two
+  different keys against the same provider, and one account key would collapse them.
+- Polled on the SLOW (5 min) tick with the other network reads. Prepaid credit only moves
+  when a turn completes; a per-minute poll would spend requests watching a static number.
+- **`visibleWindows` reads `show[kind] !== false`, not a truthy test.** Prefs persist per
+  machine, so a prefs object written before a window kind existed has `undefined` for it --
+  a truthy test hides a newly added meter from exactly the people already using the app,
+  who never learn there is a switch to turn on.
+
+## Where live model switching lives
+
+`ProviderAdapter::model_switch_command` + `lib.rs`'s `switch_session_model`.
+
+- **A restart is the FALLBACK, not the mechanism.** Model, endpoint and credentials are read
+  once at process start, so Conduit cannot push a change into a running agent -- but every
+  mature TUI here already solves that for itself with a slash command, and driving the
+  agent's OWN command preserves the conversation by construction. Restarting applies the
+  same model and throws away the context that motivated the change, which is exactly wrong
+  for a task-driven "drop to a cheap model".
+- **Returning `None` is a real answer.** OpenCode's `/models` opens an interactive picker
+  and takes no argument, so its adapter reports None and the caller restarts. Do NOT invent
+  a command: an unrecognized slash command is pasted into the composer as literal text and
+  sits there, which reads to the user as "nothing happened".
+- Claude gets `/model <name>` ONLY -- no provider (it has none) and no effort (a launch
+  flag). Appending either hands its slash parser flags it rejects. Hermes takes all three in
+  one command (`/model <m> --provider <p> --reasoning <e>`), session-scoped by default;
+  `--global` is deliberately never sent, because a task-driven switch must not rewrite the
+  user's `config.yaml` default.
+- The choice is PERSISTED before it is sent, so a later restart or a `session_budget` reap
+  comes back on the model the user picked rather than the one the session launched with.
+- **Every configured endpoint is written into the agent's config, not just the active one.**
+  `/model --provider` can only reach providers ALREADY in the config, so one endpoint per
+  agent left the provider half of a live switch unreachable. See "Where the endpoint pool
+  lives" below.
+
+## Where the endpoint pool lives
+
+An agent has a LIST of endpoints (`PersistState.agent_endpoints`) and one of them is ACTIVE
+(`agent_providers`, unchanged). The pool exists for one reason: an agent's own
+`/model --provider` only reaches providers already present in its config, so a session that
+launched against Ollama could never be moved to OpenRouter without a restart -- which throws
+away the context live switching exists to preserve.
+
+- **`#[serde(default)]` and seeded on load** (`seed_endpoint_pool`, pure/tested). A
+  `state.json` written before the pool has an active endpoint and no pool; without the seed
+  the list renders empty beside a session demonstrably talking to something, and the first
+  write drops the endpoint in use. An agent that already HAS a pool is left alone -- newer
+  state wins, the same rule `adopt_legacy_opencode` beside it follows.
+- **`set_provider_settings` rewrites the pool entry that WAS active** rather than appending.
+  Appending forks the endpoint: the pool keeps the old values and `endpoint_pool` adds the new
+  ones beside them, so one endpoint appears twice and the stale copy is still offered as
+  somewhere to switch to. Matching on the NEW url instead leaves a renamed endpoint as a ghost.
+- **Keys are per (agent, BASE URL)**, not per agent (`key_slot`). A pool routinely holds a
+  keyed cloud endpoint beside a keyless local one, and may hold two cloud endpoints with two
+  keys; collapsing them onto the agent hands one endpoint's key to another, which surfaces as
+  an unexplainable 401. The one exception is `promote_unbound_key`: a key typed BEFORE any URL
+  exists lands in the agent's empty slot and is moved onto the first endpoint it gets. That is
+  deliberately NOT a general "follow the active endpoint" rule -- that would carry a cloud key
+  onto a local server the moment the user switched preset.
+- **Hermes reaches them through a `providers:` MAP in the managed overlay**, one entry per
+  pooled endpoint keyed `conduit-<preset>`, each naming its own `key_env`. Verified against the
+  installed CLI, not docs: `providers:` merges per leaf, `get_compatible_custom_providers`
+  normalizes the entries, and `custom_provider_slug` derives a stable `custom:<key>` slug from
+  the entry KEY -- which is what `/model --provider` takes. A Conduit-private variable is
+  CORRECT here and does NOT contradict `key_env_var`'s warning: that failure was
+  `model.api_key: "${VAR}"`, a mechanism the credential resolver never consults, whereas a
+  `providers:` entry NAMES its variable and is read with `get_secret_str`. A test pins the slug
+  and env-var format, because a drift makes `/model --provider` silently reach nothing -- the
+  switch is accepted and the endpoint does not change.
+- **The silo filters the POOL, not just the launch endpoint.** A local-only session under
+  private mode gets only local endpoints written into its config; otherwise the launch-time
+  `is_local()` check is decoration, because the agent is one slash command away from routing
+  siloed work through OpenRouter.
+- **A live switch persists `Session.provider`.** `/model --provider` moves the running
+  process, but the next start reads the AGENT's active endpoint -- so without the pin a
+  restart silently moves the session back, with a model pinned that the original endpoint may
+  not serve. `session_endpoint` resolves it, falling back to the active endpoint when the
+  pinned slug names nothing (a deleted endpoint must degrade to "the normal one", never to
+  "no endpoint at all").
+- **`add_session` takes `provider`, resolved by `resolve_provider_slug`.** A caller types what
+  it knows (`openrouter`); the stored pin must be the slug `pooled_provider_slugs` produces or
+  `session_endpoint` never matches it. Both spellings resolve, and an unknown name passes
+  through rather than being dropped. It rides the CREATE call for the same reason `model` does
+  -- set afterwards, the terminal has already spawned.
+- **`ProviderAdapter::pooled_provider_slugs` is the seam**, and all-`None` is a real answer:
+  OpenCode's `/models` takes no argument, and every other agent reads its endpoint once at
+  process start. An invented slug would render an enabled chip that silently does nothing.
+- UI: the pool list in `EndpointsPanel.tsx` (clicking a row makes it active, which is also
+  what points the editor below at it -- two ways to edit one endpoint is how the two end up
+  disagreeing), and the endpoint chip row in `ModelPanel.tsx`, which carries the endpoint's
+  OWN pinned model across: a model id served by Ollama is not one OpenRouter serves.
+
+## Where spawn conditions live
+
+`OpenRequest` gained `provider`/`model`/`effort` (`cli_open.rs`), carried by both shims, so
+ONE agent can launch another under conditions it chose -- a Hermes session on a local model
+starting a worker on OpenRouter.
+
+- All three are `#[serde(default)]`: the shim is GENERATED and an older installed one sends
+  only `path`+`agent`. Without that, every `conduit .` from a stale shim would 400. A test
+  pins it.
+- `parse_open` stays purely the security boundary (token, origin, body size) and does NOT
+  validate them -- whether "gpt-9" is a real model is a question only the agent can answer.
+  The FRONTEND re-checks the agent id against `AGENTS` before spawning, the same rule
+  `decisionRoute` follows: `AgentId`'s lenient deserialize would otherwise spawn Claude
+  under an invented name.
+- The model rides in `addSession` rather than being set afterwards, so the session is
+  created WITH it instead of being corrected after its terminal has already spawned.
+
+## Where the agent profile panel lives
+
+`agent_profile.rs` + `AgentPanel.tsx` -- the Agent tab. The Model tab answers "what is this
+running on"; this answers "what does it know and what can it reach".
+
+- **Adaptive, and an empty section is OMITTED rather than drawn empty.** Agents expose very
+  different things, and a blank "Memory" heading reads as "this agent forgot everything"
+  rather than "this agent has no such concept". Rust returns only sections it could fill.
+- **Sections come from whoever holds the data.** Hermes' memory/skills/MCP are files, so
+  Rust reads them; Claude's MCP registry is localStorage, so the frontend composes that
+  section itself. The frontend skips its own MCP section when Rust already supplied one, so
+  an agent is never listed twice under two sources.
+- Hermes' three memory documents are listed SEPARATELY (`SOUL.md` = what you told it,
+  `USER.md` = what it inferred about you, `MEMORY.md` = what it remembered). Merging them
+  would hide the inferred one, which is the one worth checking.
+- **MCP is read from `config.yaml`, not `hermes mcp list`** -- the CLI costs a Python
+  process start (seconds) and this panel refreshes while open.
+- `serde_yaml` parses what OTHERS wrote (skill frontmatter, Hermes' config); `hermes.rs`
+  still hand-emits its overlay, because that file carries an explanatory header comment a
+  serializer would drop and its values are three known scalars.
+- **Memory documents and SKILL.md files are EDITABLE; everything else is read-only.** An
+  unreadable file costs that section, never the panel. A truncated preview is never written
+  back -- the UI refuses to save one, which is why the caps (`MEMORY_PREVIEW_BYTES`,
+  `SKILL_PREVIEW_BYTES`) are generous enough that truncation is rare.
+- **A skill is located by ENUMERATION, never by joining its key onto a path.**
+  `hermes_skill_dirs` walks the tree and the frontend's key is compared against the directory
+  names it found; a key matching nothing is refused. Same shape as `MEMORY_DOCS`, and for the
+  same reason: "sanitize the path" is a guess about what the OS does with `..`, a symlink, an
+  ADS or a UNC prefix, whereas a path Conduit produced has nothing to sanitize. The key is
+  the DIRECTORY name because Hermes' own predicate (`prompt_builder.hides`) accepts either it
+  or the frontmatter name, and only the directory name always exists -- a skill with
+  unparseable frontmatter still lists.
+- Editing a SKILL.md takes effect on its own: Hermes' snapshot manifest
+  (`_build_skills_manifest`) is a file signature of every SKILL.md, so a write invalidates the
+  cached prompt rather than being masked by it.
+- **Skill enable/disable is SHOWN but not editable, and that is a measured limit rather than
+  a gap in the UI.** `skills.disabled` is read by the agent side straight out of
+  `HERMES_HOME/config.yaml` (`agent/skill_utils.py::_load_raw_config`, whose docstring says
+  "no hermes_cli.config import"), so the managed-scope overlay -- a `hermes_cli.config`
+  feature -- never reaches it. Measured: an overlay carrying `skills.disabled: [findmy]`
+  leaves `get_disabled_skill_names()` empty, while `hermes_cli`'s own
+  `get_disabled_skills(cfg)` sees it. `get_config_path()` is strictly
+  `HERMES_HOME/config.yaml` with no override, so the only ways to change what the AGENT sees
+  are writing the user's own config (machine-wide) or redirecting `HERMES_HOME` (moves
+  memory, skills, sessions and auth too). Both are the user's call, not a side effect of
+  opening a panel -- so the panel dims a disabled skill and says where it was turned off.
+  `ESSENTIAL_SKILLS` is kept for whatever surface eventually does offer the switch:
+  `save_disabled_skills` drops those SILENTLY, so a control offered for one would flip, save,
+  and come back on with no error anywhere.
 
 ## Where agent routing lives
 

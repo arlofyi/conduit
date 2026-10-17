@@ -12,6 +12,8 @@ import {
   agyRow,
   claudeRow,
   commandCodeRow,
+  openRouterRow,
+  codexRow,
   meterView,
   rowHealth,
   visibleWindows,
@@ -42,11 +44,29 @@ function shortReset(iso: string | null): string {
  * The number and the bar both come from a single `meterView` call, which is the whole point
  * of that function — they used to be computed separately here and pointed opposite ways.
  */
+/** Money, short enough for a meter label. Sub-dollar keeps cents visible (a $0.04 day is
+ *  not "$0"), everything else rounds to cents. */
+function money(n: number): string {
+  return n < 1 ? `$${n.toFixed(3)}` : `$${n.toFixed(2)}`;
+}
+
 function Meter({ w, metric, threshold }: { w: UWindow; metric: UsageMetric; threshold: number }) {
   const v = meterView(w, metric);
   const reset = shortReset(w.resetsAt);
-  const text = w.disabled ? "disabled" : `${v.pct}% ${v.word}`;
-  const fillPct = w.disabled ? 0 : v.fraction * 100;
+  // A prepaid balance is reported in currency, never as a percentage: "you have spent
+  // $12.40" is the number that matters, and an UNCAPPED key has no percentage to state at
+  // all. `money.limit === null` is the normal state on a funded account, not an error.
+  const text = w.disabled
+    ? "disabled"
+    : w.money
+      ? w.money.limit == null
+        ? `${money(w.money.spent)} spent`
+        : `${money(w.money.spent)} of ${money(w.money.limit)}`
+      : `${v.pct}% ${v.word}`;
+  // No cap, no bar. Scaling spend against an invented ceiling would put a number on screen
+  // that the provider explicitly declined to give.
+  const uncapped = !!w.money && w.money.limit == null;
+  const fillPct = w.disabled || uncapped ? 0 : v.fraction * 100;
   // Smooth ramp: tint the fill from the agent's base color (var(--meter-base)) toward muted
   // red as CONSUMPTION approaches full. Keyed on severity, not on the drawn fraction, so a
   // meter reading "left" still reddens when it runs low instead of when it runs full. Ramp
@@ -68,6 +88,7 @@ function Meter({ w, metric, threshold }: { w: UWindow; metric: UsageMetric; thre
         <span>{w.label}</span>
         <span>
           {text}
+          {w.money?.remaining != null ? ` · ${money(w.money.remaining)} left` : ""}
           {reset ? ` · resets ${reset}` : ""}
         </span>
       </div>
@@ -108,7 +129,9 @@ function RowBlock({
         {/* The endpoint rate-limits; rather than blanking the meters we keep showing the
             last good read and say so, so a number never silently means "a minute ago". */}
         {row.stale && (
-          <span className="usage-stale-chip" title="The last check was rate-limited; these are the most recent numbers we could read.">
+          <span className="usage-stale-chip" title={row.agent === "codex"
+            ? "Codex has not written a recent local rate-limit snapshot."
+            : "The last check was rate-limited; these are the most recent numbers we could read."}>
             last known
           </span>
         )}
@@ -192,6 +215,8 @@ export function UsagePanel() {
   const claudeUsage = useStore((s) => s.claudeUsage);
   const agyMap = useStore((s) => s.agyUsageByAccount);
   const commandCodeUsage = useStore((s) => s.commandCodeUsage);
+  const openrouterUsage = useStore((s) => s.openrouterUsage);
+  const codexUsage = useStore((s) => s.codexUsage);
   const prefs = useStore((s) => s.usagePrefs);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const setSettingsTab = useStore((s) => s.setSettingsTab);
@@ -223,6 +248,11 @@ export function UsagePanel() {
     // A signed-out account has no windows to draw and nothing actionable in this panel,
     // so it is left out entirely rather than rendered as an empty row.
     ...commandCodeUsage.filter((u) => u.usage.windows?.length).map(commandCodeRow),
+    // Only rows we actually read. A "disconnected" row (no key held yet) has no spend to
+    // report and nothing this panel could do about it -- the fix lives in the endpoint
+    // editor -- so it is left out rather than shown as $0.00, which would read as "free".
+    ...openrouterUsage.filter((u) => u.source === "live").map(openRouterRow),
+    ...(codexUsage?.windows.length ? [codexRow(codexUsage)] : []),
   ].map((row) => {
     const wins = visibleWindows(row.windows, prefs.windows);
     return { row, wins, health: rowHealth(wins) };

@@ -258,6 +258,9 @@ mod tests {
         crate::cli_open::OpenRequest {
             path: path.to_string(),
             agent: None,
+            provider: None,
+            model: None,
+            effort: None,
         }
     }
 

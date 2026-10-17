@@ -7,24 +7,30 @@ import { AccountList } from "./AccountList";
 import { UsagePrefsPanel } from "./UsagePrefsPanel";
 import { FormatPrefsPanel } from "./FormatPrefsPanel";
 import { GeneralSettings } from "./GeneralSettings";
+import { SessionSettings } from "./SessionSettings";
 import { TerminalSettings } from "./TerminalSettings";
 import { TrustPanel } from "./TrustPanel";
 import { OpenCodePanel } from "./OpenCodePanel";
+import { EndpointsPanel } from "./EndpointsPanel";
 import { CommandCodePanel } from "./CommandCodePanel";
 import { RoutingPanel } from "./RoutingPanel";
+import { OrchestrationPanel } from "./OrchestrationPanel";
 import { PluginsPanel } from "./PluginsPanel";
 
 // Exported for the native menu integration (menu → open Settings at a specific tab).
 export type SettingsTab =
   | "general"
+  | "sessions"
   | "terminal"
   | "agents"
   | "accounts"
   | "usage"
   | "mcp"
   | "localmodels"
+  | "endpoints"
   | "commandcode"
   | "routing"
+  | "orchestration"
   | "formatting"
   | "security"
   | "privacy"
@@ -37,6 +43,7 @@ const NAV: Array<{ group: string; items: Array<{ id: SettingsTab; label: string 
     group: "",
     items: [
       { id: "general", label: "General" },
+      { id: "sessions", label: "Sessions" },
       { id: "terminal", label: "Terminal" },
     ],
   },
@@ -45,8 +52,10 @@ const NAV: Array<{ group: string; items: Array<{ id: SettingsTab; label: string 
     items: [
       { id: "agents", label: "Agents" },
       { id: "localmodels", label: "Local models" },
+      { id: "endpoints", label: "Model endpoints" },
       { id: "commandcode", label: "Command Code" },
       { id: "routing", label: "Routing" },
+      { id: "orchestration", label: "Orchestration" },
       { id: "mcp", label: "MCP servers" },
     ],
   },
@@ -128,6 +137,16 @@ export function Settings({
                   <GeneralSettings />
                 </>
               )}
+              {tab === "sessions" && (
+                <>
+                  <p className="settings-intro">
+                    When sessions start and stop on their own. A stopped session keeps its
+                    conversation and scrollback; opening it, clicking into it or pressing a key
+                    there resumes it where it left off.
+                  </p>
+                  <SessionSettings />
+                </>
+              )}
               {tab === "terminal" && (
                 <>
                   <p className="settings-intro">How terminal panes are drawn.</p>
@@ -156,8 +175,22 @@ export function Settings({
                   <OpenCodePanel />
                 </>
               )}
+              {tab === "endpoints" && (
+                <>
+                  <p className="settings-intro">
+                    Point an agent at the endpoint of your choice — a local server (Ollama, LM
+                    Studio, vLLM, llama.cpp, OpenWebUI), OpenRouter, or any other
+                    OpenAI-compatible URL. This is the default every new session on that agent
+                    inherits; a single session's model and reasoning are set from the Model tab
+                    beside Git. API keys are held in memory for this run only and never written
+                    to disk.
+                  </p>
+                  <EndpointsPanel />
+                </>
+              )}
               {tab === "commandcode" && <CommandCodePanel />}
               {tab === "routing" && <RoutingPanel />}
+              {tab === "orchestration" && <OrchestrationPanel openRouting={() => setTab("routing")} />}
               {tab === "formatting" && <FormatPrefsPanel />}
               {tab === "security" && (
                 <>

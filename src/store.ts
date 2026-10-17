@@ -65,6 +65,11 @@ import {
   type PrettierOptions,
 } from "./format/options";
 import { formatWithFallback } from "./format/fallback";
+import {
+  launchResumeTargets,
+  parseLifecycle,
+  type SessionLifecyclePrefs,
+} from "./sessionLifecycle";
 
 // ---- Types (mirror the Rust serde structs, rename_all = "camelCase") ----
 export type ToastKind = "info" | "error";
@@ -93,14 +98,24 @@ export interface Session {
   /** Must run against a local model and receive no cloud MCP (siloed sensitive-data agent). */
   localOnly?: boolean;
   channels?: string[];
+  /** A CONCRETE model id pinned for this session, as chosen by a route or by hand. Takes
+   *  precedence over `modelTier`. Only acted on for agents whose `supportsModelFlags` is
+   *  true, and only at the next spawn. */
+  model?: string | null;
   modelTier?: string | null;
   seedMemory?: string | null;
   effort?: string | null;
+  /** The endpoint this session was switched to, as the agent's own provider slug. Absent =
+   *  follow the agent's active endpoint, which is every session never switched. */
+  provider?: string | null;
   /** The agent's own captured conversation id (agy), for resume. Set by the backend. */
   agentConversationId?: string | null;
   /** User stopped this session's processes without deleting it (persisted). Its terminal
    *  stays mounted and keeps its scrollback; starting it resumes the conversation. */
   stopped?: boolean;
+  /** The agent's last persisted activity (running | needsInput | done | idle), written by
+   *  the Rust hook listener on every change. Decides what resumes at launch. */
+  agentState?: string | null;
   /** MCP registry names this session may load; absent/null = inherit everything. */
   mcpServers?: string[] | null;
 }
@@ -143,20 +158,76 @@ export interface SensitivityHit {
 
 // ---- OpenCode local provider — mirror the Rust serde structs (camelCase) ----
 
-/** Non-secret local-provider settings. The endpoint API key is never part of this (or of
- * any persisted state) — it is held in backend memory and reaches OpenCode via child env. */
-export interface OpenCodeSettings {
-  enabled: boolean;
-  /** "ollama" | "lmstudio" | "vllm" | "llamacpp" | "openwebui" | "custom" ("" = unset). */
-  preset: string;
-  /** Full OpenAI-compatible base URL (e.g. http://127.0.0.1:11434/v1). */
-  baseUrl: string;
-  /** Model id exactly as the server reports it. */
-  model: string;
-  contextLimit?: number | null;
-  outputLimit?: number | null;
-  /** Allowlist the injected provider so OpenCode can't fall back to cloud providers. */
-  pinLocal: boolean;
+/** Endpoint-provider types and rules live in their own module -- `store.ts` cannot be
+ *  imported under the node-env vitest, and these need to be testable. Re-exported here so
+ *  call sites keep one import path (same arrangement as `accountKey` / `usageRows.ts`). */
+export {
+  LOCAL_PRESETS,
+  isLocalPreset,
+  providerReady,
+  allowedForLocalOnly,
+  EMPTY_PROVIDER,
+} from "./providers";
+export type { ProviderSettings, EndpointView } from "./providers";
+import type { ProviderSettings, EndpointView } from "./providers";
+
+/** The old name, kept for OpenCode's own call sites. */
+export type OpenCodeSettings = ProviderSettings;
+
+/** One agent's OpenRouter spend (mirrors the Rust `OpenRouterUsage`). Dollars, not a
+ *  fraction: `limit`/`remaining` are null for an uncapped key, which is normal. */
+export interface OpenRouterUsage {
+  agent: AgentId;
+  label: string;
+  spent: number;
+  limit: number | null;
+  remaining: number | null;
+  usageDaily: number | null;
+  usageWeekly: number | null;
+  usageMonthly: number | null;
+  isFreeTier: boolean;
+  /** "live" | "disconnected" (no key held) | "unavailable" (key rejected / shape moved). */
+  source: string;
+}
+
+/** What a live model switch actually did (mirrors the Rust `ModelSwitch`). */
+export interface ModelSwitch {
+  /** True when the agent's own command was sent, so the conversation continues. */
+  live: boolean;
+  command: string;
+  /** Why it was not live. Empty when it was. */
+  reason: string;
+}
+
+/** One entry in an agent profile section (mirrors the Rust `ProfileItem`). */
+export interface ProfileItem {
+  name: string;
+  detail: string;
+  /** Full text for items that have one (a memory document, a SKILL.md); null for a bare row. */
+  body?: string | null;
+  /** What this item is addressed by when written back — a skill's DIRECTORY name.
+   *  Null for rows that cannot be acted on. */
+  key?: string | null;
+  /** Whether the item is active, for things that can be inactive. Null = not applicable.
+   *  READ-ONLY: Hermes' agent side reads `skills.disabled` from its own config.yaml and
+   *  never sees Conduit's overlay, so this is state to show, not a control. */
+  enabled?: boolean | null;
+}
+
+/** One section of what an agent knows/can reach. Sections the agent has no concept of are
+ *  absent, never present-and-empty — a blank "Memory" heading reads as amnesia. */
+export interface ProfileSection {
+  id: string;
+  title: string;
+  items: ProfileItem[];
+  /** Where these were read from, so the panel can point at the real file. */
+  source: string;
+}
+
+export interface AgentProfile {
+  sections: ProfileSection[];
+  /** This agent exposes nothing Conduit can read, so the panel says so plainly. */
+  unsupported: boolean;
 }
 
 /** One probed local inference server (detect_local_providers). */
@@ -332,6 +403,8 @@ export interface ContextUsage {
   fraction: number;
   /** The model the latest usage line named, when it named one. */
   model: string | null;
+  source?: string;
+  observedAt?: number;
 }
 
 export interface LiveState {
@@ -368,7 +441,7 @@ export interface ContextMenuState {
 }
 
 export type TopTab = "files" | "changes" | "todos" | "subagents";
-export type BottomTab = "terminal" | "git" | "decisions" | "messages";
+export type BottomTab = "terminal" | "git" | "model" | "agent" | "decisions" | "messages";
 
 // ---- Claude ambient (status + usage) — mirror Rust serde camelCase ----
 export interface StatusComponent { name: string; status: string; }
@@ -444,6 +517,12 @@ export interface CommandCodeAccountUsage {
   usage: CommandCodeUsage;
 }
 
+// ---- Codex rate limits from local rollout token_count events ----
+export interface CodexUsage {
+  windows: { kind: "fiveHour" | "weekly"; usedPercent: number; resetsAt: number }[];
+  stale: boolean;
+}
+
 // ---- Antigravity (agy) usage — mirror Rust agy_usage.rs (camelCase) ----
 export interface AgyBucket {
   bucketId: string;
@@ -481,7 +560,7 @@ export interface UsagePrefs {
   /** How the usage bar renders. "selected" reproduces the pre-multi-account single panel. */
   layout: "selected" | "stacked" | "summary" | "lowAlertOnly";
   /** Which windows to show. Off-by-one agents just skip the windows they don't have. */
-  windows: { fiveHour: boolean; weekly: boolean; weeklyOpus: boolean; context: boolean };
+  windows: { fiveHour: boolean; weekly: boolean; weeklyOpus: boolean; context: boolean; credit: boolean };
   /** Row order: most-critical (least remaining) first, or alphabetical by label. */
   sort: "critical" | "label";
   /** Which direction every meter reads. Defaults to "used" -- what each agent's own usage
@@ -492,7 +571,7 @@ export interface UsagePrefs {
 }
 export const DEFAULT_USAGE_PREFS: UsagePrefs = {
   layout: "selected",
-  windows: { fiveHour: true, weekly: true, weeklyOpus: true, context: true },
+  windows: { fiveHour: true, weekly: true, weeklyOpus: true, context: true, credit: true },
   sort: "critical",
   metric: "used",
   lowThresholdPct: 20,
@@ -576,6 +655,49 @@ export function readPlanConnected(): Record<string, boolean> {
 function writePlanConnected(v: Record<string, boolean>): void {
   try {
     localStorage.setItem(PLAN_CONNECTED_KEY, JSON.stringify(v));
+  } catch {
+    /* quota — non-fatal */
+  }
+}
+
+const KEEP_RUNNING_KEY = "conduit.keepRunning";
+function readKeepRunning(): Record<string, true> {
+  try {
+    const v = JSON.parse(localStorage.getItem(KEEP_RUNNING_KEY) ?? "{}");
+    const out: Record<string, true> = {};
+    if (v && typeof v === "object") for (const k of Object.keys(v)) if (v[k] === true) out[k] = true;
+    return out;
+  } catch {
+    return {};
+  }
+}
+function writeKeepRunning(v: Record<string, true>): void {
+  try {
+    localStorage.setItem(KEEP_RUNNING_KEY, JSON.stringify(v));
+  } catch {
+    /* quota — non-fatal */
+  }
+}
+
+/** Whether this app run has applied the launch rule yet (see `load`). */
+let launchDecided = false;
+
+// Session lifecycle prefs (Settings → Sessions); the rules live in sessionLifecycle.ts.
+// The legacy restore switch below is read once, only to carry over an explicit opt-out.
+const SESSION_LIFECYCLE_KEY = "conduit.sessionLifecycle";
+function readSessionLifecycle(): SessionLifecyclePrefs {
+  try {
+    return parseLifecycle(
+      localStorage.getItem(SESSION_LIFECYCLE_KEY),
+      localStorage.getItem(RESTORE_SESSIONS_KEY),
+    );
+  } catch {
+    return parseLifecycle(null, null);
+  }
+}
+function writeSessionLifecycle(v: SessionLifecyclePrefs): void {
+  try {
+    localStorage.setItem(SESSION_LIFECYCLE_KEY, JSON.stringify(v));
   } catch {
     /* quota — non-fatal */
   }
@@ -1257,6 +1379,7 @@ interface AppState {
   /** Per-account Command Code usage. Empty when Command Code is not set up at all —
    *  the usage bar then simply has no Command Code rows, rather than showing zeros. */
   commandCodeUsage: CommandCodeAccountUsage[];
+  codexUsage: CodexUsage | null;
   /** Per-account "plan usage connected" flags, keyed by accountKey. */
   planConnected: Record<string, boolean>;
   /** agy usage per account, keyed by accountKey (accountId ?? "default"). */
@@ -1355,6 +1478,21 @@ interface AppState {
    *  resumes all its sessions instead of waiting for a click. */
   restoreSessionsOnOpen: boolean;
   setRestoreSessionsOnOpen: (v: boolean) => void;
+  /** Persisted (Settings → Sessions). When sessions start and stop on their own. */
+  sessionLifecycle: SessionLifecyclePrefs;
+  setSessionLifecycle: (patch: Partial<SessionLifecyclePrefs>) => void;
+  /** Sessions that came back from the last run and resume only when you ask (click,
+   *  key, or opening them). Runtime only; computed once at launch. */
+  parkedSessions: Record<string, true>;
+  /** Sessions the launch rule starts by itself (their agent was mid-task at exit). */
+  launchResume: Record<string, true>;
+  /** Session ids that existed at launch. Anything else was created this run. */
+  launchSessionIds: Record<string, true>;
+  unparkSession: (sessionId: string) => void;
+  /** Persisted per machine. Sessions the user pinned "keep running": exempt from the idle
+   *  auto-stop, for work the process tree cannot reveal (an agent waiting on a remote job). */
+  keepRunning: Record<string, true>;
+  toggleKeepRunning: (sessionId: string) => void;
   /** Persisted. When true (default), Claude sessions announce Conduit as their IDE:
    *  diff review lands in a Monaco overlay, editor selections reach the session. */
   announceAsIde: boolean;
@@ -1473,6 +1611,19 @@ interface AppState {
   setAccountAgents: (accountId: string, agents: AgentId[]) => Promise<void>;
   /** Pin (id) or clear (null) a single session's account. */
   setSessionAccount: (sessionId: string, id: string | null) => Promise<void>;
+  /** Pin (or clear, with null) this session's model. Applies at the next spawn. */
+  setSessionModel: (sessionId: string, model: string | null) => Promise<void>;
+  /** Pin (or clear, with null) this session's reasoning effort. Applies at the next spawn. */
+  setSessionEffort: (sessionId: string, effort: string | null) => Promise<void>;
+  /** Change a RUNNING session's model without losing its conversation, by driving the
+   *  agent's own in-session command. Falls back to "applies at next start" for agents that
+   *  have none — reported in the result rather than silently restarting. */
+  switchSessionModel: (
+    sessionId: string,
+    model: string,
+    provider?: string | null,
+    effort?: string | null,
+  ) => Promise<ModelSwitch>;
 
   // ---- Trust boundaries (Feature 4) ----
   /** Master switch for the trust-boundary regime. When false the whole thing is inert. */
@@ -1494,9 +1645,56 @@ interface AppState {
   setOpenCodeKey: (key: string) => Promise<void>;
   detectLocalProviders: () => Promise<LocalProviderStatus[]>;
   /** Models the server at baseUrl offers; a string is the error message. */
-  listLocalModels: (baseUrl: string, preset: string) => Promise<LocalModel[] | string>;
+  listLocalModels: (
+    baseUrl: string,
+    preset: string,
+    /** Whose endpoint this is — decides which agent's key is attached. */
+    agent?: AgentId,
+  ) => Promise<LocalModel[] | string>;
   /** Live-test native tool calling on the served model; a string is the error message. */
-  probeToolCall: (baseUrl: string, model: string) => Promise<ToolProbeResult | string>;
+  probeToolCall: (
+    baseUrl: string,
+    model: string,
+    agent?: AgentId,
+  ) => Promise<ToolProbeResult | string>;
+
+  // ---- Per-agent endpoints ----
+  /** Every agent's endpoint settings. Absent = that agent has none configured. */
+  agentProviders: Partial<Record<AgentId, ProviderSettings>>;
+  /** OpenRouter spend per agent routed at it. Empty when no agent is. */
+  openrouterUsage: OpenRouterUsage[];
+  loadOpenRouterUsage: () => Promise<void>;
+  /** Last model catalogue fetched per agent endpoint. Shared so the endpoint editor's
+   *  fetch also feeds the Model tab's "what am I actually running" card, instead of each
+   *  asking the provider for the same 447 rows. */
+  endpointModels: Partial<Record<AgentId, LocalModel[]>>;
+  setEndpointModels: (agent: AgentId, models: LocalModel[]) => void;
+  /** What the selected session's agent knows: memory, skills, MCP. Keyed by session. */
+  agentProfiles: Record<string, AgentProfile>;
+  loadAgentProfile: (sessionId: string) => Promise<void>;
+  /** Rewrite one of the agent's memory documents. Returns an error string, or null. */
+  writeAgentMemory: (sessionId: string, file: string, body: string) => Promise<string | null>;
+  /** Rewrite one skill's SKILL.md. Returns an error string, or null. */
+  writeAgentSkill: (sessionId: string, key: string, body: string) => Promise<string | null>;
+  /** Which agents hold an endpoint API key this run. Membership only — never a key. */
+  providerKeys: AgentId[];
+  loadProviderSettings: () => Promise<void>;
+  setProviderSettings: (agent: AgentId, settings: ProviderSettings) => Promise<void>;
+  /** Non-empty = hold/replace this agent's key for this run; empty = clear. Never persisted. */
+  setProviderKey: (agent: AgentId, key: string) => Promise<void>;
+
+  /**
+   * Every endpoint configured per agent, with the slug each one can be switched to LIVE.
+   *
+   * Separate from `agentProviders`, which holds only the ACTIVE endpoint — the one a new
+   * session spawns on. The pool is what the agent's own `/model --provider` can reach
+   * mid-conversation, and a pool of one is why switching provider used to need a restart.
+   */
+  endpointPools: Partial<Record<AgentId, EndpointView[]>>;
+  loadEndpointPools: () => Promise<void>;
+  setEndpointPool: (agent: AgentId, endpoints: ProviderSettings[]) => Promise<void>;
+  /** Hold/replace (non-empty) or clear (empty) the key for ONE endpoint. Never persisted. */
+  setEndpointKey: (agent: AgentId, baseUrl: string, key: string) => Promise<void>;
 
   // ---- MCP server registry ----
   mcpServers: McpServer[];
@@ -1520,7 +1718,7 @@ interface AppState {
 
   addProject: (path: string) => Promise<void>;
   removeProject: (id: string) => Promise<void>;
-  addSession: (projectId: string, opts?: { name?: string; useWorktree?: boolean; agent?: AgentId; role?: SessionRole; account?: string | null; mcpServers?: string[] | null; model?: string | null }) => Promise<void>;
+  addSession: (projectId: string, opts?: { name?: string; useWorktree?: boolean; agent?: AgentId; role?: SessionRole; account?: string | null; mcpServers?: string[] | null; model?: string | null; provider?: string | null }) => Promise<void>;
   renameSession: (projectId: string, sessionId: string, name: string) => Promise<void>;
   /** Rename a project's display label only (not the directory on disk). */
   renameProject: (projectId: string, name: string) => Promise<void>;
@@ -1689,6 +1887,7 @@ interface AppState {
   refreshClaudeStatus: () => Promise<void>;
   refreshClaudeUsage: () => Promise<void>;
   refreshCommandCodeUsage: () => Promise<void>;
+  refreshCodexUsage: () => Promise<void>;
   /** Connect plan usage for one account (null = env default). */
   connectPlanUsage: (accountId: string | null) => Promise<boolean>;
   /** One click: enable agy push-tracking + connect plan usage for every Claude account. */
@@ -1825,6 +2024,7 @@ export const useStore = create<AppState>((set, get) => {
     routes: null,
     taskKinds: [],
     commandCodeUsage: [],
+    codexUsage: null,
     planConnected: readPlanConnected(),
     updateInfo: null,
     updatePhase: "idle",
@@ -1847,6 +2047,11 @@ export const useStore = create<AppState>((set, get) => {
     pendingDecisions: [],
     decisionRoutes: {},
     restoreSessionsOnOpen: readRestoreSessionsOnOpen(),
+    sessionLifecycle: readSessionLifecycle(),
+    parkedSessions: {},
+    launchResume: {},
+    launchSessionIds: {},
+    keepRunning: readKeepRunning(),
     announceAsIde: readAnnounceAsIde(),
     pendingDiffs: [],
     openBehavior: readOpenBehavior(),
@@ -1881,6 +2086,12 @@ export const useStore = create<AppState>((set, get) => {
       pinLocal: false,
     },
     opencodeKeySet: false,
+    agentProviders: {},
+    providerKeys: [],
+    endpointPools: {},
+    openrouterUsage: [],
+    endpointModels: {},
+    agentProfiles: {},
     agentSetupComplete: localStorage.getItem(SETUP_DONE_KEY) === "1",
     telemetryOptOut: readTelemetryOptOut(),
 
@@ -1966,7 +2177,30 @@ export const useStore = create<AppState>((set, get) => {
       const selectedProjectId = wp.isMain
         ? initialProjectSelection(visibleIds, get().openBehavior, readLastProject())
         : (projects.find((p) => inProfile(p.profileId, wp.profileId, knownProfiles))?.id ?? null);
+      // The launch rule, decided ONCE per app run (a later load must not re-park a session
+      // the user has since opened). `working`: only agents that were mid-task when Conduit
+      // closed come back by themselves; every other session is parked until you ask for it.
+      const launchPatch: Partial<AppState> = {};
+      if (!launchDecided) {
+        launchDecided = true;
+        const all = projects.flatMap((p) => p.sessions);
+        const prefs = get().sessionLifecycle;
+        const resume = launchResumeTargets(all, prefs);
+        const launchResume: Record<string, true> = {};
+        const parkedSessions: Record<string, true> = {};
+        const launchSessionIds: Record<string, true> = {};
+        for (const s of all) {
+          launchSessionIds[s.id] = true;
+          if (resume.has(s.id)) launchResume[s.id] = true;
+          else if (prefs.launchRestore !== "project") parkedSessions[s.id] = true;
+        }
+        Object.assign(launchPatch, { launchResume, parkedSessions, launchSessionIds });
+        void invoke("set_keep_agents_in_project", { enabled: prefs.keepAgentsInProject }).catch(
+          () => {},
+        );
+      }
       set({
+        ...launchPatch,
         projects,
         homeDir: home,
         layouts,
@@ -2231,6 +2465,49 @@ export const useStore = create<AppState>((set, get) => {
         })),
       }));
     },
+    setSessionModel: async (sessionId, model) => {
+      await invoke("set_session_model", { sessionId, model }).catch(() => {});
+      set((s) => ({
+        projects: s.projects.map((p) => ({
+          ...p,
+          sessions: p.sessions.map((sess) =>
+            sess.id === sessionId ? { ...sess, model } : sess,
+          ),
+        })),
+      }));
+    },
+    switchSessionModel: async (sessionId, model, provider, effort) => {
+      try {
+        const res = await invoke<ModelSwitch>("switch_session_model", {
+          sessionId,
+          model,
+          provider: provider ?? null,
+          effort: effort ?? null,
+        });
+        set((s) => ({
+          projects: s.projects.map((p) => ({
+            ...p,
+            sessions: p.sessions.map((sess) =>
+              sess.id === sessionId ? { ...sess, model: model || null } : sess,
+            ),
+          })),
+        }));
+        return res;
+      } catch (e) {
+        return { live: false, command: "", reason: String(e) };
+      }
+    },
+    setSessionEffort: async (sessionId, effort) => {
+      await invoke("set_session_effort", { sessionId, effort }).catch(() => {});
+      set((s) => ({
+        projects: s.projects.map((p) => ({
+          ...p,
+          sessions: p.sessions.map((sess) =>
+            sess.id === sessionId ? { ...sess, effort } : sess,
+          ),
+        })),
+      }));
+    },
 
     // ---- Trust boundaries (Feature 4) ----
     loadTrustSettings: async () => {
@@ -2295,6 +2572,96 @@ export const useStore = create<AppState>((set, get) => {
         set({ opencodeKeySet: false });
       }
     },
+
+    setEndpointModels: (agent, models) =>
+      set((st) => ({ endpointModels: { ...st.endpointModels, [agent]: models } })),
+    loadAgentProfile: async (sessionId) => {
+      try {
+        const profile = await invoke<AgentProfile>("agent_profile", { sessionId });
+        set((st) => ({ agentProfiles: { ...st.agentProfiles, [sessionId]: profile } }));
+      } catch { /* keep the last good read */ }
+    },
+    writeAgentMemory: async (sessionId, file, body) => {
+      try {
+        await invoke("write_agent_memory", { sessionId, file, body });
+        await get().loadAgentProfile(sessionId);
+        return null;
+      } catch (e) {
+        return String(e);
+      }
+    },
+    writeAgentSkill: async (sessionId, key, body) => {
+      try {
+        await invoke("write_agent_skill", { sessionId, key, body });
+        await get().loadAgentProfile(sessionId);
+        return null;
+      } catch (e) {
+        return String(e);
+      }
+    },
+    loadOpenRouterUsage: async () => {
+      try {
+        set({ openrouterUsage: await invoke<OpenRouterUsage[]>("openrouter_usage") });
+      } catch { /* keep the last good read rather than blanking the meter */ }
+    },
+
+    // ---- Per-agent endpoints ----
+    loadProviderSettings: async () => {
+      try {
+        const [agentProviders, providerKeys] = await Promise.all([
+          invoke<Partial<Record<AgentId, ProviderSettings>>>("get_all_provider_settings"),
+          invoke<AgentId[]>("provider_keys_set"),
+        ]);
+        // OpenCode's own slice is the same row; keep the two in step so a panel reading
+        // either one never shows a stale endpoint after the other wrote.
+        const opencode = agentProviders.opencode;
+        set({
+          agentProviders,
+          providerKeys,
+          ...(opencode ? { opencode, opencodeKeySet: providerKeys.includes("opencode") } : {}),
+        });
+      } catch { /* keep current */ }
+    },
+    setProviderSettings: async (agent, settings) => {
+      await invoke("set_provider_settings", { agent, settings }).catch(() => {});
+      set((st) => ({
+        agentProviders: { ...st.agentProviders, [agent]: settings },
+        ...(agent === "opencode" ? { opencode: settings } : {}),
+      }));
+    },
+    setProviderKey: async (agent, key) => {
+      const held = key.trim().length > 0;
+      await invoke(held ? "set_provider_key" : "clear_provider_key",
+        held ? { agent, key } : { agent }).catch(() => {});
+      set((st) => ({
+        providerKeys: held
+          ? Array.from(new Set([...st.providerKeys, agent]))
+          : st.providerKeys.filter((a) => a !== agent),
+        ...(agent === "opencode" ? { opencodeKeySet: held } : {}),
+      }));
+    },
+    setEndpointKey: async (agent, baseUrl, key) => {
+      const held = key.trim().length > 0;
+      await invoke(held ? "set_endpoint_key" : "clear_endpoint_key", {
+        agent,
+        baseUrl,
+        ...(held ? { key } : {}),
+      }).catch(() => {});
+      // Re-read rather than patching in place: `hasKey` is the server's answer, and the
+      // active endpoint's key also feeds the agent-scoped `providerKeys` set.
+      await get().loadEndpointPools();
+      await get().loadProviderSettings();
+    },
+    loadEndpointPools: async () => {
+      try {
+        const pools = await invoke<Partial<Record<AgentId, EndpointView[]>>>("all_endpoint_pools");
+        set({ endpointPools: pools ?? {} });
+      } catch { /* keep current */ }
+    },
+    setEndpointPool: async (agent, endpoints) => {
+      await invoke("set_endpoint_pool", { agent, endpoints }).catch(() => {});
+      await get().loadEndpointPools();
+    },
     detectLocalProviders: async () => {
       try {
         return await invoke<LocalProviderStatus[]>("detect_local_providers");
@@ -2302,16 +2669,16 @@ export const useStore = create<AppState>((set, get) => {
         return [];
       }
     },
-    listLocalModels: async (baseUrl, preset) => {
+    listLocalModels: async (baseUrl, preset, agent) => {
       try {
-        return await invoke<LocalModel[]>("list_local_models", { baseUrl, preset });
+        return await invoke<LocalModel[]>("list_local_models", { baseUrl, preset, agent: agent ?? null });
       } catch (e) {
         return String(e);
       }
     },
-    probeToolCall: async (baseUrl, model) => {
+    probeToolCall: async (baseUrl, model, agent) => {
       try {
-        return await invoke<ToolProbeResult>("probe_tool_call", { baseUrl, model });
+        return await invoke<ToolProbeResult>("probe_tool_call", { baseUrl, model, agent: agent ?? null });
       } catch (e) {
         return String(e);
       }
@@ -2480,7 +2847,10 @@ export const useStore = create<AppState>((set, get) => {
       // `model` is the concrete id a route picked. Both ride the CREATE call rather than a
       // follow-up so the session is never persisted, however briefly, without them.
       const model = opts?.model ?? null;
-      const session = await invoke<Session | null>("add_session", { projectId, name, useWorktree, agent, role, mcpServers, model });
+      // `provider` names the endpoint the new session runs on. It rides the CREATE call for
+      // the same reason `model` does: set afterwards, the terminal has already spawned.
+      const provider = opts?.provider ?? null;
+      const session = await invoke<Session | null>("add_session", { projectId, name, useWorktree, agent, role, mcpServers, model, provider });
       if (!session) return;
       // Pin an explicitly-chosen account (blank = inherit the project/global default).
       if (opts?.account) {
@@ -2894,10 +3264,12 @@ export const useStore = create<AppState>((set, get) => {
       // this, the tab would reopen onto a terminal whose PTY was killed and never respawn.
       const session = findSession(get().projects, sessionId)?.session;
       if (session?.stopped) void get().startSession(projectId, sessionId);
+      get().unparkSession(sessionId);
     },
 
     openTab: (projectId, tab) => {
       set({ selectedRootChatId: null });
+      if (tab.kind === "session") get().unparkSession(tab.ref);
       applyLayout(projectId, (l) => rOpenTab(l, tab));
     },
     openToSide: (projectId, tab) => {
@@ -2908,6 +3280,7 @@ export const useStore = create<AppState>((set, get) => {
         // Same rule as selectSession: opening a stopped session resumes it.
         const session = findSession(get().projects, tab.ref)?.session;
         if (session?.stopped) void get().startSession(projectId, tab.ref);
+        get().unparkSession(tab.ref);
       }
     },
     openFile: (projectId, path, opts) => {
@@ -3429,7 +3802,10 @@ export const useStore = create<AppState>((set, get) => {
         }
         return l;
       });
-      if (isSession) clearNeeds(ref);
+      if (isSession) {
+        clearNeeds(ref);
+        get().unparkSession(ref);
+      }
     },
 
     setActiveGroup: (projectId, groupId) =>
@@ -3496,6 +3872,34 @@ export const useStore = create<AppState>((set, get) => {
       set({ restoreSessionsOnOpen: v });
     },
 
+    setSessionLifecycle: (patch) => {
+      const next = { ...get().sessionLifecycle, ...patch };
+      writeSessionLifecycle(next);
+      set({ sessionLifecycle: next });
+      if (patch.keepAgentsInProject !== undefined) {
+        void invoke("set_keep_agents_in_project", { enabled: next.keepAgentsInProject }).catch(
+          () => {},
+        );
+      }
+    },
+
+    toggleKeepRunning: (sessionId) => {
+      const keepRunning = { ...get().keepRunning };
+      if (keepRunning[sessionId]) delete keepRunning[sessionId];
+      else keepRunning[sessionId] = true;
+      writeKeepRunning(keepRunning);
+      set({ keepRunning });
+    },
+
+    unparkSession: (sessionId) => {
+      if (!get().parkedSessions[sessionId]) return;
+      set((s) => {
+        const parkedSessions = { ...s.parkedSessions };
+        delete parkedSessions[sessionId];
+        return { parkedSessions };
+      });
+    },
+
     setAnnounceAsIde: (v) => {
       writeAnnounceAsIde(v);
       set({ announceAsIde: v });
@@ -3536,11 +3940,12 @@ export const useStore = create<AppState>((set, get) => {
       set((s) => {
         const cur = s.sessionContext[sessionId];
         if (!usage) {
-          // Keep the last known fill rather than blanking the meter: a transcript that
-          // momentarily fails to read has not emptied the context window.
-          return {};
+          if (!cur) return {};
+          const next = { ...s.sessionContext };
+          delete next[sessionId];
+          return { sessionContext: next };
         }
-        if (cur && cur.used === usage.used && cur.window === usage.window) return {};
+        if (cur && cur.used === usage.used && cur.window === usage.window && cur.observedAt === usage.observedAt) return {};
         return { sessionContext: { ...s.sessionContext, [sessionId]: usage } };
       });
     },
@@ -3711,6 +4116,13 @@ export const useStore = create<AppState>((set, get) => {
       } catch { /* fail-open: keep last-known */ }
     },
 
+    refreshCodexUsage: async () => {
+      try {
+        const usage = await invoke<CodexUsage | null>("fetch_codex_usage");
+        set({ codexUsage: usage });
+      } catch { /* fail-open: a missing local snapshot leaves quota unknown */ }
+    },
+
     checkForUpdates: async (opts) => {
       // Don't interfere with an install already in progress.
       if (get().updatePhase === "downloading") return;
@@ -3771,7 +4183,12 @@ export const useStore = create<AppState>((set, get) => {
       try {
         let downloaded = 0;
         let total = 0;
-        await pendingUpdate.downloadAndInstall((ev) => {
+        // Download, THEN end the sessions, THEN install. On Windows `install()` runs the
+        // installer and exits the app on the spot (`std::process::exit`), so no quit path
+        // ever runs and nothing would tree-kill the agents and their MCP servers.
+        // `prepare_for_update` does it first. Ending sessions before the download would cost
+        // them if the download failed, which is why this is not `downloadAndInstall`.
+        await pendingUpdate.download((ev) => {
           switch (ev.event) {
             case "Started":
               total = ev.data.contentLength ?? 0;
@@ -3785,8 +4202,10 @@ export const useStore = create<AppState>((set, get) => {
               break;
           }
         });
-        // Installed to disk; restart into the new version. This tears down PTYs —
-        // the notice copy warns about that before the user clicks Install.
+        await invoke("prepare_for_update").catch(() => {});
+        await pendingUpdate.install();
+        // Installed to disk; restart into the new version (on Windows the installer has
+        // already closed the app by now). The notice copy warns before the user clicks.
         await relaunch();
       } catch (e) {
         set({ updatePhase: "error", updateError: String(e) });

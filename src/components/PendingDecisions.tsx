@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { useStore } from "../store";
 import { summarize } from "../rootProposals";
 import { decisionRoute } from "../pendingDecisionRouting";
-import { agyRow, availabilityFrom, claudeRow, commandCodeRow } from "../usageRows";
+import { agyRow, availabilityFrom, claudeRow, codexAvailabilityRows, commandCodeRow } from "../usageRows";
 
 /** Cards for work root chat wants to start. Rendered at the app root so an approval is
  *  reachable from anywhere, not only from the chat that asked. */
@@ -15,6 +15,7 @@ export function PendingDecisions() {
   const claudeUsage = useStore((s) => s.claudeUsage);
   const agyMap = useStore((s) => s.agyUsageByAccount);
   const commandCodeUsage = useStore((s) => s.commandCodeUsage);
+  const codexUsage = useStore((s) => s.codexUsage);
   const lowThresholdPct = useStore((s) => s.usagePrefs.lowThresholdPct);
 
   // The exact account-health collapse NewSessionDialog uses, so a card can never decide
@@ -25,8 +26,9 @@ export function PendingDecisions() {
         ...claudeUsage.map(claudeRow),
         ...Object.values(agyMap).map(agyRow),
         ...commandCodeUsage.filter((u) => u.usage.windows?.length).map(commandCodeRow),
+        ...codexAvailabilityRows(codexUsage),
       ]),
-    [detected, claudeUsage, agyMap, commandCodeUsage],
+    [detected, claudeUsage, agyMap, commandCodeUsage, codexUsage],
   );
   const threshold = useMemo(
     () => Math.max(0, Math.min(1, lowThresholdPct / 100)),
