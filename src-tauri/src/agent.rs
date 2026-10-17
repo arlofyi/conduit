@@ -2472,7 +2472,8 @@ mod tests {
             "{cmd}"
         );
         assert!(cmd.contains("event=result"), "{cmd}");
-        assert!(cmd.ends_with("; codex"), "{cmd}");
+        // The interactive leg keeps its retry: a rejected pin falls back to plain `codex`.
+        assert!(cmd.ends_with("; codex || codex"), "{cmd}");
     }
 
     #[cfg(not(windows))]
@@ -2856,7 +2857,11 @@ mod tests {
         let resumed =
             HermesAdapter.build_invocation("sess-1", None, "", None, Some("some-other-id"));
         assert_eq!(fresh, resumed, "a captured id must not change the command");
-        assert!(fresh.contains("-c sess-1"), "{fresh}");
+        // Quoted the platform's way: bare under cmd.exe, single-quoted under sh.
+        assert!(
+            fresh.contains(&format!("-c {}", crate::pty::quote_arg("sess-1"))),
+            "{fresh}"
+        );
         assert!(fresh.contains("--create-if-missing"), "{fresh}");
         // The house guarantee: a rejected flag still opens a usable terminal.
         assert!(fresh.ends_with("|| hermes chat"), "{fresh}");

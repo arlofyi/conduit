@@ -2300,10 +2300,16 @@ mod tests {
             false,
             None,
         );
+        // The per-launch hook overrides lead and the pin follows them; the retry after
+        // `||` keeps the hooks and drops only the pin (same contract as the Windows test).
+        let (pinned, retry) = script.split_once(" || ").expect("a retry leg");
+        assert!(pinned.contains("codex -c 'hooks."), "{script}");
         assert!(
-            script.contains("codex -m 'gpt-6-sol' -c 'model_reasoning_effort=high'"),
+            pinned.ends_with(" -m 'gpt-6-sol' -c 'model_reasoning_effort=high'"),
             "{script}"
         );
+        assert!(retry.starts_with("codex -c 'hooks."), "{script}");
+        assert!(!retry.contains("gpt-6-sol"), "{script}");
     }
 
     #[cfg(windows)]
