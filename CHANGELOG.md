@@ -61,7 +61,150 @@ All notable changes to Conduit are documented here. This project uses
 - **Fixed — Codex hooks no longer change your project.** Conduit passes hooks when it
   starts Codex and removes its old project hook entries. Review the hooks in an
   interactive Codex session; Codex silently skips untrusted fleet hooks.
-
+- **Added — orchestration policy and context display.** Settings now offers versioned, scoped policy import and export with a preview. Optional context rings show session-attributed Claude and agy readings, and show Unknown when no reliable reading exists. Policy limits do not enforce behavior yet.
+- **Fixed — Codex sessions use the chosen model.** Routed sessions now start with a
+  supported model and reasoning effort; if a pin is rejected, Codex retries with its
+  default while keeping session hooks and other launch settings.
+- **Fixed — Stale Codex quota snapshots continue to guide routing; rollout discovery now stops after the newest 32 candidates.**
+- **Added — Codex quota in the usage meter.** Recent local Codex rollout snapshots now
+  show the five-hour and weekly limits and inform routing when a readable snapshot exists.
+- **Fixed — Writing an IDE lock file avoids a Windows-only Clippy failure while retaining Unix file permissions.**
+- **Fixed — Opening several sessions at once can no longer corrupt shared settings.** Sessions
+  now start in the background, one at a time, so two launches never rewrite the same hook or
+  account file at once; keys typed while a session is still starting are delivered once it
+  is up instead of being lost.
+- **Added — Edit a skill, not just read it.** The Agent tab's skills open like its memory
+  documents do, and their `SKILL.md` can be edited in place. An edit takes effect on its own
+  — Hermes rebuilds its prompt when the file changes — so tightening a skill's instructions
+  no longer means leaving the app to find the file.
+- **Added — Skills that are switched off now look switched off.** A skill disabled in
+  Hermes' own config is dimmed and marked, read from the same file the agent reads. A skill
+  the agent is quietly ignoring is exactly what you go looking for when it will not do
+  something you expect. Turning one on or off is still done with `hermes skills config`;
+  Conduit shows the state rather than owning it.
+- **Fixed — Typing and tab switching no longer lag on Windows.** The Git panel's
+  background refresh, file reads, session launches and similar work used to run on the same
+  thread that delivers your keystrokes, so each refresh (four `git` processes, often half a
+  second or more, several seconds in a large or cloud-synced repo) held typed text back
+  until it finished. That work now runs in the background, a slow repo can no longer stack
+  up refreshes behind each other, and busy terminals send their output in fewer, larger
+  pieces — which matters most with many sessions open across several profiles.
+- **Fixed — Opening a profile window no longer risks freezing Conduit on Windows.** The
+  window was created on the UI thread, which WebView2 can deadlock on; it is now created
+  in the background.
+- **Added — Several endpoints per agent, and switching between them mid-conversation.**
+  An agent is no longer pinned to one endpoint. Configure a local model *and* OpenRouter in
+  Settings → Model endpoints, and the Model tab gets a row of buttons to move a running
+  session between them — without restarting it, so the work in progress survives. That is
+  the decision you actually make mid-task: is a local model enough for this bit, or is this
+  one worth sending to a frontier model? Hermes switches live; agents that read their
+  endpoint once at startup say so instead of offering a button that does nothing.
+- **Added — A key per endpoint.** Each endpoint holds its own API key, so a keyed cloud
+  endpoint and a keyless local one sit side by side without one being handed the other's
+  credential. Keys are still held in memory for the session only and never written to disk.
+- **Changed — A switched session stays switched.** The endpoint you move a session to is
+  remembered, so restarting or resuming it comes back where you left it rather than quietly
+  reverting to the agent's default with a model that endpoint may not serve.
+- **Changed — `conduit --provider` now picks the endpoint.** It was accepted and ignored;
+  it now starts the new session on the endpoint you named, which is what makes one agent
+  able to launch another under conditions it chose.
+- **Fixed — A private session cannot be routed out of its silo.** A local-only session
+  under private mode is given only local endpoints, so its agent cannot switch itself to a
+  cloud provider mid-conversation.
+- **Added — Change a session's model without losing the conversation.** Switching model is
+  a decision you make *during* a task — this part is mechanical, drop to something cheap;
+  this part is hard, go back up — so it no longer restarts the session. Conduit sends the
+  agent's own in-session command, which keeps the context by definition. Claude, Hermes and
+  Command Code switch live; OpenCode's model picker cannot be driven from a command, so it
+  still needs a restart and now says so instead of pretending.
+- **Added — One-click model switching.** The Model tab offers the endpoint's best
+  tool-capable models as buttons, so a mid-task change is a click rather than typing a
+  40-character id out of several hundred.
+- **Added — Start sessions with chosen conditions from the command line.**
+  `conduit . --agent hermes --provider openrouter --model x-ai/grok-4 --effort high` — so an
+  agent can launch other sessions under conditions it picked. A Hermes session running on a
+  local model can start workers on OpenRouter, or on Claude, without you configuring
+  anything in between. An unknown agent name is refused rather than quietly starting Claude.
+- **Added — Edit what the agent remembers.** The Agent tab's memory documents are now
+  editable, not just readable — including what the agent has worked out about you, which is
+  the one you actually want to correct. A document too large to show in full refuses to save
+  rather than risk truncating it.
+- **Added — Manage links.** The Agent tab points at the editor that already owns each thing
+  (MCP servers → Settings), rather than growing a second editor that could disagree with it.
+- **Added — OpenRouter spend in the usage bar.** Sessions routed at OpenRouter now report
+  what they have actually cost, beside the subscription meters. Unlike those, this is money
+  rather than an allowance: a key with a spending cap shows `$12.40 of $50.00 · $37.60
+  left`, and a key without one shows what you have spent and no bar — because there is no
+  cap to draw it against. Each agent gets its own row, so Hermes and OpenCode on separate
+  keys are counted separately.
+- **Added — An Agent tab.** Beside Model: what the session's agent knows and what it can
+  reach. For Hermes that is its memory — the persona you gave it, what it has worked out
+  about you, and what it has remembered, each openable — plus its loaded skills and MCP
+  servers. For Claude it lists the MCP servers that session will load. Sections an agent has
+  no concept of are left out rather than shown empty.
+- **Added — The Model tab says what it is running.** The model in use is shown with its
+  context window, its price per million tokens in and out, and whether it supports tool
+  calling. On a provider offering hundreds of near-identically-named models, that is the
+  difference between a few cents and a few dollars per session.
+- **Changed — Endpoint setup moved to Settings.** Base URL, API key and provider were
+  set-and-forget controls sitting in a panel you open constantly, and they apply to every
+  session on an agent rather than the one you are looking at. They now live in
+  Settings → Model endpoints; the Model tab links to them and keeps only what genuinely
+  varies per session.
+- **Fixed — OpenRouter and local endpoints now actually connect.** A session pointed at an
+  endpoint still opened its agent's "no inference provider is configured" wizard: the API
+  key was passed in a way the agent's credential resolver never reads, so it saw no key at
+  all. The key is now handed over in the variable each provider actually expects.
+- **Fixed — Hermes sessions failed to start** with "uv trampoline failed to spawn Python
+  child process" on machines where Windows stops following directory junctions.
+- **Added — Pick a model instead of typing one.** Entering an endpoint's API key now loads
+  its catalogue straight away and offers a filterable list showing each model's context
+  window, price per million tokens, and whether it supports tool calling — sorted so
+  tool-capable models come first. Previously all of OpenRouter's 400+ models showed none of
+  that, because only one server's spelling of "context window" was understood.
+- **Added — Settings changes apply themselves.** Changing a session's model, reasoning,
+  account or endpoint no longer needs a manual restart: an idle session restarts itself on
+  the new settings, and a session that is mid-turn waits until it finishes rather than
+  throwing away work in flight.
+- **Changed — Local and cloud endpoints are told apart.** The endpoint picker now groups
+  servers running on your machine separately from cloud providers, names which kind the
+  selected one is, and says where to get an API key. "Use only this endpoint" now spells out
+  that it does not keep a cloud provider's traffic local.
+- **Fixed — The right API key is used when two agents share an endpoint.** Keys were matched
+  by URL alone, so putting OpenRouter on two agents could attach the wrong one.
+- **Added — Hermes Agent.** Nous Research's Hermes joins Claude, Codex, Gemini, OpenCode,
+  Antigravity and Command Code as a seventh agent you can start sessions with. It reports
+  live status the way Claude does — busy, finished, and a real "needs you" badge when it
+  asks to run a command — and reopens the same conversation when you restart a session.
+  Install it in one click from Settings → Agents.
+- **Added — Run any agent on OpenRouter.** OpenRouter joins the endpoint list beside
+  Ollama, LM Studio, vLLM, llama.cpp and OpenWebUI, so an OpenCode or Hermes session can
+  run on hundreds of hosted models behind one API key. Keys are held in memory for the
+  session only and are never written to disk.
+- **Added — Local models for Hermes.** Point Hermes at your own GPU the same way OpenCode
+  already could. Conduit configures the session without touching your own Hermes settings.
+- **Added — A Model tab.** A new tab beside Git shows what the selected session is actually
+  running — its agent, model, reasoning level, account and endpoint — and lets you change
+  any of them. It follows whichever session you select, offers only the controls that
+  agent genuinely supports, and says plainly which changes need a restart (with a button
+  to do it).
+- **Added — Settings → Model endpoints.** One place to set the default endpoint each agent
+  inherits, separate from the per-session Model tab.
+- **Changed — Endpoint settings are now per agent.** Each agent keeps its own endpoint
+  instead of sharing one slot. Existing OpenCode settings carry over untouched.
+- **Fixed — A local-only session can no longer be routed to the cloud.** Marking a session
+  local-only under private mode now refuses a non-local endpoint outright instead of
+  accepting one that merely had "use only this endpoint" ticked.
+- **Fixed — Numeric tab switching works on Windows and Linux.** Jumping to a tab by
+  position was bound to Cmd+1..9 only, so off macOS there was no way to do it at all:
+  Ctrl+digit has to reach the terminal untouched (Ctrl+3 is ESC, which interrupts a
+  running agent) and the Windows key is reserved by the OS. Windows and Linux now use
+  Alt+1..9, matching VS Code. 9 still jumps to the last tab.
+- **Fixed — Save All and Toggle Word Wrap have keyboard shortcuts off macOS.** Both menu
+  items were mac-only, leaving them mouse-only everywhere else. Save All is now
+  Ctrl+Shift+S and Toggle Word Wrap is Alt+Z on Windows and Linux. Find and Replace stays
+  deliberately unbound there: its usual Ctrl+H is backspace in a terminal, and Monaco's
+  own editor-scoped Ctrl+H still works.
 
 ## 0.42.0 — 2026-10-12
 
@@ -105,56 +248,8 @@ All notable changes to Conduit are documented here. This project uses
   finds such an account's sign-in in the Keychain, so its usage row fills in instead of
   staying "not connected".
 
+## 0.40.0 — 2026-09-24
 
-## 0.43.0 — 2026-09-29
-
-- **Added — orchestration policy and context display.** Settings now offers versioned, scoped policy import and export with a preview. Optional context rings show session-attributed Claude and agy readings, and show Unknown when no reliable reading exists. Policy limits do not enforce behavior yet.
-
-
-- **Fixed — Codex sessions use the chosen model.** Routed sessions now start with a
-  supported model and reasoning effort; if a pin is rejected, Codex retries with its
-  default while keeping session hooks and other launch settings.
-
-
-- **Fixed — Stale Codex quota snapshots continue to guide routing; rollout discovery now stops after the newest 32 candidates.**
-
-- **Added — Codex quota in the usage meter.** Recent local Codex rollout snapshots now
-  show the five-hour and weekly limits and inform routing when a readable snapshot exists.
-
-
-- **Fixed — Writing an IDE lock file avoids a Windows-only Clippy failure while retaining Unix file permissions.**
-
-
-## 0.42.1 — 2026-09-27
-
-- **Fixed — Opening several sessions at once can no longer corrupt shared settings.** Sessions
-  now start in the background, one at a time, so two launches never rewrite the same hook or
-  account file at once; keys typed while a session is still starting are delivered once it
-  is up instead of being lost.
-
-## 0.42.0 — 2026-09-27
-
-- **Added — Edit a skill, not just read it.** The Agent tab's skills open like its memory
-  documents do, and their `SKILL.md` can be edited in place. An edit takes effect on its own
-  — Hermes rebuilds its prompt when the file changes — so tightening a skill's instructions
-  no longer means leaving the app to find the file.
-- **Added — Skills that are switched off now look switched off.** A skill disabled in
-  Hermes' own config is dimmed and marked, read from the same file the agent reads. A skill
-  the agent is quietly ignoring is exactly what you go looking for when it will not do
-  something you expect. Turning one on or off is still done with `hermes skills config`;
-  Conduit shows the state rather than owning it.
-- **Fixed — Typing and tab switching no longer lag on Windows.** The Git panel's
-  background refresh, file reads, session launches and similar work used to run on the same
-  thread that delivers your keystrokes, so each refresh (four `git` processes, often half a
-  second or more, several seconds in a large or cloud-synced repo) held typed text back
-  until it finished. That work now runs in the background, a slow repo can no longer stack
-  up refreshes behind each other, and busy terminals send their output in fewer, larger
-  pieces — which matters most with many sessions open across several profiles.
-- **Fixed — Opening a profile window no longer risks freezing Conduit on Windows.** The
-  window was created on the UI thread, which WebView2 can deadlock on; it is now created
-  in the background.
-- **Changed — Merged upstream Conduit 0.38.0–0.40.0.** The items below shipped upstream
-  under those numbers and are new to this build.
 - **Changed — the session chat view speaks HQ's design language.** The rich session view
   is now the same condensed, centered conversation the root chat uses — warm accent
   bubbles for you, plain prose for the agent, quiet one-line tool calls — instead of a
@@ -177,6 +272,9 @@ All notable changes to Conduit are documented here. This project uses
   title with an (i) that unfolds the full explanation, instead of a wall of paragraphs.
   Notes you must see — restart requirements, a missing tmux, the CLI install path —
   stay visible without clicking.
+
+## 0.39.0 — 2026-09-24
+
 - **Added — Profiles can open in their own windows.** A new Settings → General option makes
   picking a profile open (or focus) a separate window pinned to it, Obsidian-style — run two
   profiles side by side. Each window shows and runs only its profile's projects; closing a
@@ -184,6 +282,9 @@ All notable changes to Conduit are documented here. This project uses
 - **Fixed — closed-window terminals no longer go permanently silent.** A terminal whose
   window disappeared used to be unrecoverable after ~2000 dropped frames; it now detaches
   cleanly and reattaches on the next open.
+
+## 0.38.0 — 2026-09-23
+
 - **Added — Conduit is now a Claude Code IDE.** Claude sessions launched in Conduit
   connect back to the app the way they connect to VS Code: review Claude's proposed
   file changes in a side-by-side diff with Keep/Reject (edit the proposal right in the
@@ -192,137 +293,13 @@ All notable changes to Conduit are documented here. This project uses
   editor. Each session gets its own private, authenticated connection, so the diff
   always lands on the session that asked. Toggle under Settings → General →
   "Announce as IDE"; applies to sessions started after the change.
-
-## 0.41.0 — 2026-09-19
-
-- **Added — Several endpoints per agent, and switching between them mid-conversation.**
-  An agent is no longer pinned to one endpoint. Configure a local model *and* OpenRouter in
-  Settings → Model endpoints, and the Model tab gets a row of buttons to move a running
-  session between them — without restarting it, so the work in progress survives. That is
-  the decision you actually make mid-task: is a local model enough for this bit, or is this
-  one worth sending to a frontier model? Hermes switches live; agents that read their
-  endpoint once at startup say so instead of offering a button that does nothing.
-- **Added — A key per endpoint.** Each endpoint holds its own API key, so a keyed cloud
-  endpoint and a keyless local one sit side by side without one being handed the other's
-  credential. Keys are still held in memory for the session only and never written to disk.
-- **Changed — A switched session stays switched.** The endpoint you move a session to is
-  remembered, so restarting or resuming it comes back where you left it rather than quietly
-  reverting to the agent's default with a model that endpoint may not serve.
-- **Changed — `conduit --provider` now picks the endpoint.** It was accepted and ignored;
-  it now starts the new session on the endpoint you named, which is what makes one agent
-  able to launch another under conditions it chose.
-- **Fixed — A private session cannot be routed out of its silo.** A local-only session
-  under private mode is given only local endpoints, so its agent cannot switch itself to a
-  cloud provider mid-conversation.
-
-## 0.40.0 — 2026-09-19
-
-- **Added — Change a session's model without losing the conversation.** Switching model is
-  a decision you make *during* a task — this part is mechanical, drop to something cheap;
-  this part is hard, go back up — so it no longer restarts the session. Conduit sends the
-  agent's own in-session command, which keeps the context by definition. Claude, Hermes and
-  Command Code switch live; OpenCode's model picker cannot be driven from a command, so it
-  still needs a restart and now says so instead of pretending.
-- **Added — One-click model switching.** The Model tab offers the endpoint's best
-  tool-capable models as buttons, so a mid-task change is a click rather than typing a
-  40-character id out of several hundred.
-- **Added — Start sessions with chosen conditions from the command line.**
-  `conduit . --agent hermes --provider openrouter --model x-ai/grok-4 --effort high` — so an
-  agent can launch other sessions under conditions it picked. A Hermes session running on a
-  local model can start workers on OpenRouter, or on Claude, without you configuring
-  anything in between. An unknown agent name is refused rather than quietly starting Claude.
-- **Added — Edit what the agent remembers.** The Agent tab's memory documents are now
-  editable, not just readable — including what the agent has worked out about you, which is
-  the one you actually want to correct. A document too large to show in full refuses to save
-  rather than risk truncating it.
-- **Added — Manage links.** The Agent tab points at the editor that already owns each thing
-  (MCP servers → Settings), rather than growing a second editor that could disagree with it.
-
-## 0.39.0 — 2026-09-19
-
-- **Added — OpenRouter spend in the usage bar.** Sessions routed at OpenRouter now report
-  what they have actually cost, beside the subscription meters. Unlike those, this is money
-  rather than an allowance: a key with a spending cap shows `$12.40 of $50.00 · $37.60
-  left`, and a key without one shows what you have spent and no bar — because there is no
-  cap to draw it against. Each agent gets its own row, so Hermes and OpenCode on separate
-  keys are counted separately.
-- **Added — An Agent tab.** Beside Model: what the session's agent knows and what it can
-  reach. For Hermes that is its memory — the persona you gave it, what it has worked out
-  about you, and what it has remembered, each openable — plus its loaded skills and MCP
-  servers. For Claude it lists the MCP servers that session will load. Sections an agent has
-  no concept of are left out rather than shown empty.
-- **Added — The Model tab says what it is running.** The model in use is shown with its
-  context window, its price per million tokens in and out, and whether it supports tool
-  calling. On a provider offering hundreds of near-identically-named models, that is the
-  difference between a few cents and a few dollars per session.
-- **Changed — Endpoint setup moved to Settings.** Base URL, API key and provider were
-  set-and-forget controls sitting in a panel you open constantly, and they apply to every
-  session on an agent rather than the one you are looking at. They now live in
-  Settings → Model endpoints; the Model tab links to them and keeps only what genuinely
-  varies per session.
-
-## 0.38.1 — 2026-09-19
-
-- **Fixed — OpenRouter and local endpoints now actually connect.** A session pointed at an
-  endpoint still opened its agent's "no inference provider is configured" wizard: the API
-  key was passed in a way the agent's credential resolver never reads, so it saw no key at
-  all. The key is now handed over in the variable each provider actually expects.
-- **Fixed — Hermes sessions failed to start** with "uv trampoline failed to spawn Python
-  child process" on machines where Windows stops following directory junctions.
-- **Added — Pick a model instead of typing one.** Entering an endpoint's API key now loads
-  its catalogue straight away and offers a filterable list showing each model's context
-  window, price per million tokens, and whether it supports tool calling — sorted so
-  tool-capable models come first. Previously all of OpenRouter's 400+ models showed none of
-  that, because only one server's spelling of "context window" was understood.
-- **Added — Settings changes apply themselves.** Changing a session's model, reasoning,
-  account or endpoint no longer needs a manual restart: an idle session restarts itself on
-  the new settings, and a session that is mid-turn waits until it finishes rather than
-  throwing away work in flight.
-- **Changed — Local and cloud endpoints are told apart.** The endpoint picker now groups
-  servers running on your machine separately from cloud providers, names which kind the
-  selected one is, and says where to get an API key. "Use only this endpoint" now spells out
-  that it does not keep a cloud provider's traffic local.
-- **Fixed — The right API key is used when two agents share an endpoint.** Keys were matched
-  by URL alone, so putting OpenRouter on two agents could attach the wrong one.
-
-## 0.38.0 — 2026-09-19
-
-- **Added — Hermes Agent.** Nous Research's Hermes joins Claude, Codex, Gemini, OpenCode,
-  Antigravity and Command Code as a seventh agent you can start sessions with. It reports
-  live status the way Claude does — busy, finished, and a real "needs you" badge when it
-  asks to run a command — and reopens the same conversation when you restart a session.
-  Install it in one click from Settings → Agents.
-- **Added — Run any agent on OpenRouter.** OpenRouter joins the endpoint list beside
-  Ollama, LM Studio, vLLM, llama.cpp and OpenWebUI, so an OpenCode or Hermes session can
-  run on hundreds of hosted models behind one API key. Keys are held in memory for the
-  session only and are never written to disk.
-- **Added — Local models for Hermes.** Point Hermes at your own GPU the same way OpenCode
-  already could. Conduit configures the session without touching your own Hermes settings.
-- **Added — A Model tab.** A new tab beside Git shows what the selected session is actually
-  running — its agent, model, reasoning level, account and endpoint — and lets you change
-  any of them. It follows whichever session you select, offers only the controls that
-  agent genuinely supports, and says plainly which changes need a restart (with a button
-  to do it).
-- **Added — Settings → Model endpoints.** One place to set the default endpoint each agent
-  inherits, separate from the per-session Model tab.
-- **Changed — Endpoint settings are now per agent.** Each agent keeps its own endpoint
-  instead of sharing one slot. Existing OpenCode settings carry over untouched.
-- **Fixed — A local-only session can no longer be routed to the cloud.** Marking a session
-  local-only under private mode now refuses a non-local endpoint outright instead of
-  accepting one that merely had "use only this endpoint" ticked.
-
-## 0.37.1 — 2026-09-19
-
-- **Fixed — Numeric tab switching works on Windows and Linux.** Jumping to a tab by
-  position was bound to Cmd+1..9 only, so off macOS there was no way to do it at all:
-  Ctrl+digit has to reach the terminal untouched (Ctrl+3 is ESC, which interrupts a
-  running agent) and the Windows key is reserved by the OS. Windows and Linux now use
-  Alt+1..9, matching VS Code. 9 still jumps to the last tab.
-- **Fixed — Save All and Toggle Word Wrap have keyboard shortcuts off macOS.** Both menu
-  items were mac-only, leaving them mouse-only everywhere else. Save All is now
-  Ctrl+Shift+S and Toggle Word Wrap is Alt+Z on Windows and Linux. Find and Replace stays
-  deliberately unbound there: its usual Ctrl+H is backspace in a terminal, and Monaco's
-  own editor-scoped Ctrl+H still works.
+- **Fixed — sessions now follow a conversation past `/clear`.** Restarting a session
+  used to reopen the conversation from before your last `/clear` — the work since
+  looked lost. Conduit now tracks the conversation Claude is actually in, resumes
+  that one, and offers a one-time repair notice for sessions that drifted before the
+  fix (your "lost" conversations are recoverable from it).
+- **Fixed — sturdier saved state.** Conduit keeps a rolling backup of its own state
+  file and recovers from a corrupted one instead of forgetting your projects.
 
 ## 0.37.0 — 2026-09-18
 
