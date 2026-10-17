@@ -918,6 +918,22 @@ impl PtyManager {
         ))
     }
 
+    /// The root of a live session's process tree, for `agent_activity`: the PTY child
+    /// (cmd.exe on Windows, the login shell on a direct POSIX spawn) or, under tmux, the
+    /// pane's process -- there the PTY child is only a tmux client and the agent belongs to
+    /// the tmux server. None if the session is not running here.
+    pub fn session_root_pid(&self, session_id: &str) -> Option<u32> {
+        #[cfg(not(windows))]
+        if let Some(tmux) = self.tmux_path() {
+            if let Some(pid) = crate::tmux::pane_pid(tmux, session_id) {
+                return Some(pid);
+            }
+        }
+        let entry = self.sessions.get(session_id)?;
+        let session = entry.lock().ok()?;
+        session.child.process_id()
+    }
+
     /// Ids of all currently-running sessions (for the bridge `list` message).
     pub fn session_ids(&self) -> Vec<String> {
         self.sessions.iter().map(|e| e.key().clone()).collect()

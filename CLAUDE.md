@@ -464,7 +464,13 @@ themselves; prefs are Settings → Sessions (`SessionSettings.tsx`, stored as
   install runs no cleanup, so the last write must already be right. Stop paths and the
   stale sweep write `idle`.
 - **Idle auto-stop** (`useAutoStopIdle`) calls the normal `stopSession` (RETIRE). Never a
-  `running` agent or a Conductor.
+  `running` agent, a Conductor, or a session pinned "keep running" (`keepRunning`,
+  localStorage). **A hook `done` means the TURN ended, not the agent**: one that started a
+  background command waits after `Stop`, and stopping it killed that work (it killed the
+  agent that wrote this feature, mid CI-watch). So every candidate is checked first with
+  `busy_sessions` (`agent_activity.rs`): a shell at depth >= 2 under the session root is a
+  running command. MCP servers are spawned directly, never through a shell, so they never
+  count. If the check fails, nothing is stopped.
 - **Terminals mount lazily** in `WorkspaceCenter` (`mountedTerminals`): first shown,
   launch-resumed, created this run, or the old `project` mode. Once mounted, never
   unmounted -- the keep-alive rule is unchanged.

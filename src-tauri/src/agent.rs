@@ -148,7 +148,7 @@ pub fn plugin_mcp_servers(plugin_dir: &str, manifest_json: &str) -> Vec<McpServe
                 command: def
                     .get("command")
                     .and_then(|c| c.as_str())
-                    .map(&subst)
+                    .map(subst)
                     .unwrap_or_default(),
                 args: def
                     .get("args")
@@ -158,7 +158,7 @@ pub fn plugin_mcp_servers(plugin_dir: &str, manifest_json: &str) -> Vec<McpServe
                 url: def
                     .get("url")
                     .and_then(|u| u.as_str())
-                    .map(&subst)
+                    .map(subst)
                     .unwrap_or_default(),
                 env,
             }

@@ -5,6 +5,15 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — idle auto-stop no longer stops an agent that is still working in the
+  background.** An agent that started a background command (a dev server, a watcher, a CI
+  watch it will be woken by) reports its turn as finished and waits; auto-stop took that
+  as done and stopped the session five minutes later, killing the work. Conduit now checks
+  whether the agent still has a command running under it and leaves those sessions alone.
+- **Added — "Keep running" for a session.** Right-click a session and choose Keep running
+  to exempt it from the idle auto-stop, for an agent waiting on something Conduit cannot
+  see, like a remote job.
+
 ## 0.44.0 — 2026-10-16
 
 - **Added — Settings → Sessions.** One place for when sessions start and stop by

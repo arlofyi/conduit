@@ -111,6 +111,10 @@ describe("idleStopTargets", () => {
     ).toEqual(["doneLong"]);
   });
 
+  it("never stops a session pinned to keep running", () => {
+    expect(ids({ ...base, pinned: new Set(["doneLong"]) })).toEqual([]);
+  });
+
   it("does nothing when switched off", () => {
     expect(ids({ ...base, prefs: { ...DEFAULT_LIFECYCLE, autoStopIdle: false } })).toEqual([]);
   });

@@ -129,6 +129,8 @@ export interface IdleStopInput {
   live: Record<string, LiveStatus | undefined>;
   /** Sessions currently on screen. */
   visible: Set<string>;
+  /** Sessions pinned "keep running" by the user: never auto-stopped. */
+  pinned?: Set<string>;
   prefs: Pick<
     SessionLifecyclePrefs,
     "autoStopIdle" | "autoStopMinutes" | "autoStopWaiting" | "autoStopVisible"
@@ -143,12 +145,13 @@ export interface IdleStopInput {
  * between worker results by design, and a stopped one cannot be woken.
  */
 export function idleStopTargets(input: IdleStopInput): { projectId: string; sessionId: string }[] {
-  const { now, sessions, live, visible, prefs } = input;
+  const { now, sessions, live, visible, prefs, pinned } = input;
   if (!prefs.autoStopIdle) return [];
   const quietMs = clampMinutes(prefs.autoStopMinutes) * 60_000;
   const out: { projectId: string; sessionId: string }[] = [];
   for (const s of sessions) {
     if (s.stopped || s.role === "conductor") continue;
+    if (pinned?.has(s.id)) continue;
     if (!prefs.autoStopVisible && visible.has(s.id)) continue;
     const l = live[s.id];
     if (!l || l.updatedAt === undefined) continue;

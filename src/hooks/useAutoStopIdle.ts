@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useStore } from "../store";
 import { idleStopTargets } from "../sessionLifecycle";
 
@@ -11,10 +12,18 @@ const CHECK_EVERY_MS = 30_000;
  * the Stop button -- processes ended, conversation and scrollback kept, a click or key in
  * the pane resumes it. The decision is `idleStopTargets` (pure, tested); this only feeds
  * it the store and what is on screen.
+ *
+ * A finished TURN is not a finished agent: one that started a background command (a dev
+ * server, a watcher, a CI watch it will be woken by) reports `done` and waits. Before
+ * stopping anything this asks Rust (`busy_sessions`) which candidates still have a shell
+ * running under the agent, and leaves those alone. Sessions pinned "keep running" are
+ * never candidates.
  */
 export function useAutoStopIdle() {
   useEffect(() => {
-    const tick = () => {
+    let inFlight = false;
+    const tick = async () => {
+      if (inFlight) return;
       const st = useStore.getState();
       const prefs = st.sessionLifecycle;
       if (!prefs.autoStopIdle) return;
@@ -25,11 +34,34 @@ export function useAutoStopIdle() {
         ),
         live: st.live,
         visible: visibleSessions(st),
+        pinned: new Set(Object.keys(st.keepRunning)),
         prefs,
       });
-      for (const t of targets) void st.stopSession(t.projectId, t.sessionId);
+      if (!targets.length) return;
+      inFlight = true;
+      try {
+        // If the check itself fails, stop nothing: a wrong "idle" kills work, a wrong
+        // "busy" only costs memory until the next tick.
+        const busy = new Set(
+          await invoke<string[]>("busy_sessions", {
+            sessionIds: targets.map((t) => t.sessionId),
+          }),
+        );
+        const now = useStore.getState();
+        for (const t of targets) {
+          if (busy.has(t.sessionId)) continue;
+          // Re-read: the agent may have started again while the check ran.
+          const status = now.live[t.sessionId]?.status;
+          if (status === "running" || now.keepRunning[t.sessionId]) continue;
+          void now.stopSession(t.projectId, t.sessionId);
+        }
+      } catch {
+        /* see above -- stop nothing */
+      } finally {
+        inFlight = false;
+      }
     };
-    const id = window.setInterval(tick, CHECK_EVERY_MS);
+    const id = window.setInterval(() => void tick(), CHECK_EVERY_MS);
     return () => window.clearInterval(id);
   }, []);
 }

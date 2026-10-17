@@ -305,6 +305,33 @@ pub fn kill_session(tmux: &Path, session_id: &str) {
         .output();
 }
 
+/// The PID of the process running in this session's pane: the login shell that runs the
+/// agent. Under persistence the agent is a child of the tmux SERVER, not of Conduit's PTY
+/// child (the tmux client), so this is the only way to find its process tree.
+pub fn pane_pid(tmux: &Path, session_id: &str) -> Option<u32> {
+    let out = Command::new(tmux)
+        .args([
+            "-L",
+            &socket(),
+            "list-panes",
+            "-t",
+            &session_name(session_id),
+            "-F",
+            "#{pane_pid}",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Is there already a live tmux session for this Conduit session?
 ///
 /// Asked at spawn time, before `new-session -A` runs, because attach-or-create deliberately

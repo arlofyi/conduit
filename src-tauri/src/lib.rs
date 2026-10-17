@@ -5,6 +5,7 @@
 //! and exposes them to the React frontend as Tauri commands.
 
 mod agent;
+mod agent_activity;
 mod agent_profile;
 mod agy_usage;
 mod asks;
@@ -421,7 +422,7 @@ fn pty_spawn(
         let usable = settings.is_ready() && (!must_be_local || settings.is_local());
         if settings.is_ready() && !usable {
             eprintln!(
-                "conduit: hermes session {session_id} is local-only, but its configured \
+                "conduit: a hermes session is local-only, but its configured \
                  endpoint is not local -- routing skipped, the session runs on its own config."
             );
         }
@@ -467,7 +468,7 @@ fn pty_spawn(
         let must_be_local = store.is_private_mode() && store.is_session_local_only(&session_id);
         if must_be_local && settings.is_ready() && !settings.is_local() {
             eprintln!(
-                "conduit: opencode session {session_id} is local-only, but its configured \
+                "conduit: an opencode session is local-only, but its configured \
                  endpoint is not local -- routing skipped, the session runs on its own config."
             );
             settings.enabled = false;
@@ -812,6 +813,25 @@ fn tmux_available(pty: State<Arc<PtyManager>>) -> TmuxInfo {
             install: None,
         }
     }
+}
+
+/// Which of `session_ids` still have background work running under their agent (a shell
+/// left by a background command, a dev server, a watcher). The idle auto-stop asks this
+/// before retiring a session whose hooks say "done": a finished TURN is not a finished
+/// agent. One process-table snapshot answers the whole batch. See `agent_activity`.
+#[tauri::command(async)]
+fn busy_sessions(session_ids: Vec<String>, pty: State<Arc<PtyManager>>) -> Vec<String> {
+    if session_ids.is_empty() {
+        return Vec::new();
+    }
+    let procs = crate::agent_activity::process_table();
+    session_ids
+        .into_iter()
+        .filter(|id| {
+            pty.session_root_pid(id)
+                .is_some_and(|root| crate::agent_activity::has_background_work(&procs, root))
+        })
+        .collect()
 }
 
 /// Settings -> Sessions "Remove stray NUL files": sweep every project folder for the
@@ -3481,6 +3501,7 @@ pub fn run() {
             set_session_persistence,
             set_keep_agents_in_project,
             remove_stray_nul_files,
+            busy_sessions,
             any_agent_running,
             load_projects,
             add_project,

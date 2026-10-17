@@ -660,6 +660,25 @@ function writePlanConnected(v: Record<string, boolean>): void {
   }
 }
 
+const KEEP_RUNNING_KEY = "conduit.keepRunning";
+function readKeepRunning(): Record<string, true> {
+  try {
+    const v = JSON.parse(localStorage.getItem(KEEP_RUNNING_KEY) ?? "{}");
+    const out: Record<string, true> = {};
+    if (v && typeof v === "object") for (const k of Object.keys(v)) if (v[k] === true) out[k] = true;
+    return out;
+  } catch {
+    return {};
+  }
+}
+function writeKeepRunning(v: Record<string, true>): void {
+  try {
+    localStorage.setItem(KEEP_RUNNING_KEY, JSON.stringify(v));
+  } catch {
+    /* quota — non-fatal */
+  }
+}
+
 /** Whether this app run has applied the launch rule yet (see `load`). */
 let launchDecided = false;
 
@@ -1470,6 +1489,10 @@ interface AppState {
   /** Session ids that existed at launch. Anything else was created this run. */
   launchSessionIds: Record<string, true>;
   unparkSession: (sessionId: string) => void;
+  /** Persisted per machine. Sessions the user pinned "keep running": exempt from the idle
+   *  auto-stop, for work the process tree cannot reveal (an agent waiting on a remote job). */
+  keepRunning: Record<string, true>;
+  toggleKeepRunning: (sessionId: string) => void;
   /** Persisted. When true (default), Claude sessions announce Conduit as their IDE:
    *  diff review lands in a Monaco overlay, editor selections reach the session. */
   announceAsIde: boolean;
@@ -2028,6 +2051,7 @@ export const useStore = create<AppState>((set, get) => {
     parkedSessions: {},
     launchResume: {},
     launchSessionIds: {},
+    keepRunning: readKeepRunning(),
     announceAsIde: readAnnounceAsIde(),
     pendingDiffs: [],
     openBehavior: readOpenBehavior(),
@@ -3857,6 +3881,14 @@ export const useStore = create<AppState>((set, get) => {
           () => {},
         );
       }
+    },
+
+    toggleKeepRunning: (sessionId) => {
+      const keepRunning = { ...get().keepRunning };
+      if (keepRunning[sessionId]) delete keepRunning[sessionId];
+      else keepRunning[sessionId] = true;
+      writeKeepRunning(keepRunning);
+      set({ keepRunning });
     },
 
     unparkSession: (sessionId) => {
