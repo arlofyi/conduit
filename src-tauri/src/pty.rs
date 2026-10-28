@@ -370,6 +370,18 @@ impl PtyManager {
 
         let adapter = crate::agent::adapter_for(agent);
 
+        // The prompt rides a file, never the command line (see `write_prompt_file_in`). A
+        // spawn without one clears any file a spawn that never ran its script left behind,
+        // so a prompt is never delivered twice.
+        let prompt_file = match initial_prompt.as_deref() {
+            _ if shell_only => None,
+            Some(p) => write_prompt_file_in(&crate::store::data_dir(), &session_id, p),
+            None => {
+                remove_prompt_file(&session_id);
+                None
+            }
+        };
+
         // Resolve --resume / transcript_exists against the SELECTED account's transcript
         // store (Feature 2 lever), not Conduit's own default env. Falls back to the
         // process-env CLAUDE_CONFIG_DIR / ~/.claude when no account is pinned.
@@ -401,6 +413,7 @@ impl PtyManager {
                     plugin_dir.as_deref(),
                     system_prompt_file.as_deref(),
                     initial_prompt.as_deref(),
+                    prompt_file.as_deref(),
                     projects_dir.as_deref(),
                     model.as_deref(),
                     effort.as_deref(),
@@ -460,6 +473,7 @@ impl PtyManager {
                     plugin_dir.as_deref(),
                     system_prompt_file.as_deref(),
                     initial_prompt.as_deref(),
+                    prompt_file.as_deref(),
                     projects_dir.as_deref(),
                     model.as_deref(),
                     effort.as_deref(),
@@ -931,6 +945,7 @@ impl PtyManager {
         self.warm_spawns.remove(session_id);
         if !how.keeps_snapshot() {
             crate::scrollback::remove(session_id);
+            remove_prompt_file(session_id);
             // DESTROY also ends the session's IDE server and removes its lock file —
             // pending diff reviews are answered DIFF_REJECTED first so claude's blocked
             // openDiff resolves instead of dangling. RETIRE deliberately keeps both:
@@ -1142,6 +1157,103 @@ fn write_spawn_script(session_id: &str, invocation: &str) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
+/// Where a session's initial prompt waits for its spawn: `initial-prompt-<id>.txt` in `dir`.
+/// One file per session id, overwritten on each spawn that carries a prompt, so the set is
+/// bounded by the session count (same convention as `write_spawn_script`).
+fn prompt_file_path_in(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("initial-prompt-{session_id}.txt"))
+}
+
+/// Write a session's initial prompt to its prompt file, owner-only, and return the path.
+///
+/// The prompt goes through a file because it can be 64 KB (`conduit --prompt-file`), and
+/// inlined into the spawn command -- twice, once per `||` branch -- it overruns cmd.exe's
+/// 8191-char line limit, tmux's command size and Linux's 128 KB per-argument cap. Same
+/// fix, same reason, as the Conductor persona (`fleet::write_persona_file`).
+///
+/// The old file is removed first so the 0600 mode applies even when one was left behind
+/// with looser permissions. Returns None on any I/O failure; the caller then inlines the
+/// prompt, which is still correct for a short one.
+pub(crate) fn write_prompt_file_in(dir: &Path, session_id: &str, prompt: &str) -> Option<String> {
+    let path = prompt_file_path_in(dir, session_id);
+    let _ = fs::remove_file(&path);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path).ok()?;
+    if f.write_all(prompt.as_bytes()).is_err() {
+        drop(f);
+        let _ = fs::remove_file(&path);
+        return None;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Delete a session's prompt file, if any. The POSIX script deletes it itself as soon as
+/// it has read it; this is the backstop for a spawn that never ran its script, and for
+/// Windows, where the agent reads the file at a time Conduit cannot see.
+fn remove_prompt_file(session_id: &str) {
+    let _ = fs::remove_file(prompt_file_path_in(&crate::store::data_dir(), session_id));
+}
+
+/// The shell variable the POSIX spawn script reads the prompt file into.
+#[cfg_attr(windows, allow(dead_code))]
+const PROMPT_VAR: &str = "CONDUIT_INITIAL_PROMPT";
+
+/// POSIX: the script prefix that loads the initial prompt, and the word `build_invocation`
+/// splices in for it. With a prompt file the prefix reads it into `PROMPT_VAR` and deletes
+/// it at once (the agent never needs the file, and both `||` branches share the variable),
+/// so the command line carries only the path. Without one (the write failed) the prompt is
+/// inlined, single-quoted. The variable is not exported, so the interactive shell the
+/// script `exec`s into does not inherit it. `$(...)` drops trailing newlines, which a
+/// prompt does not need.
+#[cfg_attr(windows, allow(dead_code))]
+fn posix_prompt(
+    initial_prompt: Option<&str>,
+    prompt_file: Option<&str>,
+) -> (String, Option<String>) {
+    match (initial_prompt, prompt_file) {
+        (Some(_), Some(file)) => {
+            let q = shell_quote(file);
+            (
+                format!("{PROMPT_VAR}=$(cat {q}); rm -f {q}; "),
+                Some(format!("\"${PROMPT_VAR}\"")),
+            )
+        }
+        (Some(p), None) => (String::new(), Some(shell_quote(p))),
+        (None, _) => (String::new(), None),
+    }
+}
+
+/// The longest prompt Windows inlines into the spawn batch file. The invocation is one
+/// batch line, capped at 8191 chars, and carries the prompt twice (`||`) beside the flags.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WIN_INLINE_PROMPT_MAX: usize = 2000;
+
+/// Windows: the word `build_invocation` splices in for the initial prompt. cmd.exe has no
+/// `$(cat file)`, and CreateProcess caps a whole command line at 32767 chars, so a long
+/// prompt cannot reach the agent as an argument at all. A short single-line prompt is
+/// inlined as before; a long one, or one with a line break (which would end the batch
+/// line and run the rest as commands), becomes a short instruction to read the prompt
+/// file -- the persona's approach, where the agent reads a file Conduit wrote.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_prompt_arg(initial_prompt: Option<&str>, prompt_file: Option<&str>) -> Option<String> {
+    let p = initial_prompt?;
+    let inline_ok = p.len() <= WIN_INLINE_PROMPT_MAX && !p.contains(['\n', '\r']);
+    match prompt_file {
+        Some(file) if !inline_ok => Some(quote_arg(&format!(
+            "Your task brief is in the file {file}. Read it and follow it."
+        ))),
+        // No file to point at: a line break would still split the batch line, so flatten it.
+        None if !inline_ok => Some(quote_arg(&p.replace(['\r', '\n'], " "))),
+        _ => Some(quote_arg(p)),
+    }
+}
+
 /// OS-appropriate argument quoting for the agent invocation string: POSIX single-quoting
 /// under a `sh -c` login shell, cmd.exe quoting under `cmd /K`. Used by the provider
 /// adapters so one `build_invocation` implementation serves both platforms.
@@ -1186,6 +1298,8 @@ fn build_script(
     plugin_dir: Option<&str>,
     system_prompt_file: Option<&str>,
     initial_prompt: Option<&str>,
+    // The file `write_prompt_file_in` put `initial_prompt` in; see `posix_prompt`.
+    prompt_file: Option<&str>,
     projects_dir: Option<&Path>,
     model: Option<&str>,
     effort: Option<&str>,
@@ -1238,15 +1352,16 @@ fn build_script(
     if let Some(e) = effort {
         flags.push_str(&format!(" --effort {}", shell_quote(e)));
     }
+    let (load_prompt, prompt_arg) = posix_prompt(initial_prompt, prompt_file);
     let invocation = adapter.build_invocation(
         session_id,
         projects_dir,
         &flags,
-        initial_prompt,
+        prompt_arg.as_deref(),
         resume_token,
     );
     format!(
-        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}{ide}; cd {dir} && {invocation}; exec {shell} -i -l",
+        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}{ide}; {load_prompt}cd {dir} && {invocation}; exec {shell} -i -l",
         sid = shell_quote(session_id),
         port = port,
         // CLAUDE_CODE_SSE_PORT is the 2.1.267 auto-connect trigger;
@@ -1312,6 +1427,8 @@ fn build_script_win(
     plugin_dir: Option<&str>,
     system_prompt_file: Option<&str>,
     initial_prompt: Option<&str>,
+    // The file `write_prompt_file_in` put `initial_prompt` in; see `windows_prompt_arg`.
+    prompt_file: Option<&str>,
     projects_dir: Option<&Path>,
     model: Option<&str>,
     effort: Option<&str>,
@@ -1350,11 +1467,12 @@ fn build_script_win(
     if let Some(e) = effort {
         flags.push_str(&format!(" --effort {}", quote_arg(e)));
     }
+    let prompt_arg = windows_prompt_arg(initial_prompt, prompt_file);
     adapter.build_invocation(
         session_id,
         projects_dir,
         &flags,
-        initial_prompt,
+        prompt_arg.as_deref(),
         resume_token,
     )
 }
@@ -1512,6 +1630,7 @@ mod tests {
             None, // plugin_dir
             None,
             None,
+            None, // prompt_file
             None,
             None,
             None,
@@ -1600,6 +1719,7 @@ mod tests {
             None, // plugin_dir
             None,
             None,
+            None, // prompt_file
             None,
             None,
             None,
@@ -1628,6 +1748,7 @@ mod tests {
             None, // plugin_dir
             None,
             None,
+            None, // prompt_file
             None,
             None,
             None,
@@ -1656,6 +1777,7 @@ mod tests {
             None, // plugin_dir
             None,
             None,
+            None, // prompt_file
             None,
             None,
             None,
@@ -1683,6 +1805,7 @@ mod tests {
             None,                     // plugin_dir
             Some("/cfg/persona.txt"), // system_prompt_file
             None,                     // initial_prompt
+            None,                     // prompt_file
             None,                     // projects_dir
             None,                     // model
             None,                     // effort
@@ -1722,6 +1845,7 @@ mod tests {
             None,
             None,
             Some("Refactor the parser and add sixteen distinct words here right now ok"),
+            None, // prompt_file
             None,
             None,
             None,
@@ -1771,29 +1895,174 @@ mod tests {
     #[test]
     fn build_script_passes_initial_prompt_positional() {
         let adapter = crate::agent::adapter_for(crate::agent::AgentId::Claude);
+        let script_with = |file: Option<&str>| {
+            build_script(
+                &*adapter,
+                "sid-2",
+                8423,
+                "/repo",
+                "/bin/zsh",
+                None,
+                None,
+                None,
+                None, // plugin_dir
+                None,
+                Some("implement the parser"),
+                file, // prompt_file
+                None,
+                None,
+                None,
+                None,
+                false, // strict_mcp
+                None,  // ide_port
+            )
+        };
+        // The normal path: the script reads the prompt file into a variable, deletes the
+        // file, and both `||` branches pass the variable as one positional.
+        let script = script_with(Some("/data/initial-prompt-sid-2.txt"));
+        assert!(
+            script.contains(
+                "CONDUIT_INITIAL_PROMPT=$(cat '/data/initial-prompt-sid-2.txt'); rm -f '/data/initial-prompt-sid-2.txt'; cd '/repo' && "
+            ),
+            "prompt must be loaded from its file before the agent starts: {script}"
+        );
+        assert_eq!(
+            script.matches(" \"$CONDUIT_INITIAL_PROMPT\"").count(),
+            2,
+            "both branches pass the prompt as one quoted positional: {script}"
+        );
+        assert!(!script.contains("implement the parser"), "{script}");
+
+        // The write-failed fallback still inlines a quoted positional.
+        let script = script_with(None);
+        assert!(
+            script.contains("'implement the parser'"),
+            "prompt must be a quoted positional: {script}"
+        );
+    }
+
+    fn prompt_test_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("conduit-prompt-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A prompt with every character a shell or a JSON layer could mangle, padded to the
+    /// 64 KB `/open` accepts.
+    fn hostile_64k_prompt() -> String {
+        let unit = "Fix 'it' \"now\" $HOME `id` \\ 100% !bang\n\ttabbed line\n";
+        let mut p = unit.repeat(65_536 / unit.len());
+        while p.len() < 65_536 {
+            p.push('x');
+        }
+        p
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_64_kb_prompt_rides_a_file_not_the_command_line() {
+        let dir = prompt_test_dir();
+        let prompt = hostile_64k_prompt();
+        assert_eq!(prompt.len(), 65_536);
+        let file = write_prompt_file_in(&dir, "sid-64", &prompt).expect("write prompt file");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            prompt,
+            "exact prompt on disk"
+        );
+
+        let adapter = crate::agent::adapter_for(crate::agent::AgentId::Claude);
         let script = build_script(
             &*adapter,
-            "sid-2",
+            "sid-64",
             8423,
             "/repo",
             "/bin/zsh",
             None,
             None,
             None,
-            None, // plugin_dir
-            None,
-            Some("implement the parser"),
             None,
             None,
+            Some(&prompt),
+            Some(&file),
             None,
             None,
-            false, // strict_mcp
-            None,  // ide_port
+            None,
+            None,
+            false,
+            None,
         );
+        assert!(script.len() < 1024, "{} bytes: {script}", script.len());
+        assert!(script.contains(&shell_quote(&file)), "{script}");
+        assert!(!script.contains("tabbed line"), "prompt inlined: {script}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_is_owner_only_and_replaces_a_looser_leftover() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = prompt_test_dir();
+        let stale = prompt_file_path_in(&dir, "sid-m");
+        fs::write(&stale, "old").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+        let file = write_prompt_file_in(&dir, "sid-m", "new").unwrap();
+        let mode = fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Run the real prefix under `sh`: the agent gets the exact prompt as ONE argument
+    /// (printf is a builtin, so 64 KB is no exec limit here), and the file is gone before
+    /// the agent would start.
+    #[cfg(unix)]
+    #[test]
+    fn the_prompt_prefix_hands_over_the_exact_prompt_and_deletes_the_file() {
+        let dir = prompt_test_dir();
+        let prompt = hostile_64k_prompt().trim_end_matches('\n').to_string();
+        let file = write_prompt_file_in(&dir, "sid-sh", &prompt).unwrap();
+        let (load, arg) = posix_prompt(Some(&prompt), Some(&file));
+        let arg = arg.unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{load}printf '%s' {arg}; printf '|%s' \"$#\""))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(stdout.strip_suffix("|0"), Some(prompt.as_str()));
         assert!(
-            script.contains("'implement the parser'"),
-            "prompt must be a quoted positional: {script}"
+            !Path::new(&file).exists(),
+            "the script deletes the prompt file"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Windows has no `$(cat file)` and caps a command line at 32767 chars: a long or
+    /// multi-line prompt is replaced by an instruction to read the file, and a short
+    /// single-line one is still inlined.
+    #[test]
+    fn windows_prompt_arg_points_at_the_file_for_a_long_or_multiline_prompt() {
+        let file = r"C:\Users\u\AppData\Roaming\ConduitTauri\initial-prompt-s.txt";
+        let long = hostile_64k_prompt();
+        let arg = windows_prompt_arg(Some(&long), Some(file)).unwrap();
+        assert!(arg.len() < 300, "{arg}");
+        assert!(arg.contains(file), "{arg}");
+
+        let multi = windows_prompt_arg(Some("line one\nline two"), Some(file)).unwrap();
+        assert!(
+            multi.contains(file) && !multi.contains("line one"),
+            "{multi}"
+        );
+
+        let short = windows_prompt_arg(Some("say hello"), Some(file)).unwrap();
+        assert_eq!(short, quote_arg("say hello"));
+
+        // No file to point at: a line break must still never reach the batch line.
+        let flat = windows_prompt_arg(Some("a\r\nb"), None).unwrap();
+        assert!(!flat.contains(['\r', '\n']), "{flat}");
+        assert_eq!(windows_prompt_arg(None, Some(file)), None);
     }
 
     #[test]
@@ -1880,6 +2149,7 @@ mod tests {
             None, // plugin_dir
             None,
             None,
+            None, // prompt_file
             None,
             None,
             None,
@@ -1903,6 +2173,7 @@ mod tests {
             None, // plugin_dir
             Some(r"C:\cfg dir\persona.txt"),
             None,
+            None, // prompt_file
             None,
             None,
             None,
@@ -1937,6 +2208,7 @@ mod tests {
             None, // plugin_dir
             None,
             None,
+            None, // prompt_file
             None,
             None,
             None,
@@ -1962,6 +2234,7 @@ mod tests {
             None, // plugin_dir
             Some(persona_path),
             None,
+            None, // prompt_file
             None,
             None,
             None,
@@ -1990,6 +2263,7 @@ mod tests {
             None, // plugin_dir
             None,
             None,
+            None, // prompt_file
             None,
             Some("claude-opus-4-8"),
             Some("high"),
@@ -2013,6 +2287,7 @@ mod tests {
             None, // plugin_dir
             None,
             None,
+            None, // prompt_file
             None,
             Some("claude-opus-4-8"),
             Some("high"),
@@ -2039,6 +2314,7 @@ mod tests {
             Some("/opt/continuity-plugin"), // plugin_dir
             None,
             None,
+            None, // prompt_file
             None,
             None,
             None,
@@ -2054,7 +2330,7 @@ mod tests {
         // None (continuity off) must add nothing -- purely additive.
         let without_plugin = build_script(
             &*adapter, "sid-1", 8423, "/repo", "/bin/zsh", None, None, None, None, None, None,
-            None, None, None, None, false, None,
+            None, None, None, None, None, false, None,
         );
         assert!(!without_plugin.contains("--plugin-dir"), "{without_plugin}");
     }
@@ -2072,6 +2348,7 @@ mod tests {
             Some(r"C:\continuity-plugin"), // plugin_dir
             None,
             None,
+            None, // prompt_file
             None,
             None,
             None,
@@ -2085,7 +2362,8 @@ mod tests {
 
         // None (continuity off) must add nothing -- purely additive.
         let without_plugin = build_script_win(
-            &*adapter, "sid-1", None, None, None, None, None, None, None, None, None, None, false,
+            &*adapter, "sid-1", None, None, None, None, None, None, None, None, None, None, None,
+            false,
         );
         assert!(!without_plugin.contains("--plugin-dir"), "{without_plugin}");
     }
