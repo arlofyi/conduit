@@ -102,7 +102,12 @@ pub fn apply_event_at(s: &mut FleetStatus, event: &str, body: &Value, now: u64) 
             // Four different situations arrive under one event name; `status_rules` says
             // which (and `None` means this one is informational -- leave the badge alone).
             let kind = body.get("notification_type").and_then(|v| v.as_str());
-            let Some(next) = crate::status_rules::notification_status(kind, &s.status) else {
+            let awaiting = s
+                .activity
+                .as_deref()
+                .is_some_and(crate::status_rules::awaits_user);
+            let Some(next) = crate::status_rules::notification_status(kind, &s.status, awaiting)
+            else {
                 return;
             };
             s.status = next.into();
@@ -335,7 +340,7 @@ pub fn is_wake_event(event: &str, body: &Value) -> bool {
             // "" as the current status: no session is ever at that status, so the
             // `idle_prompt` rescue (which needs `running`) correctly declines here and
             // only the genuinely-wants-you kinds answer.
-            crate::status_rules::notification_status(kind, "") == Some("needsInput")
+            crate::status_rules::notification_status(kind, "", false) == Some("needsInput")
         }
         _ => false,
     }
@@ -512,7 +517,13 @@ impl FleetState {
         let mut map = self.status.lock().unwrap_or_else(|e| e.into_inner());
         let mut swept = Vec::new();
         for (id, s) in map.iter_mut() {
-            if crate::status_rules::is_stale_working(&s.status, s.updated_at, now) {
+            // A turn parked on a question to the user is silent for as long as the user
+            // takes to answer; that silence is not a lost turn.
+            let awaiting = s
+                .activity
+                .as_deref()
+                .is_some_and(crate::status_rules::awaits_user);
+            if !awaiting && crate::status_rules::is_stale_working(&s.status, s.updated_at, now) {
                 s.status = "idle".into();
                 s.activity = None;
                 s.updated_at = now;
@@ -767,6 +778,39 @@ mod tests {
 
         // Idempotent: a second pass has nothing left to do.
         assert!(fleet.sweep_stale_working_at(t).is_empty());
+    }
+
+    #[test]
+    fn a_question_left_unanswered_reads_as_needs_input_not_idle() {
+        let mut s = FleetStatus::default();
+        apply_event(
+            &mut s,
+            "pretool",
+            &serde_json::json!({"tool_name":"AskUserQuestion"}),
+        );
+        apply_event(
+            &mut s,
+            "notification",
+            &serde_json::json!({ "notification_type": "idle_prompt" }),
+        );
+        assert_eq!(s.status, "needsInput");
+    }
+
+    #[test]
+    fn the_sweep_leaves_a_turn_waiting_on_the_user_alone() {
+        let fleet = FleetState::default();
+        let t = 1_000_000_000;
+        fleet.record(
+            "asking",
+            "pretool",
+            &serde_json::json!({"tool_name":"AskUserQuestion"}),
+        );
+        {
+            let mut map = fleet.status.lock().unwrap();
+            map.get_mut("asking").unwrap().updated_at = t - 60 * 60_000;
+        }
+        assert!(fleet.sweep_stale_working_at(t).is_empty());
+        assert_eq!(fleet.snapshot()["asking"].status, "running");
     }
 
     #[test]

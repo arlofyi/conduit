@@ -5,6 +5,7 @@ import {
   holdsOffWorking,
   isStaleWorking,
   notificationStatus,
+  awaitsUser,
 } from "./statusRules";
 
 const NOW = 1_000_000_000;
@@ -61,6 +62,15 @@ describe("notificationStatus", () => {
     expect(notificationStatus("idle_prompt", "done")).toBeUndefined();
     expect(notificationStatus("idle_prompt", "idle")).toBeUndefined();
     expect(notificationStatus("idle_prompt", "needsInput")).toBeUndefined();
+  });
+
+  it("reads idle_prompt on a question to the user as needs input, not a stuck turn", () => {
+    expect(notificationStatus("idle_prompt", "running", true)).toBe("needsInput");
+    expect(notificationStatus("idle_prompt", "done", true)).toBeUndefined();
+    expect(awaitsUser("AskUserQuestion")).toBe(true);
+    expect(awaitsUser("ExitPlanMode")).toBe(true);
+    expect(awaitsUser("Bash")).toBe(false);
+    expect(awaitsUser(undefined)).toBe(false);
   });
 
   it("ignores informational and unknown kinds", () => {

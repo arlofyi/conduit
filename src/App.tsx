@@ -29,7 +29,7 @@ import {
 
 import { type ChatItem } from "./rootChat";
 import { type PendingDecision } from "./rootProposals";
-import { holdsOffWorking, notificationStatus } from "./statusRules";
+import { awaitsUser, holdsOffWorking, notificationStatus } from "./statusRules";
 import { type ThemePref } from "./themes";
 import { useClaudeAmbient } from "./hooks/useClaudeAmbient";
 import { useAutoStopIdle } from "./hooks/useAutoStopIdle";
@@ -310,6 +310,12 @@ export default function App() {
 
   // Claude Code hook events relayed by the Rust HTTP listener.
   useEffect(() => {
+    // Sessions whose current turn is parked on a question to the user: a tool that asks
+    // (AskUserQuestion, a plan to approve) or a permission prompt. Claude's `idle_prompt`
+    // fires there once the user has not answered for a minute, and must read as "waiting
+    // on you" rather than as a stuck turn -- `idle` is what the idle auto-stop retires.
+    // Not store state: nothing renders it, it only qualifies the next notification.
+    const awaiting = new Set<string>();
     const unlisten = listen<HookPayload>("hook", ({ payload }) => {
       feedHook(payload);
       const { session, event, body } = payload;
@@ -331,6 +337,9 @@ export default function App() {
       // older CLIs, in which case the chip stays label-only.
       if (typeof body?.permission_mode === "string") {
         st.setPermissionMode(session, body.permission_mode);
+      }
+      if (event === "prompt" || event === "tooluse" || event === "stop" || event === "sessionend") {
+        awaiting.delete(session);
       }
       switch (event) {
         case "prompt":
@@ -354,6 +363,8 @@ export default function App() {
           // showing as busy forever. See statusRules.ts.
           const cur = st.live[session];
           if (holdsOffWorking(cur?.status, cur?.updatedAt, Date.now())) break;
+          if (awaitsUser(body?.tool_name)) awaiting.add(session);
+          else awaiting.delete(session);
           st.setStatus(session, "running");
           st.setCompacting(session, false);
           st.setActivity(session, toolActivity(agentOf(session), body?.tool_name, body?.tool_input));
@@ -382,8 +393,15 @@ export default function App() {
           // One event name, four situations. `statusRules` says which — and undefined
           // means this one is informational, so the badge (and any alert) stays put.
           const cur = st.live[session];
-          const next = notificationStatus(body?.notification_type, cur?.status);
+          const next = notificationStatus(
+            body?.notification_type,
+            cur?.status,
+            awaiting.has(session),
+          );
           if (next === undefined) break;
+          // A permission prompt is a question too. Remembered even when the badge below is
+          // skipped for the session in front of the user, which stays `running` meanwhile.
+          if (next === "needsInput") awaiting.add(session);
           if (next === "idle") {
             // The `idle_prompt` rescue: the CLI is back at its prompt with no turn-end hook
             // ever having fired (Esc during a tool call). Nothing was accomplished, so this

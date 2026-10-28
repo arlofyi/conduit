@@ -65,15 +65,34 @@ pub fn holds_off_working(status: &str, updated_at: u64, now: u64) -> bool {
 /// A payload with **no** `notification_type` at all keeps the legacy behavior (`needsInput`)
 /// rather than falling into the unknown-type no-op -- that is exactly what shipped before
 /// this rule existed, so a Claude build that omits the field cannot lose its badge.
-pub fn notification_status(notification_type: Option<&str>, current: &str) -> Option<&'static str> {
+///
+/// `awaiting_user` closes the hole in that rescue: a turn paused on a question the agent
+/// asked (`AskUserQuestion`, a plan to approve -- see `awaits_user`) is also `running` with
+/// no turn-end hook, and `idle_prompt` fires there too once the user has not answered for a
+/// minute. Read as "stuck", it turned a session waiting on the user into `idle`, which the
+/// idle auto-stop then retired. When the turn is waiting on the user, the prompt reads as
+/// exactly that: `needsInput`.
+pub fn notification_status(
+    notification_type: Option<&str>,
+    current: &str,
+    awaiting_user: bool,
+) -> Option<&'static str> {
     match notification_type {
         None => Some("needsInput"),
         Some("permission_prompt" | "elicitation_dialog" | "agent_needs_input") => {
             Some("needsInput")
         }
-        Some("idle_prompt") => (current == "running").then_some("idle"),
+        Some("idle_prompt") if current == "running" => {
+            Some(if awaiting_user { "needsInput" } else { "idle" })
+        }
         Some(_) => None,
     }
+}
+
+/// Tools whose call IS a question to the user: the turn sits in the tool until they answer,
+/// so a `running` session parked in one is waiting on the user, not stuck and not working.
+pub fn awaits_user(tool_name: &str) -> bool {
+    matches!(tool_name, "AskUserQuestion" | "ExitPlanMode")
 }
 
 #[cfg(test)]
@@ -121,8 +140,14 @@ mod tests {
             "elicitation_dialog",
             "agent_needs_input",
         ] {
-            assert_eq!(notification_status(Some(t), "running"), Some("needsInput"));
-            assert_eq!(notification_status(Some(t), "done"), Some("needsInput"));
+            assert_eq!(
+                notification_status(Some(t), "running", false),
+                Some("needsInput")
+            );
+            assert_eq!(
+                notification_status(Some(t), "done", false),
+                Some("needsInput")
+            );
         }
     }
 
@@ -130,14 +155,39 @@ mod tests {
     fn idle_prompt_rescues_a_stuck_turn_and_never_disturbs_a_finished_one() {
         // The Esc-during-a-tool-call case: no Stop hook ever ran, so this is the way out.
         assert_eq!(
-            notification_status(Some("idle_prompt"), "running"),
+            notification_status(Some("idle_prompt"), "running", false),
             Some("idle")
         );
         // The same event also fires after a normal turn end. Touching `done` here is what
         // made every completed session bounce back to a "needs input" badge.
-        assert_eq!(notification_status(Some("idle_prompt"), "done"), None);
-        assert_eq!(notification_status(Some("idle_prompt"), "idle"), None);
-        assert_eq!(notification_status(Some("idle_prompt"), "needsInput"), None);
+        assert_eq!(
+            notification_status(Some("idle_prompt"), "done", false),
+            None
+        );
+        assert_eq!(
+            notification_status(Some("idle_prompt"), "idle", false),
+            None
+        );
+        assert_eq!(
+            notification_status(Some("idle_prompt"), "needsInput", false),
+            None
+        );
+    }
+
+    #[test]
+    fn idle_prompt_on_a_question_to_the_user_means_needs_input_not_idle() {
+        // A turn parked in AskUserQuestion is `running` and fires idle_prompt after a
+        // minute unanswered. Reading that as a stuck turn made it `idle`, and the idle
+        // auto-stop then stopped a session that was waiting on the user.
+        assert_eq!(
+            notification_status(Some("idle_prompt"), "running", true),
+            Some("needsInput")
+        );
+        assert_eq!(notification_status(Some("idle_prompt"), "done", true), None);
+        assert!(awaits_user("AskUserQuestion"));
+        assert!(awaits_user("ExitPlanMode"));
+        assert!(!awaits_user("Bash"));
+        assert!(!awaits_user("Agent"));
     }
 
     #[test]
@@ -148,14 +198,17 @@ mod tests {
             "agent_completed",
             "some_future_kind",
         ] {
-            assert_eq!(notification_status(Some(t), "running"), None, "{t}");
-            assert_eq!(notification_status(Some(t), "done"), None, "{t}");
+            assert_eq!(notification_status(Some(t), "running", false), None, "{t}");
+            assert_eq!(notification_status(Some(t), "done", false), None, "{t}");
         }
     }
 
     #[test]
     fn a_payload_with_no_type_keeps_the_legacy_badge() {
-        assert_eq!(notification_status(None, "running"), Some("needsInput"));
-        assert_eq!(notification_status(None, "done"), Some("needsInput"));
+        assert_eq!(
+            notification_status(None, "running", false),
+            Some("needsInput")
+        );
+        assert_eq!(notification_status(None, "done", false), Some("needsInput"));
     }
 }

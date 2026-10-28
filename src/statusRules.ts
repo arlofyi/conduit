@@ -60,6 +60,7 @@ export function holdsOffWorking(
 export function notificationStatus(
   notificationType: string | undefined,
   current: SessionStatus | undefined,
+  awaitingUser = false,
 ): SessionStatus | undefined {
   if (notificationType === undefined) return "needsInput";
   switch (notificationType) {
@@ -68,8 +69,17 @@ export function notificationStatus(
     case "agent_needs_input":
       return "needsInput";
     case "idle_prompt":
-      return current === "running" ? "idle" : undefined;
+      // A turn parked on a question to the user also fires this once it has gone a minute
+      // unanswered; that is waiting, not stuck (status_rules.rs, `awaiting_user`).
+      if (current !== "running") return undefined;
+      return awaitingUser ? "needsInput" : "idle";
     default:
       return undefined;
   }
+}
+
+/** Tools whose call IS a question to the user: the turn sits in the tool until they
+ *  answer. Same list as `status_rules::awaits_user`. */
+export function awaitsUser(toolName: string | undefined): boolean {
+  return toolName === "AskUserQuestion" || toolName === "ExitPlanMode";
 }

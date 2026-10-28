@@ -819,8 +819,16 @@ fn tmux_available(pty: State<Arc<PtyManager>>) -> TmuxInfo {
 /// left by a background command, a dev server, a watcher). The idle auto-stop asks this
 /// before retiring a session whose hooks say "done": a finished TURN is not a finished
 /// agent. One process-table snapshot answers the whole batch. See `agent_activity`.
+///
+/// A Claude session with a subagent still working is busy too. Background subagents run
+/// inside the `claude` process, never in a shell, so the process tree cannot show them --
+/// their own `meta.json` (`subagents::has_running_subagent`) can.
 #[tauri::command(async)]
-fn busy_sessions(session_ids: Vec<String>, pty: State<Arc<PtyManager>>) -> Vec<String> {
+fn busy_sessions(
+    session_ids: Vec<String>,
+    pty: State<Arc<PtyManager>>,
+    store: State<Arc<store::Store>>,
+) -> Vec<String> {
     if session_ids.is_empty() {
         return Vec::new();
     }
@@ -830,6 +838,9 @@ fn busy_sessions(session_ids: Vec<String>, pty: State<Arc<PtyManager>>) -> Vec<S
         .filter(|id| {
             pty.session_root_pid(id)
                 .is_some_and(|root| crate::agent_activity::has_background_work(&procs, root))
+                || pty::session_projects_dir(&store, id).is_some_and(|projects| {
+                    subagents::has_running_subagent(&projects, &store.claude_conversation_id(id))
+                })
         })
         .collect()
 }

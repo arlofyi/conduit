@@ -192,6 +192,57 @@ pub fn parse_meta(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether an `agent-<id>.meta.json` describes a subagent that has not finished. Claude
+/// writes the file when the subagent starts and adds `"finished": true` when it ends, so
+/// the key's absence is what "still running" looks like. Unreadable JSON is not running:
+/// this feeds the idle auto-stop, where a wrong "running" only delays a stop by one
+/// window, but a file we cannot read says nothing either way.
+pub fn meta_is_unfinished(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .is_some_and(|v| v.is_object() && v.get("finished").and_then(Value::as_bool) != Some(true))
+}
+
+/// How recently an unfinished subagent must have written its transcript to still count as
+/// running. A subagent killed with its `claude` process never gets `"finished": true`, so
+/// without a bound a session that once lost a subagent would read as busy forever and never
+/// auto-stop again. Half an hour of silence is far past any single model response.
+pub const SUBAGENT_ACTIVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Whether this conversation has a subagent still working. Background subagents run inside
+/// the `claude` process, not in a shell, so the process-tree check in `agent_activity`
+/// cannot see them -- and a session whose main turn ended while they work reports `done`.
+pub fn has_running_subagent(projects_dir: &Path, conversation_id: &str) -> bool {
+    let Some(dir) = subagent_dir(projects_dir, conversation_id) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now();
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let Some(stem) = name.strip_suffix(".meta.json") else {
+            return false;
+        };
+        let unfinished = std::fs::read_to_string(&path)
+            .ok()
+            .is_some_and(|t| meta_is_unfinished(&t));
+        if !unfinished {
+            return false;
+        }
+        // Recent activity on either file: the transcript moves with every message, the
+        // meta file is the subagent's start.
+        [dir.join(format!("{stem}.jsonl")), path.clone()]
+            .iter()
+            .filter_map(|p| p.metadata().ok()?.modified().ok())
+            .any(|t| now.duration_since(t).unwrap_or_default() < SUBAGENT_ACTIVE_WINDOW)
+    })
+}
+
 /// Read the tail of a file as lossy UTF-8, capped.
 fn read_tail(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
@@ -374,6 +425,36 @@ mod tests {
         );
         assert_eq!(parse_meta("{}"), None);
         assert_eq!(parse_meta("garbage"), None);
+    }
+
+    #[test]
+    fn a_meta_file_without_finished_is_a_running_subagent() {
+        assert!(meta_is_unfinished(
+            r#"{"agentType":"general-purpose","toolUseId":"t","requestShape":"background"}"#
+        ));
+        assert!(meta_is_unfinished(r#"{"toolUseId":"t","finished":false}"#));
+        assert!(!meta_is_unfinished(r#"{"toolUseId":"t","finished":true}"#));
+        assert!(!meta_is_unfinished("not json"));
+        assert!(!meta_is_unfinished("[]"));
+    }
+
+    #[test]
+    fn a_running_subagent_is_found_and_a_finished_one_is_not() {
+        let root = std::env::temp_dir().join(format!("conduit-subrun-{}", uuid::Uuid::new_v4()));
+        let subs = root.join("slug").join("conv-1").join("subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::write(
+            subs.join("agent-a.meta.json"),
+            r#"{"toolUseId":"t","finished":true}"#,
+        )
+        .unwrap();
+        std::fs::write(subs.join("agent-a.jsonl"), "{}\n").unwrap();
+        assert!(!has_running_subagent(&root, "conv-1"));
+        std::fs::write(subs.join("agent-b.meta.json"), r#"{"toolUseId":"u"}"#).unwrap();
+        std::fs::write(subs.join("agent-b.jsonl"), "{}\n").unwrap();
+        assert!(has_running_subagent(&root, "conv-1"));
+        assert!(!has_running_subagent(&root, "conv-other"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

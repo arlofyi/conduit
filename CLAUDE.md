@@ -470,7 +470,17 @@ themselves; prefs are Settings → Sessions (`SessionSettings.tsx`, stored as
   agent that wrote this feature, mid CI-watch). So every candidate is checked first with
   `busy_sessions` (`agent_activity.rs`): a shell at depth >= 2 under the session root is a
   running command. MCP servers are spawned directly, never through a shell, so they never
-  count. If the check fails, nothing is stopped.
+  count. **Subagents are invisible to that check** -- background ones run inside the
+  `claude` process -- so `busy_sessions` also asks `subagents::has_running_subagent`: a
+  `subagents/agent-*.meta.json` without `"finished": true` whose files moved in the last
+  30 min. The bound matters: a subagent killed with its process never gets `finished`, and
+  without it that session would never auto-stop again. If the check fails, nothing is
+  stopped.
+- **A turn parked on a question is waiting, not stuck.** `idle_prompt` fires once a question
+  has gone a minute unanswered (`AskUserQuestion`, `ExitPlanMode`, a permission prompt), and
+  the old rescue read that as a stuck turn and made it `idle` -- which auto-stop retires.
+  `status_rules::awaits_user` / `statusRules.awaitsUser` name those tools; the rescue
+  answers `needsInput` for them and the 20-min stale sweep skips them.
 - **Terminals mount lazily** in `WorkspaceCenter` (`mountedTerminals`): first shown,
   launch-resumed, created this run, or the old `project` mode. Once mounted, never
   unmounted -- the keep-alive rule is unchanged.
