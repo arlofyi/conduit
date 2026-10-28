@@ -582,4 +582,52 @@ mod tests {
             .recv_timeout(std::time::Duration::from_millis(300))
             .is_err());
     }
+
+    /// Every way `resolve` refuses an authenticated request is a 400 on the wire, and the
+    /// sink never runs: a bad slug, an oversized prompt file, options without an agent.
+    #[test]
+    fn handle_open_answers_400_and_never_fires_the_sink_for_a_bad_request() {
+        let dir = tmpdir();
+        let big = dir.join("big.md");
+        fs::write(&big, vec![b'a'; 65_537]).unwrap();
+        let big_body = serde_json::json!({
+            "path": "/tmp/p",
+            "agent": "claude",
+            "prompt_file": big.display().to_string(),
+        })
+        .to_string();
+        for body in [
+            r#"{"path":"/tmp/p","agent":"claude","worktree":"Fix_A"}"#.to_string(),
+            big_body,
+            r#"{"path":"/tmp/p","name":"no agent"}"#.to_string(),
+        ] {
+            let (ptx, prx) = std::sync::mpsc::channel();
+            let rx = serve_one(&ptx, TOK.to_string());
+            let port = prx.recv().unwrap();
+            let out = std::process::Command::new("curl")
+                .args([
+                    "-s",
+                    "-o",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                    "-w",
+                    "%{http_code}",
+                    "-X",
+                    "POST",
+                    "-H",
+                    &format!("X-Conduit-Token: {TOK}"),
+                    "--data",
+                    &body,
+                    &format!("http://127.0.0.1:{port}/open"),
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "400", "{body}");
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "the sink fired for {body}"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
 }
