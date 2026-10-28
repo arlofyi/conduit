@@ -1243,14 +1243,17 @@ const WIN_INLINE_PROMPT_MAX: usize = 2000;
 #[cfg_attr(not(windows), allow(dead_code))]
 fn windows_prompt_arg(initial_prompt: Option<&str>, prompt_file: Option<&str>) -> Option<String> {
     let p = initial_prompt?;
-    let inline_ok = p.len() <= WIN_INLINE_PROMPT_MAX && !p.contains(['\n', '\r']);
+    // Measured AFTER quoting: `win_quote` doubles every `"` and carets every `%` and `^`,
+    // so a short prompt full of them can still overrun the batch line.
+    let quoted = quote_arg(p);
+    let inline_ok = quoted.len() <= WIN_INLINE_PROMPT_MAX && !p.contains(['\n', '\r']);
     match prompt_file {
         Some(file) if !inline_ok => Some(quote_arg(&format!(
             "Your task brief is in the file {file}. Read it and follow it."
         ))),
         // No file to point at: a line break would still split the batch line, so flatten it.
         None if !inline_ok => Some(quote_arg(&p.replace(['\r', '\n'], " "))),
-        _ => Some(quote_arg(p)),
+        _ => Some(quoted),
     }
 }
 
@@ -1360,8 +1363,21 @@ fn build_script(
         prompt_arg.as_deref(),
         resume_token,
     );
+    // The prompt loader is POSIX (`VAR=$(...)`), but without tmux this script runs under
+    // the user's own `$SHELL`, and fish rejects a standalone assignment at parse time --
+    // nothing would run, not even the trailing `exec`. So a prompted agent runs in its own
+    // `sh -c`, single-quoted as one word (the tmux path already uses `sh -c`), and the outer
+    // script stays plain `export; cd &&; exec`. A spawn without a prompt file is unchanged.
+    let invocation = if load_prompt.is_empty() {
+        invocation
+    } else {
+        format!(
+            "sh -c {}",
+            shell_quote(&format!("{load_prompt}{invocation}"))
+        )
+    };
     format!(
-        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}{ide}; {load_prompt}cd {dir} && {invocation}; exec {shell} -i -l",
+        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}{ide}; cd {dir} && {invocation}; exec {shell} -i -l",
         sid = shell_quote(session_id),
         port = port,
         // CLAUDE_CODE_SSE_PORT is the 2.1.267 auto-connect trigger;
@@ -1920,17 +1936,23 @@ mod tests {
         // The normal path: the script reads the prompt file into a variable, deletes the
         // file, and both `||` branches pass the variable as one positional.
         let script = script_with(Some("/data/initial-prompt-sid-2.txt"));
+        let (outer, inner) = script
+            .split_once("cd '/repo' && sh -c '")
+            .unwrap_or_else(|| panic!("a prompted agent runs in its own sh -c: {script}"));
+        // Fish parses the outer script: no POSIX-only assignment may sit at top level.
+        assert!(!outer.contains("CONDUIT_INITIAL_PROMPT="), "{script}");
         assert!(
-            script.contains(
-                "CONDUIT_INITIAL_PROMPT=$(cat '/data/initial-prompt-sid-2.txt'); rm -f '/data/initial-prompt-sid-2.txt'; cd '/repo' && "
+            inner.starts_with(
+                "CONDUIT_INITIAL_PROMPT=$(cat '\\''/data/initial-prompt-sid-2.txt'\\''); rm -f "
             ),
             "prompt must be loaded from its file before the agent starts: {script}"
         );
         assert_eq!(
-            script.matches(" \"$CONDUIT_INITIAL_PROMPT\"").count(),
+            inner.matches(" \"$CONDUIT_INITIAL_PROMPT\"").count(),
             2,
             "both branches pass the prompt as one quoted positional: {script}"
         );
+        assert!(script.ends_with("'; exec /bin/zsh -i -l"), "{script}");
         assert!(!script.contains("implement the parser"), "{script}");
 
         // The write-failed fallback still inlines a quoted positional.
@@ -1998,6 +2020,87 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// The whole prompted script, run for real with persistence off: an outer POSIX shell
+    /// stands in for `$SHELL -c`, a fake `claude` on PATH records what it received, and
+    /// `true` stands in for the trailing interactive shell. Also parsed by `fish -n` when
+    /// fish is installed, since a fish `$SHELL` runs this script directly.
+    #[cfg(unix)]
+    #[test]
+    fn a_prompted_script_delivers_the_exact_prompt_and_parses_under_fish() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = prompt_test_dir();
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let out_file = dir.join("got.txt");
+        let fake = bin.join("claude");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nfor a; do last=$a; done\nprintf '%s|%s' \"$#\" \"$last\" > {}\n",
+                shell_quote(&out_file.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prompt = hostile_64k_prompt().trim_end_matches('\n').to_string();
+        let file = write_prompt_file_in(&dir, "sid-e2e", &prompt).unwrap();
+        let adapter = crate::agent::adapter_for(crate::agent::AgentId::Claude);
+        let script = build_script(
+            &*adapter,
+            "sid-e2e",
+            8423,
+            &dir.to_string_lossy(),
+            "true",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&prompt),
+            Some(&file),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", &path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{script}");
+        // `--session-id <id> <prompt>`: three args, the prompt intact as the last one.
+        assert_eq!(
+            fs::read_to_string(&out_file).unwrap(),
+            format!("3|{prompt}")
+        );
+        assert!(
+            !Path::new(&file).exists(),
+            "the script deletes the prompt file"
+        );
+
+        if let Ok(out) = std::process::Command::new("fish")
+            .args(["-n", "-c", &script])
+            .output()
+        {
+            assert!(
+                out.status.success(),
+                "fish cannot parse the script: {}\n{script}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[cfg(unix)]
     #[test]
     fn prompt_file_is_owner_only_and_replaces_a_looser_leftover() {
@@ -2055,6 +2158,13 @@ mod tests {
             multi.contains(file) && !multi.contains("line one"),
             "{multi}"
         );
+
+        // Short in bytes, long once quoted: win_quote doubles `"` (and shell_quote turns
+        // `'` into four chars), so the limit must be measured on the quoted form.
+        let quotes = "\"'".repeat(700);
+        assert!(quotes.len() <= WIN_INLINE_PROMPT_MAX);
+        let arg = windows_prompt_arg(Some(&quotes), Some(file)).unwrap();
+        assert!(arg.contains(file) && !arg.contains("\"'\"'"), "{arg}");
 
         let short = windows_prompt_arg(Some("say hello"), Some(file)).unwrap();
         assert_eq!(short, quote_arg("say hello"));
