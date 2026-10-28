@@ -10,6 +10,8 @@ type ShimStatus = {
   path: string | null;
   dir: string | null;
   onPath: boolean;
+  /** Installed by an older Conduit; the shim lacks this version's flags. */
+  outdated: boolean;
 };
 
 /**
@@ -303,6 +305,13 @@ export function GeneralSettings() {
         }
         control={
           <div className="cli-shim-action">
+            {shim?.outdated && (
+              <>
+                <button onClick={() => void runShim("install_cli_shim")}>
+                  Update command line tool
+                </button>{" "}
+              </>
+            )}
             <button
               onClick={() =>
                 void runShim(shim?.installed ? "remove_cli_shim" : "install_cli_shim")

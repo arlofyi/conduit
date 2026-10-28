@@ -250,3 +250,144 @@ fn awkward_path_characters_round_trip() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(recv(&rx).path.ends_with(r#"we"ird\dir"#));
 }
+
+fn git_init(dir: &Path) {
+    let out = Command::new("git")
+        .args(["init", "-q"])
+        .arg(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git init: {}", stderr(&out));
+}
+
+/// The name carries every character the shim must neither evaluate nor let break its
+/// JSON: a double quote, a `$` expansion, a backslash.
+#[cfg(unix)]
+#[test]
+fn shim_forwards_name_worktree_and_prompt_file() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("repo");
+    std::fs::create_dir_all(&project).unwrap();
+    git_init(&project);
+    let brief = f.home.join("brief.md");
+    let contents = "Fix \"it\"\n\ttabbed $HOME `x` \\ done\n";
+    std::fs::write(&brief, contents).unwrap();
+
+    let name = r#"He said "hi" $HOME \ ok"#;
+    let out = f.run(&[
+        project.to_str().unwrap(),
+        "--agent",
+        "claude",
+        "--worktree",
+        "fix-a",
+        "--name",
+        name,
+        "--prompt-file",
+        brief.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let got = recv(&rx);
+    assert_eq!(got.agent.as_deref(), Some("claude"));
+    assert_eq!(got.name.as_deref(), Some(name));
+    assert_eq!(got.worktree.as_deref(), Some("fix-a"));
+    assert_eq!(got.prompt.as_deref(), Some(contents));
+}
+
+/// A relative prompt file is resolved against the caller's directory, and a newline
+/// and a tab in the name survive the JSON encoding.
+#[cfg(unix)]
+#[test]
+fn shim_resolves_a_relative_prompt_file_and_escapes_control_characters() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("rel");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("brief.md"), "relative brief").unwrap();
+
+    let out = f
+        .command()
+        .current_dir(&project)
+        .args([
+            ".",
+            "--agent",
+            "claude",
+            "--name",
+            "two\nlines\tand $(echo x)",
+            "--prompt-file",
+            "brief.md",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let got = recv(&rx);
+    assert_eq!(got.name.as_deref(), Some("two\nlines\tand $(echo x)"));
+    assert_eq!(got.prompt.as_deref(), Some("relative brief"));
+}
+
+#[test]
+fn a_missing_prompt_file_fails_before_any_request() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("p");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let missing = f.home.join("nope.md");
+    let out = f.run(&[
+        project.to_str().unwrap(),
+        "--agent",
+        "claude",
+        "--prompt-file",
+        missing.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not a file"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    silent(&rx);
+}
+
+#[test]
+fn shim_drops_worktree_outside_git() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("plain");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let out = f.run(&[
+        project.to_str().unwrap(),
+        "--agent",
+        "claude",
+        "--worktree",
+        "fix-a",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("is not a git work tree"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    let got = recv(&rx);
+    assert_eq!(got.agent.as_deref(), Some("claude"));
+    assert_eq!(got.worktree, None);
+}
+
+#[test]
+fn options_without_agent_exit_2() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("p");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let out = f.run(&[project.to_str().unwrap(), "--name", "x"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("usage"), "stderr: {}", stderr(&out));
+    silent(&rx);
+}
