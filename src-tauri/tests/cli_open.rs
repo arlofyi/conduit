@@ -388,6 +388,18 @@ fn options_without_agent_exit_2() {
 
     let out = f.run(&[project.to_str().unwrap(), "--name", "x"]);
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    // v1 also exited 2 here, as an unknown option. The v2 guard prints the v2 usage
+    // line, which names --worktree, and no unknown-option complaint.
     assert!(stderr(&out).contains("usage"), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--worktree"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("unknown option"),
+        "stderr: {}",
+        stderr(&out)
+    );
     silent(&rx);
 }

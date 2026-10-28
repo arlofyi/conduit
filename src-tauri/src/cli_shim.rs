@@ -90,14 +90,15 @@ done
 [ -n "$target" ] || target="."
 [ -d "$target" ] || {{ echo "conduit: not a directory: $target" >&2; exit 1; }}
 # Resolve symlinks so a checkout reached through a link is not added twice.
-path=$(cd "$target" && pwd -P)
+# CDPATH unset so `cd` neither searches elsewhere nor prints; `--` so a leading `-` is a name.
+path=$(CDPATH= cd -- "$target" && pwd -P)
 
 prompt_abs=""
 if [ -n "$prompt_file" ]; then
   [ -f "$prompt_file" ] || {{ echo "conduit: not a file: $prompt_file" >&2; exit 1; }}
   # Conduit reads the file itself and only accepts an absolute path.
-  prompt_dir=$(cd "$(dirname "$prompt_file")" && pwd -P)
-  prompt_abs="${{prompt_dir%/}}/$(basename "$prompt_file")"
+  prompt_dir=$(CDPATH= cd -- "$(dirname -- "$prompt_file")" && pwd -P)
+  prompt_abs="${{prompt_dir%/}}/$(basename -- "$prompt_file")"
 fi
 
 if [ -n "$worktree" ] && [ "$(git -C "$path" rev-parse --is-inside-work-tree 2>/dev/null || true)" != "true" ]; then
@@ -165,9 +166,10 @@ post || cold_start
 /// refuses them (exit 2) instead of sending a mangled one. Arguments are parsed with
 /// delayed expansion OFF so a `!` survives long enough to be seen and refused.
 ///
-/// Backslashes in JSON values become `\`, never `\\`: curl.exe's argv parser turns
-/// backslashes followed by `\"` into something else, and a value ending in `\` (a drive
-/// root, a name) would otherwise swallow its closing quote.
+/// Backslashes in JSON values are doubled. The body is written to a temp file and sent
+/// with `--data-binary @file`, because curl.exe's MSVCRT argv parser rewrites
+/// backslashes that precede a double quote, so a value ending in `\` (a drive root, a
+/// name) would lose its closing quote if the body went on the command line.
 pub fn shim_cmd() -> String {
     format!(
         r##"@echo off
@@ -251,27 +253,33 @@ if exist "%dir%\cli-token" (
   for /f "usebackq delims=" %%a in ("%dir%\cli-token") do set "token=%%a"
 )
 
-set "esc=!path_abs:\=\!"
-set "body=\"path\":\"!esc!\""
-if defined agent set "body=!body!,\"agent\":\"!agent!\""
-if defined worktree set "body=!body!,\"worktree\":\"!worktree!\""
+set "esc=!path_abs:\=\\!"
+set "body="path":"!esc!""
+if defined agent set "body=!body!,"agent":"!agent!""
+if defined worktree set "body=!body!,"worktree":"!worktree!""
 if not defined sname goto body_name_done
-set "esc=!sname:\=\!"
+set "esc=!sname:\=\\!"
 set "esc=!esc:{TAB}=\t!"
-set "body=!body!,\"name\":\"!esc!\""
+set "body=!body!,"name":"!esc!""
 :body_name_done
 if not defined prompt_abs goto body_prompt_done
-set "esc=!prompt_abs:\=\!"
-set "body=!body!,\"prompt_file\":\"!esc!\""
+set "esc=!prompt_abs:\=\\!"
+set "body=!body!,"prompt_file":"!esc!""
 :body_prompt_done
 set "body={{!body!}}"
 
+rem The body goes through a file, never argv: curl.exe splits its command line with
+rem MSVCRT rules, which rewrite backslashes that precede a double quote.
+set "bodyfile=%TEMP%\conduit-open-%RANDOM%%RANDOM%.json"
+>"%bodyfile%" echo(!body!
+
 if not "!port!"=="" if not "!token!"=="" (
   curl.exe -sf -m 5 -X POST -H "Content-Type: application/json" ^
-    -H "X-Conduit-Token: !token!" --data "!body!" ^
+    -H "X-Conduit-Token: !token!" --data-binary "@%bodyfile%" ^
     "http://127.0.0.1:!port!/open" >nul 2>&1
-  if not errorlevel 1 exit /b 0
+  if not errorlevel 1 (del "%bodyfile%" >nul 2>&1 & exit /b 0)
 )
+del "%bodyfile%" >nul 2>&1
 
 if not "%CONDUIT_DATA_DIR_NAME%"=="" (
   echo conduit: no Conduit answering for CONDUIT_DATA_DIR_NAME=%CONDUIT_DATA_DIR_NAME%. 1>&2
@@ -559,6 +567,30 @@ mod tests {
         assert!(remove_in(&dir).is_err());
         assert!(file.exists(), "must not delete a stranger's binary");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// serde_json parses `/open` strictly: a bare `\` turns `C:\Users` into a 400 and
+    /// `C:\new` into a newline. Every value is escaped `\` -> `\\`, and the body reaches
+    /// curl.exe through a file, so MSVCRT argv parsing never sees a trailing `\` + quote.
+    #[test]
+    fn cmd_shim_escapes_backslashes_and_sends_the_body_from_a_file() {
+        let s = shim_cmd();
+        for v in ["path_abs", "sname", "prompt_abs"] {
+            let doubled = format!("!{v}:\\=\\\\!");
+            assert!(s.contains(&doubled), "{v} backslashes not doubled");
+        }
+        assert!(
+            s.contains("--data-binary \"@%bodyfile%\""),
+            "body not sent from a file"
+        );
+        assert!(
+            !s.contains("--data \"!body!\""),
+            "body must not go through argv"
+        );
+        assert!(
+            s.contains("del \"%bodyfile%\""),
+            "temp body file not deleted"
+        );
     }
 
     #[test]
