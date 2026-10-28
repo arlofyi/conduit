@@ -1321,10 +1321,13 @@ fn open_profile_window(
     Ok(())
 }
 
-/// One window's drain of every `conduit <path> [--agent <id>]` invocation the cli-open
-/// sink queued for it while it had no live window yet (Finding 1's pending-open path).
-/// Called once per window right after `load()` resolves, alongside the live `cli-open`
-/// listener that handles the same payload shape for a window that was already open.
+/// One window's drain of every `conduit <path> [--agent <id>] [--worktree <slug>]
+/// [--name <text>] [--prompt-file <file>]` invocation the cli-open sink queued for it
+/// while it had no live window yet (Finding 1's pending-open path). Each is a resolved
+/// `OpenPayload` carrying the prompt TEXT (read when `/open` accepted the request), the
+/// slug and the name. Called once per window right after `load()` resolves, alongside
+/// the live `cli-open` listener that handles the same payload shape for a window that was
+/// already open. Draining removes the entries, so a payload's prompt is handed out once.
 #[tauri::command]
 fn take_pending_opens(
     window: tauri::Window,

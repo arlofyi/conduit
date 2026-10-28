@@ -76,9 +76,12 @@ impl WindowRegistry {
     }
 }
 
-/// `conduit <path> [--agent <id>]` payloads waiting for the profile window they're
-/// addressed to, keyed by that window's LABEL (its would-be label if the window doesn't
-/// exist yet -- see `profile_window_label`).
+/// `conduit <path> [--agent <id>] [--worktree <slug>] [--name <text>] [--prompt-file
+/// <file>]` payloads waiting for the profile window they're addressed to, keyed by that
+/// window's LABEL (its would-be label if the window doesn't exist yet -- see
+/// `profile_window_label`). Each entry is a resolved `cli_open::OpenPayload`: the prompt
+/// file was already read when `/open` accepted it, so the queued payload carries the
+/// prompt text itself, plus the slug and name, and nothing is re-read at drain time.
 ///
 /// Exists for one reason: the hook server's `/open` sink used to fall through to "main"
 /// (or whichever window has OS focus) whenever the matched project's own profile had no

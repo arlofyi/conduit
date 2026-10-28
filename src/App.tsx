@@ -179,8 +179,9 @@ export default function App() {
     void load().then(
       () => {
         if (useStore.getState().windowProfile.isMain) void initPlugins();
-        // Finding 1's pending-open queue: drain whatever `conduit <path> [--agent <id>]`
-        // invocations the Rust cli-open sink queued for THIS window's label while it had
+        // Finding 1's pending-open queue: drain whatever `conduit <path> [--agent <id>]
+        // [--worktree <slug>] [--name <text>] [--prompt-file <file>]` invocations (each a
+        // resolved payload carrying the prompt text) the Rust cli-open sink queued for THIS window's label while it had
         // no live window to emit to yet (a project's own profile had none open, and
         // there was nothing to redirect the payload to). Runs in every window, not just
         // main -- any window's label can be the one a queued open was addressed to.
