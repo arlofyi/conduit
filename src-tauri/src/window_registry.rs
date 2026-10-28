@@ -91,11 +91,11 @@ impl WindowRegistry {
 /// handled.
 #[derive(Default)]
 pub struct PendingOpens {
-    map: Mutex<HashMap<String, Vec<crate::cli_open::OpenRequest>>>,
+    map: Mutex<HashMap<String, Vec<crate::cli_open::OpenPayload>>>,
 }
 
 impl PendingOpens {
-    pub fn push(&self, label: &str, open: crate::cli_open::OpenRequest) {
+    pub fn push(&self, label: &str, open: crate::cli_open::OpenPayload) {
         self.map
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -107,7 +107,7 @@ impl PendingOpens {
     /// Drain and return every payload queued for `label`. Empty (not an error) when
     /// nothing is pending -- the overwhelmingly common case, so every window's boot pays
     /// one cheap map lookup.
-    pub fn take(&self, label: &str) -> Vec<crate::cli_open::OpenRequest> {
+    pub fn take(&self, label: &str) -> Vec<crate::cli_open::OpenPayload> {
         self.map
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -254,10 +254,13 @@ mod tests {
         assert_eq!(claim, Claim::Existing("main".to_string()));
     }
 
-    fn open(path: &str) -> crate::cli_open::OpenRequest {
-        crate::cli_open::OpenRequest {
+    fn open(path: &str) -> crate::cli_open::OpenPayload {
+        crate::cli_open::OpenPayload {
             path: path.to_string(),
             agent: None,
+            worktree: None,
+            name: None,
+            prompt: None,
         }
     }
 

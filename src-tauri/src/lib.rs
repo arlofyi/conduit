@@ -1329,7 +1329,7 @@ fn open_profile_window(
 fn take_pending_opens(
     window: tauri::Window,
     pending: State<Arc<window_registry::PendingOpens>>,
-) -> Vec<cli_open::OpenRequest> {
+) -> Vec<cli_open::OpenPayload> {
     pending.take(window.label())
 }
 

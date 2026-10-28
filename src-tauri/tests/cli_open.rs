@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-use conduit_tauri_lib::cli_open::{self, OpenRequest};
+use conduit_tauri_lib::cli_open::{self, OpenPayload};
 use conduit_tauri_lib::cli_shim;
 
 struct Fixture {
@@ -79,10 +79,10 @@ impl Drop for Fixture {
 }
 
 /// Serve `/open` forever on an ephemeral port, reporting each accepted request.
-fn serve(token: String) -> (u16, Receiver<OpenRequest>) {
+fn serve(token: String) -> (u16, Receiver<OpenPayload>) {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let port = server.server_addr().to_ip().unwrap().port();
-    let (tx, rx): (Sender<OpenRequest>, Receiver<OpenRequest>) = channel();
+    let (tx, rx): (Sender<OpenPayload>, Receiver<OpenPayload>) = channel();
     std::thread::spawn(move || {
         for req in server.incoming_requests() {
             let tx = tx.clone();
@@ -94,12 +94,12 @@ fn serve(token: String) -> (u16, Receiver<OpenRequest>) {
     (port, rx)
 }
 
-fn recv(rx: &Receiver<OpenRequest>) -> OpenRequest {
+fn recv(rx: &Receiver<OpenPayload>) -> OpenPayload {
     rx.recv_timeout(Duration::from_secs(10))
         .expect("no request reached the handler")
 }
 
-fn silent(rx: &Receiver<OpenRequest>) {
+fn silent(rx: &Receiver<OpenPayload>) {
     assert!(
         rx.recv_timeout(Duration::from_millis(300)).is_err(),
         "the handler acted on a request it should have refused"

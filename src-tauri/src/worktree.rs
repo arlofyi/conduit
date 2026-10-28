@@ -33,6 +33,19 @@ pub fn slug(name: &str, uid: &str) -> String {
     format!("{base}-{short}")
 }
 
+/// Whether `s` is an acceptable caller-supplied worktree slug: `^[a-z0-9]+(-[a-z0-9]+)*$`,
+/// 1 to 60 chars, ASCII only. Lowercase alnum runs joined by single hyphens, so it can
+/// never be empty, absolute, or contain `..` or a separator.
+pub fn valid_slug(s: &str) -> bool {
+    (1..=60).contains(&s.len())
+        && s.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
 /// The directory Claude creates for `--worktree <slug>`: `<repo>/.claude/worktrees/<slug>`.
 pub fn worktree_path(project_path: &str, slug: &str) -> String {
     Path::new(project_path)
@@ -154,6 +167,28 @@ mod tests {
     #[test]
     fn slug_falls_back_when_empty() {
         assert_eq!(slug("   ", "abcdef12"), "session-abcdef");
+    }
+
+    #[test]
+    fn valid_slug_accepts_only_hyphenated_lowercase_alnum() {
+        for ok in ["a", "fix-a", "fix-push-main-01abcd", "0", &"a".repeat(60)] {
+            assert!(valid_slug(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "Fix-A",
+            "fix_a",
+            "-fix",
+            "fix-",
+            "fix--a",
+            "../x",
+            "a/b",
+            "fix a",
+            "caf\u{e9}",
+            &"a".repeat(61),
+        ] {
+            assert!(!valid_slug(bad), "{bad}");
+        }
     }
 
     #[test]
