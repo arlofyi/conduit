@@ -3,6 +3,21 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+- **Fixed — idle auto-stop no longer stops a session whose subagents are still working.**
+  When an agent hands work to background subagents its own turn ends, and Conduit read that
+  as finished and stopped the session five minutes later, taking the subagents with it.
+  Conduit now checks for subagents that have not finished and leaves those sessions alone.
+- **Fixed — a session waiting on your answer is no longer stopped as idle.** A question the
+  agent asked, a plan waiting for approval or a permission prompt left unanswered for a
+  minute was mistaken for a stuck turn, marked idle, and then stopped by idle auto-stop. It
+  now shows as waiting on you, which auto-stop leaves alone unless you opt in.
+- **Fixed — Windows: the `conduit` command's new options work.** With `--worktree`,
+  `--name`, `--prompt-file` and friends the Windows command could run fragments of its own
+  script, report "no Conduit answering" for a request Conduit had refused, or, with two
+  runs started in the same second, send one run's request for the other.
+
 ## 0.46.0 — 2026-10-28
 
 - **Added — `conduit` command opens named worktree sessions.** With `--agent`, `conduit` now also takes `--worktree <slug>` (run the session in its own worktree), `--name <text>` (name its tab) and `--prompt-file <file>` (send the file's text as the session's first message).
