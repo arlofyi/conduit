@@ -169,7 +169,23 @@ fn a_wrong_token_is_refused_and_the_shim_reports_failure() {
     std::fs::create_dir_all(&project).unwrap();
 
     let out = f.run(&[project.to_str().unwrap()]);
-    assert!(!out.status.success(), "a 403 must not look like success");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a 403 must not look like success: {}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("refused the CLI token"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    // A refusal came from a RUNNING Conduit: never read it as "not running".
+    assert!(
+        !stderr(&out).contains("no Conduit answering"),
+        "stderr: {}",
+        stderr(&out)
+    );
     silent(&rx);
 }
 
@@ -401,5 +417,94 @@ fn options_without_agent_exit_2() {
         "stderr: {}",
         stderr(&out)
     );
+    silent(&rx);
+}
+
+/// The shim checks the slug itself, so the common mistake is a usage error before any
+/// request, not a 400 (or worse, a cold start).
+#[test]
+fn a_bad_worktree_slug_exits_2_before_any_request() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("p");
+    std::fs::create_dir_all(&project).unwrap();
+
+    for bad in [
+        "Fix-A",
+        "fix_a",
+        "-fix",
+        "fix-",
+        "fix--a",
+        "../x",
+        &"a".repeat(61),
+    ] {
+        let started = std::time::Instant::now();
+        let out = f.run(&[
+            project.to_str().unwrap(),
+            "--agent",
+            "claude",
+            "--worktree",
+            bad,
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{bad}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("invalid --worktree slug"),
+            "{bad}: {}",
+            stderr(&out)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{bad}: not quick"
+        );
+    }
+    silent(&rx);
+
+    // The longest legal slug still goes through.
+    let ok = "a".repeat(60);
+    let out = f.run(&[
+        project.to_str().unwrap(),
+        "--agent",
+        "claude",
+        "--worktree",
+        &ok,
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(recv(&rx).path.ends_with("p"));
+}
+
+/// A 400 from a running Conduit is reported as a refusal at once, with exit 2: never
+/// retried as a cold start that ends in "did not come up in time" fifteen seconds later.
+#[test]
+fn a_400_from_the_app_exits_2_without_a_cold_start() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("p");
+    std::fs::create_dir_all(&project).unwrap();
+    // The shim only checks that the prompt file exists; the size cap is Conduit's.
+    let big = f.home.join("big.md");
+    std::fs::write(&big, vec![b'a'; 65_537]).unwrap();
+
+    let started = std::time::Instant::now();
+    let out = f.run(&[
+        project.to_str().unwrap(),
+        "--agent",
+        "claude",
+        "--prompt-file",
+        big.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Conduit rejected the request"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("no Conduit answering") && !stderr(&out).contains("in time"),
+        "a refusal must not fall into the cold start: {}",
+        stderr(&out)
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "not quick");
     silent(&rx);
 }

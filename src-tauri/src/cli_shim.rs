@@ -87,6 +87,19 @@ while [ $# -gt 0 ]; do
 done
 # A worktree, a name and a prompt all belong to a new session, and only --agent starts one.
 [ -z "$options" ] || [ -n "$agent" ] || usage
+# The slug rule Conduit enforces (lowercase letters, digits, single inner hyphens, at most
+# 60 chars), checked here so the common mistake is a usage error, not a 400. The class is
+# spelled out rather than a-z: a range in a bracket expression is locale-dependent.
+if [ -n "$worktree" ]; then
+  case "$worktree" in
+    -*|*-|*--*|*[!abcdefghijklmnopqrstuvwxyz0123456789-]*) bad_slug=1 ;;
+    *) bad_slug="" ;;
+  esac
+  if [ -n "$bad_slug" ] || [ ${{#worktree}} -gt 60 ]; then
+    echo "conduit: invalid --worktree slug: $worktree (use lowercase letters, digits and single hyphens, at most 60 characters)" >&2
+    exit 2
+  fi
+fi
 [ -n "$target" ] || target="."
 [ -d "$target" ] || {{ echo "conduit: not a directory: $target" >&2; exit 1; }}
 # Resolve symlinks so a checkout reached through a link is not added twice.
@@ -120,18 +133,39 @@ body="\"path\":\"$(json_esc "$path")\""
 [ -z "$prompt_abs" ] || body="$body,\"prompt_file\":\"$(json_esc "$prompt_abs")\""
 body="{{$body}}"
 
+# Sets `code` to the HTTP status of one POST, or 000 when nothing answered (no published
+# port or token yet, or the connection failed). Without -f curl exits 0 on a 4xx, so the
+# status, not the exit code, is what tells "not running" apart from "refused".
 post() {{
-  [ -f "$dir/hook-endpoint.sh" ] || return 1
-  [ -f "$dir/cli-token" ] || return 1
+  code=000
+  [ -f "$dir/hook-endpoint.sh" ] || return 0
+  [ -f "$dir/cli-token" ] || return 0
   # One KEY=value line, sourced not executed — the contract hooks.rs writes it under.
   . "$dir/hook-endpoint.sh"
-  [ -n "${{CONDUIT_HOOK_PORT:-}}" ] || return 1
+  [ -n "${{CONDUIT_HOOK_PORT:-}}" ] || return 0
   token=$(cat "$dir/cli-token")
-  curl -sf -m 5 -X POST \
+  code=$(curl -s -o /dev/null -w '%{{http_code}}' -m 5 -X POST \
     -H "Content-Type: application/json" \
     -H "X-Conduit-Token: $token" \
     --data "$body" \
-    "http://127.0.0.1:$CONDUIT_HOOK_PORT/open" >/dev/null 2>&1
+    "http://127.0.0.1:$CONDUIT_HOOK_PORT/open" 2>/dev/null) || true
+  [ -n "$code" ] || code=000
+}}
+
+# Exits for every answer a running Conduit gave. Returns 1 only when nothing answered,
+# which is the one case a cold start can fix: retrying a refusal would only turn a clear
+# error into "did not come up in time" fifteen seconds later.
+answered() {{
+  case "$code" in
+    000) return 1 ;;
+    2??) exit 0 ;;
+    400) echo "conduit: Conduit rejected the request (check --worktree slug; the prompt file must be UTF-8 and at most 64 KB)" >&2
+         exit 2 ;;
+    403) echo "conduit: Conduit refused the CLI token; restart Conduit, or check CONDUIT_DATA_DIR_NAME names the running instance." >&2
+         exit 1 ;;
+    *) echo "conduit: Conduit answered HTTP $code." >&2
+       exit 1 ;;
+  esac
 }}
 
 cold_start() {{
@@ -149,7 +183,8 @@ cold_start() {{
   n=0
   while [ $n -lt 30 ]; do
     # Re-read every attempt: the port is only published once the server binds.
-    if post; then return 0; fi
+    post
+    answered || true
     n=$((n + 1))
     sleep 0.5
   done
@@ -157,7 +192,8 @@ cold_start() {{
   exit 1
 }}
 
-post || cold_start
+post
+answered || cold_start
 "##
     )
 }
@@ -200,8 +236,27 @@ exit /b 2
 :bad_name
 echo conduit: in conduit.cmd --name cannot contain double quotes, percent signs or exclamation marks 1>&2
 exit /b 2
+:bad_slug
+rem The value is not echoed: it failed the check, so it may hold & or |.
+echo conduit: invalid --worktree slug (use lowercase letters, digits and single hyphens, at most 60 characters) 1>&2
+exit /b 2
 :parsed
 if defined options if not defined agent goto usage
+
+rem The slug rule Conduit enforces, checked here so the common mistake is a usage error,
+rem not a 400. `set` prints the variable without expanding its value into a command, so
+rem a hostile slug cannot run anything; findstr is case-sensitive and the class is
+rem spelled out because its ranges are collation-ordered, not ASCII.
+if not defined worktree goto slug_ok
+set "cslug=%worktree%"
+set cslug | findstr /r /x /c:"cslug=[abcdefghijklmnopqrstuvwxyz0123456789][abcdefghijklmnopqrstuvwxyz0123456789-]*" >nul 2>&1
+if errorlevel 1 goto bad_slug
+setlocal enabledelayedexpansion
+if not "!cslug:--=!"=="!cslug!" goto bad_slug
+if "!cslug:~-1!"=="-" goto bad_slug
+if not "!cslug:~60!"=="" goto bad_slug
+endlocal
+:slug_ok
 
 if not defined sname goto name_ok
 set "sname_nq=%sname:"=%"
@@ -273,19 +328,34 @@ rem MSVCRT rules, which rewrite backslashes that precede a double quote.
 set "bodyfile=%TEMP%\conduit-open-%RANDOM%%RANDOM%.json"
 >"%bodyfile%" echo(!body!
 
-if not "!port!"=="" if not "!token!"=="" (
-  curl.exe -sf -m 5 -X POST -H "Content-Type: application/json" ^
-    -H "X-Conduit-Token: !token!" --data-binary "@%bodyfile%" ^
-    "http://127.0.0.1:!port!/open" >nul 2>&1
-  if not errorlevel 1 (del "%bodyfile%" >nul 2>&1 & exit /b 0)
-)
+rem The status, not curl's exit code, tells "not running" (000) from "refused": without -f
+rem curl exits 0 on a 4xx, and a refusal must not read as Conduit being absent.
+set "code=000"
+if "!port!"=="" goto posted
+if "!token!"=="" goto posted
+for /f "delims=" %%c in ('curl.exe -s -o NUL -w "%%{{http_code}}" -m 5 -X POST -H "Content-Type: application/json" -H "X-Conduit-Token: !token!" --data-binary "@%bodyfile%" "http://127.0.0.1:!port!/open" 2^>NUL') do set "code=%%c"
+:posted
 del "%bodyfile%" >nul 2>&1
+if "!code!"=="" set "code=000"
+if "!code:~0,1!"=="2" exit /b 0
+if "!code!"=="400" goto rejected
+if "!code!"=="403" goto refused
+if not "!code!"=="000" goto http_error
 
 if not "%CONDUIT_DATA_DIR_NAME%"=="" (
   echo conduit: no Conduit answering for CONDUIT_DATA_DIR_NAME=%CONDUIT_DATA_DIR_NAME%. 1>&2
   exit /b 1
 )
 echo conduit: Conduit is not running. Start it and try again. 1>&2
+exit /b 1
+:rejected
+echo conduit: Conduit rejected the request (check --worktree slug; the prompt file must be UTF-8 and at most 64 KB) 1>&2
+exit /b 2
+:refused
+echo conduit: Conduit refused the CLI token; restart Conduit, or check CONDUIT_DATA_DIR_NAME names the running instance. 1>&2
+exit /b 1
+:http_error
+echo conduit: Conduit answered HTTP !code!. 1>&2
 exit /b 1
 "##,
         TAB = '\t'
@@ -591,6 +661,23 @@ mod tests {
             s.contains("del \"%bodyfile%\""),
             "temp body file not deleted"
         );
+    }
+
+    /// `curl -f` folds a 400 into the same failure as "nothing listening", which sent a
+    /// refusal down the cold-start path. Both shims read the status instead.
+    #[test]
+    fn shims_branch_on_the_http_status_not_curls_exit_code() {
+        for s in [shim_sh(), shim_cmd()] {
+            assert!(s.contains("%{http_code}"), "status not captured");
+            assert!(!s.contains("curl -sf") && !s.contains("curl.exe -sf"));
+            assert!(s.contains("Conduit rejected the request"), "400 message");
+            assert!(s.contains("refused the CLI token"), "403 message");
+            assert!(s.contains("invalid --worktree slug"), "slug check");
+        }
+        // Only "nothing answered" may cold start.
+        let sh = shim_sh();
+        assert!(sh.contains("000) return 1 ;;"));
+        assert!(sh.trim_end().ends_with("answered || cold_start"));
     }
 
     #[test]
