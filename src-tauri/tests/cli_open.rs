@@ -267,6 +267,7 @@ fn awkward_path_characters_round_trip() {
     assert!(recv(&rx).path.ends_with(r#"we"ird\dir"#));
 }
 
+#[cfg(unix)]
 fn git_init(dir: &Path) {
     let out = Command::new("git")
         .args(["init", "-q"])
