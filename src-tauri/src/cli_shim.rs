@@ -35,7 +35,11 @@ pub fn shim_file_name() -> &'static str {
 
 pub fn shim_text() -> String {
     if cfg!(windows) {
-        shim_cmd()
+        // CRLF, not the LF the source literal carries: cmd.exe finds `goto` labels by
+        // re-reading the file, and with bare LF endings that search can land mid-line and
+        // run a fragment of it as a command (`'m' is not recognized ...`). The v2 shim's
+        // many labels made that reachable; v1 only got lucky.
+        shim_cmd().replace('\n', "\r\n")
     } else {
         shim_sh()
     }
@@ -576,6 +580,15 @@ mod tests {
             s.contains(r#"m["\\"] = "\\\\""#),
             "backslash escape missing"
         );
+    }
+
+    #[test]
+    fn windows_shim_text_uses_crlf_line_endings() {
+        if cfg!(windows) {
+            let t = shim_text();
+            assert!(t.contains("\r\n"));
+            assert!(!t.replace("\r\n", "").contains('\n'), "a bare LF is left");
+        }
     }
 
     #[test]
