@@ -3,7 +3,7 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.43.0 — 2026-10-28
 
 - **Added — `conduit` command opens named worktree sessions.** With `--agent`, `conduit` now also takes `--worktree <slug>` (run the session in its own worktree), `--name <text>` (name its tab) and `--prompt-file <file>` (send the file's text as the session's first message).
 - **Fixed — plan usage for an account on your default `.claude` folder.** Registering `~/.claude` as a named account (to label it) left it unable to connect plan usage on macOS: "No sign-in found". It now reads the default sign-in, as an unnamed default always did.
