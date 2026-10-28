@@ -6,6 +6,8 @@ All notable changes to Conduit are documented here. This project uses
 ## Unreleased
 
 - **Added — `conduit` command opens named worktree sessions.** With `--agent`, `conduit` now also takes `--worktree <slug>` (run the session in its own worktree), `--name <text>` (name its tab) and `--prompt-file <file>` (send the file's text as the session's first message).
+- **Fixed — plan usage for an account on your default `.claude` folder.** Registering `~/.claude` as a named account (to label it) left it unable to connect plan usage on macOS: "No sign-in found". It now reads the default sign-in, as an unnamed default always did.
+- **Fixed — plan usage no longer goes blank when a Mac account's sign-in renews.** A Claude sign-in lasts a few hours; once it ran out the meter emptied for good until you reconnected by hand. Conduit now picks up the renewed sign-in on its own the next time a session on that account refreshes it, and says plainly when a sign-in has expired instead of calling the plan "unreachable".
 
 ## 0.42.0 — 2026-10-12
 

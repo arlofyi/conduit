@@ -15,8 +15,10 @@ pub struct ClaudeUsage {
     pub local: LocalUsage,
     /// Present only when plan limits were fetched successfully.
     pub plan: Option<Vec<PlanWindow>>,
-    /// "live" | "stale" | "unavailable" | "disconnected".
+    /// "live" | "stale" | "expired" | "unavailable" | "disconnected".
     /// "stale" = this poll failed (usually a 429) but a recent good read stood in for it.
+    /// "expired" = the endpoint refused the token (401/403): the saved sign-in has run out,
+    /// and only a `claude` running on that account can refresh it.
     pub plan_source: String,
 }
 
@@ -210,6 +212,12 @@ fn read_local_usage(config_dir: Option<&str>) -> LocalUsage {
 pub struct ClaudeAuth {
     pub tokens: Mutex<HashMap<String, String>>,
     last_plan: Mutex<HashMap<String, CachedPlan>>,
+    /// macOS only: the Keychain item's modification date as of our last secret read, per
+    /// account. Reading the secret (`-w`) can prompt; reading the attributes cannot. So a
+    /// poll re-reads the secret only when the item CHANGED since -- i.e. a `claude` on that
+    /// account refreshed its sign-in -- and an expired, untouched item is never re-read.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    keychain_seen: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -257,6 +265,10 @@ impl ClaudeAuth {
             .unwrap_or_else(|e| e.into_inner())
             .remove(account_id);
         self.last_plan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(account_id);
+        self.keychain_seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(account_id);
@@ -343,11 +355,11 @@ pub async fn fetch_claude_usage(
                 let token = tokens.get(&key).cloned();
                 let (mut plan, mut plan_source) = fetch_plan(token.clone());
                 // A connected account whose fetch didn't come back live may just hold a
-                // stale token: Claude Code rotates the on-disk credentials whenever one of
-                // its sessions runs, and this cache is memory-only. Re-read the file (never
-                // the Keychain -- that prompts) and retry once with the fresh token.
+                // stale token: Claude Code rotates its credentials whenever one of its
+                // sessions runs, and this cache is memory-only. Re-read them (the Keychain
+                // only once the item has changed -- see `reread_token`) and retry once.
                 if token.is_some() && plan.is_none() {
-                    if let Some(fresh) = reread_token_file(config_dir.as_deref()) {
+                    if let Some(fresh) = reread_token(&auth, &key, config_dir.as_deref()) {
                         if Some(&fresh) != token.as_ref() {
                             auth.tokens
                                 .lock()
@@ -448,6 +460,8 @@ fn fetch_plan(token: Option<String>) -> (Option<Vec<PlanWindow>>, String) {
             "-s",
             "--max-time",
             "8",
+            "-w",
+            "\n%{http_code}",
             "-H",
             &format!("Authorization: Bearer {token}"),
             USAGE_ENDPOINT,
@@ -455,14 +469,26 @@ fn fetch_plan(token: Option<String>) -> (Option<Vec<PlanWindow>>, String) {
         .no_window()
         .output();
     match out {
-        Ok(o) if o.status.success() => {
-            let body = String::from_utf8_lossy(&o.stdout);
-            match parse_plan(&body) {
-                Some(windows) => (Some(windows), "live".into()),
-                None => (None, "unavailable".into()),
-            }
-        }
+        Ok(o) if o.status.success() => classify_plan_response(&String::from_utf8_lossy(&o.stdout)),
         _ => (None, "unavailable".into()),
+    }
+}
+
+/// Split curl's `body\n<status>` output and decide what it means. A refused token is told
+/// apart from every other failure because it is the one the user can act on: the sign-in
+/// expired and a `claude` run on that account renews it. Everything else (429, 5xx, a shape
+/// we can't read) stays "unavailable" -- transient, nothing to do.
+fn classify_plan_response(out: &str) -> (Option<Vec<PlanWindow>>, String) {
+    let (body, status) = match out.rsplit_once('\n') {
+        Some((b, s)) => (b, s.trim()),
+        None => (out, ""),
+    };
+    if status == "401" || status == "403" {
+        return (None, "expired".into());
+    }
+    match parse_plan(body) {
+        Some(windows) => (Some(windows), "live".into()),
+        None => (None, "unavailable".into()),
     }
 }
 
@@ -528,15 +554,78 @@ fn read_oauth_token(config_dir: Option<&str>) -> Option<String> {
         if let Some(t) = read_credentials_file(std::path::Path::new(dir)) {
             return Some(t);
         }
-        // A flat CLAUDE_CONFIG_DIR account on macOS keeps its login in the Keychain under
-        // its OWN item, suffixed by a hash of that dir. Only for a dir Conduit hands over as
-        // CLAUDE_CONFIG_DIR (see `agent::claude_profile_env`): a `.claude`-named dir runs
-        // with HOME redirected instead, and claude never sees the path to hash it.
-        return keychain_service_for_config_dir(dir).and_then(|svc| keychain_token(&svc));
     }
-    // Env-default account only: the login Keychain (this is the read that prompts).
-    keychain_token("Claude Code-credentials")
+    // Otherwise the account's own Keychain item (this is the read that prompts).
+    keychain_service_for_account(config_dir, dirs::home_dir().as_deref())
+        .and_then(|svc| keychain_token(&svc))
 }
+
+/// Which Keychain item holds this account's login, or None when no item is its alone.
+///
+/// - The env default, AND a registered account whose dir IS `~/.claude`, use the
+///   unsuffixed item: registering the default folder as an account (to label it) still
+///   names the default login, so it must not be locked out of it. It once was -- the
+///   "never fall back to the default item" guard below caught it too, and that account
+///   could never connect.
+/// - A flat `CLAUDE_CONFIG_DIR` account uses its own hash-suffixed item.
+/// - Any OTHER `.claude`-named dir runs with HOME redirected (`agent::claude_profile_env`),
+///   so claude never hashes its path; the only item it could use is the default's, and
+///   reading that would cache the default account's token under this one's key.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn keychain_service_for_account(
+    config_dir: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> Option<String> {
+    const DEFAULT_ITEM: &str = "Claude Code-credentials";
+    let Some(dir) = config_dir.filter(|d| !d.trim().is_empty()) else {
+        return Some(DEFAULT_ITEM.into());
+    };
+    if home.is_some_and(|h| std::path::Path::new(dir) == h.join(".claude")) {
+        return Some(DEFAULT_ITEM.into());
+    }
+    keychain_service_for_config_dir(dir)
+}
+
+/// The item's modification date, from its ATTRIBUTES (`security` without `-w`), which never
+/// prompts. Only compared for equality, so the raw text is kept as-is.
+#[cfg(target_os = "macos")]
+fn keychain_stamp(service: &str) -> Option<String> {
+    let out = Command::new("security")
+        .args(["find-generic-password", "-s", service])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_keychain_mdat(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pull the `"mdat"<timedate>=...` value out of `security find-generic-password` output.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_keychain_mdat(attrs: &str) -> Option<String> {
+    attrs
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("\"mdat\"<timedate>="))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Note the Keychain item's current stamp for `key`, after a secret read at connect time,
+/// so the poll does not read the very same item again.
+#[cfg(target_os = "macos")]
+fn remember_keychain_stamp(auth: &ClaudeAuth, key: &str, config_dir: Option<&str>) {
+    let stamp = keychain_service_for_account(config_dir, dirs::home_dir().as_deref())
+        .and_then(|svc| keychain_stamp(&svc));
+    if let Some(stamp) = stamp {
+        auth.keychain_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), stamp);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn remember_keychain_stamp(_auth: &ClaudeAuth, _key: &str, _config_dir: Option<&str>) {}
 
 /// `security find-generic-password -s <service> -w`, parsed. `-w` prints only the secret,
 /// which is never logged.
@@ -592,19 +681,41 @@ fn read_oauth_token(config_dir: Option<&str>) -> Option<String> {
     read_credentials_file(&claude_config_dir(config_dir)?)
 }
 
-/// Poll-time credentials re-read: file stores only. On macOS the env-default account
-/// lives in the login Keychain, and reading THAT prompts the user -- a background poll
-/// must never trigger it, so the default account stays connect-time only there.
+/// Poll-time credentials re-read, for a connected account whose fetch failed.
+///
+/// On macOS a plain file is read freely, but the Keychain secret only when the item has
+/// CHANGED since we last read it. That is the whole trick: an access token lives a few
+/// hours, the poll used to read files only, and a Keychain account's meter therefore went
+/// blank for good the first time its token ran out. The item changes exactly when a
+/// `claude` on that account refreshes its sign-in, so this re-reads once per refresh, and
+/// an expired item nobody refreshes is never read again (no prompt loop). The read can
+/// still prompt if the user answered the connect-time prompt with "Allow" rather than
+/// "Always Allow" -- but only once per refresh, and only for an account they connected.
 #[cfg(target_os = "macos")]
-fn reread_token_file(config_dir: Option<&str>) -> Option<String> {
-    let dir = config_dir.filter(|d| !d.trim().is_empty())?;
-    read_credentials_file(std::path::Path::new(dir))
+fn reread_token(auth: &ClaudeAuth, key: &str, config_dir: Option<&str>) -> Option<String> {
+    if let Some(dir) = config_dir.filter(|d| !d.trim().is_empty()) {
+        if let Some(t) = read_credentials_file(std::path::Path::new(dir)) {
+            return Some(t);
+        }
+    }
+    let svc = keychain_service_for_account(config_dir, dirs::home_dir().as_deref())?;
+    let stamp = keychain_stamp(&svc)?;
+    {
+        let mut seen = auth.keychain_seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.get(key) == Some(&stamp) {
+            return None;
+        }
+        // Recorded BEFORE the secret read, so a read that fails or is declined is not
+        // retried every poll.
+        seen.insert(key.to_string(), stamp);
+    }
+    keychain_token(&svc)
 }
 
 /// Windows/Linux keep every account's credentials as a plain file, so re-reading is
 /// always prompt-free.
 #[cfg(not(target_os = "macos"))]
-fn reread_token_file(config_dir: Option<&str>) -> Option<String> {
+fn reread_token(_auth: &ClaudeAuth, _key: &str, config_dir: Option<&str>) -> Option<String> {
     read_oauth_token(config_dir)
 }
 
@@ -632,6 +743,7 @@ pub async fn connect_claude_plan_usage(
     let ok = tauri::async_runtime::spawn_blocking(move || {
         match read_oauth_token(config_dir.as_deref()) {
             Some(token) => {
+                remember_keychain_stamp(&auth, &key, config_dir.as_deref());
                 auth.tokens
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -664,6 +776,61 @@ mod tests {
         );
         // A `.claude` dir runs with HOME redirected, so claude never hashes its path.
         assert_eq!(keychain_service_for_config_dir("/Users/x/.claude"), None);
+    }
+
+    #[test]
+    fn an_account_registered_on_the_default_folder_reads_the_default_item() {
+        let home = std::path::Path::new("/Users/x");
+        let svc = |d: Option<&str>| keychain_service_for_account(d, Some(home));
+        // The env default and `~/.claude` registered as an account are the same login.
+        assert_eq!(svc(None).as_deref(), Some("Claude Code-credentials"));
+        assert_eq!(svc(Some("")).as_deref(), Some("Claude Code-credentials"));
+        assert_eq!(
+            svc(Some("/Users/x/.claude")).as_deref(),
+            Some("Claude Code-credentials")
+        );
+        assert_eq!(
+            svc(Some("/Users/x/.claude/")).as_deref(),
+            Some("Claude Code-credentials")
+        );
+        // Another profile's `.claude` is NOT the default login, and must not borrow it.
+        assert_eq!(svc(Some("/Users/x/profiles/work/.claude")), None);
+        // A flat CLAUDE_CONFIG_DIR account keeps its own hashed item.
+        assert_eq!(
+            keychain_service_for_account(
+                Some("/Users/uzairhayat/.claude-arlo"),
+                Some(std::path::Path::new("/Users/uzairhayat"))
+            )
+            .as_deref(),
+            Some("Claude Code-credentials-40501f86")
+        );
+    }
+
+    #[test]
+    fn keychain_mdat_is_read_from_the_attributes() {
+        let attrs = "keychain: \"/Users/x/Library/Keychains/login.keychain-db\"\n\
+            attributes:\n    \"acct\"<blob>=\"x\"\n    \
+            \"mdat\"<timedate>=0x32303236  \"20261018211231Z\\000\"\n";
+        assert_eq!(
+            parse_keychain_mdat(attrs).as_deref(),
+            Some("0x32303236  \"20261018211231Z\\000\"")
+        );
+        assert_eq!(parse_keychain_mdat("attributes:\n"), None);
+    }
+
+    #[test]
+    fn a_refused_token_reads_as_expired_not_unavailable() {
+        let ok = r#"{"five_hour":{"utilization":0.2,"resets_at":null}}"#;
+        let (p, s) = classify_plan_response(&format!("{ok}\n200"));
+        assert!(p.is_some());
+        assert_eq!(s, "live");
+        let (p, s) = classify_plan_response("{\"error\":\"unauthorized\"}\n401");
+        assert!(p.is_none());
+        assert_eq!(s, "expired");
+        assert_eq!(classify_plan_response("{}\n403").1, "expired");
+        // Rate limits and server errors are transient, nothing for the user to do.
+        assert_eq!(classify_plan_response("{}\n429").1, "unavailable");
+        assert_eq!(classify_plan_response("\n000").1, "unavailable");
     }
 
     const FIXTURE: &str = r#"{
