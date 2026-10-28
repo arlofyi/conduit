@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.46.1 — 2026-10-29
+
 - **Fixed — idle auto-stop no longer stops a session whose subagents are still working.**
   When an agent hands work to background subagents its own turn ends, and Conduit read that
   as finished and stopped the session five minutes later, taking the subagents with it.
