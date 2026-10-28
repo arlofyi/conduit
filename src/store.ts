@@ -413,8 +413,9 @@ export interface ClaudeUsage {
   local: LocalUsage;
   plan: PlanWindow[] | null;
   /** "stale" = this poll failed (the endpoint rate-limits) and a recent good read stood in
-   *  for it. The numbers are real, just not from this minute -- see claude_usage.rs. */
-  planSource: "live" | "stale" | "unavailable" | "disconnected";
+   *  for it. The numbers are real, just not from this minute -- see claude_usage.rs.
+   *  "expired" = the endpoint refused the saved sign-in; a `claude` run on the account renews it. */
+  planSource: "live" | "stale" | "expired" | "unavailable" | "disconnected";
 }
 /** One account's Claude usage (mirrors Rust ClaudeAccountUsage). accountId null = env default. */
 export interface ClaudeAccountUsage {

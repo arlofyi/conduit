@@ -119,12 +119,19 @@ function RowBlock({
             <div className="usage-local">{fmtTokens(row.localTotal)} tokens used (local)</div>
           ) : null}
           <button className="usage-connect-btn" onClick={() => void connectPlanUsage(row.accountId)}>
-            {connectFailed || row.planSource === "unavailable" ? "Retry plan usage" : "Connect plan usage"}
+            {connectFailed || row.planSource === "unavailable" || row.planSource === "expired"
+              ? "Retry plan usage"
+              : "Connect plan usage"}
           </button>
           {connectFailed ? (
             <div className="usage-local">
               No sign-in found for this account. Open a session on it and run claude to sign in,
               or re-add the correct .claude folder.
+            </div>
+          ) : row.planSource === "expired" ? (
+            <div className="usage-local">
+              This account's sign-in has expired. Open a Claude session on it to renew the
+              sign-in; usage comes back on its own once it does.
             </div>
           ) : row.planSource === "unavailable" ? (
             <div className="usage-local">
