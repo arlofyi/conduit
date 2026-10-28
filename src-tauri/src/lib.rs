@@ -1735,6 +1735,9 @@ fn add_session(
     // (today's behavior). See `Session::mcp_servers` for why None != Some(<everything>).
     mcp_servers: Option<Vec<String>>,
     model: Option<String>,
+    // `conduit open --worktree <slug>`: use this slug instead of the one derived from the
+    // name. Ignored without `use_worktree`; an invalid slug is dropped (derived one stays).
+    worktree_slug: Option<String>,
     store: State<Arc<Store>>,
 ) -> Option<Session> {
     let mut session = store.add_session(
@@ -1756,6 +1759,16 @@ fn add_session(
     if model.is_some() {
         store.set_session_model(&session.id, model.clone());
         session.model = model;
+    }
+    if use_worktree {
+        if let Some(slug) = worktree_slug.filter(|s| crate::worktree::valid_slug(s)) {
+            let path = store
+                .list()
+                .into_iter()
+                .find(|p| p.id == project_id)
+                .map(|p| p.path)?;
+            session = store.set_session_worktree_slug(&session.id, &path, &slug)?;
+        }
     }
     Some(session)
 }
