@@ -290,8 +290,11 @@ export function GeneralSettings() {
           <>
             Open a project from your terminal the way <code>code .</code> does.{" "}
             <code>conduit .</code> opens the current folder;{" "}
-            <code>conduit . --agent claude</code> also starts one new session in it. If
-            Conduit is not running, it launches first.
+            <code>conduit . --agent claude</code> also starts one new session in it. With{" "}
+            <code>--agent</code>, <code>--worktree &lt;slug&gt;</code> runs that session in its own
+            worktree, <code>--name &lt;text&gt;</code> names its tab, and{" "}
+            <code>--prompt-file &lt;file&gt;</code> sends the file&apos;s text as its first
+            message. If Conduit is not running, it launches first.
           </>
         }
         status={

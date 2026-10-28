@@ -3,6 +3,10 @@
 All notable changes to Conduit are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+- **Added — `conduit` command opens named worktree sessions.** With `--agent`, `conduit` now also takes `--worktree <slug>` (run the session in its own worktree), `--name <text>` (name its tab) and `--prompt-file <file>` (send the file's text as the session's first message).
+
 ## 0.42.0 — 2026-10-12
 
 - **Added — Continuity tables.** The Continuity view gains tabs for Decisions, Handoffs, Tasks, Files and Activity — everything your sessions record in Continuity, for this project only. Tasks shows a claim that has run past its expiry as expired rather than open. Files highlights a path two sessions are editing at once. Click any session's avatar to jump to it on the map.
