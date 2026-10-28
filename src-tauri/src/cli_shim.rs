@@ -347,17 +347,27 @@ set "body={{!body!}}"
 
 rem The body goes through a file, never argv: curl.exe splits its command line with
 rem MSVCRT rules, which rewrite backslashes that precede a double quote.
-set "bodyfile=%TEMP%\conduit-open-%RANDOM%%RANDOM%.json"
->"%bodyfile%" echo(!body!
+rem The file lives in a directory CLAIMED with mkdir, which fails when the name exists.
+rem %RANDOM% is seeded from the clock in whole seconds, so two shims started in the same
+rem second draw the same numbers: a bare name made them share one file, each posting
+rem the other's body or finding it deleted. The loser of the mkdir draws again.
+set "tries=0"
+:claim
+set /a tries+=1
+if !tries! gtr 50 (echo conduit: could not create a temporary file in %TEMP% 1>&2 & exit /b 1)
+set "bodydir=%TEMP%\conduit-open-!RANDOM!!RANDOM!!RANDOM!"
+mkdir "!bodydir!" 2>NUL || goto claim
+set "bodyfile=!bodydir!\body.json"
+>"!bodyfile!" echo(!body!
 
 rem The status, not curl's exit code, tells "not running" (000) from "refused": without -f
 rem curl exits 0 on a 4xx, and a refusal must not read as Conduit being absent.
 set "code=000"
 if "!port!"=="" goto posted
 if "!token!"=="" goto posted
-for /f "delims=" %%c in ('curl.exe -s -o NUL -w "%%{{http_code}}" -m 5 -X POST -H "Content-Type: application/json" -H "X-Conduit-Token: !token!" --data-binary "@%bodyfile%" "http://127.0.0.1:!port!/open" 2^>NUL') do set "code=%%c"
+for /f "delims=" %%c in ('curl.exe -s -o NUL -w "%%{{http_code}}" -m 5 -X POST -H "Content-Type: application/json" -H "X-Conduit-Token: !token!" --data-binary "@!bodyfile!" "http://127.0.0.1:!port!/open" 2^>NUL') do set "code=%%c"
 :posted
-del "%bodyfile%" >nul 2>&1
+rd /s /q "!bodydir!" >nul 2>&1
 if "!code!"=="" set "code=000"
 if "!code:~0,1!"=="2" exit /b 0
 if "!code!"=="400" goto rejected
@@ -681,7 +691,7 @@ mod tests {
             assert!(s.contains(&doubled), "{v} backslashes not doubled");
         }
         assert!(
-            s.contains("--data-binary \"@%bodyfile%\""),
+            s.contains("--data-binary \"@!bodyfile!\""),
             "body not sent from a file"
         );
         assert!(
@@ -689,8 +699,14 @@ mod tests {
             "body must not go through argv"
         );
         assert!(
-            s.contains("del \"%bodyfile%\""),
+            s.contains("rd /s /q \"!bodydir!\""),
             "temp body file not deleted"
+        );
+        // Two shims started in the same second draw the same %RANDOM%; the body's directory
+        // must be claimed (mkdir fails on a taken name) rather than assumed unique.
+        assert!(
+            s.contains("mkdir \"!bodydir!\" 2>NUL || goto claim"),
+            "temp body path not claimed atomically"
         );
     }
 
