@@ -1321,15 +1321,18 @@ fn open_profile_window(
     Ok(())
 }
 
-/// One window's drain of every `conduit <path> [--agent <id>]` invocation the cli-open
-/// sink queued for it while it had no live window yet (Finding 1's pending-open path).
-/// Called once per window right after `load()` resolves, alongside the live `cli-open`
-/// listener that handles the same payload shape for a window that was already open.
+/// One window's drain of every `conduit <path> [--agent <id>] [--worktree <slug>]
+/// [--name <text>] [--prompt-file <file>]` invocation the cli-open sink queued for it
+/// while it had no live window yet (Finding 1's pending-open path). Each is a resolved
+/// `OpenPayload` carrying the prompt TEXT (read when `/open` accepted the request), the
+/// slug and the name. Called once per window right after `load()` resolves, alongside
+/// the live `cli-open` listener that handles the same payload shape for a window that was
+/// already open. Draining removes the entries, so a payload's prompt is handed out once.
 #[tauri::command]
 fn take_pending_opens(
     window: tauri::Window,
     pending: State<Arc<window_registry::PendingOpens>>,
-) -> Vec<cli_open::OpenRequest> {
+) -> Vec<cli_open::OpenPayload> {
     pending.take(window.label())
 }
 
@@ -1735,6 +1738,9 @@ fn add_session(
     // (today's behavior). See `Session::mcp_servers` for why None != Some(<everything>).
     mcp_servers: Option<Vec<String>>,
     model: Option<String>,
+    // `conduit open --worktree <slug>`: use this slug instead of the one derived from the
+    // name. Ignored without `use_worktree`; an invalid slug is dropped (derived one stays).
+    worktree_slug: Option<String>,
     store: State<Arc<Store>>,
 ) -> Option<Session> {
     let mut session = store.add_session(
@@ -1756,6 +1762,16 @@ fn add_session(
     if model.is_some() {
         store.set_session_model(&session.id, model.clone());
         session.model = model;
+    }
+    if use_worktree {
+        if let Some(slug) = worktree_slug.filter(|s| crate::worktree::valid_slug(s)) {
+            let path = store
+                .list()
+                .into_iter()
+                .find(|p| p.id == project_id)
+                .map(|p| p.path)?;
+            session = store.set_session_worktree_slug(&session.id, &path, &slug)?;
+        }
     }
     Some(session)
 }

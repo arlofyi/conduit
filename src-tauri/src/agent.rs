@@ -274,12 +274,17 @@ pub trait ProviderAdapter {
     /// `resume_token` is the agent's own captured conversation id: agy and Command Code can't
     /// pin one up front, and Claude's moves off the pinned `session_id` after a `/clear`.
     /// None = the adapter's default (start fresh, or Claude's pinned id).
+    /// `prompt_arg` is the initial prompt as ONE ready-to-splice shell word, already quoted
+    /// by the caller (`pty::build_script`): usually `"$CONDUIT_INITIAL_PROMPT"`, a variable
+    /// the script read from the session's prompt file, because a 64 KB prompt inlined into
+    /// the command (twice, with the `||` fallback) overruns cmd.exe's line limit, tmux's
+    /// command size and Linux's per-argument cap. Adapters splice it verbatim, never quote it.
     fn build_invocation(
         &self,
         session_id: &str,
         projects_dir: Option<&Path>,
         flags: &str,
-        initial_prompt: Option<&str>,
+        prompt_arg: Option<&str>,
         resume_token: Option<&str>,
     ) -> String;
     /// A config file, RELATIVE TO THE SESSION'S WORKING DIRECTORY, that this CLI reads
@@ -352,7 +357,7 @@ impl ProviderAdapter for ClaudeAdapter {
         session_id: &str,
         projects_dir: Option<&Path>,
         flags: &str,
-        initial_prompt: Option<&str>,
+        prompt_arg: Option<&str>,
         resume_token: Option<&str>,
     ) -> String {
         // Claude pins its FIRST conversation to Conduit's own id (`--session-id`), but the
@@ -363,13 +368,10 @@ impl ProviderAdapter for ClaudeAdapter {
         // disk. Resuming the pinned id instead is what reopened a conversation the user had
         // cleared away, every time Conduit restarted.
         //
-        // An initial prompt rides as a quoted positional so the worker starts working
-        // immediately (used by the Conductor's fleet_spawn). Applied to both branches.
-        // `quote_arg` is POSIX single-quoting under `sh -c` and cmd.exe quoting under
-        // `cmd /K`, so this one invocation string serves both platforms.
-        let prompt = initial_prompt
-            .map(|p| format!(" {}", crate::pty::quote_arg(p)))
-            .unwrap_or_default();
+        // An initial prompt rides as a positional so the worker starts working
+        // immediately (fleet_spawn, `conduit --prompt-file`). Applied to both branches.
+        // `prompt_arg` arrives already quoted for the platform's shell (see the trait doc).
+        let prompt = prompt_arg.map(|p| format!(" {p}")).unwrap_or_default();
         if let Some(token) = resume_token
             .filter(|t| projects_dir.is_some_and(|d| crate::pty::transcript_exists(t, d)))
         {
@@ -443,7 +445,7 @@ impl ProviderAdapter for GeminiAdapter {
         _session_id: &str,
         _projects_dir: Option<&Path>,
         _flags: &str,
-        _initial_prompt: Option<&str>,
+        _prompt_arg: Option<&str>,
         _resume_token: Option<&str>,
     ) -> String {
         "gemini || gemini".to_string()
@@ -563,13 +565,12 @@ impl ProviderAdapter for CodexAdapter {
         session_id: &str,
         _projects_dir: Option<&Path>,
         flags: &str,
-        initial_prompt: Option<&str>,
+        prompt_arg: Option<&str>,
         _resume_token: Option<&str>,
     ) -> String {
-        let Some(prompt) = initial_prompt else {
+        let Some(quoted) = prompt_arg else {
             return "codex || codex".to_string();
         };
-        let quoted = crate::pty::quote_arg(prompt);
         // `.conduit/result.schema.json` (and, on Windows, `.conduit\result.cmd`) are
         // provisioned by the same worktree-setup step that installs this adapter's
         // HooksProfile -- see `hooks::write_codex_result_schema`/`write_codex_result_script`
@@ -699,11 +700,11 @@ impl ProviderAdapter for OpenCodeAdapter {
         _session_id: &str,
         _projects_dir: Option<&Path>,
         flags: &str,
-        initial_prompt: Option<&str>,
+        prompt_arg: Option<&str>,
         _resume_token: Option<&str>,
     ) -> String {
-        let prompt = initial_prompt
-            .map(|p| format!(" --prompt {}", crate::pty::quote_arg(p)))
+        let prompt = prompt_arg
+            .map(|p| format!(" --prompt {p}"))
             .unwrap_or_default();
         format!("opencode{flags}{prompt} || opencode{flags}{prompt}")
     }
@@ -756,7 +757,7 @@ impl ProviderAdapter for AntigravityAdapter {
         _session_id: &str,
         _projects_dir: Option<&Path>,
         _flags: &str,
-        _initial_prompt: Option<&str>,
+        _prompt_arg: Option<&str>,
         resume_token: Option<&str>,
     ) -> String {
         // agy can't pin our id, so we resume by the conversation id we captured after the first
@@ -894,13 +895,11 @@ impl ProviderAdapter for CommandCodeAdapter {
         _session_id: &str,
         _projects_dir: Option<&Path>,
         flags: &str,
-        initial_prompt: Option<&str>,
+        prompt_arg: Option<&str>,
         resume_token: Option<&str>,
     ) -> String {
         let bin = COMMAND_CODE_BIN;
-        let prompt = initial_prompt
-            .map(|p| format!(" {}", crate::pty::quote_arg(p)))
-            .unwrap_or_default();
+        let prompt = prompt_arg.map(|p| format!(" {p}")).unwrap_or_default();
         match resume_token {
             Some(tok) => {
                 let id = crate::pty::quote_arg(tok);
@@ -1762,14 +1761,26 @@ mod tests {
     fn command_code_initial_prompt_rides_as_a_quoted_positional() {
         let a = CommandCodeAdapter;
         // A hostile prompt must reach the agent as ONE argument or not at all.
-        let inv = a.build_invocation("s1", None, "", Some("fix it; rm -rf /"), None);
+        let inv = a.build_invocation(
+            "s1",
+            None,
+            "",
+            Some(&crate::pty::quote_arg("fix it; rm -rf /")),
+            None,
+        );
         assert!(
             inv.contains(&crate::pty::quote_arg("fix it; rm -rf /")),
             "got {inv}"
         );
         // The prompt is repeated on the fallback branch too, so a stale resume does not
         // silently drop the task the user asked for.
-        let resumed = a.build_invocation("s1", None, "", Some("do the thing"), Some("cc-1"));
+        let resumed = a.build_invocation(
+            "s1",
+            None,
+            "",
+            Some(&crate::pty::quote_arg("do the thing")),
+            Some("cc-1"),
+        );
         let quoted = crate::pty::quote_arg("do the thing");
         assert_eq!(resumed.matches(&quoted).count(), 2, "got {resumed}");
     }
@@ -1955,7 +1966,13 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn codex_with_prompt_chains_exec_then_interactive() {
-        let cmd = CodexAdapter.build_invocation("sid-1", None, "", Some("say hello"), None);
+        let cmd = CodexAdapter.build_invocation(
+            "sid-1",
+            None,
+            "",
+            Some(&crate::pty::quote_arg("say hello")),
+            None,
+        );
         assert!(cmd.contains("exec --json"), "{cmd}");
         assert!(
             cmd.contains("--output-schema .conduit/result.schema.json"),
@@ -1968,15 +1985,26 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn codex_with_prompt_and_flags_ends_with_flagged_fallback() {
-        let cmd =
-            CodexAdapter.build_invocation("sid-1", None, " --worktree 'wt'", Some("hi"), None);
+        let cmd = CodexAdapter.build_invocation(
+            "sid-1",
+            None,
+            " --worktree 'wt'",
+            Some(&crate::pty::quote_arg("hi")),
+            None,
+        );
         assert!(cmd.ends_with("; codex --worktree 'wt'"), "{cmd}");
     }
 
     #[cfg(windows)]
     #[test]
     fn codex_with_prompt_uses_ampersand_chain_on_windows() {
-        let cmd = CodexAdapter.build_invocation("sid-1", None, "", Some("say hello"), None);
+        let cmd = CodexAdapter.build_invocation(
+            "sid-1",
+            None,
+            "",
+            Some(&crate::pty::quote_arg("say hello")),
+            None,
+        );
         // Every separator is `&` (cmd.exe's actual chain operator) -- never `;`, which
         // cmd.exe doesn't understand as a command separator at all.
         assert!(cmd.contains(" & call .conduit\\result.cmd & "), "{cmd}");
@@ -2029,7 +2057,13 @@ mod tests {
 
     #[test]
     fn claude_appends_initial_prompt_as_quoted_positional() {
-        let cmd = ClaudeAdapter.build_invocation("id", None, "", Some("write a haiku"), None);
+        let cmd = ClaudeAdapter.build_invocation(
+            "id",
+            None,
+            "",
+            Some(&crate::pty::quote_arg("write a haiku")),
+            None,
+        );
         // The spaced prompt is quoted as a single positional; quoting is OS-aware.
         #[cfg(not(windows))]
         let expected = "claude --session-id 'id' 'write a haiku' || claude 'write a haiku'";
@@ -2093,7 +2127,7 @@ mod tests {
             "pinned",
             Some(&projects),
             " --worktree 'wt'",
-            Some("go"),
+            Some(&crate::pty::quote_arg("go")),
             Some("after-clear"),
         );
         #[cfg(not(windows))]
@@ -2327,7 +2361,13 @@ mod tests {
 
     #[test]
     fn opencode_appends_initial_prompt_via_prompt_flag() {
-        let cmd = OpenCodeAdapter.build_invocation("sid", None, "", Some("do X"), None);
+        let cmd = OpenCodeAdapter.build_invocation(
+            "sid",
+            None,
+            "",
+            Some(&crate::pty::quote_arg("do X")),
+            None,
+        );
         #[cfg(not(windows))]
         let expected = "opencode --prompt 'do X' || opencode --prompt 'do X'";
         #[cfg(windows)]

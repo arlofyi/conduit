@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-use conduit_tauri_lib::cli_open::{self, OpenRequest};
+use conduit_tauri_lib::cli_open::{self, OpenPayload};
 use conduit_tauri_lib::cli_shim;
 
 struct Fixture {
@@ -79,10 +79,10 @@ impl Drop for Fixture {
 }
 
 /// Serve `/open` forever on an ephemeral port, reporting each accepted request.
-fn serve(token: String) -> (u16, Receiver<OpenRequest>) {
+fn serve(token: String) -> (u16, Receiver<OpenPayload>) {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let port = server.server_addr().to_ip().unwrap().port();
-    let (tx, rx): (Sender<OpenRequest>, Receiver<OpenRequest>) = channel();
+    let (tx, rx): (Sender<OpenPayload>, Receiver<OpenPayload>) = channel();
     std::thread::spawn(move || {
         for req in server.incoming_requests() {
             let tx = tx.clone();
@@ -94,12 +94,12 @@ fn serve(token: String) -> (u16, Receiver<OpenRequest>) {
     (port, rx)
 }
 
-fn recv(rx: &Receiver<OpenRequest>) -> OpenRequest {
+fn recv(rx: &Receiver<OpenPayload>) -> OpenPayload {
     rx.recv_timeout(Duration::from_secs(10))
         .expect("no request reached the handler")
 }
 
-fn silent(rx: &Receiver<OpenRequest>) {
+fn silent(rx: &Receiver<OpenPayload>) {
     assert!(
         rx.recv_timeout(Duration::from_millis(300)).is_err(),
         "the handler acted on a request it should have refused"
@@ -169,7 +169,23 @@ fn a_wrong_token_is_refused_and_the_shim_reports_failure() {
     std::fs::create_dir_all(&project).unwrap();
 
     let out = f.run(&[project.to_str().unwrap()]);
-    assert!(!out.status.success(), "a 403 must not look like success");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a 403 must not look like success: {}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("refused the CLI token"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    // A refusal came from a RUNNING Conduit: never read it as "not running".
+    assert!(
+        !stderr(&out).contains("no Conduit answering"),
+        "stderr: {}",
+        stderr(&out)
+    );
     silent(&rx);
 }
 
@@ -249,4 +265,246 @@ fn awkward_path_characters_round_trip() {
     let out = f.run(&[project.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(recv(&rx).path.ends_with(r#"we"ird\dir"#));
+}
+
+fn git_init(dir: &Path) {
+    let out = Command::new("git")
+        .args(["init", "-q"])
+        .arg(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git init: {}", stderr(&out));
+}
+
+/// The name carries every character the shim must neither evaluate nor let break its
+/// JSON: a double quote, a `$` expansion, a backslash.
+#[cfg(unix)]
+#[test]
+fn shim_forwards_name_worktree_and_prompt_file() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("repo");
+    std::fs::create_dir_all(&project).unwrap();
+    git_init(&project);
+    let brief = f.home.join("brief.md");
+    let contents = "Fix \"it\"\n\ttabbed $HOME `x` \\ done\n";
+    std::fs::write(&brief, contents).unwrap();
+
+    let name = r#"He said "hi" $HOME \ ok"#;
+    let out = f.run(&[
+        project.to_str().unwrap(),
+        "--agent",
+        "claude",
+        "--worktree",
+        "fix-a",
+        "--name",
+        name,
+        "--prompt-file",
+        brief.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let got = recv(&rx);
+    assert_eq!(got.agent.as_deref(), Some("claude"));
+    assert_eq!(got.name.as_deref(), Some(name));
+    assert_eq!(got.worktree.as_deref(), Some("fix-a"));
+    assert_eq!(got.prompt.as_deref(), Some(contents));
+}
+
+/// A relative prompt file is resolved against the caller's directory, and a newline
+/// and a tab in the name survive the JSON encoding.
+#[cfg(unix)]
+#[test]
+fn shim_resolves_a_relative_prompt_file_and_escapes_control_characters() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("rel");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("brief.md"), "relative brief").unwrap();
+
+    let out = f
+        .command()
+        .current_dir(&project)
+        .args([
+            ".",
+            "--agent",
+            "claude",
+            "--name",
+            "two\nlines\tand $(echo x)",
+            "--prompt-file",
+            "brief.md",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let got = recv(&rx);
+    assert_eq!(got.name.as_deref(), Some("two\nlines\tand $(echo x)"));
+    assert_eq!(got.prompt.as_deref(), Some("relative brief"));
+}
+
+#[test]
+fn a_missing_prompt_file_fails_before_any_request() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("p");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let missing = f.home.join("nope.md");
+    let out = f.run(&[
+        project.to_str().unwrap(),
+        "--agent",
+        "claude",
+        "--prompt-file",
+        missing.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not a file"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    silent(&rx);
+}
+
+#[test]
+fn shim_drops_worktree_outside_git() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("plain");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let out = f.run(&[
+        project.to_str().unwrap(),
+        "--agent",
+        "claude",
+        "--worktree",
+        "fix-a",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("is not a git work tree"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    let got = recv(&rx);
+    assert_eq!(got.agent.as_deref(), Some("claude"));
+    assert_eq!(got.worktree, None);
+}
+
+#[test]
+fn options_without_agent_exit_2() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("p");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let out = f.run(&[project.to_str().unwrap(), "--name", "x"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    // v1 also exited 2 here, as an unknown option. The v2 guard prints the v2 usage
+    // line, which names --worktree, and no unknown-option complaint.
+    assert!(stderr(&out).contains("usage"), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--worktree"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("unknown option"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    silent(&rx);
+}
+
+/// The shim checks the slug itself, so the common mistake is a usage error before any
+/// request, not a 400 (or worse, a cold start).
+#[test]
+fn a_bad_worktree_slug_exits_2_before_any_request() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("p");
+    std::fs::create_dir_all(&project).unwrap();
+
+    for bad in [
+        "Fix-A",
+        "fix_a",
+        "-fix",
+        "fix-",
+        "fix--a",
+        "../x",
+        &"a".repeat(61),
+    ] {
+        let started = std::time::Instant::now();
+        let out = f.run(&[
+            project.to_str().unwrap(),
+            "--agent",
+            "claude",
+            "--worktree",
+            bad,
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{bad}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("invalid --worktree slug"),
+            "{bad}: {}",
+            stderr(&out)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{bad}: not quick"
+        );
+    }
+    silent(&rx);
+
+    // The longest legal slug still goes through.
+    let ok = "a".repeat(60);
+    let out = f.run(&[
+        project.to_str().unwrap(),
+        "--agent",
+        "claude",
+        "--worktree",
+        &ok,
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(recv(&rx).path.ends_with("p"));
+}
+
+/// A 400 from a running Conduit is reported as a refusal at once, with exit 2: never
+/// retried as a cold start that ends in "did not come up in time" fifteen seconds later.
+#[test]
+fn a_400_from_the_app_exits_2_without_a_cold_start() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("p");
+    std::fs::create_dir_all(&project).unwrap();
+    // The shim only checks that the prompt file exists; the size cap is Conduit's.
+    let big = f.home.join("big.md");
+    std::fs::write(&big, vec![b'a'; 65_537]).unwrap();
+
+    let started = std::time::Instant::now();
+    let out = f.run(&[
+        project.to_str().unwrap(),
+        "--agent",
+        "claude",
+        "--prompt-file",
+        big.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Conduit rejected the request"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("no Conduit answering") && !stderr(&out).contains("in time"),
+        "a refusal must not fall into the cold start: {}",
+        stderr(&out)
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "not quick");
+    silent(&rx);
 }

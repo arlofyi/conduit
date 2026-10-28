@@ -76,9 +76,12 @@ impl WindowRegistry {
     }
 }
 
-/// `conduit <path> [--agent <id>]` payloads waiting for the profile window they're
-/// addressed to, keyed by that window's LABEL (its would-be label if the window doesn't
-/// exist yet -- see `profile_window_label`).
+/// `conduit <path> [--agent <id>] [--worktree <slug>] [--name <text>] [--prompt-file
+/// <file>]` payloads waiting for the profile window they're addressed to, keyed by that
+/// window's LABEL (its would-be label if the window doesn't exist yet -- see
+/// `profile_window_label`). Each entry is a resolved `cli_open::OpenPayload`: the prompt
+/// file was already read when `/open` accepted it, so the queued payload carries the
+/// prompt text itself, plus the slug and name, and nothing is re-read at drain time.
 ///
 /// Exists for one reason: the hook server's `/open` sink used to fall through to "main"
 /// (or whichever window has OS focus) whenever the matched project's own profile had no
@@ -91,11 +94,11 @@ impl WindowRegistry {
 /// handled.
 #[derive(Default)]
 pub struct PendingOpens {
-    map: Mutex<HashMap<String, Vec<crate::cli_open::OpenRequest>>>,
+    map: Mutex<HashMap<String, Vec<crate::cli_open::OpenPayload>>>,
 }
 
 impl PendingOpens {
-    pub fn push(&self, label: &str, open: crate::cli_open::OpenRequest) {
+    pub fn push(&self, label: &str, open: crate::cli_open::OpenPayload) {
         self.map
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -107,7 +110,7 @@ impl PendingOpens {
     /// Drain and return every payload queued for `label`. Empty (not an error) when
     /// nothing is pending -- the overwhelmingly common case, so every window's boot pays
     /// one cheap map lookup.
-    pub fn take(&self, label: &str) -> Vec<crate::cli_open::OpenRequest> {
+    pub fn take(&self, label: &str) -> Vec<crate::cli_open::OpenPayload> {
         self.map
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -254,10 +257,13 @@ mod tests {
         assert_eq!(claim, Claim::Existing("main".to_string()));
     }
 
-    fn open(path: &str) -> crate::cli_open::OpenRequest {
-        crate::cli_open::OpenRequest {
+    fn open(path: &str) -> crate::cli_open::OpenPayload {
+        crate::cli_open::OpenPayload {
             path: path.to_string(),
             agent: None,
+            worktree: None,
+            name: None,
+            prompt: None,
         }
     }
 

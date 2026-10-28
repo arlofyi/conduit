@@ -1291,6 +1291,48 @@ impl Store {
         self.persist();
     }
 
+    /// Replace a worktree session's derived slug with an explicit one (`conduit open
+    /// --worktree <slug>`): recomputes `worktree_path` and `branch` from it. A session with no
+    /// worktree (`use_worktree` false, or a Conductor) is returned unchanged. The caller has
+    /// already validated `slug` with `worktree::valid_slug`. `None` when the session is unknown.
+    ///
+    /// Two sessions on one slug would share a worktree folder and a branch, each agent
+    /// editing under the other. The slug is caller-chosen, so a second `--worktree` with a
+    /// slug another session in the project already uses keeps its derived slug instead,
+    /// with one log line.
+    pub fn set_session_worktree_slug(
+        &self,
+        session_id: &str,
+        project_path: &str,
+        slug: &str,
+    ) -> Option<Session> {
+        let updated = {
+            let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+            let project = projects
+                .iter_mut()
+                .find(|p| p.sessions.iter().any(|s| s.id == session_id))?;
+            let path = crate::worktree::worktree_path(project_path, slug);
+            let taken = project
+                .sessions
+                .iter()
+                .any(|s| s.id != session_id && s.worktree_path.as_deref() == Some(path.as_str()));
+            let s = project.sessions.iter_mut().find(|s| s.id == session_id)?;
+            if s.worktree_path.is_some() {
+                if taken {
+                    eprintln!(
+                        "conduit: worktree slug {slug} is already used by another session; keeping the derived one"
+                    );
+                } else {
+                    s.worktree_path = Some(path);
+                    s.branch = Some(crate::worktree::branch_name(slug));
+                }
+            }
+            s.clone()
+        };
+        self.persist();
+        Some(updated)
+    }
+
     /// Whether any project owns this session id — the membership test for "is this ours".
     ///
     /// Cheap on purpose (a bool, no clone): the hook listener calls it on EVERY posted
@@ -2386,6 +2428,96 @@ mod tests {
             "got {path}"
         );
         assert!(s.branch.unwrap().starts_with("worktree-"));
+    }
+
+    #[test]
+    fn explicit_worktree_slug_replaces_the_derived_one() {
+        let dir = temp_dir("wt_slug");
+        let store = Store::for_test(&dir);
+        let p = store.add_project("/repo".into(), store.active_profile());
+        let s = store
+            .add_session(
+                &p.id,
+                "Fix: push".into(),
+                true,
+                crate::agent::AgentId::Claude,
+                SessionRole::Worker,
+            )
+            .unwrap();
+        let s = store
+            .set_session_worktree_slug(&s.id, "/repo", "fix-push-01abcd")
+            .unwrap();
+        assert_eq!(
+            s.worktree_path.as_deref(),
+            Some(crate::worktree::worktree_path("/repo", "fix-push-01abcd").as_str())
+        );
+        assert_eq!(s.branch.as_deref(), Some("worktree-fix-push-01abcd"));
+        // The write is persisted on the stored session, not just the returned copy.
+        let stored = store
+            .list()
+            .into_iter()
+            .flat_map(|p| p.sessions)
+            .find(|x| x.id == s.id)
+            .unwrap();
+        assert_eq!(stored.branch.as_deref(), Some("worktree-fix-push-01abcd"));
+    }
+
+    #[test]
+    fn a_slug_another_session_uses_keeps_the_derived_one() {
+        let dir = temp_dir("wt_slug_taken");
+        let store = Store::for_test(&dir);
+        let p = store.add_project("/repo".into(), store.active_profile());
+        let add = |name: &str| {
+            store
+                .add_session(
+                    &p.id,
+                    name.into(),
+                    true,
+                    crate::agent::AgentId::Claude,
+                    SessionRole::Worker,
+                )
+                .unwrap()
+        };
+        let first = add("First");
+        let first = store
+            .set_session_worktree_slug(&first.id, "/repo", "fix-a")
+            .unwrap();
+        let second = add("Second");
+        let derived = second.worktree_path.clone();
+        let second = store
+            .set_session_worktree_slug(&second.id, "/repo", "fix-a")
+            .unwrap();
+        assert_eq!(second.worktree_path, derived, "must not share a worktree");
+        assert_ne!(second.branch, first.branch, "must not share a branch");
+        // The first session still holds the slug.
+        assert_eq!(first.branch.as_deref(), Some("worktree-fix-a"));
+
+        // Re-applying a session's OWN slug is not a collision.
+        let again = store
+            .set_session_worktree_slug(&first.id, "/repo", "fix-a")
+            .unwrap();
+        assert_eq!(again.branch.as_deref(), Some("worktree-fix-a"));
+    }
+
+    #[test]
+    fn explicit_slug_is_ignored_for_a_session_without_a_worktree() {
+        let dir = temp_dir("wt_slug_none");
+        let store = Store::for_test(&dir);
+        let p = store.add_project("/repo".into(), store.active_profile());
+        let s = store
+            .add_session(
+                &p.id,
+                "Plain".into(),
+                false,
+                crate::agent::AgentId::Claude,
+                SessionRole::Worker,
+            )
+            .unwrap();
+        let s = store
+            .set_session_worktree_slug(&s.id, "/repo", "fix-push-01abcd")
+            .unwrap();
+        assert!(s.worktree_path.is_none());
+        assert!(s.branch.is_none());
     }
 
     #[test]

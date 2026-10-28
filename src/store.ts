@@ -1520,7 +1520,7 @@ interface AppState {
 
   addProject: (path: string) => Promise<void>;
   removeProject: (id: string) => Promise<void>;
-  addSession: (projectId: string, opts?: { name?: string; useWorktree?: boolean; agent?: AgentId; role?: SessionRole; account?: string | null; mcpServers?: string[] | null; model?: string | null }) => Promise<void>;
+  addSession: (projectId: string, opts?: { name?: string; useWorktree?: boolean; worktreeSlug?: string | null; prompt?: string | null; agent?: AgentId; role?: SessionRole; account?: string | null; mcpServers?: string[] | null; model?: string | null }) => Promise<void>;
   renameSession: (projectId: string, sessionId: string, name: string) => Promise<void>;
   /** Rename a project's display label only (not the directory on disk). */
   renameProject: (projectId: string, name: string) => Promise<void>;
@@ -2480,7 +2480,9 @@ export const useStore = create<AppState>((set, get) => {
       // `model` is the concrete id a route picked. Both ride the CREATE call rather than a
       // follow-up so the session is never persisted, however briefly, without them.
       const model = opts?.model ?? null;
-      const session = await invoke<Session | null>("add_session", { projectId, name, useWorktree, agent, role, mcpServers, model });
+      // `worktreeSlug` only means something with `useWorktree`; Rust ignores it otherwise.
+      const worktreeSlug = opts?.worktreeSlug ?? null;
+      const session = await invoke<Session | null>("add_session", { projectId, name, useWorktree, worktreeSlug, agent, role, mcpServers, model });
       if (!session) return;
       // Pin an explicitly-chosen account (blank = inherit the project/global default).
       if (opts?.account) {
@@ -2494,6 +2496,11 @@ export const useStore = create<AppState>((set, get) => {
           p.id === projectId ? { ...p, sessions: [...p.sessions, session] } : p,
         ),
         selectedProjectId: projectId,
+        // Same `set()` that adds the session, so the Terminal's first `takePendingPrompt`
+        // can never run before the prompt is there. Consumed once; never persisted.
+        pendingPrompts: opts?.prompt
+          ? { ...s.pendingPrompts, [session.id]: opts.prompt }
+          : s.pendingPrompts,
       }));
       feedSession("session.start", { id: session.id, title: session.name });
       applyLayout(projectId, (l) => rOpenTab(l, { kind: "session", ref: session.id }));

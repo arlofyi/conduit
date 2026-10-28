@@ -10,7 +10,8 @@
 //!
 //! Nothing in this module touches Tauri. `handle_open` takes a SINK, which is what lets
 //! `tests/cli_open.rs` drive the real handler with a real shim process over a real
-//! socket. Keep it that way.
+//! socket. Keep it that way. The sink receives an `OpenPayload`: the parsed request after
+//! `resolve` has validated its options and read the prompt file.
 
 use std::fs;
 use std::io::Read;
@@ -28,12 +29,84 @@ pub const TOKEN_HEADER: &str = "x-conduit-token";
 /// the hook loop's 1 MB cap, tighter because an open request is a path and a word.
 const MAX_BODY: u64 = 64 * 1024;
 
-/// One `conduit <path> [--agent <id>]` invocation.
+/// The longest prompt file `/open` will read, in bytes.
+pub const MAX_PROMPT_BYTES: u64 = 65_536;
+
+/// The longest session name, in chars (not bytes).
+const MAX_NAME_CHARS: usize = 80;
+
+/// One `conduit <path> [--agent <id>] [--worktree <slug>] [--name <name>]
+/// [--prompt-file <path>]` invocation, as it arrives on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenRequest {
     pub path: String,
     #[serde(default)]
     pub agent: Option<String>,
+    #[serde(default)]
+    pub worktree: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub prompt_file: Option<String>,
+}
+
+/// A validated `OpenRequest` with the prompt file already read: the shape emitted as the
+/// `cli-open` event and returned by `take_pending_opens`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenPayload {
+    pub path: String,
+    pub agent: Option<String>,
+    pub worktree: Option<String>,
+    pub name: Option<String>,
+    pub prompt: Option<String>,
+}
+
+/// Validate an authenticated request and read its prompt file. `worktree`, `name` and
+/// `prompt_file` only make sense when an agent is started, so they require `agent`.
+/// Any failure is a `BadBody`, and the caller never fires the sink.
+pub fn resolve(req: OpenRequest) -> Result<OpenPayload, Reject> {
+    let OpenRequest {
+        path,
+        agent,
+        worktree,
+        name,
+        prompt_file,
+    } = req;
+    if agent.is_none() && (worktree.is_some() || name.is_some() || prompt_file.is_some()) {
+        return Err(Reject::BadBody);
+    }
+    if let Some(slug) = &worktree {
+        if !crate::worktree::valid_slug(slug) {
+            return Err(Reject::BadBody);
+        }
+    }
+    let name = name
+        .map(|n| n.trim().chars().take(MAX_NAME_CHARS).collect::<String>())
+        .filter(|n| !n.is_empty());
+    let prompt = prompt_file.map(|p| read_prompt(&p)).transpose()?;
+    Ok(OpenPayload {
+        path,
+        agent,
+        worktree,
+        name,
+        prompt,
+    })
+}
+
+/// Read a prompt file: absolute, a regular file (links followed), at most
+/// `MAX_PROMPT_BYTES`, UTF-8. The metadata check precedes any open, so a FIFO is never
+/// opened (which would block).
+fn read_prompt(path: &str) -> Result<String, Reject> {
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err(Reject::BadBody);
+    }
+    let meta = fs::metadata(p).map_err(|_| Reject::BadBody)?;
+    if !meta.is_file() || meta.len() > MAX_PROMPT_BYTES {
+        return Err(Reject::BadBody);
+    }
+    let bytes = fs::read(p).map_err(|_| Reject::BadBody)?;
+    String::from_utf8(bytes).map_err(|_| Reject::BadBody)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,8 +203,9 @@ pub fn parse_open(
 }
 
 /// Handle one `/open`. On success the sink runs BEFORE the response is written, so a
-/// shim that waits for 200 knows the app has already acted.
-pub fn handle_open<F: FnOnce(OpenRequest)>(mut request: Request, expected: &str, sink: F) {
+/// shim that waits for 200 knows the app has already acted. The sink receives the
+/// resolved `OpenPayload`; a request that fails `resolve` is a 400 and never reaches it.
+pub fn handle_open<F: FnOnce(OpenPayload)>(mut request: Request, expected: &str, sink: F) {
     let headers: Vec<(String, String)> = request
         .headers()
         .iter()
@@ -146,7 +220,7 @@ pub fn handle_open<F: FnOnce(OpenRequest)>(mut request: Request, expected: &str,
     let mut body = String::new();
     let _ = request.as_reader().take(MAX_BODY).read_to_string(&mut body);
 
-    match parse_open(&headers, &body, expected) {
+    match parse_open(&headers, &body, expected).and_then(resolve) {
         Ok(open) => {
             sink(open);
             let _ = request.respond(Response::from_string("ok"));
@@ -178,7 +252,10 @@ mod tests {
             got,
             OpenRequest {
                 path: "/tmp/p".into(),
-                agent: Some("claude".into())
+                agent: Some("claude".into()),
+                worktree: None,
+                name: None,
+                prompt_file: None,
             }
         );
     }
@@ -281,11 +358,158 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    fn req_with(f: impl FnOnce(&mut OpenRequest)) -> OpenRequest {
+        let mut r = OpenRequest {
+            path: "/tmp/p".into(),
+            agent: Some("claude".into()),
+            worktree: None,
+            name: None,
+            prompt_file: None,
+        };
+        f(&mut r);
+        r
+    }
+
+    fn tmpdir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("conduit-tok-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn v1_bodies_still_resolve_unchanged() {
+        let h = hdrs(&[("X-Conduit-Token", TOK)]);
+        let req = parse_open(&h, r#"{"path":"/tmp/p","agent":"claude"}"#, TOK).unwrap();
+        assert_eq!(
+            resolve(req).unwrap(),
+            OpenPayload {
+                path: "/tmp/p".into(),
+                agent: Some("claude".into()),
+                worktree: None,
+                name: None,
+                prompt: None
+            }
+        );
+        let req = parse_open(&h, r#"{"path":"/tmp/p"}"#, TOK).unwrap();
+        assert_eq!(resolve(req).unwrap().agent, None);
+    }
+
+    #[test]
+    fn options_without_agent_are_rejected() {
+        for body in [
+            r#"{"path":"/p","worktree":"fix-a"}"#,
+            r#"{"path":"/p","name":"x"}"#,
+            r#"{"path":"/p","prompt_file":"/tmp/x"}"#,
+        ] {
+            let req: OpenRequest = serde_json::from_str(body).unwrap();
+            assert_eq!(resolve(req), Err(Reject::BadBody), "{body}");
+        }
+    }
+
+    #[test]
+    fn slug_must_be_safe() {
+        for bad in [
+            "",
+            "Fix-A",
+            "fix_a",
+            "-fix",
+            "fix-",
+            "fix--a",
+            "../x",
+            &"a".repeat(61),
+        ] {
+            assert_eq!(
+                resolve(req_with(|r| r.worktree = Some(bad.into()))),
+                Err(Reject::BadBody),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            resolve(req_with(
+                |r| r.worktree = Some("fix-push-main-01abcd".into())
+            ))
+            .unwrap()
+            .worktree
+            .as_deref(),
+            Some("fix-push-main-01abcd")
+        );
+    }
+
+    #[test]
+    fn name_is_trimmed_and_capped_by_chars() {
+        let long = "\u{e9}".repeat(100);
+        let got = resolve(req_with(|r| r.name = Some(format!("  {long}  ")))).unwrap();
+        assert_eq!(got.name.unwrap().chars().count(), 80);
+        assert_eq!(
+            resolve(req_with(|r| r.name = Some("   ".into())))
+                .unwrap()
+                .name,
+            None
+        );
+    }
+
+    fn prompt_of(p: &Path) -> Result<Option<String>, Reject> {
+        resolve(req_with(|r| r.prompt_file = Some(p.display().to_string()))).map(|o| o.prompt)
+    }
+
+    #[test]
+    fn prompt_file_is_read_and_checked() {
+        let dir = tmpdir();
+        let ok = dir.join("brief.md");
+        fs::write(&ok, "Fix: push main\n").unwrap();
+        assert_eq!(prompt_of(&ok).unwrap().as_deref(), Some("Fix: push main\n"));
+
+        let exact = dir.join("exact.md");
+        fs::write(&exact, vec![b'a'; 65_536]).unwrap();
+        assert!(prompt_of(&exact).is_ok());
+
+        let big = dir.join("big.md");
+        fs::write(&big, vec![b'a'; 65_537]).unwrap();
+        let not_utf8 = dir.join("bin.md");
+        fs::write(&not_utf8, [0xff, 0xfe, 0x00]).unwrap();
+        for bad in [
+            dir.join("missing.md"),
+            dir.clone(),
+            big,
+            not_utf8,
+            PathBuf::from("relative.md"),
+        ] {
+            assert_eq!(prompt_of(&bad), Err(Reject::BadBody), "{}", bad.display());
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_symlinks_follow_but_fifos_are_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tmpdir();
+        let file = dir.join("brief.md");
+        fs::write(&file, "hello").unwrap();
+        let link = dir.join("link.md");
+        symlink(&file, &link).unwrap();
+        assert_eq!(prompt_of(&link).unwrap().as_deref(), Some("hello"));
+
+        let dir_link = dir.join("dirlink");
+        symlink(&dir, &dir_link).unwrap();
+        assert_eq!(prompt_of(&dir_link), Err(Reject::BadBody));
+
+        let fifo = dir.join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // Must return promptly: a FIFO is rejected on metadata, never opened.
+        assert_eq!(prompt_of(&fifo), Err(Reject::BadBody));
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// Serve exactly one request against a real socket, and report what the sink saw.
     fn serve_one(
         port_out: &std::sync::mpsc::Sender<u16>,
         token: String,
-    ) -> std::sync::mpsc::Receiver<OpenRequest> {
+    ) -> std::sync::mpsc::Receiver<OpenPayload> {
         let (tx, rx) = std::sync::mpsc::channel();
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         port_out
@@ -319,7 +543,7 @@ mod tests {
                 "-H",
                 &format!("X-Conduit-Token: {TOK}"),
                 "--data",
-                r#"{"path":"/tmp/p","agent":"claude"}"#,
+                r#"{"path":"/tmp/p","agent":"claude","name":"Fix: x","worktree":"fix-x"}"#,
                 &format!("http://127.0.0.1:{port}/open"),
             ])
             .output()
@@ -328,6 +552,8 @@ mod tests {
         let got = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(got.path, "/tmp/p");
         assert_eq!(got.agent.as_deref(), Some("claude"));
+        assert_eq!(got.name.as_deref(), Some("Fix: x"));
+        assert_eq!(got.worktree.as_deref(), Some("fix-x"));
     }
 
     #[test]
@@ -355,5 +581,53 @@ mod tests {
         assert!(rx
             .recv_timeout(std::time::Duration::from_millis(300))
             .is_err());
+    }
+
+    /// Every way `resolve` refuses an authenticated request is a 400 on the wire, and the
+    /// sink never runs: a bad slug, an oversized prompt file, options without an agent.
+    #[test]
+    fn handle_open_answers_400_and_never_fires_the_sink_for_a_bad_request() {
+        let dir = tmpdir();
+        let big = dir.join("big.md");
+        fs::write(&big, vec![b'a'; 65_537]).unwrap();
+        let big_body = serde_json::json!({
+            "path": "/tmp/p",
+            "agent": "claude",
+            "prompt_file": big.display().to_string(),
+        })
+        .to_string();
+        for body in [
+            r#"{"path":"/tmp/p","agent":"claude","worktree":"Fix_A"}"#.to_string(),
+            big_body,
+            r#"{"path":"/tmp/p","name":"no agent"}"#.to_string(),
+        ] {
+            let (ptx, prx) = std::sync::mpsc::channel();
+            let rx = serve_one(&ptx, TOK.to_string());
+            let port = prx.recv().unwrap();
+            let out = std::process::Command::new("curl")
+                .args([
+                    "-s",
+                    "-o",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                    "-w",
+                    "%{http_code}",
+                    "-X",
+                    "POST",
+                    "-H",
+                    &format!("X-Conduit-Token: {TOK}"),
+                    "--data",
+                    &body,
+                    &format!("http://127.0.0.1:{port}/open"),
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "400", "{body}");
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "the sink fired for {body}"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
     }
 }
