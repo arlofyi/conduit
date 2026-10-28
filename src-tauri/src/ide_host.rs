@@ -553,6 +553,9 @@ impl IdeHost {
 
 fn write_lock_file(path: &Path, _port: u16, workspace_dir: &str, token: &str) {
     let body = lock_json(std::process::id(), workspace_dir, token);
+    // An if/else rather than an early `return`: on Windows the `#[cfg(unix)]` block below
+    // compiles away, which leaves the return as the function's last statement and fails
+    // clippy's `needless_return` on the Windows leg only.
     if std::fs::write(path, body).is_err() {
         eprintln!("conduit: could not write ide lock file {path:?}");
     } else {

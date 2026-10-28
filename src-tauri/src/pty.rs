@@ -77,6 +77,9 @@ const TMUX_SCROLLBACK: u32 = 50_000;
 pub struct RingBuffer {
     cap: usize,
     inner: Mutex<VecDeque<u8>>,
+    /// Bumped on every push, so the scrollback timer can tell an idle terminal (nothing to
+    /// write) from one with new output without comparing 256 KB of bytes.
+    generation: AtomicU64,
 }
 
 impl RingBuffer {
@@ -84,15 +87,23 @@ impl RingBuffer {
         RingBuffer {
             cap,
             inner: Mutex::new(VecDeque::with_capacity(cap)),
+            generation: AtomicU64::new(0),
         }
     }
 
     pub fn push(&self, bytes: &[u8]) {
         let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         q.extend(bytes.iter().copied());
-        while q.len() > self.cap {
-            q.pop_front();
+        let excess = q.len().saturating_sub(self.cap);
+        if excess > 0 {
+            q.drain(..excess);
         }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many pushes this buffer has seen.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Last `max_bytes` of buffered output, lossy-UTF8 and ANSI-stripped.
@@ -223,11 +234,26 @@ pub struct PtyManager {
     /// reattach must not: tmux repaints the pane itself, and a replay on top of that prints
     /// the same screen twice.
     warm_spawns: DashMap<String, ()>,
+    /// The output-ring generation each session's snapshot was last written at. The 20 s
+    /// scrollback timer used to rewrite every live terminal's 256 KB unconditionally -- an
+    /// idle fleet still wrote ~1 GB/day per terminal into Roaming AppData, each write
+    /// scanned by real-time AV. Cleared on spawn, because a new ring restarts at zero.
+    saved_generation: DashMap<String, u64>,
+    /// Serializes spawn against teardown. `pty_spawn` runs on a worker thread (so a slow
+    /// process launch cannot freeze the UI), which turns its "already running? else create"
+    /// into a check-then-insert other threads can interleave with: two spawns of one id
+    /// would both miss and start two agents, and a kill landing mid-spawn would find
+    /// nothing and orphan the process the spawn then inserts. Held for the whole of both.
+    lifecycle: Mutex<()>,
     /// The IDE-announce host, set once at startup (`set_ide_host`). Lives here so
     /// `tear_down` can stop a DESTROYED session's IDE server and drop its lock file;
     /// a RETIRE keeps both — the persisted port makes the resume spawn reuse them
     /// (`IdeHost::start_for_session` is idempotent).
     ide_host: std::sync::OnceLock<Arc<crate::ide_host::IdeHost>>,
+    /// Settings -> Sessions "Keep Claude in the project folder". Pushed down by
+    /// `set_keep_agents_in_project` like `persist`; read at spawn, so it applies to the
+    /// next session started rather than to one already running.
+    keep_in_project: AtomicBool,
 }
 
 /// Why a session's processes are being ended. The two verbs kill the same things; they
@@ -263,7 +289,32 @@ impl PtyManager {
             #[cfg(not(windows))]
             tmux: std::sync::OnceLock::new(),
             warm_spawns: DashMap::new(),
+            saved_generation: DashMap::new(),
+            lifecycle: Mutex::new(()),
             ide_host: std::sync::OnceLock::new(),
+            keep_in_project: AtomicBool::new(true),
+        }
+    }
+
+    /// Mirror the frontend's "Keep Claude in the project folder" setting.
+    pub fn set_keep_in_project(&self, on: bool) {
+        self.keep_in_project.store(on, Ordering::SeqCst);
+    }
+
+    /// Env every spawn of `agent` gets from Conduit's own preferences.
+    ///
+    /// `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` makes Claude Code return its Bash tool to
+    /// the session's directory after every command. Without it a single `cd /` or `cd ~`
+    /// sticks for the rest of the session -- and in Git Bash `/` is the Git install folder
+    /// and `~` the profile folder -- which is how agents ended up working outside the project.
+    fn preference_env(&self, agent: crate::agent::AgentId) -> Vec<(String, String)> {
+        if agent == crate::agent::AgentId::Claude && self.keep_in_project.load(Ordering::SeqCst) {
+            vec![(
+                "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR".to_string(),
+                "1".to_string(),
+            )]
+        } else {
+            Vec::new()
         }
     }
 
@@ -329,6 +380,9 @@ impl PtyManager {
         agent: crate::agent::AgentId,
         suppress_remote: bool,
         opencode: Option<crate::agent::OpenCodeSpawnConfig>,
+        // Hermes: the per-session managed-config overlay (status hooks, and the endpoint
+        // block when provider routing is on). None = spawn untouched.
+        hermes: Option<crate::hermes::HermesSpawnConfig>,
         is_conductor: bool,
         model: Option<String>,
         effort: Option<String>,
@@ -343,6 +397,7 @@ impl PtyManager {
         ide_port: Option<u16>,
         on_event: Channel<String>,
     ) -> Result<(), String> {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         // Already running → re-attach the live reader to the new channel and force
         // a repaint via a winsize nudge, rather than spawning a second process.
         // Single atomic lookup (no contains_key/get gap that could race kill()).
@@ -455,12 +510,14 @@ impl PtyManager {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect();
                 if let Some(dir) = account_config_dir.as_deref() {
-                    session_env.extend(adapter.account_env(dir));
+                    session_env
+                        .extend(crate::agent::with_real_tool_homes(adapter.account_env(dir)));
                 }
                 // Continuity identity must ride the export line too: `cmd.env` below
                 // dies at the tmux server boundary, and continuity would fall back to
                 // an unsalted cwd-hash label.
                 session_env.extend(continuity_env(&session_id, plugin_dir.is_some()));
+                session_env.extend(self.preference_env(agent));
                 let script = build_script(
                     adapter.as_ref(),
                     &session_id,
@@ -561,6 +618,17 @@ impl PtyManager {
             for (k, v) in adapter.env_overrides() {
                 cmd.env(k, v);
             }
+            for (k, v) in self.preference_env(agent) {
+                cmd.env(k, v);
+            }
+            if adapter.id() == crate::agent::AgentId::Codex {
+                cmd.env(
+                    "CONDUIT_CODEX_HOOK_RELAY",
+                    crate::hooks::codex_hook_relay_path()
+                        .to_string_lossy()
+                        .as_ref(),
+                );
+            }
             // Route OpenCode to the configured local/self-hosted provider:
             // an inline config env var that outranks the user's opencode.json files, plus
             // the endpoint key in its own env var (referenced from the config as
@@ -571,6 +639,29 @@ impl PtyManager {
                     cmd.env("CONDUIT_OC_APIKEY", key);
                 }
             }
+            // Hermes: point this session at its own managed-scope overlay. Hermes
+            // deep-merges that file's leaves on top of the user's config.yaml and leaves
+            // every sibling key theirs, so this installs Conduit's status hooks (and, when
+            // routing is on, the endpoint) without writing a byte to the user's Hermes
+            // home. Keys are never written into that file -- every one of them rides in an
+            // environment variable the file merely NAMES, so the secret lives in this
+            // process env and nowhere on disk.
+            if let Some(h) = &hermes {
+                cmd.env(crate::hermes::MANAGED_DIR_ENV, &h.managed_dir);
+                // The ACTIVE endpoint's key goes in the PROVIDER's own variable name, not a
+                // Conduit-private one: Hermes' startup credential gate only reads the
+                // canonical names. See `hermes::key_env_var`.
+                if let Some((var, key)) = &h.api_key {
+                    cmd.env(var, key);
+                }
+                // One variable per POOLED endpoint, each named by that entry's own
+                // `key_env`. This is the mechanism `key_env_var` documents as the one that
+                // works for a named provider entry, and it is what lets a mid-session
+                // `/model --provider` reach a second endpoint with a different key.
+                for (var, key) in &h.pool_keys {
+                    cmd.env(var, key);
+                }
+            }
             // Select the pinned account (Feature 1/2) without disturbing the user's default
             // agent. The account->env mapping now lives behind `ProviderAdapter::account_env`
             // (the multi-account extension seam): Claude and Antigravity redirect
@@ -578,7 +669,7 @@ impl PtyManager {
             // every other adapter returns nothing. Behavior is byte-identical to the block
             // this replaced. Values are path-derived account identifiers -- never logged.
             if let Some(dir) = account_config_dir.as_deref() {
-                for (k, v) in adapter.account_env(dir) {
+                for (k, v) in crate::agent::with_real_tool_homes(adapter.account_env(dir)) {
                     cmd.env(k, v);
                 }
             }
@@ -610,6 +701,7 @@ impl PtyManager {
         let suppress_flag = Arc::new(AtomicBool::new(suppress_remote));
         let suppress_for_reader = suppress_flag.clone();
 
+        self.saved_generation.remove(&session_id);
         self.sessions.insert(
             session_id.clone(),
             Mutex::new(PtySession {
@@ -649,62 +741,46 @@ impl PtyManager {
         #[cfg(windows)]
         let sid_for_reader = session_id.clone();
 
-        // Reader thread: blocking reads → base64 → current sink. Send errors are
-        // ignored (the channel may be briefly absent during a reload); only a read
-        // EOF/error ends the thread.
+        // Two threads per session. The READER does blocking reads into the ring buffer and
+        // hands the raw bytes over; the FLUSHER coalesces them (see `OUTPUT_FRAME`) and
+        // sends each batch to the current sink. Sink state never ends either loop: only a
+        // read EOF/error ends the reader, and the flusher drains what is left and follows.
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
             let engine = base64::engine::general_purpose::STANDARD;
-            let mut buf = [0u8; 16 * 1024];
             // Detach the sink after a long run of failed sends (dead channel that was
             // never re-attached, never detached via a clean window close, never killed)
             // — a safety net so a stuck Channel doesn't retry forever. This never ends
             // the loop: the child may still be alive, so send failure only clears the
-            // sink (see `send_to_sink`'s `Failed` arm below); the reader keeps reading
-            // into the ring buffer either way. Resets on any successful send, so reload
-            // gaps don't trip it.
+            // sink (see `send_to_sink`'s `Failed` arm below). Resets on any successful
+            // send, so reload gaps don't trip it.
             let mut consecutive_fails: u32 = 0;
-            // Only a real read EOF/error sets this — sink/channel state never ends the
-            // loop. No initializer: every path out of the loop below (`Ok(0)`/`Err(_)`)
-            // assigns before breaking, so it is always set by the time either `#[cfg]`
-            // arm below reads it.
-            let child_exited;
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        child_exited = true;
-                        break;
+            let mut last_flush: Option<std::time::Instant> = None;
+            while let Some(batch) = next_output_batch(&out_rx, last_flush, OUTPUT_FRAME) {
+                last_flush = Some(std::time::Instant::now());
+                let encoded = engine.encode(&batch);
+                // Remote (bridge) fan-out is suppressed for a siloed session so its
+                // output never leaves the machine via a paired phone; the desktop sink
+                // below still receives everything (the human reads the silo directly).
+                if !suppress_for_reader.load(Ordering::Relaxed) {
+                    if let Ok(mut subs) = subs_for_reader.lock() {
+                        broadcast(&mut subs, &encoded);
                     }
-                    Ok(n) => {
-                        output_for_reader.push(&buf[..n]);
-                        let encoded = engine.encode(&buf[..n]);
-                        // Remote (bridge) fan-out is suppressed for a siloed session so its
-                        // output never leaves the machine via a paired phone; the desktop sink
-                        // below still receives everything (the human reads the silo directly).
-                        if !suppress_for_reader.load(Ordering::Relaxed) {
-                            if let Ok(mut subs) = subs_for_reader.lock() {
-                                broadcast(&mut subs, &encoded);
+                }
+                match send_to_sink(&sink, encoded) {
+                    SinkSend::Ok => consecutive_fails = 0,
+                    SinkSend::Detached => {} // window closed; ring buffer + scrollback keep running
+                    SinkSend::Failed => {
+                        consecutive_fails += 1;
+                        if consecutive_fails > 2000 {
+                            // The channel is dead but the child is alive: detach instead of the
+                            // old `break` that left a zombie entry whose next spawn re-attached
+                            // to silence.
+                            if let Ok(mut s) = sink.lock() {
+                                *s = None;
                             }
+                            consecutive_fails = 0;
                         }
-                        match send_to_sink(&sink, encoded) {
-                            SinkSend::Ok => consecutive_fails = 0,
-                            SinkSend::Detached => {} // window closed; ring buffer + scrollback keep running
-                            SinkSend::Failed => {
-                                consecutive_fails += 1;
-                                if consecutive_fails > 2000 {
-                                    // The channel is dead but the child is alive: detach instead of the
-                                    // old `break` that left a zombie entry whose next spawn re-attached
-                                    // to silence.
-                                    if let Ok(mut s) = sink.lock() {
-                                        *s = None;
-                                    }
-                                    consecutive_fails = 0;
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        child_exited = true;
-                        break;
                     }
                 }
             }
@@ -720,6 +796,28 @@ impl PtyManager {
                     let _ = ch.send(enc_notice);
                 }
             }
+        });
+
+        thread::spawn(move || {
+            let mut buf = [0u8; 16 * 1024];
+            // Only a real read EOF/error sets this — sink/channel state never ends the
+            // loop, and neither does the flusher (it only stops after this thread does).
+            let child_exited;
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        child_exited = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        output_for_reader.push(&buf[..n]);
+                        let _ = out_tx.send(buf[..n].to_vec());
+                    }
+                }
+            }
+            // Dropping the sender lets the flusher drain what is left, then print the
+            // exit notice after it -- never before the agent's last output.
+            drop(out_tx);
             // Free the dead session's handles/buffers and let a re-spawn of this id
             // cold-start instead of re-attaching a dead PTY. Only on a real child exit.
             // Windows-only so macOS behavior is untouched (see the clones above).
@@ -834,6 +932,22 @@ impl PtyManager {
         ))
     }
 
+    /// The root of a live session's process tree, for `agent_activity`: the PTY child
+    /// (cmd.exe on Windows, the login shell on a direct POSIX spawn) or, under tmux, the
+    /// pane's process -- there the PTY child is only a tmux client and the agent belongs to
+    /// the tmux server. None if the session is not running here.
+    pub fn session_root_pid(&self, session_id: &str) -> Option<u32> {
+        #[cfg(not(windows))]
+        if let Some(tmux) = self.tmux_path() {
+            if let Some(pid) = crate::tmux::pane_pid(tmux, session_id) {
+                return Some(pid);
+            }
+        }
+        let entry = self.sessions.get(session_id)?;
+        let session = entry.lock().ok()?;
+        session.child.process_id()
+    }
+
     /// Ids of all currently-running sessions (for the bridge `list` message).
     pub fn session_ids(&self) -> Vec<String> {
         self.sessions.iter().map(|e| e.key().clone()).collect()
@@ -848,11 +962,17 @@ impl PtyManager {
             let Ok(session) = entry.value().lock() else {
                 continue;
             };
+            let generation = session.output.generation();
+            if self.saved_generation.get(entry.key()).map(|g| *g) == Some(generation) {
+                continue; // nothing new since the last write
+            }
             let bytes = session.output.tail_bytes(crate::scrollback::MAX_BYTES);
             if bytes.is_empty() {
                 continue;
             }
             crate::scrollback::save(entry.key(), &bytes);
+            self.saved_generation
+                .insert(entry.key().clone(), generation);
         }
     }
 
@@ -908,6 +1028,7 @@ impl PtyManager {
     /// dispositions `Teardown` names, which is exactly why that decision is a tested table
     /// rather than a comment.
     fn tear_down(&self, session_id: &str, how: Teardown) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         // Freshen the snapshot BEFORE dropping the PTY: after the entry is gone the live
         // buffer is unreachable, and a retire that saved nothing would come back to
         // whatever the slow flush timer last happened to write.
@@ -943,6 +1064,7 @@ impl PtyManager {
         // The next spawn must be COLD either way, so it replays rather than assuming tmux
         // will repaint a pane that no longer exists.
         self.warm_spawns.remove(session_id);
+        self.saved_generation.remove(session_id);
         if !how.keeps_snapshot() {
             crate::scrollback::remove(session_id);
             remove_prompt_file(session_id);
@@ -1010,6 +1132,25 @@ impl PtyManager {
             }
         }
     }
+}
+
+/// End a `std::process::Child` and everything it started, then reap it.
+///
+/// On Windows `Child::kill` is TerminateProcess on the immediate child only. Conduit's
+/// headless `claude -p` children (titler, root chat) are `cmd.exe /C claude ...`, so a
+/// plain kill ends the cmd.exe and leaves the real `claude` running. `taskkill /T` walks
+/// the tree while the root is still alive to be found -- the same order `tear_down` uses.
+pub(crate) fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        use crate::NoWindow;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .no_window()
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// True if a transcript named `<session_id>.jsonl` exists under any project-slug
@@ -1275,6 +1416,52 @@ pub(crate) fn quote_arg(s: &str) -> String {
 /// A subscriber whose bounded buffer is full has the frame DROPPED (slow consumer —
 /// must never block the desktop webview); a subscriber whose receiver hung up is
 /// pruned from the list. Mutates `subs` in place.
+/// How long a busy terminal's output is held to coalesce it into one frame.
+///
+/// Every batch crosses to the webview as its own script evaluation, and on Windows each one
+/// is dispatched through the UI thread -- the same thread that delivers keystrokes. A TUI
+/// agent repaints in many small writes, so a dozen live sessions sent read-by-read keep that
+/// thread busy with hundreds of evaluations a second. The first chunk after a quiet spell
+/// is never held (keystroke echo stays immediate); only a stream arriving faster than this
+/// is merged. VS Code's terminal buffers its PTY data for the same reason.
+const OUTPUT_FRAME: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// A single batch is capped so one flood cannot build an unbounded frame.
+const OUTPUT_BATCH_MAX: usize = 256 * 1024;
+
+/// The next batch of PTY output to send, or None once the reader is gone and nothing is left.
+///
+/// Blocks for the first chunk. If the previous flush was less than `frame` ago the output is
+/// streaming, so it keeps collecting until that frame boundary; either way it then takes
+/// whatever else is already queued.
+fn next_output_batch(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    last_flush: Option<std::time::Instant>,
+    frame: std::time::Duration,
+) -> Option<Vec<u8>> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut batch = rx.recv().ok()?;
+    if let Some(deadline) = last_flush.map(|t| t + frame) {
+        while batch.len() < OUTPUT_BATCH_MAX {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok(more) => batch.extend_from_slice(&more),
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+    while batch.len() < OUTPUT_BATCH_MAX {
+        match rx.try_recv() {
+            Ok(more) => batch.extend_from_slice(&more),
+            Err(_) => break,
+        }
+    }
+    Some(batch)
+}
+
 fn broadcast(subs: &mut Vec<(u64, SyncSender<String>)>, frame: &str) {
     subs.retain(|(_, tx)| match tx.try_send(frame.to_string()) {
         Ok(()) => true,
@@ -1315,6 +1502,13 @@ fn build_script(
     ide_port: Option<u16>,
 ) -> String {
     let mut flags = String::new();
+    if adapter.id() == crate::agent::AgentId::Codex {
+        if let Some(profile) = adapter.hooks_profile() {
+            for config in crate::hooks::codex_hook_overrides(&profile.rows) {
+                flags.push_str(&format!(" -c {}", shell_quote(&config)));
+            }
+        }
+    }
     if let Some(name) = worktree {
         flags.push_str(&format!(" --worktree {}", shell_quote(name)));
     }
@@ -1346,20 +1540,29 @@ fn build_script(
             shell_quote(path)
         ));
     }
-    // SPEC-B: only ever populated for Claude (the caller in lib.rs gates on
-    // agent == AgentId::Claude before resolving these) -- verified real flags, not a guess
-    // (`claude --help` lists both `--model <model>` and `--effort <level>`).
+    let retry_flags = flags.clone();
+    // SPEC-B: populated for any adapter whose `supports_model_flags()` is true (the
+    // caller in lib.rs gates on exactly that) -- verified real flags per CLI, not a guess.
+    // `--model` is spelled the same by every agent that takes one; the effort flag is NOT
+    // (Hermes spells it `--reasoning`), so its spelling comes from the adapter. An unknown
+    // flag does not degrade -- the CLI exits non-zero and the whole session falls through
+    // to its bare `||` fallback with the effort silently lost.
     if let Some(m) = model {
-        flags.push_str(&format!(" --model {}", shell_quote(m)));
+        flags.push_str(&format!(" {} {}", adapter.model_flag(), shell_quote(m)));
     }
     if let Some(e) = effort {
-        flags.push_str(&format!(" --effort {}", shell_quote(e)));
+        flags.push_str(&format!(
+            " {} {}",
+            adapter.effort_flag(),
+            shell_quote(&adapter.effort_value(e))
+        ));
     }
     let (load_prompt, prompt_arg) = posix_prompt(initial_prompt, prompt_file);
-    let invocation = adapter.build_invocation(
+    let invocation = adapter.build_invocation_with_retry_flags(
         session_id,
         projects_dir,
         &flags,
+        &retry_flags,
         prompt_arg.as_deref(),
         resume_token,
     );
@@ -1377,9 +1580,17 @@ fn build_script(
         )
     };
     format!(
-        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}{ide}; cd {dir} && {invocation}; exec {shell} -i -l",
+        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}{relay}{ide}; cd {dir} && {invocation}; exec {shell} -i -l",
         sid = shell_quote(session_id),
         port = port,
+        relay = if adapter.id() == crate::agent::AgentId::Codex {
+            format!(
+                " CONDUIT_CODEX_HOOK_RELAY={}",
+                shell_quote(&crate::hooks::codex_hook_relay_path().to_string_lossy())
+            )
+        } else {
+            String::new()
+        },
         // CLAUDE_CODE_SSE_PORT is the 2.1.267 auto-connect trigger;
         // ENABLE_IDE_INTEGRATION covers older CLIs (harmless on new ones).
         ide = ide_port
@@ -1452,6 +1663,13 @@ fn build_script_win(
     strict_mcp: bool,
 ) -> String {
     let mut flags = String::new();
+    if adapter.id() == crate::agent::AgentId::Codex {
+        if let Some(profile) = adapter.hooks_profile() {
+            for config in crate::hooks::codex_hook_overrides(&profile.rows) {
+                flags.push_str(&format!(" -c {}", quote_arg(&config)));
+            }
+        }
+    }
     if let Some(name) = worktree {
         flags.push_str(&format!(" --worktree {}", quote_arg(name)));
     }
@@ -1476,18 +1694,25 @@ fn build_script_win(
     if let Some(path) = system_prompt_file {
         flags.push_str(&format!(" --append-system-prompt-file {}", quote_arg(path)));
     }
-    // SPEC-B: only ever populated for Claude -- see build_script's matching comment.
+    let retry_flags = flags.clone();
+    // SPEC-B: see build_script's matching comment -- the effort flag's spelling is the
+    // adapter's, because Hermes spells it `--reasoning`.
     if let Some(m) = model {
-        flags.push_str(&format!(" --model {}", quote_arg(m)));
+        flags.push_str(&format!(" {} {}", adapter.model_flag(), quote_arg(m)));
     }
     if let Some(e) = effort {
-        flags.push_str(&format!(" --effort {}", quote_arg(e)));
+        flags.push_str(&format!(
+            " {} {}",
+            adapter.effort_flag(),
+            quote_arg(&adapter.effort_value(e))
+        ));
     }
     let prompt_arg = windows_prompt_arg(initial_prompt, prompt_file);
-    adapter.build_invocation(
+    adapter.build_invocation_with_retry_flags(
         session_id,
         projects_dir,
         &flags,
+        &retry_flags,
         prompt_arg.as_deref(),
         resume_token,
     )
@@ -1499,6 +1724,58 @@ mod tests {
     // imports (same pattern as the hooks.rs test module).
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn output_batch_after_quiet_spell_is_not_held() {
+        // Keystroke echo: nothing flushed recently, so the chunk goes out alone and at once
+        // even though a long frame is configured.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(b"a".to_vec()).unwrap();
+        let started = std::time::Instant::now();
+        let batch = next_output_batch(&rx, None, std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(batch, b"a");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn output_batch_merges_what_is_queued_in_order() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for chunk in [&b"one "[..], b"two ", b"three"] {
+            tx.send(chunk.to_vec()).unwrap();
+        }
+        assert_eq!(
+            next_output_batch(&rx, None, OUTPUT_FRAME).unwrap(),
+            b"one two three"
+        );
+    }
+
+    #[test]
+    fn output_batch_while_streaming_waits_for_the_frame_boundary() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(b"x".to_vec()).unwrap();
+        let later = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            tx.send(b"y".to_vec()).unwrap();
+        });
+        // Flushed just now, so this is a stream: "y" lands inside the frame and joins "x".
+        let batch = next_output_batch(
+            &rx,
+            Some(std::time::Instant::now()),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        later.join().unwrap();
+        assert_eq!(batch, b"xy");
+    }
+
+    #[test]
+    fn output_batch_ends_after_the_reader_is_gone() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(b"last".to_vec()).unwrap();
+        drop(tx);
+        assert_eq!(next_output_batch(&rx, None, OUTPUT_FRAME).unwrap(), b"last");
+        assert!(next_output_batch(&rx, None, OUTPUT_FRAME).is_none());
+    }
 
     const ID: &str = "11111111-2222-3333-4444-555555555555";
 
@@ -2385,6 +2662,41 @@ mod tests {
         assert!(script.contains("--effort 'high'"), "{script}");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_script_uses_model_and_reasoning_config() {
+        let script = build_script(
+            &*crate::agent::adapter_for(crate::agent::AgentId::Codex),
+            "sid-1",
+            8423,
+            "/repo",
+            "/bin/sh",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // prompt_file
+            Some("gpt-6-sol"),
+            Some("high"),
+            None,
+            false,
+            None,
+        );
+        // The per-launch hook overrides lead and the pin follows them; the retry after
+        // `||` keeps the hooks and drops only the pin (same contract as the Windows test).
+        let (pinned, retry) = script.split_once(" || ").expect("a retry leg");
+        assert!(pinned.contains("codex -c 'hooks."), "{script}");
+        assert!(
+            pinned.ends_with(" -m 'gpt-6-sol' -c 'model_reasoning_effort=high'"),
+            "{script}"
+        );
+        assert!(retry.starts_with("codex -c 'hooks."), "{script}");
+        assert!(!retry.contains("gpt-6-sol"), "{script}");
+    }
+
     #[cfg(windows)]
     #[test]
     fn build_script_win_appends_model_and_effort_flags() {
@@ -2406,6 +2718,37 @@ mod tests {
         );
         assert!(script.contains("--model claude-opus-4-8"), "{script}");
         assert!(script.contains("--effort high"), "{script}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_script_win_uses_model_and_reasoning_config() {
+        let script = build_script_win(
+            &*crate::agent::adapter_for(crate::agent::AgentId::Codex),
+            "sid-1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // prompt_file
+            Some("gpt-6-sol"),
+            Some("high"),
+            None,
+            false,
+        );
+        // The per-launch hook overrides lead; the pin follows them. The retry after `||`
+        // keeps the hooks (structural) and drops only the model pin.
+        let (pinned, retry) = script.split_once(" || ").expect("a retry leg");
+        assert!(pinned.starts_with("codex -c \"hooks."), "{script}");
+        assert!(
+            pinned.ends_with(" -m gpt-6-sol -c model_reasoning_effort=high"),
+            "{script}"
+        );
+        assert!(retry.starts_with("codex -c \"hooks."), "{script}");
+        assert!(!retry.contains("gpt-6-sol"), "{script}");
     }
 
     #[cfg(not(windows))]

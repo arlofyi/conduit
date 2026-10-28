@@ -999,6 +999,23 @@ button {
   color: var(--red);
 }
 
+.context-ring {
+  width: 20px;
+  height: 20px;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  color: var(--text-dim);
+  font: 8px var(--mono-font);
+}
+.context-ring.large { width: 28px; height: 28px; font-size: 9px; }
+.context-ring svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); fill: none; stroke-width: 2.5; }
+.context-ring-track { stroke: var(--border); }
+.context-ring-fill { stroke: var(--text-dim); stroke-linecap: round; }
+.context-ring-label { position: relative; }
+
 /* Tethers. Under every box on the plane, so each line is clipped to the gap between the
    two things it joins. */
 .canvas-links {
@@ -3725,7 +3742,7 @@ button {
   border-radius: 6px;
   border: 1px solid var(--border);
   background: var(--bg-elevated, var(--bg));
-  color: var(--text);
+  color: var(--text-bright);
 }
 .trust-scan-actions {
   display: flex;
@@ -3764,7 +3781,7 @@ button {
   color: var(--text-mid);
 }
 .trust-scan-list code {
-  color: var(--text);
+  color: var(--text-bright);
 }
 
 /* ---- OpenCode local-provider panel (Settings -> Local models) ---- */
@@ -5876,6 +5893,624 @@ input[type="number"]:focus {
 .decision-actions .primary { background: var(--accent); color: var(--panel-bg); }
 .decision-actions .primary:disabled { opacity: 0.45; }
 
+/* ---- Model tab (right column, bottom panel) -------------------------------- */
+/* Absolutely positioned like `.git-host`: the bottom panel's content box holds the
+   keep-alive terminal stack, so a new sibling must sit over it rather than in flow. */
+.model-host {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  z-index: 2;
+}
+.model-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 10px 12px;
+}
+.mp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mp-head-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.mp-title {
+  font-size: 12px;
+  color: var(--text-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mp-sub {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.mp-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.mp-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-mid);
+}
+/* The scope caption is what stops "I changed the model" being confused with "I changed
+   it for every session on this agent". It must stay visible, not a tooltip. */
+.mp-scope {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.mp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mp-label {
+  flex: 0 0 74px;
+  font-size: 11px;
+  color: var(--text-mid);
+}
+.mp-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  color: var(--text-bright);
+  font-family: var(--mono-font);
+  outline: none;
+  caret-color: var(--accent);
+}
+.mp-input:focus {
+  border-color: var(--accent);
+}
+.mp-toggle {
+  font-size: 11px;
+  color: var(--text-mid);
+}
+.mp-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.mp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-mid);
+  cursor: pointer;
+}
+.mp-chip.active {
+  border-color: var(--accent);
+  color: var(--text-bright);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.mp-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+}
+.mp-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mp-btn {
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-mid);
+  cursor: pointer;
+}
+.mp-btn:hover:not(:disabled) {
+  color: var(--text-bright);
+  border-color: var(--accent);
+}
+.mp-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.mp-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin: 0;
+}
+.mp-warn {
+  font-size: 11px;
+  color: var(--amber);
+  margin: 0;
+}
+.mp-restart {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-mid);
+  padding: 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/* ---- Endpoint editor: local vs cloud, and the model picker ------------------ */
+/* The group split is load-bearing, not decoration: a flat chip row gave no way to see
+   that OpenRouter sends every prompt off the machine while Ollama does not — and that
+   distinction is what `allowedForLocalOnly` enforces for a private-mode session. */
+.ep-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.ep-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+.ep-group-sub {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+.ep-scope {
+  font-size: 11px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+}
+.ep-scope.local {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 35%, transparent);
+  background: color-mix(in srgb, var(--green) 8%, transparent);
+}
+.ep-scope.cloud {
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 35%, transparent);
+  background: color-mix(in srgb, var(--amber) 8%, transparent);
+}
+.ep-keyhint {
+  margin-left: 82px;
+}
+.ep-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ep-filter {
+  flex: 1 1 auto;
+}
+.ep-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 210px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.ep-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-mid);
+  cursor: pointer;
+}
+.ep-item:last-child {
+  border-bottom: none;
+}
+.ep-item:hover {
+  background: var(--hover);
+}
+.ep-item.active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text-bright);
+}
+.ep-item-id {
+  font-family: var(--mono-font);
+  font-size: 11px;
+  color: var(--text-bright);
+}
+.ep-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.ep-badge {
+  padding: 1px 5px;
+  border-radius: 999px;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ep-badge.tools {
+  background: var(--tag-chip-bg);
+  color: var(--tag-chip-text);
+}
+/* An agent without tool calling is near-useless, so say so rather than just ranking it low. */
+.ep-badge.no {
+  background: color-mix(in srgb, var(--red) 18%, transparent);
+  color: var(--red);
+}
+
+/* ---- Model tab: what is actually running ----------------------------------- */
+/* Read-only and first, because "which model am I paying for" is the question the tab is
+   opened to answer -- especially on an aggregator where 447 near-identical names differ by
+   two orders of magnitude in price. */
+.mp-running {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.mp-running-id {
+  font-family: var(--mono-font);
+  font-size: 12px;
+  color: var(--text-bright);
+  overflow-wrap: anywhere;
+}
+.mp-running-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-mid);
+}
+.mp-running-where {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.mp-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+}
+.mp-link:hover {
+  text-decoration: underline;
+}
+
+/* ---- Agent tab: memory, skills, MCP ---------------------------------------- */
+.agent-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+}
+.ap-section {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.ap-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 2px 0;
+  font-size: 11px;
+  color: var(--text-mid);
+  cursor: pointer;
+  text-align: left;
+}
+.ap-caret {
+  color: var(--text-dim);
+  font-size: 9px;
+}
+.ap-count {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.ap-items {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px 0 0 14px;
+}
+.ap-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 4px 6px;
+  border: none;
+  background: transparent;
+  border-radius: 4px;
+  color: var(--text-mid);
+}
+/* Only a row with something to read is interactive; a bare row must not invite a click
+   that does nothing. */
+.ap-item.readable {
+  cursor: pointer;
+}
+.ap-item.readable:hover {
+  background: var(--hover);
+}
+.ap-item-name {
+  font-size: 11px;
+  color: var(--text-bright);
+}
+.ap-item-detail {
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.ap-source {
+  font-size: 9px;
+  color: var(--text-dim);
+  opacity: 0.7;
+  padding: 4px 6px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ap-reader {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+}
+.ap-reader-box {
+  display: flex;
+  flex-direction: column;
+  max-width: 760px;
+  max-height: 100%;
+  width: 100%;
+  background: var(--sidebar-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.ap-reader-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-bright);
+}
+.ap-reader-body {
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  font-family: var(--mono-font);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-mid);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* One-click model switching. A task-driven change should not require typing a
+   40-character id out of a 447-entry catalogue. */
+.mp-quick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-left: 82px;
+}
+
+.ap-reader-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* The editor and the read-only view share .ap-reader-body so switching between them does
+   not move the text. */
+.ap-reader-edit {
+  border: none;
+  outline: none;
+  background: transparent;
+  resize: none;
+  min-height: 320px;
+}
+
+.ap-manage {
+  align-self: flex-start;
+  margin-left: 14px;
+  font-size: 10px;
+}
+
+/* ---- Settings -> Model endpoints: the pool ---------------------------------- */
+/* An agent has a LIST of endpoints and one of them is active. The list is above the
+   editor because the editor always edits the active one -- reading top to bottom you pick
+   which endpoint, then configure it. */
+.ep-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ep-pool {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ep-pool-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-mid);
+}
+.ep-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ep-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-bg);
+}
+.ep-row.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel-bg));
+}
+.ep-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+}
+.ep-row-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-bright);
+}
+.ep-row-detail,
+.ep-row-slug {
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ep-row-slug {
+  font-family: var(--mono-font);
+  color: var(--text-mid);
+}
+.ep-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* The key field spans both columns so a long hint wraps under the row rather than
+   squeezing the actions off the end. */
+.ep-row-key {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.ep-row-key input {
+  flex: 1;
+  min-width: 140px;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-bright);
+  font-family: var(--mono-font);
+  outline: none;
+}
+.ep-row-key input:focus {
+  border-color: var(--accent);
+}
+.ep-badge.key {
+  background: var(--tag-chip-bg);
+  color: var(--tag-chip-text);
+}
+.mp-link.danger {
+  color: var(--red);
+}
+/* A label over its control rather than beside it: a chip row of endpoint names does not
+   fit in the 74px gutter the single-line rows use. */
+.mp-row-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+}
+
+/* ---- Agent tab: skill rows that can be switched off ------------------------- */
+/* The row is a grid so the switch keeps its column while the label wraps; the label itself
+   stays the full-width button it was, so the whole name is still a click target for the
+   reader. */
+.ap-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 6px;
+}
+.ap-row > .ap-item {
+  min-width: 0;
+  width: 100%;
+}
+/* A disabled skill is dimmed rather than hidden: "it is here and it is off" is the state
+   worth showing, and hiding it would make the list disagree with the agent's own. */
+.ap-row.off > .ap-item {
+  opacity: 0.45;
+}
+/* Said once per section rather than per row: every dimmed row in it means the same. */
+.ap-apply-note,
+.ap-locked {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+.ap-locked {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ap-apply-note {
+  padding: 4px 6px 0 14px;
+}
+
 /* ---- IDE diff review overlay (Conduit-as-IDE, 2026-09-23 spec) ----
    Same overlay contract as .chat-pane: absolute sibling inside .term-host, covers the
    terminal, never unmounts it. */
@@ -6201,3 +6836,28 @@ input[type="number"]:focus {
 /* No filter here: in WKWebView a filter in these keyframes left the card unpainted. */
 @keyframes ask-pop { from { opacity: 0; transform: translateY(4px) scale(0.98); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .ask-card { animation: none; } .cgraph-pulse { display: none; } }
+
+/* Settings -> Sessions: inline "after [5] minutes" control and a result note. */
+.setting-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-mid);
+}
+.setting-number {
+  width: 64px;
+  padding: 2px 6px;
+  font: inherit;
+  color: var(--text-bright);
+  background: var(--bg-input, var(--hover));
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.setting-number:disabled {
+  opacity: 0.5;
+}
+.setting-note {
+  font-size: 11.5px;
+  color: var(--text-mid);
+}

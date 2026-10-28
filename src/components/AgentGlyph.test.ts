@@ -39,14 +39,43 @@ describe("glyphStateFor", () => {
   });
 });
 
+/**
+ * Agents that ship no brand mark, and why.
+ *
+ * The rule this list makes an exception to is real: a missing mark falls back to a
+ * monogram, which is the thing these marks replaced. But the rule underneath it is
+ * stronger — `agents.ts` says an agent with no mark falls back to its letter "rather than
+ * shipping a guessed logo", because transcribing path data by hand is a silent error
+ * nobody catches in review.
+ *
+ * Hermes publishes no vector mark: its own favicon is the caduceus CHARACTER (U+2624)
+ * rendered as `<text>`, not a path. There is nothing to copy, so it keeps its monogram
+ * until Nous Research ships one. Add an agent here only when the same is true of it, and
+ * remove it the moment a real mark exists.
+ */
+const NO_BRAND_MARK: ReadonlySet<string> = new Set(["hermes"]);
+
 describe("AGENT_MARKS", () => {
   it("has a mark for every agent Conduit can spawn", () => {
     // A missing mark silently falls back to a monogram, which is the thing these replaced.
-    for (const a of AGENTS) expect(AGENT_MARKS[a.id], a.id).toBeDefined();
+    for (const a of AGENTS) {
+      if (NO_BRAND_MARK.has(a.id)) continue;
+      expect(AGENT_MARKS[a.id], a.id).toBeDefined();
+    }
+  });
+
+  it("gives every markless agent a monogram to fall back to", () => {
+    // The fallback is only safe while the letter is actually there.
+    for (const a of AGENTS) {
+      if (!NO_BRAND_MARK.has(a.id)) continue;
+      expect(AGENT_MARKS[a.id], `${a.id} has a mark — drop it from NO_BRAND_MARK`).toBeUndefined();
+      expect(a.letter.trim().length, a.id).toBeGreaterThan(0);
+    }
   });
 
   it("keeps each mark a single path in its source viewBox", () => {
     for (const a of AGENTS) {
+      if (NO_BRAND_MARK.has(a.id)) continue;
       const mark = AGENT_MARKS[a.id]!;
       expect(mark.viewBox, a.id).toMatch(/^0 0 \d+ \d+$/);
       // One path, so `fill: currentColor` tints the whole mark and nothing carries a

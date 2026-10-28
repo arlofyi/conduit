@@ -48,7 +48,7 @@ pub fn shim_sh() -> String {
 set -eu
 
 usage() {{
-  echo "usage: conduit <path> [--agent <id>] [--worktree <slug>] [--name <text>] [--prompt-file <file>]" >&2
+  echo "usage: conduit <path> [--agent <id>] [--worktree <slug>] [--name <text>] [--prompt-file <file>] [--provider <p>] [--model <m>] [--effort <e>]" >&2
   exit 2
 }}
 
@@ -73,6 +73,9 @@ agent=""
 worktree=""
 session_name=""
 prompt_file=""
+provider=""
+model=""
+effort=""
 options=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -80,6 +83,9 @@ while [ $# -gt 0 ]; do
     --worktree) [ $# -ge 2 ] || usage; worktree="$2"; options=1; shift 2 ;;
     --name) [ $# -ge 2 ] || usage; session_name="$2"; options=1; shift 2 ;;
     --prompt-file) [ $# -ge 2 ] || usage; prompt_file="$2"; options=1; shift 2 ;;
+    --provider) [ $# -ge 2 ] || usage; provider="$2"; options=1; shift 2 ;;
+    --model) [ $# -ge 2 ] || usage; model="$2"; options=1; shift 2 ;;
+    --effort) [ $# -ge 2 ] || usage; effort="$2"; options=1; shift 2 ;;
     -h|--help) usage ;;
     -*) echo "conduit: unknown option $1" >&2; usage ;;
     *) [ -z "$target" ] || usage; target="$1"; shift ;;
@@ -131,6 +137,9 @@ body="\"path\":\"$(json_esc "$path")\""
 [ -z "$worktree" ] || body="$body,\"worktree\":\"$(json_esc "$worktree")\""
 [ -z "$session_name" ] || body="$body,\"name\":\"$(json_esc "$session_name")\""
 [ -z "$prompt_abs" ] || body="$body,\"prompt_file\":\"$(json_esc "$prompt_abs")\""
+[ -z "$provider" ] || body="$body,\"provider\":\"$(json_esc "$provider")\""
+[ -z "$model" ] || body="$body,\"model\":\"$(json_esc "$model")\""
+[ -z "$effort" ] || body="$body,\"effort\":\"$(json_esc "$effort")\""
 body="{{$body}}"
 
 # Sets `code` to the HTTP status of one POST, or 000 when nothing answered (no published
@@ -218,6 +227,9 @@ set "worktree="
 set "sname="
 set "prompt_file="
 set "options="
+set "provider="
+set "model="
+set "effort="
 :parse
 if "%~1"=="" goto parsed
 if /i "%~1"=="-a" (set "agent=%~2" & shift & shift & goto parse)
@@ -225,13 +237,16 @@ if /i "%~1"=="--agent" (set "agent=%~2" & shift & shift & goto parse)
 if /i "%~1"=="--worktree" (set "worktree=%~2" & set "options=1" & shift & shift & goto parse)
 if /i "%~1"=="--name" (set "sname=%~2" & set "options=1" & shift & shift & goto parse)
 if /i "%~1"=="--prompt-file" (set "prompt_file=%~2" & set "options=1" & shift & shift & goto parse)
+if /i "%~1"=="--provider" (set "provider=%~2" & set "options=1" & shift & shift & goto parse)
+if /i "%~1"=="--model" (set "model=%~2" & set "options=1" & shift & shift & goto parse)
+if /i "%~1"=="--effort" (set "effort=%~2" & set "options=1" & shift & shift & goto parse)
 if /i "%~1"=="-h" goto usage
 if /i "%~1"=="--help" goto usage
 set "target=%~1"
 shift
 goto parse
 :usage
-echo usage: conduit ^<path^> [--agent ^<id^>] [--worktree ^<slug^>] [--name ^<text^>] [--prompt-file ^<file^>] 1>&2
+echo usage: conduit ^<path^> [--agent ^<id^>] [--worktree ^<slug^>] [--name ^<text^>] [--prompt-file ^<file^>] [--provider ^<p^>] [--model ^<m^>] [--effort ^<e^>] 1>&2
 exit /b 2
 :bad_name
 echo conduit: in conduit.cmd --name cannot contain double quotes, percent signs or exclamation marks 1>&2
@@ -321,6 +336,9 @@ if not defined prompt_abs goto body_prompt_done
 set "esc=!prompt_abs:\=\\!"
 set "body=!body!,"prompt_file":"!esc!""
 :body_prompt_done
+if defined provider set "body=!body!,"provider":"!provider!""
+if defined model set "body=!body!,"model":"!model!""
+if defined effort set "body=!body!,"effort":"!effort!""
 set "body={{!body!}}"
 
 rem The body goes through a file, never argv: curl.exe splits its command line with

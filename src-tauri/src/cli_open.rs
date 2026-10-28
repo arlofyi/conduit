@@ -36,7 +36,19 @@ pub const MAX_PROMPT_BYTES: u64 = 65_536;
 const MAX_NAME_CHARS: usize = 80;
 
 /// One `conduit <path> [--agent <id>] [--worktree <slug>] [--name <name>]
-/// [--prompt-file <path>]` invocation, as it arrives on the wire.
+/// [--prompt-file <path>] [--provider <p>] [--model <m>] [--effort <e>]` invocation, as it
+/// arrives on the wire.
+///
+/// `provider`/`model`/`effort` are what let ONE agent start another under conditions it
+/// chose: a Hermes session running on a local model can launch a worker on OpenRouter, or on
+/// Claude, without the human configuring anything first. Every optional field is
+/// `#[serde(default)]` so a shim from an older install -- which sends only `path` and
+/// `agent` -- still parses.
+///
+/// `provider`/`model`/`effort` are NOT validated here: whether "gpt-9" is a real model is a
+/// question only the agent can answer, and the frontend re-checks the agent id against
+/// `AGENTS` before spawning anything -- the same rule `dispatch_work` follows, for the same
+/// reason: a model-invented id must never render as a promise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenRequest {
     pub path: String,
@@ -48,6 +60,15 @@ pub struct OpenRequest {
     pub name: Option<String>,
     #[serde(default)]
     pub prompt_file: Option<String>,
+    /// Endpoint preset for the new session's agent ("openrouter", "ollama", ...).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Exact model id, in the agent's own spelling.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Reasoning effort, for agents that take one.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// A validated `OpenRequest` with the prompt file already read: the shape emitted as the
@@ -59,6 +80,9 @@ pub struct OpenPayload {
     pub worktree: Option<String>,
     pub name: Option<String>,
     pub prompt: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// Validate an authenticated request and read its prompt file. `worktree`, `name` and
@@ -71,6 +95,9 @@ pub fn resolve(req: OpenRequest) -> Result<OpenPayload, Reject> {
         worktree,
         name,
         prompt_file,
+        provider,
+        model,
+        effort,
     } = req;
     if agent.is_none() && (worktree.is_some() || name.is_some() || prompt_file.is_some()) {
         return Err(Reject::BadBody);
@@ -90,6 +117,9 @@ pub fn resolve(req: OpenRequest) -> Result<OpenPayload, Reject> {
         worktree,
         name,
         prompt,
+        provider,
+        model,
+        effort,
     })
 }
 
@@ -256,8 +286,38 @@ mod tests {
                 worktree: None,
                 name: None,
                 prompt_file: None,
+                provider: None,
+                model: None,
+                effort: None,
             }
         );
+    }
+
+    #[test]
+    fn spawn_conditions_ride_along_so_one_agent_can_launch_another() {
+        // The point of these three: a Hermes session on a local model launching a worker
+        // on OpenRouter, without a human configuring anything in between.
+        let h = hdrs(&[("X-Conduit-Token", TOK)]);
+        let got = parse_open(
+            &h,
+            r#"{"path":"/tmp/p","agent":"hermes","provider":"openrouter","model":"x-ai/grok-4","effort":"high"}"#,
+            TOK,
+        )
+        .unwrap();
+        assert_eq!(got.provider.as_deref(), Some("openrouter"));
+        assert_eq!(got.model.as_deref(), Some("x-ai/grok-4"));
+        assert_eq!(got.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_shim_that_predates_the_new_fields_still_parses() {
+        // The installed shim is generated, and an older one sends only path+agent. If that
+        // stopped parsing, every `conduit .` from a stale shim would 400.
+        let h = hdrs(&[("X-Conduit-Token", TOK)]);
+        let got = parse_open(&h, r#"{"path":"/tmp/p","agent":"claude"}"#, TOK).unwrap();
+        assert_eq!(got.provider, None);
+        assert_eq!(got.model, None);
+        assert_eq!(got.effort, None);
     }
 
     #[test]
@@ -365,6 +425,9 @@ mod tests {
             worktree: None,
             name: None,
             prompt_file: None,
+            provider: None,
+            model: None,
+            effort: None,
         };
         f(&mut r);
         r
@@ -387,7 +450,10 @@ mod tests {
                 agent: Some("claude".into()),
                 worktree: None,
                 name: None,
-                prompt: None
+                prompt: None,
+                provider: None,
+                model: None,
+                effort: None,
             }
         );
         let req = parse_open(&h, r#"{"path":"/tmp/p"}"#, TOK).unwrap();

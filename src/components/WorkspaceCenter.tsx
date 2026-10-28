@@ -30,6 +30,8 @@ import { CanvasControls, CanvasUnderlay } from "./CanvasView";
 import { CanvasRail } from "./CanvasRail";
 import { effectiveCenterMode } from "../centerViews";
 import { ContextMeter } from "./ContextMeter";
+import { ContextRing } from "./ContextRing";
+import { useOrchestrationDisplay } from "../hooks/useOrchestrationDisplay";
 import { FOOTER_H, HEADER_H, LIVE_ZOOM_MIN, nodeH, nodeW } from "../canvas";
 import { useCanvas } from "../hooks/useCanvas";
 import { TerminalIcon, FileIcon, CodeIcon, CloseIcon } from "./Icons";
@@ -104,6 +106,11 @@ export function WorkspaceCenter({
   const moveTab = useStore((s) => s.moveTab);
   const splitTab = useStore((s) => s.splitTab);
   const dropSessionIntoPane = useStore((s) => s.dropSessionIntoPane);
+  const launchResume = useStore((s) => s.launchResume);
+  const launchSessionIds = useStore((s) => s.launchSessionIds);
+  const launchMode = useStore((s) => s.sessionLifecycle.launchRestore);
+  /** Sessions whose terminal has been mounted this run (see `allSessions`). */
+  const mountedTerminals = useRef<Set<string>>(new Set());
   const wsRef = useRef<HTMLDivElement>(null);
 
   // drag-to-split / move-between-groups
@@ -328,7 +335,22 @@ export function WorkspaceCenter({
   const allSessions = projects
     .filter((p) => mountedInWindow(p, WINDOWED, windowProfile.profileId, knownProfileIds))
     .flatMap((p) => p.sessions.map((s) => ({ project: p, session: s })))
-    .sort((a, b) => a.session.id.localeCompare(b.session.id));
+    .sort((a, b) => a.session.id.localeCompare(b.session.id))
+    // Mount a terminal the first time it is needed, then keep it for good. Every session
+    // used to get a mounted xterm (5,000-line buffer, a renderer context) at launch,
+    // whether it ever ran or not: 79 of them on one machine. The keep-alive rule is about
+    // LIVE terminals and still holds: nothing here ever unmounts, and adding a keyed node
+    // does not move its siblings.
+    .filter(({ project, session }) => {
+      if (mountedTerminals.current.has(session.id)) return true;
+      const wanted =
+        placeSession(session.id).visible ||
+        launchResume[session.id] === true ||
+        launchSessionIds[session.id] !== true || // created this run (fleet workers too)
+        (launchMode === "project" && project.id === projectId);
+      if (wanted) mountedTerminals.current.add(session.id);
+      return wanted;
+    });
 
   return (
     <div className="center">
@@ -705,6 +727,7 @@ function GroupTabStrip({
   const dropSessionIntoPane = useStore((s) => s.dropSessionIntoPane);
   const sessionDirs = useStore((s) => s.sessionDirs);
   const sessionContext = useStore((s) => s.sessionContext);
+  const contextDisplay = useOrchestrationDisplay(projects.map((p) => p.id));
   const richSessionView = useStore((s) => s.richSessionView);
   const richViewOpen = useStore((s) => s.richViewOpen);
   const toggleRichView = useStore((s) => s.toggleRichView);
@@ -841,6 +864,7 @@ function GroupTabStrip({
               <CloseIcon size={10} />
             </button>
             {t.kind === "session" && <ContextMeter usage={sessionContext[t.ref]} />}
+            {t.kind === "session" && contextDisplay[tabProjectId(t, projectId)] && <ContextRing usage={sessionContext[t.ref]} />}
           </div>
         </Fragment>
       ))}

@@ -9,9 +9,9 @@
  * importing it (see cliOpen.test.ts).
  */
 import { invoke } from "@tauri-apps/api/core";
-import type { AgentId } from "./agents";
+import { AGENTS, type AgentId } from "./agents";
 import { eventInThisWindow, normalizeProfileId } from "./profiles";
-import { useStore, WINDOWED } from "./store";
+import { globalSelectedSessionId, useStore, WINDOWED } from "./store";
 
 /** Guard wrapper for per-window listeners, binding the pure (and tested, profiles.test.ts)
  *  `eventInThisWindow` to `WINDOWED` and this window's live profile list. The item's
@@ -55,7 +55,8 @@ export function matchProjectByPath(
   return projects.find((p) => normalize(p.path) === want)?.id ?? null;
 }
 
-/** One `conduit <path> [--agent <id> [--worktree <slug>] [--name <text>] [--prompt-file <file>]]`
+/** One `conduit <path> [--agent <id> [--worktree <slug>] [--name <text>] [--prompt-file <file>]
+ *  [--provider <p>] [--model <m>] [--effort <e>]]`
  *  invocation's payload -- shared by the live `cli-open` listener and the
  *  `take_pending_opens` boot-time drain. Mirrors Rust's `OpenPayload`; `prompt` is the
  *  prompt file's text, already read by Rust. */
@@ -65,6 +66,9 @@ export type CliOpenPayload = {
   worktree?: string | null;
   name?: string | null;
   prompt?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  effort?: string | null;
 };
 
 /** Apply one `cli-open` payload: select (or add) its project and spawn `--agent`'s
@@ -103,12 +107,31 @@ export async function applyCliOpenPayload(payload: CliOpenPayload): Promise<void
   // `--agent` creates a session unconditionally and never resumes an existing
   // one, so its effect never depends on `restoreSessionsOnOpen`.
   if (projectId && payload.agent) {
+    // An agent id invented by whatever called the CLI must never render as a promise:
+    // `AgentId`'s deserialize is deliberately lenient, so an unknown id would silently
+    // spawn Claude under it. Same check `decisionRoute` makes.
+    if (!AGENTS.some((a) => a.id === payload.agent)) {
+      useStore.getState().pushToast(`conduit: unknown agent "${payload.agent}"`, "error");
+      return;
+    }
+    // `--provider` / `--model` / `--effort` pin the NEW session, which is what lets one
+    // agent launch another under conditions it chose -- a Hermes session on a local model
+    // starting a worker on OpenRouter, say. Provider and model ride in `addSession` so the
+    // session is created WITH them rather than corrected after its terminal has spawned.
+    // The provider is resolved to the agent's own slug on the Rust side, where the
+    // endpoint pool lives.
     await useStore.getState().addSession(projectId, {
       agent: payload.agent as AgentId,
       name: payload.name ?? undefined,
       useWorktree: !!payload.worktree,
       worktreeSlug: payload.worktree ?? null,
       prompt: payload.prompt ?? null,
+      model: payload.model ?? null,
+      provider: payload.provider ?? null,
     });
+    if (payload.effort) {
+      const id = globalSelectedSessionId(useStore.getState());
+      if (id) await useStore.getState().setSessionEffort(id, payload.effort);
+    }
   }
 }

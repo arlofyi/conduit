@@ -20,12 +20,19 @@ import { applyCliOpenPayload, inThisWindow, type CliOpenPayload } from "./cliOpe
 import { askGateOpen, askResolvedToast, askShouldHandOff, type PendingAsk } from "./asks";
 import { effectiveCenterMode } from "./centerViews";
 import { type PendingDiff } from "./ideBridge";
-import { isEditableTarget, isInTerminal } from "./keyboardGuards";
+import {
+  isEditableTarget,
+  isInTerminal,
+  isMacPlatform,
+  tabSwitchDigit,
+} from "./keyboardGuards";
+
 import { type ChatItem } from "./rootChat";
 import { type PendingDecision } from "./rootProposals";
 import { holdsOffWorking, notificationStatus } from "./statusRules";
 import { type ThemePref } from "./themes";
 import { useClaudeAmbient } from "./hooks/useClaudeAmbient";
+import { useAutoStopIdle } from "./hooks/useAutoStopIdle";
 import { useSessionDirs } from "./hooks/useSessionDirs";
 import { useSessionContext } from "./hooks/useSessionContext";
 import { getLastFocusedEditor } from "./monaco/setup";
@@ -106,6 +113,7 @@ export default function App() {
   // which agent is selected or whether the sidebar is collapsed (both would unmount a
   // sidebar-hosted poller).
   useClaudeAmbient();
+  useAutoStopIdle();
   useSessionDirs();
   useSessionContext();
   const projects = useStore((s) => s.projects);
@@ -229,8 +237,10 @@ export default function App() {
   //   keyEquivalent, which AppKit never matches against a real Tab keypress, so the
   //   Window-menu accelerator is display-only on macOS. Capture phase because xterm
   //   cancels Tab-family keydowns before they'd bubble out of a focused terminal.
-  // - ⌘1..9 (⌘9 = last, browser convention): meta ONLY — ctrl+digit is a real
-  //   terminal input (ctrl+3 = ESC would interrupt the agent) and must pass through.
+  // - ⌘1..9 on macOS / Alt+1..9 on Windows and Linux (9 = last, browser convention).
+  //   The modifier splits by platform because ctrl+digit is a real terminal input
+  //   (ctrl+3 = ESC would interrupt the agent) and meta is the reserved Windows key --
+  //   see `tabSwitchDigit`, which owns that decision and is tested.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === "Tab") {
@@ -239,11 +249,10 @@ export default function App() {
         useStore.getState().cycleTab(e.shiftKey ? -1 : 1);
         return;
       }
-      if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-        const m = /^Digit([1-9])$/.exec(e.code);
-        if (!m) return;
+      const digit = tabSwitchDigit(e, isMacPlatform(navigator.platform || navigator.userAgent));
+      if (digit !== null) {
         e.preventDefault();
-        useStore.getState().activateTabAt(Number(m[1]));
+        useStore.getState().activateTabAt(digit);
         return;
       }
       // ⇧⌘B: toggle the task board overlay for the selected project (no native menu
@@ -285,7 +294,7 @@ export default function App() {
       // textarea, a section's rename input) still blocks unconditionally on every
       // platform, same as the other three listeners.
       if (e.shiftKey && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "c") {
-        const isMac = /Mac|iPhone|iPod|iPad/i.test(navigator.platform || navigator.userAgent);
+        const isMac = isMacPlatform(navigator.platform || navigator.userAgent);
         if (isInTerminal(e.target) ? !isMac : isEditableTarget(e.target)) return;
         // Canvas pref off: inert (leave the key to the terminal / default behaviour).
         if (!useStore.getState().canvasEnabled) return;
@@ -816,6 +825,7 @@ export default function App() {
   useEffect(() => {
     const un = getCurrentWebviewWindow().listen<CliOpenPayload>("cli-open", ({ payload }) => {
       void applyCliOpenPayload(payload);
+
     });
     return () => {
       void un.then((f) => f());

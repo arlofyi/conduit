@@ -264,6 +264,9 @@ mod tests {
             worktree: None,
             name: None,
             prompt: None,
+            provider: None,
+            model: None,
+            effort: None,
         }
     }
 

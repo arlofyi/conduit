@@ -4,7 +4,7 @@ import { AGENTS, agentMeta, type AgentId } from "../agents";
 import { AgentGlyph } from "./AgentGlyph";
 import { Dropdown } from "./Dropdown";
 import { pickTarget, type TaskKind } from "../routing";
-import { agyRow, availabilityFrom, claudeRow, commandCodeRow } from "../usageRows";
+import { agyRow, availabilityFrom, claudeRow, codexAvailabilityRows, commandCodeRow } from "../usageRows";
 
 export function NewSessionDialog({
   projectId,
@@ -42,6 +42,7 @@ export function NewSessionDialog({
   const claudeUsage = useStore((s) => s.claudeUsage);
   const agyMap = useStore((s) => s.agyUsageByAccount);
   const commandCodeUsage = useStore((s) => s.commandCodeUsage);
+  const codexUsage = useStore((s) => s.codexUsage);
   const lowThresholdPct = useStore((s) => s.usagePrefs.lowThresholdPct);
   /** "" = pick the agent by hand, which is what this dialog did before routing existed. */
   const [task, setTask] = useState<TaskKind | "">("");
@@ -90,8 +91,9 @@ export function NewSessionDialog({
         ...claudeUsage.map(claudeRow),
         ...Object.values(agyMap).map(agyRow),
         ...commandCodeUsage.filter((u) => u.usage.windows?.length).map(commandCodeRow),
+        ...codexAvailabilityRows(codexUsage),
       ]),
-    [detected, claudeUsage, agyMap, commandCodeUsage],
+    [detected, claudeUsage, agyMap, commandCodeUsage, codexUsage],
   );
 
   const decision = useMemo(

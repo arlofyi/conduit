@@ -16,6 +16,7 @@ import { useStore, type SessionRole } from "../store";
 import { SessionChat } from "./SessionChat";
 import { DiffReviewOverlay } from "./DiffReviewOverlay";
 import { fontForZoom } from "../terminalZoom";
+import { isMacPlatform } from "../keyboardGuards";
 
 function b64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
@@ -139,8 +140,44 @@ export function TerminalView({
    *  through either the stop transition or the reveal path, depending on whether the pane
    *  was on screen when the flag cleared. */
   const resetOnSpawnRef = useRef(false);
+  /** Keystrokes typed while `pty_spawn` is in flight, sent in order once it resolves.
+   *  `pty_spawn` runs off the UI thread (and one at a time), while `pty_write` stays on it
+   *  to keep keystroke order -- so a key pressed as a session opens would otherwise reach
+   *  Rust before the session exists and be dropped. Both used to share one thread, which
+   *  queued the write behind the spawn for free. Holds the spawn generation it waits on, so
+   *  a superseded spawn resolving late cannot release input meant for its replacement. */
+  const spawnPendingRef = useRef<number | null>(null);
+  const pendingInputRef = useRef<string[]>([]);
 
-  const restoreOnOpen = useStore((s) => s.restoreSessionsOnOpen);
+  // Settings → Sessions. `parked`: this session came back from the last run and waits for
+  // you (a click, a key, or opening it); `launchResume`: its agent was mid-task when
+  // Conduit closed, so it starts by itself. Both are decided once at launch (store.load).
+  const launchMode = useStore((s) => s.sessionLifecycle.launchRestore);
+  const parked = useStore((s) => !!s.parkedSessions[sessionId]);
+  const launchResume = useStore((s) => !!s.launchResume[sessionId]);
+  // A session created during this run (a new one, a fleet_spawn worker) is not part of
+  // the launch rule: it starts the way sessions always did, so a worker spawned into a
+  // background tab still runs its brief.
+  const createdThisRun = useStore((s) => s.launchSessionIds[sessionId] !== true);
+  /** Whether the "closed, press a key" hint is on screen (so it is written once). */
+  const parkHintRef = useRef(false);
+  /** Resume a parked or stopped pane from a key or click inside it. Returns true when it
+   *  did, so the key that woke the session is not also typed into it. Reassigned every
+   *  render because the input handlers are bound once, at create time. */
+  const wakeRef = useRef<() => boolean>(() => false);
+  wakeRef.current = () => {
+    if (spawnedRef.current || shellOnly) return false;
+    const st = useStore.getState();
+    if (stopped) {
+      void st.startSession(projectId, sessionId);
+      return true;
+    }
+    if (parked) {
+      st.unparkSession(sessionId);
+      return true;
+    }
+    return false;
+  };
   const rendererPref = useStore((s) => s.terminalRenderer);
   const selectedProjectId = useStore((s) => s.selectedProjectId);
 
@@ -180,6 +217,15 @@ export function TerminalView({
       if (disposedRef.current || gen !== spawnGenRef.current) return;
       termRef.current?.write(b64ToBytes(msg));
     };
+    spawnPendingRef.current = gen;
+    const releaseInput = (deliver: boolean) => {
+      if (spawnPendingRef.current !== gen) return;
+      const queued = pendingInputRef.current;
+      pendingInputRef.current = [];
+      spawnPendingRef.current = null;
+      if (!deliver || disposedRef.current) return;
+      for (const data of queued) void invoke("pty_write", { sessionId, data }).catch(() => {});
+    };
     void invoke("pty_spawn", {
       sessionId,
       workingDirectory: wd,
@@ -197,6 +243,7 @@ export function TerminalView({
       onEvent: channel,
     })
       .then(() => {
+        releaseInput(true);
         // Cold-spawn repaint. When the agent resumes (`claude --resume <id>`, agy
         // `--conversation=<id>`) it replays into the alternate screen and nothing repaints
         // it, so the pane can come back blank or half-drawn — the long-standing "resume
@@ -212,7 +259,10 @@ export function TerminalView({
             .catch(() => {});
         }, 400);
       })
-      .catch((e) => termRef.current?.write(`\r\n[spawn error: ${e}]\r\n`));
+      .catch((e) => {
+        releaseInput(false);
+        termRef.current?.write(`\r\n[spawn error: ${e}]\r\n`);
+      });
   };
 
   // Create the xterm instance exactly once.
@@ -233,14 +283,20 @@ export function TerminalView({
     // The renderer addon is attached by its own effect below, not here: it has to be able
     // to swap when the preference changes, and this effect must stay one-shot because
     // re-running it would recreate the xterm and kill the PTY under it.
-    const writeSeq = (data: string) =>
+    const writeSeq = (data: string) => {
+      if (wakeRef.current()) return;
+      if (spawnPendingRef.current !== null) {
+        pendingInputRef.current.push(data);
+        return;
+      }
       void invoke("pty_write", { sessionId, data }).catch(() => {});
+    };
 
     term.onData((d) => writeSeq(d));
 
     // The open-path / clipboard modifier is Cmd on macOS, Ctrl on Windows & Linux (VS Code parity).
     // `navigator.platform` is deprecated and occasionally empty in webviews, so fall back to UA.
-    const isMac = /Mac|iPhone|iPod|iPad/i.test(navigator.platform || navigator.userAgent);
+    const isMac = isMacPlatform(navigator.platform || navigator.userAgent);
     const openModHeld = (ev: { metaKey: boolean; ctrlKey: boolean }) =>
       isMac ? ev.metaKey : ev.ctrlKey;
 
@@ -502,6 +558,11 @@ export function TerminalView({
       else pasteClipboard();
     };
     innerRef.current?.addEventListener("contextmenu", onContextMenu);
+    // A click inside a parked or stopped pane resumes it, the same as a key does.
+    const onWakeClick = () => {
+      wakeRef.current();
+    };
+    innerRef.current?.addEventListener("mousedown", onWakeClick);
 
     termRef.current = term;
     const unregister = registerTerminal(term);
@@ -550,6 +611,7 @@ export function TerminalView({
       window.removeEventListener("keyup", onMod, true);
       window.removeEventListener("blur", onBlur);
       innerRef.current?.removeEventListener("contextmenu", onContextMenu);
+      innerRef.current?.removeEventListener("mousedown", onWakeClick);
       mouseDisposables.forEach((d) => d.dispose());
       // Renderer addon first, xterm second — see disposePane. React runs this cleanup
       // before the renderer effect's own, so a bare term.dispose() here would be the one
@@ -628,7 +690,17 @@ export function TerminalView({
       const rows = term.rows;
 
       if (!spawnedRef.current) {
-        if (dirReady && !stopped) spawnPty(cols, rows);
+        if (dirReady && !stopped && !parked) {
+          spawnPty(cols, rows);
+        } else if (parked && !shellOnly && !parkHintRef.current) {
+          // Back from the last run, not asked for yet: say so instead of starting an agent
+          // nobody requested. The hint is cleared by the spawn that answers it.
+          parkHintRef.current = true;
+          resetOnSpawnRef.current = true;
+          term.write(
+            "\x1b[2m── session closed to save memory. Click here or press any key to resume ──\x1b[0m\r\n",
+          );
+        }
       } else {
         void invoke("pty_resize", { sessionId, cols, rows }).catch(() => {});
       }
@@ -657,7 +729,7 @@ export function TerminalView({
       }, 120);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, dirReady, stopped]);
+  }, [visible, dirReady, stopped, parked]);
 
   // Eager restore-on-open: bring every session of the ACTIVE project live without waiting for
   // a click (VSCode-style — the whole project comes back where you left off). Companion shells
@@ -666,14 +738,21 @@ export function TerminalView({
   // A session the user deliberately stopped is skipped here: without that, restoring the
   // project on the next open would relaunch it and silently undo the decision — which is
   // exactly why `stopped` is persisted rather than kept in component state.
+  //
+  // Settings → Sessions decides who that is. `working` (default): only a session whose
+  // agent was still mid-task when Conduit closed (`launchResume`), in whichever project it
+  // lives. `project`: the old rule above. `none`: nobody.
   useEffect(() => {
     if (spawnedRef.current || shellOnly || stopped) return;
-    if (!restoreOnOpen || projectId !== selectedProjectId) return;
+    const eager =
+      launchResume ||
+      ((launchMode === "project" || createdThisRun) && projectId === selectedProjectId);
+    if (!eager) return;
     const term = termRef.current;
     if (!term) return;
     spawnPty(term.cols || 80, term.rows || 24);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [restoreOnOpen, selectedProjectId, stopped]);
+  }, [launchMode, launchResume, createdThisRun, selectedProjectId, stopped]);
 
   // Shell-only: the resolved directory changed after spawn — a confirmed worktree was
   // deleted (fall back to the project root) or a deleted one came back. Kill + respawn
@@ -724,7 +803,7 @@ export function TerminalView({
       // Deliberately NO reset() here: a stopped tab keeps showing where the session got to.
       // The clear happens at the NEXT spawn, just before Rust replays the snapshot.
       termRef.current?.write(
-        "\r\n\x1b[2m── session stopped — click this tab to resume ──\x1b[0m\r\n",
+        "\r\n\x1b[2m── session stopped. Click here or press any key to resume ──\x1b[0m\r\n",
       );
       // No pty_kill here. Tearing down the processes belongs to the `stop_session` /
       // `stop_idle_sessions` command that set this flag, and it uses RETIRE. `pty_kill` is
