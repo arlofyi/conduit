@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useStore, findSession } from "../store";
 import { answerSummary, buildAnswers, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "../asks";
 import { blocksGlobalShortcut } from "../keyboardGuards";
-import { alreadyAnsweredCopy, remoteNote, resolvedCopy } from "../permissionView";
+import { cardResolution } from "../permissionView";
 import { handedOff } from "../askHandoff";
 
 /** How long the done state stays up if `ask-resolved` never arrives to remove it. */
@@ -72,9 +72,10 @@ export function AskCard({
 
   // Answered elsewhere (the phone, the terminal, another window): say where, instead of
   // leaving an interactive card up until it vanishes, or claiming "Sent to …".
+  // A lost race (`gone`) keeps the winner's name once it is known: no flip back to the form.
   const resolvedBy = useStore((s) => s.askResolvedBy[ask.id] ?? null);
-  const remote = state === "done" ? null : remoteNote(resolvedBy, state === "sending");
-  const remoteCopy = remote ? resolvedCopy(remote) : null;
+  const resolution = cardResolution(state, resolvedBy, "ask");
+  const remoteCopy = resolution?.view === "remote" ? resolution.copy : null;
 
   const q = ask.questions[page];
   const total = ask.questions.length;
@@ -375,7 +376,7 @@ export function AskCard({
             <small>It's carrying on. This card closes in a moment.</small>
           </div>
         </div>
-      ) : remoteCopy && state !== "gone" ? (
+      ) : remoteCopy ? (
         <div className="ask-card-done" role="status">
           <span className="ask-card-ck" aria-hidden />
           <div>
@@ -387,8 +388,8 @@ export function AskCard({
         <>
           <p className="ask-card-q">{q.question}</p>
           {meta}
-          {state === "gone" ? (
-            <div className="ask-card-note">{alreadyAnsweredCopy(resolvedBy)}</div>
+          {resolution?.view === "gone" ? (
+            <div className="ask-card-note">{resolution.copy}</div>
           ) : (
             <>
               <div className="ask-card-opts">{rows}</div>

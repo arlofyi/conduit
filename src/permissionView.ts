@@ -16,15 +16,29 @@ export function parseBy(v: unknown): ResolvedBy | null {
   return typeof v === "string" && (BY as readonly string[]).includes(v) ? (v as ResolvedBy) : null;
 }
 
+/** Which card is asking: a question (asks.rs) or a tool permission (broker.rs). They differ
+ *  only in what `by: "terminal"` can mean. */
+export type HeldKind = "ask" | "permission";
+
+/** What `by: "terminal"` honestly says, per kind.
+ *  - Ask: it is ALWAYS a hand-off (Esc killing the hook, another window's auto hand-off,
+ *    the last phone leaving). Nothing was answered; the question waits in the terminal.
+ *  - Permission: a terminal "No"/Esc killing the hook OR the last phone leaving, and
+ *    `permission-resolved` carries only `{id, by}`, so it cannot claim an answer. */
+function terminalCopy(kind: HeldKind, already: boolean): string {
+  if (kind === "ask") return already ? "It moved to the terminal." : "Moved to the terminal";
+  return already ? "Already handled in the terminal." : "Handled in the terminal";
+}
+
 /** Where it was answered, as this Mac's card says it. A card's OWN answer never reaches
  *  this (it shows its own confirmation), so "desktop" here is another Conduit window.
  *  A cancellation (the turn moved on) is removed silently: null. */
-export function resolvedCopy(by: ResolvedBy | null): string | null {
+export function resolvedCopy(by: ResolvedBy | null, kind: HeldKind): string | null {
   switch (by) {
     case "phone":
       return "Answered on your phone";
     case "terminal":
-      return "Answered in the terminal";
+      return terminalCopy(kind, false);
     case "timeout":
       return "Moved to the terminal";
     case "desktop":
@@ -35,12 +49,12 @@ export function resolvedCopy(by: ResolvedBy | null): string | null {
 }
 
 /** The note on a card whose own answer came back `false` (someone got there first). */
-export function alreadyAnsweredCopy(by: ResolvedBy | null): string {
+export function alreadyAnsweredCopy(by: ResolvedBy | null, kind: HeldKind): string {
   switch (by) {
     case "phone":
       return "Already answered on your phone.";
     case "terminal":
-      return "Already answered in the terminal.";
+      return terminalCopy(kind, true);
     case "desktop":
       return "Already answered in another Conduit window.";
     case "timeout":
@@ -57,6 +71,25 @@ export function remoteNote(by: ResolvedBy | null, sendingHere: boolean): Resolve
   if (!by || by === "cancelled") return null;
   if (by === "desktop" && sendingHere) return null;
   return by;
+}
+
+/** What a card that is not showing its OWN confirmation draws instead of its form.
+ *  `remote`: the done view naming where it went. `gone`: the "already answered" note under
+ *  the form, used only when nobody said who. When this card's own call loses the race
+ *  (`gone`) after the winner was already named, the named copy STAYS: flipping back to the
+ *  form with a second note is a flicker. `state` is the card's own: `done` = its own answer
+ *  landed, `sending` = its call is in flight. */
+export function cardResolution(
+  state: "idle" | "sending" | "error" | "gone" | "done",
+  by: ResolvedBy | null,
+  kind: HeldKind,
+): { view: "remote" | "gone"; copy: string } | null {
+  if (state === "done") return null;
+  const note = remoteNote(by, state === "sending");
+  const copy = note ? resolvedCopy(note, kind) : null;
+  if (copy) return { view: "remote", copy };
+  if (state === "gone") return { view: "gone", copy: alreadyAnsweredCopy(by, kind) };
+  return null;
 }
 
 /** Whether a resolved card stays up for a moment (to say where it went) or leaves at once.

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   alreadyAnsweredCopy,
+  cardResolution,
   parseBy,
   permissionOutcomeCopy,
   remoteNote,
@@ -21,25 +22,62 @@ describe("parseBy", () => {
 
 describe("resolvedCopy", () => {
   it("names where it was answered, from the Mac's side", () => {
-    expect(resolvedCopy("phone")).toBe("Answered on your phone");
-    expect(resolvedCopy("terminal")).toBe("Answered in the terminal");
-    expect(resolvedCopy("timeout")).toBe("Moved to the terminal");
-    expect(resolvedCopy("desktop")).toBe("Answered in another Conduit window");
+    for (const kind of ["ask", "permission"] as const) {
+      expect(resolvedCopy("phone", kind)).toBe("Answered on your phone");
+      expect(resolvedCopy("timeout", kind)).toBe("Moved to the terminal");
+      expect(resolvedCopy("desktop", kind)).toBe("Answered in another Conduit window");
+    }
+  });
+  it("never calls a question's hand-off an answer", () => {
+    // An ask's `by: terminal` is always a hand-off (Esc killing the hook, another window's
+    // auto hand-off, the last phone leaving): the question is still waiting in the menu.
+    expect(resolvedCopy("terminal", "ask")).toBe("Moved to the terminal");
+  });
+  it("does not claim a permission was answered when the event cannot tell", () => {
+    // A permission's `by: terminal` is a terminal "No"/Esc OR the last phone leaving, and
+    // `permission-resolved` carries only {id, by}, so it cannot say which.
+    expect(resolvedCopy("terminal", "permission")).toBe("Handled in the terminal");
   });
   it("says nothing for a cancellation or an unknown resolver", () => {
-    expect(resolvedCopy("cancelled")).toBeNull();
-    expect(resolvedCopy(null)).toBeNull();
+    expect(resolvedCopy("cancelled", "ask")).toBeNull();
+    expect(resolvedCopy(null, "permission")).toBeNull();
   });
 });
 
 describe("alreadyAnsweredCopy", () => {
   it("says where when it knows, and never guesses", () => {
-    expect(alreadyAnsweredCopy("phone")).toBe("Already answered on your phone.");
-    expect(alreadyAnsweredCopy("terminal")).toBe("Already answered in the terminal.");
-    expect(alreadyAnsweredCopy("desktop")).toBe("Already answered in another Conduit window.");
-    expect(alreadyAnsweredCopy("timeout")).toBe("It moved to the terminal.");
-    expect(alreadyAnsweredCopy("cancelled")).toBe("Already answered.");
-    expect(alreadyAnsweredCopy(null)).toBe("Already answered.");
+    for (const kind of ["ask", "permission"] as const) {
+      expect(alreadyAnsweredCopy("phone", kind)).toBe("Already answered on your phone.");
+      expect(alreadyAnsweredCopy("desktop", kind)).toBe("Already answered in another Conduit window.");
+      expect(alreadyAnsweredCopy("timeout", kind)).toBe("It moved to the terminal.");
+      expect(alreadyAnsweredCopy("cancelled", kind)).toBe("Already answered.");
+      expect(alreadyAnsweredCopy(null, kind)).toBe("Already answered.");
+    }
+    expect(alreadyAnsweredCopy("terminal", "ask")).toBe("It moved to the terminal.");
+    expect(alreadyAnsweredCopy("terminal", "permission")).toBe("Already handled in the terminal.");
+  });
+});
+
+describe("cardResolution", () => {
+  it("shows a remote resolution on an open card", () => {
+    expect(cardResolution("idle", "phone", "ask")).toEqual({ view: "remote", copy: "Answered on your phone" });
+    expect(cardResolution("idle", null, "ask")).toBeNull();
+    expect(cardResolution("error", "terminal", "ask")).toEqual({ view: "remote", copy: "Moved to the terminal" });
+  });
+  it("does not take this card's own in-flight answer for another window's", () => {
+    expect(cardResolution("sending", "desktop", "permission")).toBeNull();
+    expect(cardResolution("sending", "phone", "permission")).toEqual({ view: "remote", copy: "Answered on your phone" });
+  });
+  it("keeps the remote copy when this card's own call then comes back false (no flip back to the form)", () => {
+    expect(cardResolution("gone", "phone", "permission")).toEqual({ view: "remote", copy: "Answered on your phone" });
+    expect(cardResolution("gone", "desktop", "ask")).toEqual({ view: "remote", copy: "Answered in another Conduit window" });
+  });
+  it("falls back to the 'already answered' note only when nobody said who", () => {
+    expect(cardResolution("gone", null, "ask")).toEqual({ view: "gone", copy: "Already answered." });
+    expect(cardResolution("gone", "cancelled", "permission")).toEqual({ view: "gone", copy: "Already answered." });
+  });
+  it("leaves the card's own confirmation alone", () => {
+    expect(cardResolution("done", "desktop", "ask")).toBeNull();
   });
 });
 

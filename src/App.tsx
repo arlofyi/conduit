@@ -19,7 +19,7 @@ import { type AgentId } from "./agents";
 import { applyCliOpenPayload, inThisWindow, type CliOpenPayload } from "./cliOpen";
 import { askGateOpen, askResolvedPlan, askShouldHandOff, type PendingAsk } from "./asks";
 import { parseBy, resolutionHold, type PendingPermission } from "./permissionView";
-import { handedOff } from "./askHandoff";
+import { handedOff, handOffView } from "./askHandoff";
 import { effectiveCenterMode } from "./centerViews";
 import { type PendingDiff } from "./ideBridge";
 import {
@@ -97,16 +97,6 @@ function runEditorAction(id: string): void {
   }
 }
 
-
-/** Where the user is looking, for the hand-off rule. */
-function handOffView(s: ReturnType<typeof useStore.getState>) {
-  return {
-    selectedSessionId: globalSelectedSessionId(s),
-    continuityVisible:
-      !!s.selectedProjectId && effectiveCenterMode(s.centerMode[s.selectedProjectId], s) === "continuity",
-    windowFocused: s.windowFocused,
-  };
-}
 
 /** An incoming ask (live or catch-up). One for the terminal the user is already watching
  *  goes straight back to it and never becomes a card: adding it first would flash a docked
@@ -987,7 +977,10 @@ export default function App() {
           const s = useStore.getState();
           const by = parseBy(payload.by);
           rememberResolvedPermission(payload.id);
-          if (resolutionHold(by, payload.id in s.permissions)) {
+          // A card hidden behind its own terminal (the dock's hand-off rule) was never seen:
+          // drop it now, or looking away during the hold would surface a stale card.
+          const held = s.permissions[payload.id];
+          if (resolutionHold(by, !!held && !askShouldHandOff(held, handOffView(s)))) {
             s.notePermissionResolved(payload.id, by!);
             setTimeout(() => useStore.getState().removePermission(payload.id), PERMISSION_DONE_HOLD_MS);
           } else s.removePermission(payload.id);

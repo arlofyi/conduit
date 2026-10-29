@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useShallow } from "zustand/react/shallow";
 import { useStore, findSession } from "../store";
-import { waitingClock } from "../asks";
+import { permissionsToShow, waitingClock } from "../asks";
+import { handOffView } from "../askHandoff";
 import {
-  alreadyAnsweredCopy,
+  cardResolution,
   permissionOutcomeCopy,
-  remoteNote,
-  resolvedCopy,
   sortPermissions,
   type PendingPermission,
 } from "../permissionView";
@@ -18,12 +18,15 @@ const GONE_MS = 2500;
 
 /** Tool permissions Rust is holding (broker.rs). Oldest docks on top of the question dock,
  *  with a count of the rest. Unlike a question, a permission is never drawn in the graph,
- *  so it always docks here. Mounted in App's `.hold-dock`, never inside the terminal tree. */
+ *  so it docks here — except one for the terminal already in front of the user, where
+ *  Claude's own dialog is asking: that one is hidden (not resolved) until the user looks
+ *  away (`permissionsToShow`). Mounted in App's `.hold-dock`, never inside the terminal tree. */
 export function PermissionDock() {
   // Raw map + memo: a selector returning a fresh array loops in Zustand v5.
   const map = useStore((s) => s.permissions);
   const projects = useStore((s) => s.projects);
-  const list = useMemo(() => sortPermissions(Object.values(map)), [map]);
+  const view = useStore(useShallow(handOffView));
+  const list = useMemo(() => permissionsToShow(sortPermissions(Object.values(map)), view), [map, view]);
   if (list.length === 0) return null;
   const first = list[0];
   const name = findSession(projects, first.session)?.session.name ?? "A session";
@@ -45,8 +48,13 @@ export function PermissionCard({ perm, sessionName }: { perm: PendingPermission;
   const resolvedBy = useStore((s) => s.permissionResolvedBy[perm.id] ?? null);
 
   const ownDone = state === "allowed" || state === "denied";
-  const remote = ownDone || state === "gone" ? null : remoteNote(resolvedBy, state === "sending");
-  const remoteCopy = remote ? resolvedCopy(remote) : null;
+  // A lost race (`gone`) keeps the winner's name once it is known: no flip back to the form.
+  const resolution = cardResolution(
+    state === "allowed" || state === "denied" ? "done" : state,
+    resolvedBy,
+    "permission",
+  );
+  const remoteCopy = resolution?.view === "remote" ? resolution.copy : null;
   const settled = ownDone || state === "gone" || !!remoteCopy;
 
   // A missed `permission-resolved` must not leave a stuck card hiding later ones.
@@ -115,8 +123,8 @@ export function PermissionCard({ perm, sessionName }: { perm: PendingPermission;
             <span className="ask-card-t">waiting {waitingClock(perm.createdMs, now)}</span>
           </div>
           {perm.summary.trim() && <pre className="perm-card-cmd">{perm.summary}</pre>}
-          {state === "gone" ? (
-            <div className="ask-card-note">{alreadyAnsweredCopy(resolvedBy)}</div>
+          {resolution?.view === "gone" ? (
+            <div className="ask-card-note">{resolution.copy}</div>
           ) : (
             <>
               <div className="ask-card-ft">

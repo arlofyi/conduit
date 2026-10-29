@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { answerSummary, askGateOpen, askResolvedPlan, askResolvedToast, askShouldHandOff, buildAnswers, sessionsAwaitingAnswer, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "./asks";
+import { answerSummary, askGateOpen, askResolvedPlan, askResolvedToast, askShouldHandOff, buildAnswers, permissionsToShow, sessionsAwaitingAnswer, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "./asks";
 import { MULTISELECT_JOIN } from "./askProtocol";
+import { resolvedCopy } from "./permissionView";
 
 const ask: PendingAsk = {
   id: "ask-1", session: "s1", toolUseId: "t",
@@ -25,6 +26,19 @@ describe("hand-off", () => {
     expect(askShouldHandOff(ask, { selectedSessionId: "s2", continuityVisible: false, windowFocused: true })).toBe(false);
     expect(askShouldHandOff(ask, { selectedSessionId: "s1", continuityVisible: false, windowFocused: false })).toBe(false);
     expect(askShouldHandOff(ask, { selectedSessionId: null, continuityVisible: false, windowFocused: true })).toBe(false);
+  });
+});
+
+describe("permissionsToShow", () => {
+  const perm = (id: string, session: string) => ({ id, session, toolName: "Bash", summary: "ls", createdMs: 0 });
+  const list = [perm("p1", "s1"), perm("p2", "s2")];
+  it("hides a permission for the terminal already in front of the user (Claude is asking there)", () => {
+    expect(permissionsToShow(list, { selectedSessionId: "s1", continuityVisible: false, windowFocused: true }).map((p) => p.id)).toEqual(["p2"]);
+  });
+  it("shows it again once the user looks away", () => {
+    expect(permissionsToShow(list, { selectedSessionId: "s2", continuityVisible: false, windowFocused: true }).map((p) => p.id)).toEqual(["p1"]);
+    expect(permissionsToShow(list, { selectedSessionId: "s1", continuityVisible: false, windowFocused: false }).map((p) => p.id)).toEqual(["p1", "p2"]);
+    expect(permissionsToShow(list, { selectedSessionId: "s1", continuityVisible: true, windowFocused: true }).map((p) => p.id)).toEqual(["p1", "p2"]);
   });
 });
 
@@ -125,9 +139,12 @@ describe("askResolvedPlan", () => {
   it("treats an answer with no resolver as before", () => {
     expect(askResolvedPlan({ how: "answered", by: null, ...base })).toEqual({ hold: true, answered: true, note: null, toast: false });
   });
-  it("drops a hand-off this window made, but says so when the terminal answered on its own", () => {
+  it("drops a hand-off this window made, and says another side moved it to the terminal", () => {
     expect(askResolvedPlan({ how: "handoff", by: "terminal", shown: true, handedOffHere: true }).hold).toBe(false);
     expect(askResolvedPlan({ how: "handoff", by: "terminal", shown: false, handedOffHere: false }).hold).toBe(false);
-    expect(askResolvedPlan({ how: "handoff", by: "terminal", ...base })).toEqual({ hold: true, answered: false, note: "terminal", toast: false });
+    const plan = askResolvedPlan({ how: "handoff", by: "terminal", ...base });
+    expect(plan).toEqual({ hold: true, answered: false, note: "terminal", toast: false });
+    // A hand-off answers nothing: the question is still waiting in the terminal's menu.
+    expect(resolvedCopy(plan.note, "ask")).toBe("Moved to the terminal");
   });
 });
