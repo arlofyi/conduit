@@ -68,6 +68,7 @@ mod telemetry;
 mod tmux;
 mod transcript;
 mod transcript_index;
+mod transcript_user;
 mod updates;
 mod usage_tally;
 mod window_registry;

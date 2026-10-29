@@ -41,11 +41,8 @@ pub fn parse_line(line: &str) -> Vec<Value> {
     let mut out = Vec::new();
     match kind {
         "user" => {
-            // User content is either a plain string (a typed prompt) or an array
-            // (tool_result blocks, which we skip — they're tool output, not chat).
-            if let Some(text) = content.and_then(|c| c.as_str()) {
-                out.push(json!({ "kind": "bubble", "role": "user", "text": text }));
-            }
+            // Not every user line is the human: see `transcript_user` for the split.
+            out.extend(crate::transcript_user::parse_user(&v));
         }
         "assistant" => {
             // SPEC-G, §7.6: real token usage per line, including cache-read vs fresh
