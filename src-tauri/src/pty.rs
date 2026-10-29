@@ -1580,9 +1580,16 @@ fn build_script(
         )
     };
     format!(
-        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port}{relay}{ide}; cd {dir} && {invocation}; exec {shell} -i -l",
+        "export CONDUIT_SESSION_ID={sid} CONDUIT_HOOK_PORT={port} CONDUIT_HOOK_ENDPOINT={endpoint}{relay}{ide}; cd {dir} && {invocation}; exec {shell} -i -l",
         sid = shell_quote(session_id),
         port = port,
+        // The hook command SOURCES this file before posting, and the file's port wins over
+        // CONDUIT_HOOK_PORT -- so a stale value here re-routes every hook. `cmd.env` alone
+        // stops at the tmux client, and a tmux server keeps the environment of whoever
+        // started it: a dev build launched from a terminal inside the installed Conduit
+        // inherited the INSTALLED app's endpoint, and every hook of every dev session went
+        // to the installed app's port (the dev build saw no status at all).
+        endpoint = shell_quote(&crate::hooks::endpoint_file_path().to_string_lossy()),
         relay = if adapter.id() == crate::agent::AgentId::Codex {
             format!(
                 " CONDUIT_CODEX_HOOK_RELAY={}",
@@ -1932,6 +1939,12 @@ mod tests {
             None,  // ide_port
         );
         assert!(script.contains("export CONDUIT_SESSION_ID='sid-1' CONDUIT_HOOK_PORT=7777"));
+        // The endpoint file rides the export line too, or a tmux server started by another
+        // Conduit instance hands its sessions that instance's hook port.
+        let endpoint = shell_quote(&crate::hooks::endpoint_file_path().to_string_lossy());
+        assert!(script.contains(&format!(
+            "CONDUIT_HOOK_PORT=7777 CONDUIT_HOOK_ENDPOINT={endpoint}"
+        )));
         assert!(script.contains("claude --session-id 'sid-1' || claude"));
         assert!(script.contains("cd '/repo' &&"));
         // No IDE announce → neither env var appears anywhere.
@@ -2020,10 +2033,11 @@ mod tests {
             false, // strict_mcp
             Some(61234),
         );
-        assert!(script.contains(
+        let endpoint = shell_quote(&crate::hooks::endpoint_file_path().to_string_lossy());
+        assert!(script.contains(&format!(
             "export CONDUIT_SESSION_ID='sid-1' CONDUIT_HOOK_PORT=7777 \
-             CLAUDE_CODE_SSE_PORT=61234 ENABLE_IDE_INTEGRATION=true;"
-        ));
+             CONDUIT_HOOK_ENDPOINT={endpoint} CLAUDE_CODE_SSE_PORT=61234 ENABLE_IDE_INTEGRATION=true;"
+        )));
     }
 
     #[cfg(not(windows))]
