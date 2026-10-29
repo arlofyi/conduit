@@ -2,9 +2,14 @@
  * The Chats list, as pure functions over the desktop's typed `projects` view
  * (src-tauri/src/bridge_view.rs is the authority for its shape). The screen only renders
  * what these return, so the ordering, filtering and counting rules are tested here.
+ *
+ * The list is FLAT, like a messenger's: the project rides on each row as a coloured label
+ * rather than as a section header, and rows sort "needs you" first, then most recent.
  */
 import type { WireProjectsView, WireViewProject, WireViewSession } from "../bridge/protocol";
 import { accentFor } from "./accent";
+import { glyphStateFor, type GlyphState } from "./agents";
+import { listTime, toMs } from "./time";
 
 /** Profile selection meaning "every profile". Desktop profile ids are uuids; this cannot collide. */
 export const ALL_PROFILES = "*all-profiles*";
@@ -12,14 +17,15 @@ export const ALL_PROFILES = "*all-profiles*";
 /** A profile id from the view (`null` = the Default profile), or ALL_PROFILES. */
 export type ProfileSel = string | null;
 
-/** "needs" (flat), "all" (grouped by project) or a project id (flat). */
-export type ChatFilter = "needs" | "all" | string;
+/** "all", "needs", "running", or a project id. */
+export type ChatFilter = "all" | "needs" | "running" | string;
 
 export type Dot = "needs" | "running" | "idle";
 
 export interface Preview {
+  /** needs = amber; running = the "typing…" line; plain = a message; private = a silo row */
   tone: "needs" | "running" | "plain" | "private";
-  /** bold lead-in on a needs row, e.g. "Asks:" */
+  /** bold lead-in: "Asks:" on a needs row, "You:" on the user's own last message */
   prefix: string | null;
   text: string;
 }
@@ -27,11 +33,16 @@ export interface Preview {
 export interface Row {
   id: string;
   projectId: string;
+  projectName: string;
   title: string;
   branch: string | null;
+  /** desktop agent id; the avatar draws its brand mark */
+  agent: string;
   initials: string;
   color: string;
   dot: Dot;
+  /** the desktop's ring vocabulary; undefined = never started this run (no ring) */
+  glyph: GlyphState | undefined;
   needs: boolean;
   time: string;
   preview: Preview;
@@ -40,21 +51,13 @@ export interface Row {
   openable: boolean;
 }
 
-export interface Section {
-  /** project id, or "flat" for an ungrouped list */
-  key: string;
-  /** project header; null for a flat list */
-  title: string | null;
-  color: string | null;
-  count: number;
-  rows: Row[];
-}
-
 export interface Chip {
   key: ChatFilter;
   label: string;
-  /** project swatch; null for Needs you / All */
+  /** project swatch; null for All / Needs you / Running */
   color: string | null;
+  /** amber treatment */
+  needs?: boolean;
 }
 
 export interface ProfileEntry {
@@ -65,7 +68,7 @@ export interface ProfileEntry {
   needs: number;
 }
 
-/** Two-letter avatar per desktop agent id (src/agents.ts lists the seven). */
+/** Two-letter fallback per desktop agent id (src/agents.ts lists the seven). */
 const AGENT_INITIALS: Record<string, string> = {
   claude: "CL",
   codex: "CX",
@@ -89,12 +92,19 @@ export function dotFor(s: WireViewSession): Dot {
   return s.status === "running" ? "running" : "idle";
 }
 
-const RANK: Record<Dot, number> = { needs: 0, running: 1, idle: 2 };
+/** The ring a row's avatar wears: the desktop's `glyphStateFor`, with "loaded" = a live PTY. */
+export function glyphFor(s: WireViewSession): GlyphState | undefined {
+  return glyphStateFor(isNeeds(s) ? "needsInput" : s.status, s.running);
+}
 
 function inProfile(p: WireViewProject, profileId: ProfileSel): boolean {
   return profileId === ALL_PROFILES || (p.profileId ?? null) === profileId;
 }
 
+/**
+ * The row's second line, WhatsApp's precedence: what needs you, then what it is doing right
+ * now (WhatsApp's "typing…"), then the last message ("You: …" for yours), then a state word.
+ */
 export function previewFor(s: WireViewSession): Preview {
   if (s.silo) {
     // Listed (and counted in Needs you) but never opened here: say where to answer it.
@@ -107,16 +117,28 @@ export function previewFor(s: WireViewSession): Preview {
   }
   if (isNeeds(s)) return { tone: "needs", prefix: null, text: "Needs your input" };
   if (s.status === "running") return { tone: "running", prefix: null, text: s.activity ? `${s.activity}…` : "working…" };
+  if (s.lastMessage && s.lastMessage.text) {
+    return { tone: "plain", prefix: s.lastMessage.role === "user" ? "You:" : null, text: s.lastMessage.text };
+  }
   if (s.status === "done") return { tone: "plain", prefix: null, text: "Finished" };
   if (s.stopped) return { tone: "plain", prefix: null, text: "Stopped" };
-  return { tone: "plain", prefix: null, text: s.branch ?? "" };
+  return { tone: "plain", prefix: null, text: s.branch ?? "No messages yet" };
+}
+
+/** When the row last moved: the later of the Mac's status change and the last message. */
+export function lastActivity(s: WireViewSession): number | null {
+  const a = s.updatedAt;
+  const b = toMs(s.lastMessage?.at ?? null);
+  if (a === null) return b;
+  if (b === null) return a;
+  return Math.max(a, b);
 }
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
 
-/** WhatsApp-style age: now · N min · N h · Yesterday · N d · N w. Empty when unknown. */
+/** Coarse age, for the offline bar: now · N min · N h · Yesterday · N d · N w. Empty when unknown. */
 export function relativeTime(ms: number | null, now: number): string {
   if (ms === null || !Number.isFinite(ms)) return "";
   const d = Math.max(0, now - ms);
@@ -136,71 +158,67 @@ export function offlineText(macName: string, lastSeen: number | null, now: numbe
 }
 
 function rowFor(p: WireViewProject, s: WireViewSession, unread: Record<string, number>, now: number): Row {
-  const needs = isNeeds(s);
   return {
     id: s.id,
     projectId: p.id,
+    projectName: p.name,
     title: s.name,
     branch: s.branch,
+    agent: s.agent,
     initials: agentInitials(s.agent),
     color: accentFor(p),
     dot: dotFor(s),
-    needs,
-    time: relativeTime(s.updatedAt, now),
+    glyph: glyphFor(s),
+    needs: isNeeds(s),
+    time: listTime(lastActivity(s), now),
     preview: previewFor(s),
     unread: unread[s.id] ?? 0,
     openable: !s.silo,
   };
 }
 
-function compare(a: { row: Row; at: number | null }, b: { row: Row; at: number | null }): number {
-  const r = RANK[a.row.dot] - RANK[b.row.dot];
-  if (r !== 0) return r;
-  return (b.at ?? -Infinity) - (a.at ?? -Infinity);
+function matches(filter: ChatFilter, p: WireViewProject, s: WireViewSession): boolean {
+  if (filter === "all") return true;
+  if (filter === "needs") return isNeeds(s);
+  if (filter === "running") return !isNeeds(s) && s.status === "running";
+  return p.id === filter;
 }
 
 export function buildRows(
   view: WireProjectsView,
   opts: { profileId: ProfileSel; filter: ChatFilter; unread: Record<string, number>; now: number },
-): Section[] {
+): Row[] {
   const { profileId, filter, unread, now } = opts;
-  const items: { row: Row; at: number | null; project: WireViewProject }[] = [];
+  const items: { row: Row; at: number | null }[] = [];
   for (const p of view.projects) {
     if (!inProfile(p, profileId)) continue;
-    if (filter !== "needs" && filter !== "all" && p.id !== filter) continue;
     for (const s of p.sessions) {
-      if (filter === "needs" && !isNeeds(s)) continue;
-      items.push({ row: rowFor(p, s, unread, now), at: s.updatedAt, project: p });
+      if (!matches(filter, p, s)) continue;
+      items.push({ row: rowFor(p, s, unread, now), at: lastActivity(s) });
     }
   }
-  // Stable sort: equal rank and time keep the desktop's order.
-  items.sort(compare);
-  if (items.length === 0) return [];
-  if (filter !== "all") {
-    return [{ key: "flat", title: null, color: null, count: items.length, rows: items.map((i) => i.row) }];
-  }
-  // Grouped: a project's section sits where its most urgent row would.
-  const sections = new Map<string, Section>();
-  for (const { row, project } of items) {
-    let sec = sections.get(project.id);
-    if (!sec) {
-      sec = { key: project.id, title: project.name, color: accentFor(project), count: 0, rows: [] };
-      sections.set(project.id, sec);
-    }
-    sec.rows.push(row);
-    sec.count++;
-  }
-  return [...sections.values()];
+  // Needs you first, then most recent. Stable sort: ties keep the desktop's order.
+  items.sort((a, b) => Number(b.row.needs) - Number(a.row.needs) || (b.at ?? -Infinity) - (a.at ?? -Infinity));
+  return items.map((i) => i.row);
 }
 
 export function chipsFor(view: WireProjectsView, profileId: ProfileSel): Chip[] {
   const projects = view.projects.filter((p) => inProfile(p, profileId) && p.sessions.length > 0);
-  const needs = projects.reduce((n, p) => n + p.sessions.filter(isNeeds).length, 0);
-  return [
-    { key: "needs", label: `Needs you ${needs}`, color: null },
-    { key: "all", label: "All", color: null },
-    ...projects.map((p) => ({ key: p.id, label: p.name, color: accentFor(p) })),
-  ];
+  const sessions = projects.flatMap((p) => p.sessions);
+  const needs = sessions.filter(isNeeds).length;
+  const running = sessions.filter((s) => !isNeeds(s) && s.status === "running").length;
+  const chips: Chip[] = [{ key: "all", label: "All", color: null }];
+  // A count chip appears only when there is something to count: "Needs you 0" is noise.
+  if (needs > 0) chips.push({ key: "needs", label: `Needs you ${needs}`, color: null, needs: true });
+  if (running > 0) chips.push({ key: "running", label: `Running ${running}`, color: null });
+  for (const p of projects) chips.push({ key: p.id, label: p.name, color: accentFor(p) });
+  return chips;
+}
+
+/** How many sessions in the profile need you (the Chats tab badge). */
+export function needsCount(view: WireProjectsView | null, profileId: ProfileSel): number {
+  if (!view) return 0;
+  return view.projects.filter((p) => inProfile(p, profileId)).reduce((n, p) => n + p.sessions.filter(isNeeds).length, 0);
 }
 
 function counts(view: WireProjectsView, profileId: ProfileSel): { projects: number; needs: number } {
@@ -287,7 +305,7 @@ export function sameRow(a: Row, b: Row): boolean {
   return a.preview.tone === b.preview.tone && a.preview.prefix === b.preview.prefix && a.preview.text === b.preview.text;
 }
 
-/** The filter to apply: one whose chip is gone (other profile, project removed) reads as All. */
+/** The filter to apply: one whose chip is gone (nothing to count, project removed) reads as All. */
 export function resolveFilter(chips: Chip[], filter: ChatFilter): ChatFilter {
   return chips.some((c) => c.key === filter) ? filter : "all";
 }

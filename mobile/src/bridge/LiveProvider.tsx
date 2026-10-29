@@ -22,7 +22,7 @@ import { BridgeClient } from "./BridgeClient";
 import { initialConn, type ConnError, type ConnState } from "./connection";
 import { appendWire, mapHistory, mapProjectsView, sameView, statusPatch, type LivePatch } from "./live";
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
-import { discoverMsg, pairMsg, type WireMac } from "./protocol";
+import { discoverMsg, pairMsg, spawnMsg, type ClientMsg, type WireMac } from "./protocol";
 
 /** Simulator/dev build: also try loopback, and offer "This Mac (simulator)". */
 export const IS_SIMULATOR_OR_DEV = __DEV__;
@@ -82,6 +82,15 @@ export interface SessionLive {
 
 const EMPTY_LIVE: SessionLive = { feed: [], status: "idle", statusAt: 0 };
 
+/** A new-chat request from the phone: the Mac answers `spawned` (or `error`). */
+export type SpawnState =
+  | { phase: "idle" }
+  | { phase: "pending" }
+  | { phase: "spawned"; sessionId: string; projectId: string; name: string }
+  | { phase: "failed"; message: string };
+
+const SPAWN_TIMEOUT_MS = 12_000;
+
 let localSeq = 0;
 
 export interface LiveValue {
@@ -134,6 +143,12 @@ export interface LiveValue {
   prompt: (sessionId: string, text: string) => void;
   /** Stop the session's current turn (Esc on the Mac) and mark it in the open feed */
   interrupt: (sessionId: string) => void;
+  /** send prepared frames (quick actions) */
+  sendFrames: (frames: ClientMsg[]) => void;
+  /** start a new session with its first message; the answer lands in `spawnState` */
+  spawn: (projectId: string, text: string, agent: string) => void;
+  spawnState: SpawnState;
+  resetSpawn: () => void;
   /** the in-app banner on screen, if any */
   banner: Banner | null;
   dismissBanner: () => void;
@@ -175,6 +190,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [sessionLive, setSessionLive] = useState<SessionLive>(EMPTY_LIVE);
   const [context, setContext] = useState<ContextInfo | null>(null);
   const [banner, setBanner] = useState<Banner | null>(null);
+  const [spawnState, setSpawnState] = useState<SpawnState>({ phase: "idle" });
+  const spawnPending = useRef(false);
   /** each session's last known needs/status, shared by the view and status-frame banner paths */
   const signalsRef = useRef<Signals>({});
   /** read inside socket callbacks, which are created once per Mac */
@@ -280,6 +297,20 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           switch (m.type) {
             case "hello":
               setHello({ macName: m.macName, conduitVersion: m.conduitVersion });
+              break;
+            case "spawned":
+              if (spawnPending.current) {
+                spawnPending.current = false;
+                setSpawnState({ phase: "spawned", sessionId: m.sessionId, projectId: m.projectId, name: m.name });
+                clientRef.current?.list(); // the new session belongs in the list now
+              }
+              break;
+            case "error":
+              // the only request that waits on an `error` answer is a spawn
+              if (spawnPending.current) {
+                spawnPending.current = false;
+                setSpawnState({ phase: "failed", message: m.message });
+              }
               break;
             case "macs":
               setDiscovered(m.macs);
@@ -556,7 +587,16 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       status: "idle",
       statusAt: Date.now(),
       activity: undefined,
-      feed: [...s.feed, { kind: "divider", id: `local-interrupt-${localSeq}`, label: "■ Interrupted by you", tone: "warning" }],
+      feed: [
+        ...s.feed,
+        {
+          kind: "divider",
+          id: `local-interrupt-${localSeq}`,
+          label: "Interrupted by you",
+          tone: "warning",
+          at: new Date().toISOString(),
+        },
+      ],
     }));
   }, []);
 
@@ -568,6 +608,40 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     // No optimistic echo: claude logs the injected prompt to its transcript, which
     // the bridge tails back as a `chat` frame — avoids a duplicate user bubble.
     clientRef.current?.prompt(sessionId, trimmed);
+  }, []);
+
+  /** Raw frames for the quick-actions sheet (its table, logic/quickActions.ts, builds them). */
+  const sendFrames = useCallback((frames: ClientMsg[]) => {
+    for (const f of frames) clientRef.current?.send(f);
+  }, []);
+
+  const spawn = useCallback((projectId: string, text: string, agent: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || spawnPending.current) return;
+    const client = clientRef.current;
+    if (!client) {
+      setSpawnState({ phase: "failed", message: "Not connected to your Mac." });
+      return;
+    }
+    spawnPending.current = true;
+    setSpawnState({ phase: "pending" });
+    client.send(spawnMsg(projectId, trimmed, agent));
+  }, []);
+
+  // A spawn the Mac never answers (link dropped mid-request) must not spin forever.
+  useEffect(() => {
+    if (spawnState.phase !== "pending") return;
+    const t = setTimeout(() => {
+      if (!spawnPending.current) return;
+      spawnPending.current = false;
+      setSpawnState({ phase: "failed", message: "Your Mac did not answer. Try again." });
+    }, SPAWN_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [spawnState.phase]);
+
+  const resetSpawn = useCallback(() => {
+    spawnPending.current = false;
+    setSpawnState({ phase: "idle" });
   }, []);
 
   const clearNotice = useCallback(() => setNotice(null), []);
@@ -603,10 +677,18 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       detach,
       prompt,
       interrupt,
+      sendFrames,
+      spawn,
+      spawnState,
+      resetSpawn,
       banner,
       dismissBanner,
     }),
     [
+      sendFrames,
+      spawn,
+      spawnState,
+      resetSpawn,
       loaded,
       macs,
       currentMac,

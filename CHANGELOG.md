@@ -13,6 +13,7 @@ All notable changes to Conduit are documented here. This project uses
 - **Changed — The mobile bridge no longer opens to the local network.** The old `CONDUIT_BRIDGE_TOKEN` setting is gone; the bridge listens only on this Mac and its Tailscale address.
 - **Changed — Tool calls in session chat show what matters.** A failed call stays on its own line with its error, a file edit shows `+N −M` and a short diff, and only finished, successful calls fold into a one-line summary such as "Ran 2 shell commands, read 3 files" — on desktop and phone alike.
 - **Fixed — Session chat no longer shows Claude's own messages as yours.** Background-task notices, messages from other sessions, scheduled check-ins, slash commands and loaded skills now appear as small notes instead of chat bubbles from you.
+- **Changed — The phone app looks and feels like Conduit.** Chats read like a messenger — times, grouped bubbles, formatted replies, a composer that grows and shrinks — with Conduit's agent marks, project colours and Liquid Glass bars.
 - **Added — Session chat shows compaction, questions and plans.** "Conversation compacted" and interruptions appear as dividers, AskUserQuestion prompts show their options, plans render as a card, and runs of tool calls collapse into one expandable line.
 
 ## 0.46.1 — 2026-10-29

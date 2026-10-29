@@ -1,4 +1,4 @@
-import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { createNativeBottomTabNavigator } from "@react-navigation/bottom-tabs/unstable";
 import {
   DarkTheme,
   DefaultTheme,
@@ -23,11 +23,14 @@ import { ConnectScreen } from "./src/screens/ConnectScreen";
 import { PairScreen } from "./src/screens/PairScreen";
 import { ChatsScreen } from "./src/screens/ChatsScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
+import { NewChatScreen } from "./src/screens/NewChatScreen";
+import { ChatsMenuScreen, QuickActionsScreen, SessionInfoScreen } from "./src/screens/Sheets";
+import { ListSelectionProvider, useListSelection } from "./src/data/ListSelection";
+import { needsCount, resolveProfile } from "./src/logic/chatList";
 import { ThemeProvider, useTheme } from "./src/theme/ThemeContext";
-import { TYPE } from "./src/theme/type";
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
-const Tab = createBottomTabNavigator<TabParamList>();
+const Tab = createNativeBottomTabNavigator<TabParamList>();
 const navigationRef = createNavigationContainerRef<RootStackParamList>();
 
 /** A banner tap opens its chat. Over another chat it REPLACES it (one chat streams at a time,
@@ -39,27 +42,52 @@ function openFromBanner(b: BannerData) {
   else navigationRef.navigate("Chat", params);
 }
 
+/**
+ * The NATIVE tab bar (UITabBarController via react-native-screens), so iOS 26 draws its own
+ * Liquid Glass capsule floating over the content, with SF Symbols and a needs-you badge; older
+ * iOS draws its standard translucent bar. Content scrolls under it.
+ */
 function Tabs() {
   const { palette } = useTheme();
+  const { view } = useLive();
+  const { profileSel } = useListSelection();
+  const profile = view ? resolveProfile(view, profileSel === undefined ? view.activeProfileId : profileSel) : null;
+  const needs = needsCount(view, profile);
   return (
     <Tab.Navigator
       screenOptions={{
         headerShown: false,
         tabBarActiveTintColor: palette.accent,
-        tabBarInactiveTintColor: palette.textDim,
-        tabBarStyle: { backgroundColor: palette.sidebarBg, borderTopColor: palette.border },
-        // text-only tabs, as in the prototype
-        tabBarIcon: () => null,
-        tabBarIconStyle: { display: "none" },
-        tabBarLabelStyle: { fontSize: TYPE.subhead, fontWeight: "600" },
-        tabBarLabelPosition: "beside-icon",
+        tabBarInactiveTintColor: palette.textMid,
+        tabBarBlurEffect: palette.appearance === "dark" ? "systemChromeMaterialDark" : "systemChromeMaterialLight",
+        tabBarBadgeStyle: { backgroundColor: palette.amber, color: palette.meText },
       }}
     >
-      <Tab.Screen name="Chats" component={ChatsScreen} />
-      <Tab.Screen name="Settings" component={SettingsScreen} />
+      <Tab.Screen
+        name="Chats"
+        component={ChatsScreen}
+        options={{
+          tabBarIcon: { type: "sfSymbol", name: "bubble.left.and.bubble.right" },
+          tabBarBadge: needs > 0 ? needs : undefined,
+        }}
+      />
+      <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: { type: "sfSymbol", name: "gearshape" } }} />
     </Tab.Navigator>
   );
 }
+
+/** Fitted native form sheet; transparent so iOS 26 gives it its own glass. */
+const SHEET = {
+  presentation: "formSheet" as const,
+  sheetAllowedDetents: "fitToContents" as const,
+  sheetGrabberVisible: true,
+  sheetCornerRadius: 28,
+  // Otherwise the sheet adopts the FIRST scroll view inside it as its content scroll view and
+  // offsets it (the New chat sheet's project row rendered on top of the title).
+  sheetExpandsWhenScrolledToEdge: false,
+  gestureEnabled: true,
+  contentStyle: { backgroundColor: "transparent" },
+};
 
 function Inner() {
   const { palette } = useTheme();
@@ -100,6 +128,10 @@ function Inner() {
             <Stack.Screen name="Chat" component={ChatScreen} />
             <Stack.Screen name="Connect" component={ConnectScreen} />
             <Stack.Screen name="Pair" component={PairScreen} />
+            <Stack.Screen name="NewChat" component={NewChatScreen} options={SHEET} />
+            <Stack.Screen name="ChatsMenu" component={ChatsMenuScreen} options={SHEET} />
+            <Stack.Screen name="QuickActions" component={QuickActionsScreen} options={SHEET} />
+            <Stack.Screen name="SessionInfo" component={SessionInfoScreen} options={SHEET} />
           </Stack.Group>
         ) : (
           <Stack.Group navigationKey="no-mac">
@@ -120,7 +152,9 @@ export default function App() {
         <PrefsProvider>
           <ThemeProvider>
             <LiveProvider>
-              <Inner />
+              <ListSelectionProvider>
+                <Inner />
+              </ListSelectionProvider>
             </LiveProvider>
           </ThemeProvider>
         </PrefsProvider>

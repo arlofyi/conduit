@@ -15,6 +15,7 @@ function sess(over: Partial<WireViewSession> & { id: string }): WireViewSession 
     activity: null,
     updatedAt: null,
     needs: null,
+    lastMessage: null,
     ...over,
   };
 }

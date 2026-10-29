@@ -33,6 +33,12 @@ describe("mapChatItem", () => {
     });
     expect(feed.map((i) => i.kind)).toEqual(["event", "result"]);
   });
+  it("carries the line's time and omits it when absent", () => {
+    expect(mapChatItem({ kind: "bubble", role: "user", text: "hi", at: "2026-10-29T20:11:42.123Z" })?.at).toBe(
+      "2026-10-29T20:11:42.123Z",
+    );
+    expect(mapChatItem({ kind: "divider", label: "x", tone: "info" })).not.toHaveProperty("at");
+  });
   it("assigns an id", () => {
     expect(mapChatItem({ kind: "bubble", role: "assistant", text: "yo" })?.id).toBeTruthy();
   });
@@ -107,6 +113,7 @@ describe("mapProjectsView", () => {
     activity: "Editing x.ts",
     updatedAt: 1700000000000,
     needs: { kind: "ask", text: "Ship it?" },
+    lastMessage: { role: "assistant", text: "Done: tests pass.", at: "2026-10-29T20:11:42.123Z" },
   };
   const frame = {
     type: "projects",
@@ -128,7 +135,22 @@ describe("mapProjectsView", () => {
       ...frame,
       projects: [{ ...frame.projects[0], sessions: [{ ...session, silo: true }] }],
     });
-    expect(v.projects[0].sessions[0]).toMatchObject({ silo: true, activity: null, needs: { kind: "input", text: null } });
+    expect(v.projects[0].sessions[0]).toMatchObject({
+      silo: true,
+      activity: null,
+      needs: { kind: "input", text: null },
+      lastMessage: null,
+    });
+  });
+
+  it("reads lastMessage defensively (Task 8a shape)", () => {
+    const one = (lastMessage: unknown) =>
+      mapProjectsView({ ...frame, projects: [{ ...frame.projects[0], sessions: [{ ...session, lastMessage }] }] })
+        .projects[0].sessions[0].lastMessage;
+    expect(one({ role: "user", text: "hi", at: null })).toEqual({ role: "user", text: "hi", at: null });
+    expect(one({ role: "system", text: "x", at: null })).toBeNull();
+    expect(one({ role: "user", text: 3 })).toBeNull();
+    expect(one(undefined)).toBeNull();
   });
 
   it("degrades a malformed frame instead of throwing", () => {
@@ -151,6 +173,7 @@ describe("mapProjectsView", () => {
         activity: null,
         updatedAt: null,
         needs: null,
+        lastMessage: null,
       },
     ]);
   });

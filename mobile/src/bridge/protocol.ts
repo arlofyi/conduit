@@ -32,8 +32,11 @@ export interface WireDiff {
   more: number;
 }
 
-/** A transcript-derived chat item (no id on the wire). Kinds mirror src-tauri/src/transcript_item_kinds.json. */
-export type WireChatItem =
+/** A transcript-derived chat item (no id on the wire). Kinds mirror src-tauri/src/transcript_item_kinds.json.
+ * `at` is the transcript line's ISO timestamp, omitted when the line had none. */
+export type WireChatItem = WireChatBody & { at?: string };
+
+type WireChatBody =
   | { kind: "bubble"; role: "user" | "assistant"; text: string }
   | {
       kind: "event";
@@ -74,6 +77,14 @@ export type WireChatItem =
 
 export type WireStatus = "idle" | "running" | "needsInput" | "done";
 
+/** The session's last chat bubble as plain text (<= 160 chars); null for silo / non-Claude / none. */
+export interface WireLastMessage {
+  role: "user" | "assistant";
+  text: string;
+  /** ISO time of the line; null when it had none */
+  at: string | null;
+}
+
 export type WireNeeds = { kind: "ask"; text: string | null } | { kind: "input"; text: null } | null;
 
 export interface WireViewSession {
@@ -92,6 +103,7 @@ export interface WireViewSession {
   /** unix ms */
   updatedAt: number | null;
   needs: WireNeeds;
+  lastMessage: WireLastMessage | null;
 }
 
 export interface WireViewProject {
@@ -179,6 +191,13 @@ export const listMsg = (): ClientMsg => ({ type: "list" });
 export const attachMsg = (id: string): ClientMsg => ({ type: "attach", session_id: id });
 export const inputMsg = (id: string, data: string): ClientMsg => ({ type: "input", session_id: id, data });
 export const interruptMsg = (id: string): ClientMsg => ({ type: "interrupt", sessionId: id });
+/** Start a new session in a project with its first message; the Mac answers `spawned` or `error`. */
+export const spawnMsg = (projectId: string, prompt: string, agent: string): ClientMsg => ({
+  type: "spawn",
+  project_id: projectId,
+  prompt,
+  agent,
+});
 
 /** A chat message as PTY input: bracketed paste around the text, then a bare `\r`.
  * Mirrors the desktop's `pty::paste_and_submit` (src-tauri/src/pty.rs) -- keep them in step.

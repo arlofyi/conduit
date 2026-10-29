@@ -15,7 +15,9 @@ import {
   profileSummary,
   resolveProfile,
   relativeTime,
+  needsCount,
 } from "./chatList";
+import { listTime } from "./time";
 
 const NOW = 1_800_000_000_000;
 const MIN = 60_000;
@@ -34,6 +36,7 @@ function sess(over: Partial<WireViewSession> & { id: string }): WireViewSession 
     activity: null,
     updatedAt: null,
     needs: null,
+    lastMessage: null,
     ...over,
   };
 }
@@ -67,48 +70,78 @@ const VIEW: WireProjectsView = {
 const ids = (rows: { id: string }[]) => rows.map((r) => r.id);
 
 describe("buildRows", () => {
-  it("needs_first_then_running_then_idle", () => {
-    const flat = buildRows(VIEW, { profileId: null, filter: "conduit", unread: {}, now: NOW });
-    expect(flat).toHaveLength(1);
-    expect(flat[0].title).toBeNull();
-    expect(ids(flat[0].rows)).toEqual(["need", "run-new", "run-old", "idle-new", "idle-null"]);
+  it("needs_first_then_most_recent", () => {
+    const rows = buildRows(VIEW, { profileId: null, filter: "conduit", unread: {}, now: NOW });
+    // running no longer outranks a more recent idle row: recency decides after needs
+    expect(ids(rows)).toEqual(["need", "idle-new", "run-new", "run-old", "idle-null"]);
   });
 
-  it("groups by project under All, ordered by each group's most urgent row", () => {
-    const secs = buildRows(VIEW, { profileId: null, filter: "all", unread: {}, now: NOW });
-    expect(secs.map((s) => s.key)).toEqual(["arlo", "conduit"]);
-    expect(secs[1]).toMatchObject({ title: "CONDUIT", count: 5, color: "#b989b1" });
+  it("is one flat list across projects under All", () => {
+    const rows = buildRows(VIEW, { profileId: null, filter: "all", unread: {}, now: NOW });
+    expect(ids(rows)).toEqual(["ask", "need", "idle-new", "run-new", "run-old", "idle-null"]);
+    expect(rows[2]).toMatchObject({ projectName: "CONDUIT", color: "#b989b1" });
   });
 
-  it("is flat across projects for Needs you", () => {
-    const secs = buildRows(VIEW, { profileId: null, filter: "needs", unread: {}, now: NOW });
-    expect(secs).toHaveLength(1);
-    expect(ids(secs[0].rows)).toEqual(["ask", "need"]);
+  it("filters Needs you and Running", () => {
+    expect(ids(buildRows(VIEW, { profileId: null, filter: "needs", unread: {}, now: NOW }))).toEqual(["ask", "need"]);
+    // a running session that needs you is a Needs you row, not a Running one
+    expect(ids(buildRows(VIEW, { profileId: null, filter: "running", unread: {}, now: NOW }))).toEqual([
+      "run-new",
+      "run-old",
+    ]);
+  });
+
+  it("sorts by the later of the status change and the last message", () => {
+    const v: WireProjectsView = {
+      ...VIEW,
+      projects: [
+        proj("p", null, [
+          sess({ id: "old-status-new-msg", updatedAt: NOW - 60 * MIN, lastMessage: { role: "assistant", text: "hi", at: new Date(NOW - MIN).toISOString() } }),
+          sess({ id: "mid", updatedAt: NOW - 10 * MIN }),
+        ]),
+      ],
+    };
+    expect(ids(buildRows(v, { profileId: null, filter: "all", unread: {}, now: NOW }))).toEqual(["old-status-new-msg", "mid"]);
   });
 
   it("profile_filter_and_all_profiles", () => {
     const work = buildRows(VIEW, { profileId: "work", filter: "all", unread: {}, now: NOW });
-    expect(work.flatMap((s) => ids(s.rows))).toEqual(["c1"]);
+    expect(ids(work)).toEqual(["c1"]);
     const all = buildRows(VIEW, { profileId: ALL_PROFILES, filter: "all", unread: {}, now: NOW });
-    expect(all.flatMap((s) => ids(s.rows))).toHaveLength(7);
+    expect(all).toHaveLength(7);
     // a project chip from another profile shows nothing rather than leaking across
     expect(buildRows(VIEW, { profileId: "work", filter: "conduit", unread: {}, now: NOW })).toEqual([]);
   });
 
   it("builds the row anatomy", () => {
-    const [sec] = buildRows(VIEW, { profileId: null, filter: "arlo", unread: { ask: 2 }, now: NOW });
-    expect(sec.rows[0]).toMatchObject({
+    const [row] = buildRows(VIEW, { profileId: null, filter: "arlo", unread: { ask: 2 }, now: NOW });
+    expect(row).toMatchObject({
       id: "ask",
       projectId: "arlo",
+      projectName: "ARLO",
       title: "ask",
+      agent: "claude",
       initials: "CL",
       dot: "needs",
+      glyph: "needsInput",
       needs: true,
-      time: "5 min",
+      time: listTime(NOW - 5 * MIN, NOW),
       unread: 2,
       openable: true,
       preview: { tone: "needs", prefix: "Asks:", text: "Ship it?" },
     });
+  });
+
+  it("rings like the desktop: a live idle session rings, a never-started one does not", () => {
+    const rows = buildRows(VIEW, { profileId: null, filter: "conduit", unread: {}, now: NOW });
+    const by = (id: string) => rows.find((r) => r.id === id)!;
+    expect(by("run-new").glyph).toBe("running");
+    expect(by("idle-null").glyph).toBeUndefined();
+    const live = buildRows(
+      { ...VIEW, projects: [proj("p", null, [sess({ id: "l", running: true }), sess({ id: "d", status: "done" })])] },
+      { profileId: null, filter: "all", unread: {}, now: NOW },
+    );
+    expect(live.map((r) => r.glyph)).toEqual(["idle", "done"]);
   });
 
   it("silo_row_not_openable_no_preview", () => {
@@ -116,7 +149,7 @@ describe("buildRows", () => {
       ...VIEW,
       projects: [proj("p", null, [sess({ id: "s", silo: true, status: "running", activity: "Editing secret.ts" })])],
     };
-    const row = buildRows(v, { profileId: null, filter: "all", unread: {}, now: NOW })[0].rows[0];
+    const row = buildRows(v, { profileId: null, filter: "all", unread: {}, now: NOW })[0];
     expect(row.openable).toBe(false);
     expect(row.preview).toEqual({ tone: "private", prefix: null, text: "Private session" });
     expect(JSON.stringify(row)).not.toContain("secret");
@@ -126,12 +159,22 @@ describe("buildRows", () => {
 describe("chipsFor", () => {
   it("needs_chip_count", () => {
     const chips = chipsFor(VIEW, null);
-    expect(chips[0]).toEqual({ key: "needs", label: "Needs you 2", color: null });
-    expect(chips[1]).toEqual({ key: "all", label: "All", color: null });
+    expect(chips[0]).toEqual({ key: "all", label: "All", color: null });
+    expect(chips[1]).toEqual({ key: "needs", label: "Needs you 2", color: null, needs: true });
+    expect(chips[2]).toEqual({ key: "running", label: "Running 2", color: null });
     // one per project with sessions in the profile; "empty" has none
-    expect(chips.slice(2).map((c) => c.key)).toEqual(["conduit", "arlo"]);
-    expect(chipsFor(VIEW, "work")[0].label).toBe("Needs you 0");
-    expect(chipsFor(VIEW, ALL_PROFILES).slice(2).map((c) => c.key)).toEqual(["conduit", "arlo", "client"]);
+    expect(chips.slice(3).map((c) => c.key)).toEqual(["conduit", "arlo"]);
+    expect(chipsFor(VIEW, ALL_PROFILES).slice(3).map((c) => c.key)).toEqual(["conduit", "arlo", "client"]);
+  });
+
+  it("hides a count chip with nothing to count", () => {
+    expect(chipsFor(VIEW, "work").map((c) => c.key)).toEqual(["all", "client"]);
+  });
+
+  it("needsCount feeds the tab badge", () => {
+    expect(needsCount(VIEW, null)).toBe(2);
+    expect(needsCount(VIEW, "work")).toBe(0);
+    expect(needsCount(null, null)).toBe(0);
   });
 });
 
@@ -167,7 +210,26 @@ describe("previewFor", () => {
     expect(previewFor(sess({ id: "a", status: "done" })).text).toBe("Finished");
     expect(previewFor(sess({ id: "a", stopped: true })).text).toBe("Stopped");
     expect(previewFor(sess({ id: "a", branch: "feat/x" })).text).toBe("feat/x");
-    expect(previewFor(sess({ id: "a" })).text).toBe("");
+    expect(previewFor(sess({ id: "a" })).text).toBe("No messages yet");
+  });
+
+  it("previewLine: the last message, 'You:' for the user's own", () => {
+    const at = new Date(NOW).toISOString();
+    expect(previewFor(sess({ id: "a", lastMessage: { role: "assistant", text: "pong", at } }))).toEqual({
+      tone: "plain",
+      prefix: null,
+      text: "pong",
+    });
+    expect(previewFor(sess({ id: "a", status: "done", lastMessage: { role: "user", text: "ping", at } }))).toEqual({
+      tone: "plain",
+      prefix: "You:",
+      text: "ping",
+    });
+    // what needs you, and what it is doing now, outrank the last message
+    const lm = { role: "assistant" as const, text: "old", at };
+    expect(previewFor(sess({ id: "a", status: "running", lastMessage: lm })).tone).toBe("running");
+    expect(previewFor(sess({ id: "a", needs: { kind: "ask", text: "Ok?" }, lastMessage: lm })).text).toBe("Ok?");
+    expect(previewFor(sess({ id: "a", silo: true, lastMessage: lm })).text).toBe("Private session");
   });
 
   it("silo_needs_preview_points_to_the_mac", () => {
@@ -175,10 +237,10 @@ describe("previewFor", () => {
     expect(previewFor(s)).toEqual({ tone: "private", prefix: null, text: "Private session — open it on your Mac" });
     // still a needs row (counted in Needs you), dimmed and not openable
     const v: WireProjectsView = { ...VIEW, projects: [proj("p", null, [s])] };
-    const row = buildRows(v, { profileId: null, filter: "needs", unread: {}, now: NOW })[0].rows[0];
+    const row = buildRows(v, { profileId: null, filter: "needs", unread: {}, now: NOW })[0];
     expect(row.needs).toBe(true);
     expect(row.openable).toBe(false);
-    expect(chipsFor(v, null)[0].label).toBe("Needs you 1");
+    expect(chipsFor(v, null)[1].label).toBe("Needs you 1");
     // a silo session that needs nothing keeps the plain copy
     expect(previewFor(sess({ id: "b", silo: true })).text).toBe("Private session");
   });
@@ -291,7 +353,7 @@ describe("profile labels", () => {
 
 describe("render stability", () => {
   it("sameRow compares rows by value, including the preview", () => {
-    const rows = () => buildRows(VIEW, { profileId: null, filter: "conduit", unread: {}, now: NOW })[0].rows;
+    const rows = () => buildRows(VIEW, { profileId: null, filter: "conduit", unread: {}, now: NOW });
     const a = rows();
     const b = rows();
     expect(a[0]).not.toBe(b[0]);

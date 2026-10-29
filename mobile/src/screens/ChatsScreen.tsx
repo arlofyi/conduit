@@ -1,82 +1,61 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Modal,
-  Pressable,
-  RefreshControl,
-  ScrollView,
-  SectionList,
-  StyleSheet,
-  Text,
-  View,
-} from "react-native";
+import { FlatList, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
-import { tint } from "../logic/accent";
+import { AgentAvatar } from "../components/AgentAvatar";
+import { GlassCircle } from "../components/Glass";
+import { useListSelection } from "../data/ListSelection";
+import { mix } from "../logic/color";
 import {
   buildRows,
   chipsFor,
   offlineText,
-  profileName,
-  profileSheet,
-  profileSummary,
   resolveFilter,
   resolveProfile,
   sameRow,
-  type ChatFilter,
-  type ProfileSel,
+  type Chip,
   type Row,
-  type Section,
 } from "../logic/chatList";
 import { connStatus } from "../logic/connCopy";
 import type { ChatsProps } from "../navigation";
-import type { Palette } from "../theme/palettes";
 import { useTheme } from "../theme/ThemeContext";
-import { MIN_TOUCH, TYPE } from "../theme/type";
+import { TYPE } from "../theme/type";
 
 /** How long a pull-to-refresh spins without an answer before giving up. */
 const REFRESH_TIMEOUT_MS = 5000;
 
-/** The relative times only need to tick about as often as their coarsest bucket changes. */
+/** Row times only change at minute granularity. */
 const CLOCK_MS = 30_000;
+
+const AVATAR = 52;
+/** the avatar's footprint including its ring (AgentAvatar) */
+const AVATAR_OUTER = AVATAR + 8;
+const GUTTER = 14;
+const TEXT_INSET = GUTTER + AVATAR_OUTER + 12;
 
 export function ChatsScreen({ navigation }: ChatsProps) {
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
   const { view, viewAt, refreshProjects, unread, lastSeen, conn, currentMac } = useLive();
+  const { profileSel, filter, setFilter } = useListSelection();
   const macName = currentMac?.macName ?? "your Mac";
-
-  // undefined = "not chosen yet on this Mac": follow the Mac's active profile.
-  const [profileSel, setProfileSel] = useState<ProfileSel | undefined>(undefined);
-  const [filter, setFilter] = useState<ChatFilter>("all");
-  const [sheetOpen, setSheetOpen] = useState(false);
-
-  // Another Mac has other profiles and projects: start it from its own active profile and All.
-  const macId = currentMac?.deviceId ?? null;
-  useEffect(() => {
-    setProfileSel(undefined);
-    setFilter("all");
-    setSheetOpen(false);
-  }, [macId]);
 
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), CLOCK_MS);
     return () => clearInterval(t);
   }, []);
-  // A fresh view re-reads the clock too, so a row that just changed never reads "1 min".
+  // A fresh view re-reads the clock too, so a row that just changed shows the right time.
   useEffect(() => setNow(Date.now()), [viewAt]);
 
   const profileId = view ? resolveProfile(view, profileSel === undefined ? view.activeProfileId : profileSel) : null;
   const chips = useMemo(() => (view ? chipsFor(view, profileId) : []), [view, profileId]);
-  // A filter whose chip is gone (project removed, or now empty) shows All rather than nothing.
+  // A filter whose chip is gone (nothing left to count, project removed) shows All.
   const activeFilter = view ? resolveFilter(chips, filter) : filter;
-  const sections = useMemo(
-    // SectionList reads each section's rows from `data`
-    () =>
-      (view ? buildRows(view, { profileId, filter: activeFilter, unread, now }) : []).map((s) => ({ ...s, data: s.rows })),
+  const rows = useMemo(
+    () => (view ? buildRows(view, { profileId, filter: activeFilter, unread, now }) : []),
     [view, profileId, activeFilter, unread, now],
   );
-  const sheet = useMemo(() => (view ? profileSheet(view) : []), [view]);
 
   // Pull to refresh: spin until the next view lands (or give up quietly).
   const [refreshing, setRefreshing] = useState(false);
@@ -101,12 +80,6 @@ export function ChatsScreen({ navigation }: ChatsProps) {
   const plainDrop = !conn.error || conn.error.kind === "closed";
   const offline = ready ? null : lastSeen !== null && plainDrop ? offlineText(macName, lastSeen, now) : status.text;
 
-  const pickProfile = (id: ProfileSel) => {
-    setProfileSel(id);
-    setFilter("all");
-    setSheetOpen(false);
-  };
-
   const open = useCallback(
     (row: Row) => {
       if (!row.openable) return;
@@ -115,188 +88,133 @@ export function ChatsScreen({ navigation }: ChatsProps) {
     [navigation],
   );
 
+  // The bar's hairline appears only once the list has scrolled under it, as iOS bars do.
+  const [scrolled, setScrolled] = useState(false);
+
   const empty = !view
     ? ready
       ? "Loading sessions…"
       : status.text
     : activeFilter === "needs"
       ? "Nothing needs you right now."
-      : "No sessions here.";
+      : view.projects.length === 0
+        ? `No projects on ${macName} yet.`
+        : "No sessions here yet. Tap + to start one.";
 
   return (
     <View style={{ flex: 1, backgroundColor: p.panelBg }}>
-      {/* header */}
+      {/* compact top bar: "…" (profile, Switch Mac) · Chats · "+" (new chat) */}
       <View
         style={{
-          paddingTop: insets.top + 6,
-          paddingHorizontal: 16,
-          paddingBottom: 10,
-          backgroundColor: p.sidebarBg,
-          borderBottomWidth: StyleSheet.hairlineWidth,
-          borderBottomColor: p.border,
+          paddingTop: insets.top + 4,
+          paddingHorizontal: GUTTER,
+          paddingBottom: 8,
           flexDirection: "row",
           alignItems: "center",
+          borderBottomWidth: StyleSheet.hairlineWidth,
+          borderBottomColor: scrolled ? p.border : "transparent",
         }}
       >
-        <Text style={{ flex: 1, fontSize: TYPE.title, fontWeight: "700", color: p.textBright }}>Chats</Text>
-        {view && (
-          <Pressable
-            onPress={() => setSheetOpen(true)}
-            hitSlop={8}
-            accessibilityRole="button"
-            accessibilityLabel={`Profile: ${profileName(view, profileId)}. Change profile`}
-            style={{
-              backgroundColor: p.selectionBg,
-              borderRadius: 14,
-              paddingHorizontal: 11,
-              paddingVertical: 6,
-              flexDirection: "row",
-            }}
-          >
-            <Text style={{ fontSize: TYPE.footnote, color: p.textMid }}>Profile: </Text>
-            <Text style={{ fontSize: TYPE.footnote, color: p.accent, fontWeight: "700" }}>
-              {profileName(view, profileId)}
-            </Text>
-            <Text style={{ fontSize: TYPE.footnote, color: p.textMid }}> ▾</Text>
-          </Pressable>
-        )}
+        <GlassCircle symbol="ellipsis" label="Profile and Mac" onPress={() => navigation.navigate("ChatsMenu")} />
+        <Text
+          accessibilityRole="header"
+          style={{ flex: 1, textAlign: "center", fontSize: TYPE.headline, fontWeight: "600", color: p.textBright }}
+        >
+          Chats
+        </Text>
+        <GlassCircle
+          symbol="plus"
+          primary
+          label="New chat"
+          disabled={!ready || !view || view.projects.length === 0}
+          onPress={() => navigation.navigate("NewChat")}
+        />
       </View>
 
-      {/* slim offline bar */}
       {offline && (
         <Pressable
           onPress={() => navigation.navigate("Settings")}
           accessibilityRole="button"
-          style={{
-            flexDirection: "row",
-            alignItems: "center",
-            gap: 7,
-            paddingHorizontal: 16,
-            paddingVertical: 6,
-            backgroundColor: p.selectionBg,
-          }}
+          style={{ flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: GUTTER + 2, paddingVertical: 6 }}
         >
-          <View
-            style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: status.tone === "busy" ? p.amber : p.red }}
-          />
-          <Text style={{ flex: 1, fontSize: TYPE.caption, color: p.textMid }} numberOfLines={1}>
+          <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: status.tone === "busy" ? p.amber : p.red }} />
+          <Text style={{ flex: 1, fontSize: TYPE.footnote, color: p.textMid }} numberOfLines={1}>
             {offline}
           </Text>
         </Pressable>
       )}
 
-      {/* filter chips */}
-      {chips.length > 0 && (
-        <View>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={{ gap: 6, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 6 }}
-          >
-            {chips.map((c) => (
-              <ChipView key={c.key} chip={c} on={activeFilter === c.key} needs={c.key === "needs"} onPress={() => setFilter(c.key)} />
-            ))}
-          </ScrollView>
-        </View>
-      )}
-
-      <SectionList<Row, Section>
-        sections={sections}
+      <FlatList
+        data={rows}
         keyExtractor={(r) => r.id}
-        stickySectionHeadersEnabled={false}
-        contentContainerStyle={{ paddingBottom: insets.bottom + 24, flexGrow: 1 }}
-        refreshControl={
-          <RefreshControl
-            refreshing={refreshing}
-            onRefresh={onRefresh}
-            enabled={ready}
-            tintColor={p.accent}
-            colors={[p.accent]}
-          />
-        }
-        renderSectionHeader={({ section }) =>
-          section.title === null ? null : (
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 4 }}>
-              {section.color && <Swatch color={section.color} />}
-              <Text
-                style={{
-                  fontSize: TYPE.micro,
-                  fontWeight: "600",
-                  letterSpacing: 0.6,
-                  textTransform: "uppercase",
-                  color: p.textMid,
-                  flexShrink: 1,
-                }}
-                numberOfLines={1}
-              >
-                {section.title}
-              </Text>
-              <View style={{ flex: 1 }} />
-              <Text style={{ fontSize: TYPE.micro, color: p.textDim }}>
-                {section.count} session{section.count === 1 ? "" : "s"}
-              </Text>
-            </View>
-          )
-        }
         renderItem={({ item }) => <ChatRow row={item} onOpen={open} />}
+        ItemSeparatorComponent={Separator}
+        contentInsetAdjustmentBehavior="automatic"
+        onScroll={(e) => setScrolled(e.nativeEvent.contentOffset.y > 2)}
+        scrollEventThrottle={64}
+        contentContainerStyle={{ paddingBottom: 24, flexGrow: 1 }}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} enabled={ready} tintColor={p.accent} colors={[p.accent]} />
+        }
+        ListHeaderComponent={
+          chips.length > 1 ? <ChipBar chips={chips} active={activeFilter} onPick={setFilter} /> : null
+        }
         ListEmptyComponent={
-          <View style={{ paddingVertical: 40, paddingHorizontal: 24, alignItems: "center" }}>
-            <Text style={{ color: p.textMid, fontSize: TYPE.subhead, textAlign: "center" }}>{empty}</Text>
+          <View style={{ paddingVertical: 48, paddingHorizontal: 32, alignItems: "center" }}>
+            <Text style={{ color: p.textMid, fontSize: TYPE.subhead, textAlign: "center", lineHeight: 21 }}>{empty}</Text>
           </View>
         }
-      />
-
-      <ProfileSheet
-        open={sheetOpen}
-        onClose={() => setSheetOpen(false)}
-        entries={sheet}
-        selected={profileId}
-        onPick={pickProfile}
-        p={p}
-        bottomInset={insets.bottom}
       />
     </View>
   );
 }
 
-function Swatch({ color }: { color: string }) {
-  return <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: color }} />;
+function Separator() {
+  const { palette: p } = useTheme();
+  return <View style={{ height: StyleSheet.hairlineWidth, marginLeft: TEXT_INSET, backgroundColor: p.border }} />;
 }
 
-function ChipView({
-  chip,
-  on,
-  needs,
-  onPress,
-}: {
-  chip: { label: string; color: string | null };
-  on: boolean;
-  needs: boolean;
-  onPress: () => void;
-}) {
+function ChipBar({ chips, active, onPick }: { chips: Chip[]; active: string; onPick: (k: string) => void }) {
+  return (
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={{ gap: 7, paddingHorizontal: GUTTER, paddingTop: 4, paddingBottom: 8 }}
+    >
+      {chips.map((c) => (
+        <ChipView key={c.key} chip={c} on={active === c.key} onPress={() => onPick(c.key)} />
+      ))}
+    </ScrollView>
+  );
+}
+
+/** Slim outlined chips; the selected one takes a tint of its own colour, as WhatsApp's does. */
+function ChipView({ chip, on, onPress }: { chip: Chip; on: boolean; onPress: () => void }) {
   const { palette: p } = useTheme();
-  const bg = needs ? (on ? p.amber : p.pillNeedsBg) : on ? p.accent : p.chipBg;
-  const fg = on ? p.panelBg : needs ? p.pillNeedsText : p.chipText;
+  const hue = chip.needs ? p.amber : chip.color ?? p.accent;
+  const fg = on ? (chip.needs ? p.pillNeedsText : p.textBright) : chip.needs ? p.pillNeedsText : p.textMid;
   return (
     <Pressable
       onPress={onPress}
       accessibilityRole="button"
       accessibilityState={{ selected: on }}
       hitSlop={{ top: 8, bottom: 8 }}
-      style={{
+      style={({ pressed }) => ({
         flexDirection: "row",
         alignItems: "center",
-        gap: 5,
-        paddingHorizontal: 11,
-        paddingVertical: 6,
-        borderRadius: 14,
-        backgroundColor: bg,
+        gap: 6,
+        height: 30,
+        paddingHorizontal: 12,
+        borderRadius: 15,
         borderWidth: 1,
-        borderColor: needs ? p.amber : "transparent",
-      }}
+        borderColor: on ? mix(hue, p.panelBg, 0.55) : chip.needs ? mix(p.amber, p.panelBg, 0.4) : p.border,
+        backgroundColor: on ? mix(hue, p.panelBg, 0.16) : pressed ? p.sidebarBg : "transparent",
+      })}
     >
-      {chip.color && <Swatch color={chip.color} />}
-      <Text style={{ fontSize: TYPE.caption, color: fg, fontWeight: on ? "700" : "500" }}>{chip.label}</Text>
+      {chip.color && <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: chip.color }} />}
+      <Text style={{ fontSize: TYPE.footnote, color: fg, fontWeight: on ? "600" : "500", fontVariant: ["tabular-nums"] }}>
+        {chip.label}
+      </Text>
     </Pressable>
   );
 }
@@ -306,9 +224,9 @@ const ChatRow = React.memo(ChatRowView, (a, b) => a.onOpen === b.onOpen && sameR
 
 function ChatRowView({ row, onOpen }: { row: Row; onOpen: (row: Row) => void }) {
   const { palette: p } = useTheme();
-  const dot = row.dot === "needs" ? p.amber : row.dot === "running" ? p.green : p.textDim;
   const pv = row.preview;
-  const previewColor = pv.tone === "running" ? p.green : pv.tone === "private" ? p.textDim : p.textMid;
+  const unread = row.unread > 0;
+  const previewColor = pv.tone === "running" ? p.green : pv.tone === "needs" ? p.pillNeedsText : pv.tone === "private" ? p.textDim : p.textMid;
   const state = row.dot === "needs" ? "needs you" : row.dot === "running" ? "working" : "idle";
   return (
     <Pressable
@@ -316,156 +234,70 @@ function ChatRowView({ row, onOpen }: { row: Row; onOpen: (row: Row) => void }) 
       disabled={!row.openable}
       accessibilityRole="button"
       accessibilityState={{ disabled: !row.openable }}
-      accessibilityLabel={`${row.title}, ${state}${row.unread ? `, ${row.unread} unread` : ""}${row.openable ? "" : ", private session, open it on your Mac"}`}
+      accessibilityLabel={`${row.title}, ${row.projectName}, ${state}${row.time ? `, ${row.time}` : ""}${unread ? `, ${row.unread} unread` : ""}. ${pv.prefix ?? ""} ${pv.text}${row.openable ? "" : ". Private session, open it on your Mac"}`}
       style={({ pressed }) => ({
         flexDirection: "row",
         alignItems: "center",
-        gap: 10,
-        minHeight: MIN_TOUCH + 16,
-        paddingHorizontal: 16,
+        gap: 12,
+        paddingLeft: GUTTER,
+        paddingRight: GUTTER + 2,
         paddingVertical: 9,
-        backgroundColor: pressed ? p.selectionBg : row.needs ? p.needsBg : "transparent",
-        borderBottomWidth: StyleSheet.hairlineWidth,
-        borderBottomColor: p.border,
-        opacity: row.openable ? 1 : 0.5,
+        backgroundColor: pressed ? p.selectionBg : "transparent",
+        opacity: row.openable ? 1 : 0.55,
       })}
     >
-      {/* avatar: agent initials on the project's colour, status dot */}
-      <View
-        style={{
-          width: 42,
-          height: 42,
-          borderRadius: 21,
-          backgroundColor: tint(row.color, 0.18) ?? p.selectionBg,
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
-        <Text style={{ color: row.color, fontWeight: "700", fontSize: TYPE.footnote }}>{row.initials}</Text>
-        <View
-          style={{
-            position: "absolute",
-            right: 0,
-            bottom: 0,
-            width: 12,
-            height: 12,
-            borderRadius: 6,
-            borderWidth: 2,
-            borderColor: p.panelBg,
-            backgroundColor: dot,
-          }}
-        />
-      </View>
+      <AgentAvatar agent={row.agent} projectColor={row.color} state={row.glyph} size={AVATAR} />
 
-      <View style={{ flex: 1, minWidth: 0 }}>
-        <View style={{ flexDirection: "row", alignItems: "baseline", gap: 6 }}>
-          <Text style={{ flex: 1, fontSize: TYPE.subhead, fontWeight: "600", color: p.textBright }} numberOfLines={1}>
+      <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+        <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
+          <Text style={{ flex: 1, fontSize: TYPE.body, fontWeight: "600", color: p.textBright }} numberOfLines={1}>
             {row.title}
           </Text>
-          {row.time !== "" && <Text style={{ fontSize: TYPE.micro, color: p.textMid }}>{row.time}</Text>}
+          {row.time !== "" && (
+            <Text
+              style={{
+                fontSize: TYPE.footnote,
+                color: unread ? (row.needs ? p.amber : p.accent) : p.textMid,
+                fontWeight: unread ? "600" : "400",
+                fontVariant: ["tabular-nums"],
+              }}
+            >
+              {row.time}
+            </Text>
+          )}
         </View>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 2 }}>
+        <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 8 }}>
           <Text
-            style={{ flex: 1, fontSize: TYPE.footnote, color: previewColor, fontStyle: pv.tone === "private" ? "italic" : "normal" }}
-            numberOfLines={1}
+            style={{ flex: 1, fontSize: TYPE.subhead, lineHeight: 20, color: previewColor, fontStyle: pv.tone === "private" ? "italic" : "normal" }}
+            numberOfLines={2}
           >
-            {pv.prefix && <Text style={{ color: p.pillNeedsText, fontWeight: "600" }}>{pv.prefix} </Text>}
+            <Text style={{ color: row.color, fontWeight: "600" }}>{row.projectName}</Text>
+            <Text style={{ color: p.textDim }}>{"  ·  "}</Text>
+            {pv.prefix && (
+              <Text style={{ color: pv.tone === "needs" ? p.pillNeedsText : p.textBright, fontWeight: "600" }}>{pv.prefix} </Text>
+            )}
             {pv.text}
           </Text>
-          {row.unread > 0 && (
+          {unread && (
             <View
               style={{
+                marginTop: 1,
                 backgroundColor: row.needs ? p.amber : p.accent,
                 borderRadius: 10,
                 minWidth: 20,
+                height: 20,
                 paddingHorizontal: 6,
-                paddingVertical: 1,
                 alignItems: "center",
+                justifyContent: "center",
               }}
             >
-              <Text style={{ color: p.panelBg, fontSize: TYPE.micro, fontWeight: "700" }}>{row.unread}</Text>
+              <Text style={{ color: p.meText, fontSize: TYPE.caption, fontWeight: "700", fontVariant: ["tabular-nums"] }}>
+                {row.unread}
+              </Text>
             </View>
           )}
         </View>
       </View>
     </Pressable>
-  );
-}
-
-function ProfileSheet({
-  open,
-  onClose,
-  entries,
-  selected,
-  onPick,
-  p,
-  bottomInset,
-}: {
-  open: boolean;
-  onClose: () => void;
-  entries: ReturnType<typeof profileSheet>;
-  selected: ProfileSel;
-  onPick: (id: ProfileSel) => void;
-  p: Palette;
-  bottomInset: number;
-}) {
-  return (
-    <Modal visible={open} transparent animationType="fade" onRequestClose={onClose}>
-      <Pressable style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.55)" }} onPress={onClose} accessibilityLabel="Close" />
-      <View
-        style={{
-          backgroundColor: p.sidebarBg,
-          borderTopLeftRadius: 18,
-          borderTopRightRadius: 18,
-          borderTopWidth: StyleSheet.hairlineWidth,
-          borderTopColor: p.border,
-          paddingHorizontal: 16,
-          paddingTop: 10,
-          paddingBottom: bottomInset + 20,
-        }}
-      >
-        <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: p.textDim, alignSelf: "center", marginBottom: 12 }} />
-        <Text style={{ fontSize: TYPE.callout, fontWeight: "700", color: p.textBright, marginBottom: 6 }}>Profile</Text>
-        {entries.map((e) => {
-          const on = e.id === selected;
-          const sum = profileSummary(e);
-          return (
-            <Pressable
-              key={e.id ?? "default"}
-              onPress={() => onPick(e.id)}
-              accessibilityRole="button"
-              accessibilityState={{ selected: on }}
-              style={{
-                flexDirection: "row",
-                alignItems: "center",
-                gap: 10,
-                minHeight: MIN_TOUCH,
-                paddingVertical: 10,
-                paddingHorizontal: 4,
-                borderBottomWidth: StyleSheet.hairlineWidth,
-                borderBottomColor: p.border,
-              }}
-            >
-              <Text style={{ width: 14, color: p.accent }}>{on ? "✓" : ""}</Text>
-              <Text
-                style={{ flex: 1, fontSize: TYPE.subhead, color: on ? p.accent : p.textBright, fontWeight: on ? "600" : "400" }}
-                numberOfLines={1}
-              >
-                {e.name}
-              </Text>
-              <Text style={{ fontSize: TYPE.caption, color: p.textMid }}>
-                {sum.projects}
-                {sum.needs && (
-                  <Text style={{ color: p.pillNeedsText }}>
-                    {" · "}
-                    {sum.needs}
-                  </Text>
-                )}
-              </Text>
-            </Pressable>
-          );
-        })}
-      </View>
-    </Modal>
   );
 }

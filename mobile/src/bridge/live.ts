@@ -5,7 +5,14 @@
  */
 import type { ChatItem, EventKind, SessionStatus, TodoProgress } from "../data/types";
 import { toolActivity } from "../logic/status";
-import type { WireChatItem, WireNeeds, WireProjectsView, WireStatus, WireViewSession } from "./protocol";
+import type {
+  WireChatItem,
+  WireLastMessage,
+  WireNeeds,
+  WireProjectsView,
+  WireStatus,
+  WireViewSession,
+} from "./protocol";
 
 let idSeq = 0;
 function nextId(prefix = "w"): string {
@@ -69,8 +76,15 @@ function taskLine(status: string): { tone: "ok" | "bad" | "info"; text: string }
   }
 }
 
-/** Transcript-derived wire item to UI ChatItem (assigns a render id). Null = not shown on the phone. */
+/** Transcript-derived wire item to UI ChatItem (assigns a render id, keeps the line's `at`).
+ * Null = not shown on the phone. */
 export function mapChatItem(w: WireChatItem): ChatItem | null {
+  const item = mapBody(w);
+  if (item && typeof w.at === "string" && w.at !== "") item.at = w.at;
+  return item;
+}
+
+function mapBody(w: WireChatItem): ChatItem | null {
   switch (w.kind) {
     case "bubble":
       return { kind: "bubble", id: nextId("b"), role: w.role, text: w.text };
@@ -166,7 +180,15 @@ function sessionOf(v: unknown): WireViewSession | null {
     activity: silo ? null : str(s.activity),
     updatedAt: typeof s.updatedAt === "number" && s.updatedAt > 0 ? s.updatedAt : null,
     needs: silo && needs ? { kind: "input", text: null } : needs,
+    // The Mac sends null for a silo session; never show one regardless.
+    lastMessage: silo ? null : lastMessageOf(s.lastMessage),
   };
+}
+
+function lastMessageOf(v: unknown): WireLastMessage | null {
+  const m = v as { role?: unknown; text?: unknown; at?: unknown } | null;
+  if (!m || (m.role !== "user" && m.role !== "assistant") || typeof m.text !== "string") return null;
+  return { role: m.role, text: m.text, at: str(m.at) };
 }
 
 /**

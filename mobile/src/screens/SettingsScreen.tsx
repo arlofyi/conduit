@@ -61,7 +61,7 @@ export function SettingsScreen({ navigation }: SettingsProps) {
       <View style={{ paddingTop: insets.top + 8, paddingHorizontal: 20, paddingBottom: 4 }}>
         <Text style={{ fontSize: TYPE.title, fontWeight: "700", color: p.textBright }}>Settings</Text>
       </View>
-      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: insets.bottom + 32 }}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 32 }}>
         <SectionLabel>Connection</SectionLabel>
         <Card>
           <Row first title="Mac" value={macName} />

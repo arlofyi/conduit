@@ -1,4 +1,5 @@
-import React, { createContext, useCallback, useContext, useMemo } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo } from "react";
+import { Appearance } from "react-native";
 import { usePrefs } from "../data/PrefsProvider";
 import { nextTheme, PALETTES, type Palette, type ThemeId } from "./palettes";
 
@@ -22,6 +23,13 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     () => ({ themeId, palette: PALETTES[themeId], cycle, setTheme }),
     [themeId, cycle, setTheme],
   );
+  // Native chrome (Liquid Glass sheets and tab bar, system materials, the keyboard) follows the
+  // app's appearance, not the phone's: a dark Warm theme under a light system would otherwise
+  // get pale glass with the theme's pale text on it.
+  const appearance = PALETTES[themeId].appearance;
+  useEffect(() => {
+    Appearance.setColorScheme(appearance);
+  }, [appearance]);
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }
 
