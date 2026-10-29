@@ -97,8 +97,8 @@ These are the founder's words, not inferences:
 - A terminal mirror on the phone. The bridge's raw PTY output stays on the wire for other
   clients but the phone never renders it.
 - Files viewer, git graph, diff review, task board, canvas, Continuity view on the phone.
-- Starting new sessions from the phone. (The bridge already accepts `spawn`; no UI for it in
-  this release.)
+- ~~Starting new sessions from the phone~~ — reversed by the founder on 2026-10-30 (the "+"
+  new chat in the WhatsApp redesign); spawning is rate-limited per device.
 - A relay that removes Tailscale (the Cloudflare Worker idea in the 2026-06-25 spec), and the
   Matrix/BadgerClaw adapter on `origin/feat/matrix-adapter`. Both are parked, not deleted.
 - Android. Expo builds it, but nothing in this release is verified on it.

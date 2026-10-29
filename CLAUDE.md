@@ -584,11 +584,15 @@ plus install/remove/status), and one listener in `App.tsx`.
 - **Peers and handshake.** A peer outside loopback and the tailnet ranges is dropped before
   the handshake; an upgrade whose `Origin` is not the bridge itself gets 403 (a web page on
   the Mac must never reach the bridge). `origin_allowed` admits only the listener's own
-  origin (arrival IP, `localhost` on loopback, this Mac's MagicDNS name on the tailnet
-  address, with the bridge port), because iOS's WebSocket ALWAYS sends `Origin:
+  origin (the arrival IP -- `127.0.0.1` on loopback -- or this Mac's MagicDNS name on the
+  tailnet address, with the bridge port), because iOS's WebSocket ALWAYS sends `Origin:
   http://<dialled host>:<port>` and JS cannot remove it -- a blanket "no Origin" rule
-  refused every phone. Never compare it to `Host` (DNS rebinding). Every peer gets `hello`; a non-loopback peer must `auth` with its device
-  token (or `pair`/`discover`) within 5 s; the WebSocket upgrade itself has ONE 5 s overall deadline (a watchdog shuts the socket down, so a byte-dribbling peer cannot hold the thread). Pre-auth frames are capped at 4 KiB and the cap is
+  refused every phone. `localhost` is NOT admitted: any local web page has that origin, and
+  the Simulator dials the literal IP. Never compare it to `Host` (DNS rebinding).
+  Every peer gets `hello`; a non-loopback peer must `auth` with its device token (or
+  `pair`/`discover`) within 5 s; the WebSocket upgrade itself has ONE 5 s overall deadline
+  (a watchdog shuts the socket down, so a byte-dribbling peer cannot hold the thread).
+  Pre-auth frames are capped at 4 KiB and the cap is
   lifted on auth. Success is acked with an `authOk` frame; a pair request waiting on the Mac
   sends `pairPending`. Failures answer one generic `unauthorized` (no oracle) and are
   rate-limited 5 per 60 s per IP -- except an `auth` refused by the rate limit or the access
@@ -613,6 +617,26 @@ plus install/remove/status), and one listener in `App.tsx`.
   8475 (see the root-chat section for the full carve-up of 8423..=8516).
 - Secrets rule applies: no token, nonce or QR secret is logged; types holding a plaintext secret or
   token (`ClientMsg`) hand-write `Debug` and print them as `<redacted>`; the rest never derive it.
+- **What leaves the Mac is a whitelist.** The `projects` frame is built by `bridge_view.rs`
+  (`projects_view`) field by field, never by serializing `Project`/`Session` (those carry
+  `seedMemory`, account ids, paths). Add a field there deliberately, and to the key-list test.
+- **Private sessions are refused, not just hidden.** `bridge_view::session_is_private`
+  (`silo || local_only`) gates every session-scoped message (`session_scope`: attach, input,
+  resize, git, kill, interrupt) from ANY peer, loopback included, with `{error: "private
+  session"}` -- BEFORE `wake_session`, so not even the PTY is started. The list still names
+  them (no preview, activity or question text).
+- **Frames carry `sessionId`** (`chat`, `history`, `status`); the phone drops one that is
+  not the open chat's and accepts untagged ones from older desktops. A failed or refused
+  `attach` clears the old subscription and tail (`clear_attachment`) so the left chat never
+  streams into the new one. The tail re-resolves the attached Claude session's transcript at
+  most once a second, scanning only when the conversation id moved or none was found
+  (`needs_resolve`/`should_switch_tail`), and re-sends `history` on a switch -- that is how a
+  `/clear` and a just-spawned chat are followed. Don't move that back to the phone.
+- **Phones can start sessions** (`spawn`, the "+" new chat). The agent is read STRICTLY
+  (`AgentId::from_wire`; the lenient deserialize would start Claude under an invented id),
+  the name comes from the first message's first line (<= 40 chars, else "Mobile"), and each
+  phone gets 10 per hour (`take_spawn_slot`, keyed by device id, or peer IP on loopback).
+  The phone offers only Claude, the one agent whose chat it can show.
 - **The phone app is `mobile/`** (Expo SDK 56 dev build; run/pairing steps in
   `mobile/README.md`). Pure logic lives in `mobile/src/logic` + `src/bridge` with jest tests;
   `LiveProvider` owns the one socket. Chat messages go into the PTY as a bracketed paste +
