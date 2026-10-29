@@ -8,7 +8,7 @@ import {
   type ConnState,
   type Effect,
 } from "./connection";
-import { attachMsg, inputMsg, interruptMsg, listMsg, type ClientMsg, type ServerMsg } from "./protocol";
+import { attachMsg, inputMsg, interruptMsg, listMsg, promptInput, type ClientMsg, type ServerMsg } from "./protocol";
 
 export interface BridgeOptions {
   /** ws:// URLs tried in order, advancing on every reconnect */
@@ -157,9 +157,9 @@ export class BridgeClient {
     this.send(interruptMsg(sessionId));
   }
 
-  /** Send a prompt: type the text + Enter into the live PTY (same as desktop typing). */
+  /** Send a prompt: the text as a bracketed paste, then Enter, into the live PTY. */
   prompt(sessionId: string, text: string) {
-    this.send(inputMsg(sessionId, text + "\r"));
+    this.send(inputMsg(sessionId, promptInput(text)));
   }
 
   close() {

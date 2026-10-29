@@ -1,4 +1,19 @@
-import { attachMsg, authMsg, discoverMsg, inputMsg, interruptMsg, listMsg, pairMsg } from "./protocol";
+import { attachMsg, authMsg, discoverMsg, inputMsg, interruptMsg, listMsg, pairMsg, promptInput } from "./protocol";
+
+describe("promptInput", () => {
+  it("prompt_enter_falls_outside_the_paste", () => {
+    // Same bytes as the desktop's pty::paste_and_submit("ship it").
+    expect(promptInput("ship it")).toBe("\u001b[200~ship it\u001b[201~\r");
+    // A long line is the case that sat unsent with a bare text + "\r".
+    const long = "x".repeat(800);
+    expect(promptInput(long).endsWith("\u001b[201~\r")).toBe(true);
+  });
+
+  it("newlines_stay_inside_and_escape_cannot_close_early", () => {
+    expect(promptInput("a\nb")).toBe("\u001b[200~a\nb\u001b[201~\r");
+    expect(promptInput("safe\u001b[201~rm -rf /")).toBe("\u001b[200~safe[201~rm -rf /\u001b[201~\r");
+  });
+});
 
 describe("wire spellings", () => {
   it("wire_spellings_pinned", () => {

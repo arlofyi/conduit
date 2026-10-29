@@ -94,7 +94,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
 
   const send = () => {
     if (!draft.trim()) return;
-    prompt(sessionId, draft); // input: text + "\r" into the live PTY; the echo comes back as a chat frame
+    prompt(sessionId, draft); // input: bracketed paste + "\r" into the live PTY; the echo comes back as a chat frame
     setDraft("");
     sentRef.current = true;
     pinnedRef.current = true;

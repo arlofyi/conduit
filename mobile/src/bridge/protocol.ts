@@ -179,3 +179,15 @@ export const listMsg = (): ClientMsg => ({ type: "list" });
 export const attachMsg = (id: string): ClientMsg => ({ type: "attach", session_id: id });
 export const inputMsg = (id: string, data: string): ClientMsg => ({ type: "input", session_id: id, data });
 export const interruptMsg = (id: string): ClientMsg => ({ type: "interrupt", sessionId: id });
+
+/** A chat message as PTY input: bracketed paste around the text, then a bare `\r`.
+ * Mirrors the desktop's `pty::paste_and_submit` (src-tauri/src/pty.rs) -- keep them in step.
+ * A plain `text + "\r"` works only for short lines: Claude Code reads a long burst as a
+ * PASTE, the `\r` lands inside it as one more newline, and the message sits unsent in the
+ * composer (seen in the Simulator with an 80-character prompt). The end marker makes the
+ * `\r` a keypress even when everything arrives in one read. ESC is dropped from the body
+ * so a `CSI 201~` inside it cannot close the paste early. */
+export function promptInput(text: string): string {
+  const body = text.split("\u001b").join("");
+  return `\u001b[200~${body}\u001b[201~\r`;
+}
