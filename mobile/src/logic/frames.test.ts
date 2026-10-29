@@ -64,8 +64,8 @@ describe("a new chat waiting on the Mac's folder-trust prompt", () => {
       kind: "notice",
       id: "n-1",
       tone: "info",
-      text: "Claude is waiting on your Mac",
-      detail: "Open this folder there once to trust it.",
+      text: "Trust this folder on your Mac to start",
+      detail: TRUST_STALL,
     });
     expect(trustStallNotice(TRUST_STALL, "s1", "other", "n-1")).toBeNull();
     expect(trustStallNotice(TRUST_STALL, "s1", null, "n-1")).toBeNull();

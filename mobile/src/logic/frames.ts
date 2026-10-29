@@ -59,14 +59,13 @@ export function trustStallNotice(
   id: string,
 ): NoticeItem | null {
   if (message !== TRUST_STALL || typeof frameSessionId !== "string" || frameSessionId !== open) return null;
-  return {
-    kind: "notice",
-    id,
-    tone: "info",
-    text: "Claude is waiting on your Mac",
-    detail: "Open this folder there once to trust it.",
-  };
+  // A notice is one line with its `detail` folded behind a chevron, so the line itself must say
+  // what to do; the Mac's full sentence is the detail.
+  return { kind: "notice", id, tone: "info", text: TRUST_STALL_LINE, detail: TRUST_STALL };
 }
+
+/** The notice line for a stalled new chat (fits one line at the default text size). */
+export const TRUST_STALL_LINE = "Trust this folder on your Mac to start";
 
 /** The sheet's sentence for a spawn error. */
 export function spawnErrorText(message: string): string {
