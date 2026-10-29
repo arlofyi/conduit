@@ -438,11 +438,14 @@ expands `%VAR%` and turns `>NUL` into a FILE, so the old inline cmd-syntax hook 
 `session=%CONDUIT_SESSION_ID%` (every event dropped by the provenance gate) and left
 `NUL` files in agents' working dirs.
 
-- `hooks::command` / `ask_command` emit only `"<dataDir>/conduit-hook.cmd" <event> <port>`
-  (forward slashes: they survive a shell that drops quotes, backslashes do not). The
-  relays (`HOOK_RELAY_CMD`, `ASK_RELAY_CMD`, written by `write_hook_relays`) run under
-  cmd's own rules, prefer the session's `CONDUIT_HOOK_PORT`, post nothing without
-  `CONDUIT_SESSION_ID`, and keep the reply off stdout (`-o NUL`) except for `/ask`.
+- `hooks::command` emits only `"<dataDir>/conduit-hook.cmd" <event> <port>`, and
+  `ask_command` / `permission_command` only `"<dataDir>/conduit-ask.cmd" <port> <max secs>` /
+  `"<dataDir>/conduit-permission.cmd" <port> <max secs>` (forward slashes: they survive a
+  shell that drops quotes, backslashes do not). The relays (`HOOK_RELAY_CMD`, `ASK_RELAY_CMD`,
+  `PERMISSION_RELAY_CMD`, written by `write_hook_relays`) run under cmd's own rules, prefer
+  the session's `CONDUIT_HOOK_PORT`, post nothing without `CONDUIT_SESSION_ID`, and keep the
+  reply off stdout (`-o NUL`) except for `/ask` and `/permission`, whose reply IS the
+  hook's answer.
 - **Never put `%VAR%`, a redirect or `||` back into a Windows hook command string.** A
   test (`windows_hook_commands_are_shell_neutral`) pins it.
 - `session_files::remove_stray_nul_files` cleans up the old files; it needs `\\?\`
@@ -647,6 +650,22 @@ plus install/remove/status), and one listener in `App.tsx`.
   (`WRITE_STALL`, 10 s)**: a frozen phone keeps its socket open at zero window, and an
   unbounded write blocked the loop before the staleness check -- measured, 70 s frozen and
   the question still held. The phone also closes its socket itself when backgrounded.
+  **Any send that fails with an I/O error ends the connection** (`send_text` /
+  `send_failure_is_fatal`): never `let _ = ws.send(..)` and carry on -- on Windows a
+  timed-out send leaves the socket indeterminate, and tungstenite would retry the
+  half-written frame into a corrupt stream.
+- **Raw PTY `output` frames go to LOOPBACK only** (`streams_raw_output`: the matrix sidecar
+  and the Simulator). A remote phone renders the transcript and never used them; a TUI
+  spinner repaints at ~19 KB/s (~70 MB per working hour of cellular data), and that stream
+  is what filled a frozen phone's window. The subscription is still taken (it is how
+  `attach` wakes the PTY) and drained.
+- **A phone-spawned Claude chat that never starts is reported** (`SpawnWatch`,
+  `TRUST_STALL` 20 s): no `sessionstart` hook within 20 s of a spawn means Claude is on its
+  "trust this folder?" prompt, which runs before any hook and which only the Mac can answer.
+  The spawning socket gets ONE `{type:"error", sessionId, message: TRUST_STALL_MESSAGE}`;
+  the phone (`logic/frames.ts trustStallNotice`) shows it as a notice in that chat, and the
+  `history` re-sent when Claude does start replaces it. Claude only -- other agents have no
+  such prompt and some fire no `sessionstart` at all.
 - **Pushes and `by`.** Each socket diffs `Asks::pending()` + `Broker::pending()` every
   250 ms (`push_frames`): `pending` once, then `pendingAdded` / `resolved{by}`, `by` from a
   64-entry ring (`phone|desktop|terminal|timeout|cancelled`; unknown reads `cancelled`).
@@ -659,8 +678,11 @@ plus install/remove/status), and one listener in `App.tsx`.
   `tooluse` too, EXCEPT a body with a non-empty `agent_id` -- measured (2.1.312): a
   background subagent's PreToolUse/PostToolUse carry `agent_id` + `agent_type`, the main
   thread's never do, so a subagent finishing a tool cannot kill the main turn's question.
-  Never `pretool` (it fires for AskUserQuestion itself). A main-thread sibling PostToolUse
-  does cancel a pending permission -- it fails open (Claude's own dialog is still up).
+  Never `pretool` (it fires for AskUserQuestion itself). A PERMISSION is narrower
+  (`permission_moved_on`): a finished tool cancels it only when its `tool_name` is the
+  permission's own tool (its PostToolUse after a terminal "Yes"), so a sibling tool in the
+  same batch finishing first leaves the card up. Two pending permissions for the same tool
+  name in one session can still clear each other; that fails open (Claude's dialog stays).
 - **A dead hook is noticed by writing to it** (`hook_wait.rs`): tiny_http exposes no socket,
   so while waiting the handler writes `102 Processing` every 500 ms on
   `request.into_writer()`; a failed write = Esc/"No" in the terminal killed curl ->
@@ -681,7 +703,10 @@ plus install/remove/status), and one listener in `App.tsx`.
   you are watching), listeners registered before the `permission_pending` catch-up, and
   `resolvedPermissions` stops a stale catch-up resurrecting one. **Phone side**:
   `logic/pending.ts` -- the Mac is the truth (a snapshot or `added` replaces a settled
-  entry: ids restart per Mac boot), a send that did not go out stays live.
+  entry: ids restart per Mac boot), a send that did not go out stays live, and an answer
+  the Mac REFUSED (`answerResult ok:false` with no `resolved` naming a winner -- e.g. over
+  `MAX_ANSWER_BYTES`) is not a settlement: the card goes back to live with "Couldn't send
+  that answer" (`rejected`), and a later `resolved` still settles it honestly.
 - **The phone app is `mobile/`** (Expo SDK 56 dev build; run/pairing steps in
   `mobile/README.md`). Pure logic lives in `mobile/src/logic` + `src/bridge` with jest tests;
   `LiveProvider` owns the one socket. Chat messages go into the PTY as a bracketed paste +
@@ -767,8 +792,9 @@ the spawn path underneath.
   `approve_root_proposal_inner` both call `Proposals::sweep` first — `get` alone never
   expires anything, only `register`/`pending` do — so a proposal past `EXPIRY_SECS` can
   neither be reported as pending nor approved late.
-- **`proposals.rs` is not `broker.rs`.** The broker hands its caller a receiver to block
-  on and forgets an answered entry (right for a 45 s approval hook). A proposal is
+- **`proposals.rs` is not `broker.rs`.** The broker is the PermissionRequest registry: it
+  hands the blocked `/permission` hook a receiver (300 s `PERMISSION_CEILING`) and drops an
+  answered entry, keeping only a short `(id, by)` ring for the push diff. A proposal is
   non-blocking, lives 24 h, and must stay readable after the answer so `dispatch_status`
   can report it. The UI merges the two queues; the registries stay separate.
 - **The agent is resolved at APPROVE time, in TypeScript.** `routing.rs` owns the
@@ -884,7 +910,10 @@ animal avatars linked by the Continuity messages they exchange, plus Claude Code
   `timeout: 660` — the default hook timeout is 60 s, so dropping the entry's `timeout` would
   silently kill every card after a minute.
 - **The gate is closed unless a card can be seen** (`set_ask_gate`, `asks.ts askGateOpen`):
-  view open or a Conduit window focused. The same `settings.local.json` is read by a `claude`
+  the Continuity view enabled AND (view open or a Conduit window focused). A connected,
+  authenticated remote phone also holds a non-private session's questions and permissions
+  (`hooks::holder_for`; see "Where the mobile bridge lives"), gate closed or not. The same
+  `settings.local.json` is read by a `claude`
   the user runs by hand in that checkout; it posts `session=unknown` and is answered `{}` at once.
 - **Hand-off is to the session's own terminal** (`askShouldHandOff`), and `ask_answer`
   returning `false` means "already answered there" — not an error.
