@@ -3,6 +3,7 @@ import kinds from "../src-tauri/src/transcript_item_kinds.json";
 import {
   RENDERED_KINDS,
   groupTools,
+  imageSrc,
   taskLine,
   toolsSummary,
   type TranscriptItem,
@@ -54,5 +55,17 @@ describe("chatItems", () => {
     expect(taskLine("stopped").mark).toBe("info");
     expect(taskLine("failed").mark).toBe("bad");
     expect(taskLine("weird").text).toBe("Background task update");
+  });
+});
+
+describe("imageSrc", () => {
+  it("accepts raster types", () => {
+    expect(imageSrc({ mediaType: "image/png", data: "AAA" })).toBe("data:image/png;base64,AAA");
+  });
+  it.each(["text/html", "image/svg+xml", "image/png;foo"])("rejects %s", (mediaType) => {
+    expect(imageSrc({ mediaType, data: "AAA" })).toBeNull();
+  });
+  it("rejects null data", () => {
+    expect(imageSrc({ mediaType: "image/png", data: null })).toBeNull();
   });
 });

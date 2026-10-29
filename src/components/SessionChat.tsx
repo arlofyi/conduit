@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { findSession, useStore, type TranscriptItem } from "../store";
-import { groupTools, taskLine, toolsSummary, type ChatRow } from "../chatItems";
+import { groupTools, imageSrc, taskLine, toolsSummary, type ChatRow } from "../chatItems";
 import { AGENTS } from "../agents";
 import { modeLabel, nextMode } from "../permissionMode";
 import { renderMarkdown, splitInsights } from "../markdown";
@@ -129,16 +129,19 @@ function CommandOutput({ text, stream }: { text: string; stream: "stdout" | "std
   const long = lines.length > 3;
   const shown = open || !long ? text : lines.slice(0, 3).join("\n");
   return (
-    <button
-      type="button"
-      className={`hq-command-output ${stream}`}
-      aria-expanded={open}
-      disabled={!long}
-      onClick={() => setOpen((v) => !v)}
-    >
+    <div className={`hq-command-output ${stream}`}>
       <pre>{shown}</pre>
-      {long && !open && <span className="hq-command-more">… {lines.length - 3} more lines</span>}
-    </button>
+      {long && (
+        <button
+          type="button"
+          className="hq-command-more"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? "Show less" : `… ${lines.length - 3} more lines`}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -238,12 +241,10 @@ function Item({ item }: { item: TranscriptItem }) {
       );
     case "command_output":
       return <CommandOutput text={item.text} stream={item.stream} />;
-    case "image":
-      return item.data ? (
-        <img className="hq-image" alt="" src={`data:${item.mediaType};base64,${item.data}`} />
-      ) : (
-        <Note label="Image" />
-      );
+    case "image": {
+      const src = imageSrc(item);
+      return src ? <img className="hq-image" alt="" src={src} /> : <Note label="Image" />;
+    }
     case "divider":
       return (
         <div className={`hq-divider ${item.tone}`} role="separator">

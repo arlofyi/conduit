@@ -104,6 +104,15 @@ export function toolsSummary(events: EventItem[]): string {
     .join(" · ");
 }
 
+const RASTER_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+/** Data URI for an inline image, or null. Only exact raster types pass: the type came off
+ *  a transcript file, and SVG is a document format that can carry script. */
+export function imageSrc(item: { mediaType: string; data: string | null }): string | null {
+  if (item.data === null || !RASTER_TYPES.has(item.mediaType)) return null;
+  return `data:${item.mediaType};base64,${item.data}`;
+}
+
 /** How a background-task notification reads in the pane. */
 export function taskLine(status: string): { mark: "ok" | "bad" | "info"; text: string } {
   switch (status) {

@@ -5835,15 +5835,18 @@ button.hq-note:hover { color: var(--hq-ink-2); border-color: var(--hq-line-2); }
   display: block; width: 100%; text-align: left; font-family: inherit;
   background: color-mix(in srgb, var(--hq-surface) 70%, transparent);
   border: 1px solid var(--hq-line); border-radius: 8px; padding: 6px 10px;
-  color: var(--hq-ink-2); cursor: pointer;
+  color: var(--hq-ink-2);
 }
-.hq-command-output:disabled { cursor: default; }
 .hq-command-output.stderr { color: var(--hq-bad); }
 .hq-command-output pre {
   margin: 0; font-family: var(--mono-font); font-size: 11.5px;
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
-.hq-command-more { font-size: 10.5px; color: var(--hq-ink-3); }
+.hq-command-more {
+  background: none; border: 0; padding: 0; cursor: pointer; font-family: inherit;
+  font-size: 10.5px; color: var(--hq-ink-3);
+}
+.hq-command-more:hover { color: var(--hq-ink-2); }
 .hq-image { max-width: 240px; border-radius: 8px; border: 1px solid var(--hq-line); align-self: flex-end; }
 .hq-divider {
   display: flex; align-items: center; gap: 12px; width: 100%;
