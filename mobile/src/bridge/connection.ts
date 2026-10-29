@@ -31,6 +31,8 @@ export interface ConnState {
   backoffMs: number;
   /** pairing connection: after hello, wait for the UI to send `pair` */
   pairing: boolean;
+  /** closed because the app went to the background; `resume` redials */
+  suspended?: boolean;
 }
 
 export type ConnEvent =
@@ -39,7 +41,11 @@ export type ConnEvent =
   | { t: "frame"; msg: ServerMsg }
   | { t: "start"; mac: SavedMac | null; addresses: string[]; pairing?: boolean }
   /** BridgeClient is about to open a socket for a scheduled reconnect */
-  | { t: "dial" };
+  | { t: "dial" }
+  /** the app went to the background: close and stay closed */
+  | { t: "suspend" }
+  /** the app is back in front: redial if suspended */
+  | { t: "resume" };
 
 export type Effect =
   | { k: "forgetMac"; deviceId: string }
@@ -88,8 +94,39 @@ const out = (state: ConnState, send: ClientMsg[] = [], effects: Effect[] = []): 
   effects,
 });
 
+/**
+ * What an AppState change does to the bridge socket. A backgrounded app is suspended by iOS
+ * and cannot answer the Mac's keepalive, and while its socket stays open the Mac counts it
+ * as a phone that can answer questions -- so it closes on `background` and redials on
+ * `active`. `inactive` (app switcher, Control Center, a system alert) is not a background.
+ */
+export function lifecycleAction(prev: string, next: string): "suspend" | "resume" | null {
+  if (next === "background" && prev !== "background") return "suspend";
+  if (next === "active" && prev !== "active") return "resume";
+  return null;
+}
+
 export function step(state: ConnState, ev: ConnEvent): StepResult {
   switch (ev.t) {
+    case "suspend": {
+      // A pairing socket is single-shot, a terminal failure stays shown, an unstarted or
+      // already-suspended client has nothing to close.
+      const retrying = state.phase === "failed" && state.error?.kind === "unavailable";
+      if (state.pairing || state.phase === "idle" || (state.phase === "failed" && !retrying)) {
+        return out(state);
+      }
+      return out({ ...state, phase: "idle", suspended: true });
+    }
+
+    case "resume":
+      // Only a suspended client redials, once, on the address that last worked.
+      if (!state.suspended) return out(state);
+      return out(
+        { ...state, phase: "connecting", suspended: false, backoffMs: BACKOFF_START_MS },
+        [],
+        [{ k: "reconnect", addressIndex: state.addressIndex, delayMs: 0 }],
+      );
+
     case "start":
       return out({
         phase: "connecting",

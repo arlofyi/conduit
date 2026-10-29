@@ -253,6 +253,24 @@ const PROTOCOL_VERSION: u32 = 1;
 const PUSH_EVERY: Duration = Duration::from_millis(250);
 /// How often a connection re-checks that the session it streams has not been made private.
 const PRIVATE_RECHECK_EVERY: Duration = Duration::from_secs(1);
+/// How often an authenticated remote connection is pinged. A phone answers with a pong
+/// from its socket layer, so a live but quiet phone still reads as heard from.
+const PING_EVERY: Duration = Duration::from_secs(15);
+/// A remote connection that has read nothing (no frame, no pong) for this long is dropped.
+/// iOS suspends a backgrounded app and a dropped network leaves the socket half-open; with
+/// nothing to write, the Mac would otherwise never notice, and the phone would keep holding
+/// every question it was sent (`has_remote_phone`) while the terminal showed nothing.
+const STALE_AFTER: Duration = Duration::from_secs(35);
+
+/// Has a connection last heard from at `last_read` gone silent for good?
+fn conn_is_stale(last_read: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_read) >= STALE_AFTER
+}
+
+/// Is the next keepalive ping due?
+fn ping_due(last_ping: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_ping) >= PING_EVERY
+}
 
 /// May a phone's `answer` resolve this ask? Only a still-pending ask (None = someone else
 /// already answered), never a private session's, and only a valid set of answers.
@@ -268,6 +286,30 @@ fn phone_may_answer(
 /// streaming it). Checked on a ~1 s tick.
 fn attached_now_private(attached: Option<&str>, is_private: impl Fn(&str) -> bool) -> Option<&str> {
     attached.filter(|sid| is_private(sid))
+}
+
+/// The attached session has been made private while streaming: unsubscribe its PTY stream,
+/// drop the transcript tail and context meter, and return the (session-tagged) refusal to
+/// send. None, with nothing touched, while it is still open.
+fn stop_streaming_if_private<R>(
+    attached: &mut Option<(String, u64, R)>,
+    transcript: &mut Option<(PathBuf, usize)>,
+    context_path: &mut Option<PathBuf>,
+    tail_conversation: &mut Option<String>,
+    attached_claude: &mut bool,
+    is_private: impl Fn(&str) -> bool,
+    unsubscribe: impl FnOnce(&str, u64),
+) -> Option<serde_json::Value> {
+    let sid = attached_now_private(attached.as_ref().map(|(s, _, _)| s.as_str()), is_private)?
+        .to_string();
+    if let Some((old_sid, old_sub)) =
+        crate::bridge_view::clear_attachment(attached, transcript, context_path)
+    {
+        unsubscribe(&old_sid, old_sub);
+    }
+    *tail_conversation = None;
+    *attached_claude = false;
+    Some(crate::bridge_view::private_session_error(&sid))
 }
 
 /// How often the tail re-checks which transcript the attached session is writing (a
@@ -869,8 +911,8 @@ pub struct BridgeController {
     /// The tailnet listener: its address and its accept loop's stop flag. Held across a
     /// whole reconcile, which serializes reconciles.
     tailnet: Mutex<Option<(Ipv4Addr, Arc<AtomicBool>)>>,
-    /// Authenticated connections by device id; setting a flag closes that socket.
-    live: Mutex<HashMap<String, Vec<Arc<AtomicBool>>>>,
+    /// Authenticated connections by device id; closing a slot closes that socket.
+    live: Mutex<HashMap<String, Vec<Arc<LiveSlot>>>>,
     /// Failed auth attempts per peer IP (`fleet::rate_limited`'s map shape).
     auth_failures: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Pair prompts raised per peer IP (a budget separate from failures).
@@ -907,10 +949,19 @@ impl BridgeController {
         let _ = self.asks.set((asks, gate));
     }
 
-    /// Is an authenticated REMOTE phone connected? Loopback peers (sidecar, simulator) never
-    /// register, so they never hold a question.
+    /// Is an authenticated REMOTE phone connected AND still heard from? Loopback peers
+    /// (sidecar, simulator) never register, so they never hold a question. A socket gone
+    /// silent past [`STALE_AFTER`] stops counting at once, before its loop gets round to
+    /// dropping it (which then hands its questions back, see `last_phone_left`).
     pub fn has_remote_phone(&self) -> bool {
-        !lock(&self.live).is_empty()
+        self.has_remote_phone_at(Instant::now())
+    }
+
+    fn has_remote_phone_at(&self, now: Instant) -> bool {
+        lock(&self.live)
+            .values()
+            .flatten()
+            .any(|slot| !conn_is_stale(slot.last_heard(), now))
     }
 
     /// The last remote phone just left. Every ask it alone was holding goes back to the
@@ -1045,7 +1096,7 @@ impl BridgeController {
         };
         if let Some(flags) = removed {
             for f in flags {
-                f.store(true, Ordering::SeqCst);
+                f.close();
             }
             if now_empty {
                 self.last_phone_left();
@@ -1058,7 +1109,7 @@ impl BridgeController {
         let any = !drained.is_empty();
         for (_, flags) in drained {
             for f in flags {
-                f.store(true, Ordering::SeqCst);
+                f.close();
             }
         }
         if any {
@@ -1084,8 +1135,8 @@ impl BridgeController {
         lock(&self.dns_name).clone()
     }
 
-    fn register_live(&self, device_id: &str) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
+    fn register_live(&self, device_id: &str) -> Arc<LiveSlot> {
+        let flag = Arc::new(LiveSlot::new(Instant::now()));
         lock(&self.live)
             .entry(device_id.to_string())
             .or_default()
@@ -1093,7 +1144,7 @@ impl BridgeController {
         flag
     }
 
-    fn unregister_live(&self, device_id: &str, flag: &Arc<AtomicBool>) {
+    fn unregister_live(&self, device_id: &str, flag: &Arc<LiveSlot>) {
         let last_left = {
             let mut live = lock(&self.live);
             let Some(v) = live.get_mut(device_id) else {
@@ -1257,6 +1308,8 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut pushed: Option<HashSet<String>> = None;
     let mut next_push = Instant::now();
     let mut next_private_check = Instant::now() + PRIVATE_RECHECK_EVERY;
+    // When this (remote, authenticated) socket last sent a keepalive ping.
+    let mut last_ping = Instant::now();
 
     loop {
         // 0. Gates: an unauthenticated peer gets AUTH_DEADLINE; a revoked device is
@@ -1270,8 +1323,15 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             break;
         }
 
-        // 1. Read a control message if one is ready (times out quickly otherwise).
-        match ws.read() {
+        // 1. Read a control message if one is ready (times out quickly otherwise). Anything
+        //    read at all -- a pong included -- is the phone being heard from.
+        let read = ws.read();
+        if read.is_ok() {
+            if let Some(conn) = device.as_ref() {
+                conn.heard(Instant::now());
+            }
+        }
+        match read {
             Ok(Message::Text(text)) if !authed => {
                 // Belt and braces with the handshake's WebSocketConfig cap.
                 if text.len() > PREAUTH_MAX_BYTES {
@@ -1615,25 +1675,38 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             Err(_) => break,
         }
 
+        // 1a. Keepalive, remote phones only: ping every PING_EVERY, and give up on a socket
+        //     that has read nothing for STALE_AFTER. Dropping it unregisters it, which hands
+        //     back any question only it was holding.
+        if let Some(conn) = device.as_ref() {
+            let now = Instant::now();
+            if conn_is_stale(conn.last_heard(), now) {
+                let _ = ws.close(None);
+                let _ = ws.flush();
+                break;
+            }
+            if ping_due(last_ping, now) {
+                last_ping = now;
+                if ws.send(Message::Ping(Vec::new())).is_err() {
+                    break;
+                }
+            }
+        }
+
         // 1b. The attached session was made private while streaming: stop, and say so.
         if attached.is_some() && Instant::now() >= next_private_check {
             next_private_check = Instant::now() + PRIVATE_RECHECK_EVERY;
             let projects = app.state::<Arc<Store>>().list();
-            let sid = attached_now_private(attached.as_ref().map(|(s, _, _)| s.as_str()), |s| {
-                crate::bridge_view::session_is_private(&projects, s)
-            })
-            .map(str::to_string);
-            if let Some(sid) = sid {
-                if let Some((old_sid, old_sub)) = crate::bridge_view::clear_attachment(
-                    &mut attached,
-                    &mut transcript,
-                    &mut context_path,
-                ) {
-                    pty.unsubscribe(&old_sid, old_sub);
-                }
-                tail_conversation = None;
-                attached_claude = false;
-                let refusal = crate::bridge_view::private_session_error(&sid);
+            let refusal = stop_streaming_if_private(
+                &mut attached,
+                &mut transcript,
+                &mut context_path,
+                &mut tail_conversation,
+                &mut attached_claude,
+                |s| crate::bridge_view::session_is_private(&projects, s),
+                |sid, sub| pty.unsubscribe(sid, sub),
+            );
+            if let Some(refusal) = refusal {
                 if ws.send(Message::Text(refusal.to_string())).is_err() {
                     break;
                 }
@@ -1797,34 +1870,16 @@ fn push_pending(
     let items = crate::bridge_view::ask_push_items(&views, |sid| {
         crate::bridge_view::session_is_private(&projects, sid)
     });
-    let ids: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
-    match pushed.as_ref() {
-        None => {
-            let frame = crate::bridge_view::pending_frame(&items);
-            if ws.send(Message::Text(frame.to_string())).is_err() {
-                return false;
-            }
-        }
-        Some(prev) => {
-            let (added, gone) = crate::bridge_view::diff_pending(prev, &items);
-            let recent = asks.recent_resolutions();
-            for item in &added {
-                let frame = crate::bridge_view::pending_added_frame(item);
-                if ws.send(Message::Text(frame.to_string())).is_err() {
-                    return false;
-                }
-            }
-            for id in &gone {
-                let by = recent
-                    .iter()
-                    .rev()
-                    .find(|(i, _)| i == id)
-                    .map_or(crate::asks::By::Cancelled, |(_, by)| *by);
-                let frame = crate::bridge_view::resolved_frame(id, by.as_str());
-                if ws.send(Message::Text(frame.to_string())).is_err() {
-                    return false;
-                }
-            }
+    // The ring is read only when something can have been resolved.
+    let recent = if pushed.is_some() {
+        asks.recent_resolutions()
+    } else {
+        Vec::new()
+    };
+    let (frames, ids) = crate::bridge_view::push_frames(pushed.as_ref(), &items, &recent);
+    for frame in frames {
+        if ws.send(Message::Text(frame.to_string())).is_err() {
+            return false;
         }
     }
     *pushed = Some(ids);
@@ -1845,7 +1900,43 @@ fn unsubscribe_bus(
 struct LiveConn {
     ctrl: Arc<BridgeController>,
     device_id: String,
-    flag: Arc<AtomicBool>,
+    flag: Arc<LiveSlot>,
+}
+
+/// One authenticated remote socket as the controller sees it: whether it has been told to
+/// close, and when it last read anything from the phone.
+struct LiveSlot {
+    closed: AtomicBool,
+    heard: Mutex<Instant>,
+}
+
+impl LiveSlot {
+    fn new(now: Instant) -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            heard: Mutex::new(now),
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// The phone was heard from (any frame, a pong included) at `at`.
+    fn heard(&self, at: Instant) {
+        let mut h = lock(&self.heard);
+        if at > *h {
+            *h = at;
+        }
+    }
+
+    fn last_heard(&self) -> Instant {
+        *lock(&self.heard)
+    }
 }
 
 impl LiveConn {
@@ -1859,7 +1950,15 @@ impl LiveConn {
     }
 
     fn revoked(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        self.flag.is_closed()
+    }
+
+    fn heard(&self, at: Instant) {
+        self.flag.heard(at);
+    }
+
+    fn last_heard(&self) -> Instant {
+        self.flag.last_heard()
     }
 }
 
@@ -2589,16 +2688,13 @@ mod tests {
         let d1b = c.register_live("d1");
         let d2 = c.register_live("d2");
         c.disconnect_device("d1");
-        assert!(d1.load(Ordering::SeqCst));
-        assert!(
-            d1b.load(Ordering::SeqCst),
-            "every socket of the device closes"
-        );
-        assert!(!d2.load(Ordering::SeqCst), "other devices stay connected");
+        assert!(d1.is_closed());
+        assert!(d1b.is_closed(), "every socket of the device closes");
+        assert!(!d2.is_closed(), "other devices stay connected");
         // A connection that ends on its own deregisters; revoking later is a no-op.
         c.unregister_live("d2", &d2);
         c.disconnect_device("d2");
-        assert!(!d2.load(Ordering::SeqCst));
+        assert!(!d2.is_closed());
     }
 
     #[test]
@@ -2607,7 +2703,7 @@ mod tests {
         let a = c.register_live("d1");
         let b = c.register_live("d2");
         c.disconnect_all_devices();
-        assert!(a.load(Ordering::SeqCst) && b.load(Ordering::SeqCst));
+        assert!(a.is_closed() && b.is_closed());
     }
 
     fn wired_controller() -> (
@@ -2693,6 +2789,82 @@ mod tests {
         );
         assert_eq!(attached_now_private(Some("open"), private), None);
         assert_eq!(attached_now_private(None, private), None);
+
+        // The whole step: unsubscribe the PTY stream, drop the tail, say why (tagged).
+        let (_tx, rx) = std::sync::mpsc::channel::<String>();
+        let mut attached = Some(("secret".to_string(), 7u64, rx));
+        let mut transcript = Some((PathBuf::from("/t/a.jsonl"), 3usize));
+        let mut context_path = Some(PathBuf::from("/t/a.jsonl"));
+        let mut tail_conversation = Some("conv".to_string());
+        let mut attached_claude = true;
+        let mut unsubscribed = Vec::new();
+        let refusal = stop_streaming_if_private(
+            &mut attached,
+            &mut transcript,
+            &mut context_path,
+            &mut tail_conversation,
+            &mut attached_claude,
+            private,
+            |sid, sub| unsubscribed.push((sid.to_string(), sub)),
+        );
+        assert_eq!(
+            refusal,
+            Some(json!({"type":"error","message":"private session","sessionId":"secret"}))
+        );
+        assert_eq!(unsubscribed, vec![("secret".to_string(), 7)]);
+        assert!(attached.is_none() && transcript.is_none() && context_path.is_none());
+        assert!(tail_conversation.is_none() && !attached_claude);
+
+        // A session that is still open is left streaming, untouched.
+        let (_tx, rx) = std::sync::mpsc::channel::<String>();
+        let mut attached = Some(("open".to_string(), 8u64, rx));
+        let mut transcript = Some((PathBuf::from("/t/b.jsonl"), 1usize));
+        let mut context_path = Some(PathBuf::from("/t/b.jsonl"));
+        let mut tail_conversation = Some("conv".to_string());
+        let mut attached_claude = true;
+        let refusal = stop_streaming_if_private(
+            &mut attached,
+            &mut transcript,
+            &mut context_path,
+            &mut tail_conversation,
+            &mut attached_claude,
+            private,
+            |_, _| panic!("nothing to unsubscribe"),
+        );
+        assert!(refusal.is_none());
+        assert!(attached.is_some() && transcript.is_some() && context_path.is_some());
+        assert!(tail_conversation.is_some() && attached_claude);
+    }
+
+    #[test]
+    fn a_silent_connection_is_pinged_then_dropped() {
+        let t0 = Instant::now();
+        assert!(!conn_is_stale(t0, t0));
+        assert!(!conn_is_stale(t0, t0 + Duration::from_secs(34)));
+        assert!(conn_is_stale(t0, t0 + Duration::from_secs(35)));
+        assert!(!ping_due(t0, t0 + Duration::from_secs(14)));
+        assert!(ping_due(t0, t0 + Duration::from_secs(15)));
+        // Two pings go unanswered before a connection is given up on.
+        assert!(STALE_AFTER > PING_EVERY * 2);
+    }
+
+    #[test]
+    fn a_stale_phone_stops_holding_questions() {
+        let (c, _asks, _gate) = wired_controller();
+        let slot = c.register_live("d1");
+        let now = Instant::now();
+        assert!(c.has_remote_phone_at(now));
+        let later = now + STALE_AFTER;
+        assert!(
+            !c.has_remote_phone_at(later),
+            "a phone silent for STALE_AFTER no longer holds a question"
+        );
+        slot.heard(later);
+        assert!(c.has_remote_phone_at(later), "a frame from it counts again");
+        // Two sockets: one fresh one is enough.
+        let fresh = c.register_live("d2");
+        fresh.heard(later + STALE_AFTER);
+        assert!(c.has_remote_phone_at(later + STALE_AFTER));
     }
 
     #[test]

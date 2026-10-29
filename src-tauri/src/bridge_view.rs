@@ -433,6 +433,33 @@ pub fn answer_result_frame(ask_id: &str, ok: bool) -> Value {
     json!({ "type": "answerResult", "askId": ask_id, "ok": ok })
 }
 
+/// The frames one connection sends for the pending list now, and the id set it has then
+/// sent. `prev` None = nothing pushed yet: the whole list as one `pending`. Otherwise
+/// `pendingAdded` for each new item, then `resolved` for each one gone, `by` read from the
+/// resolution ring (`Asks::recent_resolutions`, oldest first, so its LAST entry for an id
+/// wins); an id that fell out of the ring reads `cancelled`.
+pub fn push_frames(
+    prev: Option<&HashSet<String>>,
+    items: &[PushItem],
+    recent: &[(String, crate::asks::By)],
+) -> (Vec<Value>, HashSet<String>) {
+    let ids: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
+    let Some(prev) = prev else {
+        return (vec![pending_frame(items)], ids);
+    };
+    let (added, gone) = diff_pending(prev, items);
+    let mut frames: Vec<Value> = added.iter().map(pending_added_frame).collect();
+    for id in &gone {
+        let by = recent
+            .iter()
+            .rev()
+            .find(|(i, _)| i == id)
+            .map_or(crate::asks::By::Cancelled, |(_, by)| *by);
+        frames.push(resolved_frame(id, by.as_str()));
+    }
+    (frames, ids)
+}
+
 /// What changed since this connection last pushed: items it has not sent yet (in `now`'s
 /// order), and ids it sent that are no longer pending. Each connection keeps its own
 /// `prev`, so two phones each learn of the same resolution.
@@ -958,6 +985,47 @@ mod tests {
             answer_result_frame("ask-1", false),
             json!({ "type": "answerResult", "askId": "ask-1", "ok": false })
         );
+    }
+
+    #[test]
+    fn push_frames_sends_pending_first_then_diffs_named_by_the_ring() {
+        use crate::asks::By;
+        let item = |id: &str| PushItem {
+            id: id.to_string(),
+            item: json!({ "kind": "ask", "id": id }),
+        };
+        // First call: the whole list, as one `pending`.
+        let (frames, sent) = push_frames(None, &[item("a"), item("b")], &[]);
+        assert_eq!(frames, vec![pending_frame(&[item("a"), item("b")])]);
+        assert_eq!(sent, ["a", "b"].iter().map(|s| s.to_string()).collect());
+
+        // Later: additions first, then each resolution with `by` from the ring (its LATEST
+        // entry for that id); one that fell out of the ring reads `cancelled`.
+        let ring = vec![
+            ("b".to_string(), By::Desktop),
+            ("x".to_string(), By::Timeout),
+            ("b".to_string(), By::Phone),
+        ];
+        let (frames, sent) = push_frames(Some(&sent), &[item("c")], &ring);
+        assert_eq!(
+            frames,
+            vec![
+                pending_added_frame(&item("c")),
+                resolved_frame("a", "cancelled"),
+                resolved_frame("b", "phone"),
+            ]
+        );
+        assert_eq!(sent, ["c"].iter().map(|s| s.to_string()).collect());
+
+        // Nothing changed: nothing to send, the same set back.
+        let (frames, again) = push_frames(Some(&sent), &[item("c")], &ring);
+        assert!(frames.is_empty());
+        assert_eq!(again, sent);
+
+        // An empty first push is still a `pending` (the phone learns the list is empty).
+        let (frames, sent) = push_frames(None, &[], &[]);
+        assert_eq!(frames, vec![pending_frame(&[])]);
+        assert!(sent.is_empty());
     }
 
     #[test]

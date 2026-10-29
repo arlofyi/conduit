@@ -697,8 +697,10 @@ fn ask_decision(
 }
 
 /// Did this hook say the session's turn has moved past any question it was asking? Then
-/// a held question is dead (the user pressed Esc, typed a new prompt, the session ended,
-/// or another tool ran) and every surface must drop it. NOT `pretool`: the no-matcher
+/// a held question is dead (the user typed a new prompt, the session ended, the turn
+/// stopped, or another tool ran) and every surface must drop it. Esc is NOT among these:
+/// an interrupt fires no `Stop` -- it kills the hook, which `handle_ask` notices as its
+/// client hanging up (`hook_wait`). NOT `pretool`: the no-matcher
 /// `PreToolUse` row fires for `AskUserQuestion` itself, beside the blocking row. And not a
 /// SUBAGENT's tool finishing (`agent_id` set): a background subagent keeps working while
 /// the main turn waits on its question.
@@ -714,7 +716,9 @@ fn turn_moved_on(event: &str, body: &Value) -> bool {
 }
 
 /// Blocking `AskUserQuestion` handler (own thread, like `/approve`). The HTTP response is
-/// the hook's stdout. Every path answers -- `{}` unless the card answered in time.
+/// the hook's stdout. Every path answers -- `{}` unless the card answered in time -- and
+/// while it waits, the hook's client is probed (`hook_wait`), so a hook Claude Code has
+/// killed hands the question back to the terminal within about a second.
 fn handle_ask(
     mut request: Request,
     url: &str,
@@ -782,7 +786,11 @@ fn handle_ask(
     if let Some(view) = asks.get(&id) {
         let _ = app.emit("ask-request", &view);
     }
-    let received = rx.recv_timeout(crate::asks::ASK_CEILING).ok();
+    // The writer carries interim probes while we wait (see `hook_wait`), so the final
+    // response is written by hand on it too.
+    let mut out = request.into_writer();
+    let waited = crate::hook_wait::wait_for_answer(&rx, &mut *out, crate::asks::ASK_CEILING);
+    let received = settle_wait(waited, asks, &id);
     // Forget FIRST, then drain once. `Asks::resolve` removes + sends under one lock, so a
     // resolve either completed before the forget (caught by try_recv) or finds nothing and
     // reports false to its card: the card is never told "answered" when we replied `{}`.
@@ -790,10 +798,33 @@ fn handle_ask(
     let outcome = crate::asks::pick_outcome(received, rx.try_recv().ok());
     let how = crate::asks::how(&outcome);
     let by = crate::asks::by_of(&outcome);
-    let _ = request.respond(Response::from_string(
-        crate::asks::ask_response(&input, outcome.as_ref()).to_string(),
-    ));
+    let _ = crate::hook_wait::write_json_response(
+        &mut *out,
+        &crate::asks::ask_response(&input, outcome.as_ref()).to_string(),
+    );
+    drop(out);
     let _ = app.emit("ask-resolved", ask_resolved_payload(&id, how, by));
+}
+
+/// What a finished wait means for the ask. An answer or a timeout passes through. A hook
+/// whose curl hung up -- Claude Code killed it (Esc interrupts the turn and fires no
+/// `Stop`) -- can no longer deliver anything, so the question goes back to the terminal:
+/// every card drops, phones are told `by: terminal`, and a later answer is refused
+/// (`answerResult ok: false`). The hand-off's send lands in the holder's receiver, where
+/// its drain picks it up.
+fn settle_wait(
+    waited: crate::hook_wait::Waited<crate::asks::AskOutcome>,
+    asks: &crate::asks::Asks,
+    id: &str,
+) -> Option<crate::asks::AskOutcome> {
+    match waited {
+        crate::hook_wait::Waited::Got(outcome) => Some(outcome),
+        crate::hook_wait::Waited::NoAnswer => None,
+        crate::hook_wait::Waited::ClientGone => {
+            asks.resolve(id, crate::asks::AskOutcome::HandOff);
+            None
+        }
+    }
 }
 
 /// The `ask-resolved` event: `{id, how, by}`. `how` is kept for the existing desktop
@@ -2148,6 +2179,42 @@ mod tests {
             AskDecision::Hold { held_for_phone, .. } => assert!(!held_for_phone),
             other => panic!("expected Hold, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_hook_that_hung_up_hands_its_question_to_the_terminal() {
+        use crate::asks::{AskOutcome, Asks, By};
+        use crate::hook_wait::Waited;
+        let asks = Asks::default();
+        let (id, rx) = asks.register_held("s".into(), "t".into(), json!([]), 1, true);
+        let received = settle_wait(Waited::ClientGone, &asks, &id);
+        assert!(received.is_none());
+        assert!(asks.get(&id).is_none(), "every card drops");
+        assert_eq!(
+            asks.recent_resolutions().last(),
+            Some(&(id.clone(), By::Terminal)),
+            "phones are told the terminal has it"
+        );
+        let late = AskOutcome::Answered {
+            answers: serde_json::Map::new(),
+            by: By::Phone,
+        };
+        assert!(!asks.resolve(&id, late), "a later phone answer is refused");
+        // What the holder then reports is the hand-off.
+        let outcome = crate::asks::pick_outcome(received, rx.try_recv().ok());
+        assert_eq!(outcome, Some(AskOutcome::HandOff));
+
+        // An answer or a plain timeout passes through untouched.
+        let (id, _rx) = asks.register_held("s".into(), "t".into(), json!([]), 2, false);
+        assert_eq!(
+            settle_wait(Waited::Got(AskOutcome::HandOff), &asks, &id),
+            Some(AskOutcome::HandOff)
+        );
+        assert!(settle_wait(Waited::NoAnswer, &asks, &id).is_none());
+        assert!(
+            asks.get(&id).is_some(),
+            "only the holder's forget removes it"
+        );
     }
 
     #[test]

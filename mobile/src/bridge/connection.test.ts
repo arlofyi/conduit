@@ -1,5 +1,14 @@
 import type { SavedMac } from "../data/types";
-import { handshaking, initialConn, isLoopbackAddress, step, type ConnEvent, type ConnState } from "./connection";
+import {
+  BACKOFF_START_MS,
+  handshaking,
+  initialConn,
+  isLoopbackAddress,
+  lifecycleAction,
+  step,
+  type ConnEvent,
+  type ConnState,
+} from "./connection";
 import type { ServerMsg } from "./protocol";
 
 const mac: SavedMac = {
@@ -234,5 +243,74 @@ describe("connection reducer", () => {
     ]);
     expect(r.state.error).toEqual({ kind: "pairFailed", reason: "declined" });
     expect(r.effects).toEqual([]);
+  });
+});
+
+describe("backgrounding", () => {
+  const ready = () =>
+    run(initialConn, [
+      start(),
+      { t: "open" },
+      { t: "frame", msg: hello() },
+      { t: "frame", msg: { type: "authOk", deviceId: "dev1" } },
+    ]).state;
+
+  it("lifecycleAction_suspends_on_background_and_resumes_on_active", () => {
+    expect(lifecycleAction("active", "background")).toBe("suspend");
+    expect(lifecycleAction("inactive", "background")).toBe("suspend");
+    expect(lifecycleAction("background", "active")).toBe("resume");
+    expect(lifecycleAction("inactive", "active")).toBe("resume");
+    // iOS passes through `inactive` for the app switcher / Control Center: not a background.
+    expect(lifecycleAction("active", "inactive")).toBeNull();
+    expect(lifecycleAction("active", "active")).toBeNull();
+    expect(lifecycleAction("background", "background")).toBeNull();
+  });
+
+  it("suspend_closes_without_reconnecting_and_resume_redials_once", () => {
+    const s = ready();
+    const sus = run(s, [{ t: "suspend" }]);
+    expect(sus.state.suspended).toBe(true);
+    expect(sus.state.phase).toBe("idle");
+    expect(sus.effects).toEqual([]);
+    // The socket's own close (or a stray one) while suspended does not dial.
+    const closed = run(sus.state, [{ t: "close" }]);
+    expect(closed.effects).toEqual([]);
+    // Back in front: one immediate dial on the address that last worked, fresh backoff.
+    const res = run(closed.state, [{ t: "resume" }]);
+    expect(res.state.phase).toBe("connecting");
+    expect(res.state.suspended).toBe(false);
+    expect(res.state.backoffMs).toBe(BACKOFF_START_MS);
+    expect(res.effects).toEqual([{ k: "reconnect", addressIndex: s.addressIndex, delayMs: 0 }]);
+    // No storm: a second `active` with nothing suspended does nothing.
+    expect(run(res.state, [{ t: "resume" }]).effects).toEqual([]);
+  });
+
+  it("resume_without_suspend_and_terminal_failures_are_left_alone", () => {
+    expect(run(ready(), [{ t: "resume" }]).effects).toEqual([]);
+    const revoked = run(initialConn, [
+      start(),
+      { t: "open" },
+      { t: "frame", msg: hello() },
+      { t: "frame", msg: { type: "error", message: "unauthorized" } },
+    ]).state;
+    expect(revoked.phase).toBe("failed");
+    const r = run(revoked, [{ t: "suspend" }, { t: "resume" }]);
+    expect(r.state).toEqual(revoked);
+    expect(r.effects).toEqual([]);
+    // A pairing socket is single-shot: never suspended.
+    const pairing = run(initialConn, [{ t: "start", mac: null, addresses: ADDRS, pairing: true }]).state;
+    expect(run(pairing, [{ t: "suspend" }]).state).toEqual(pairing);
+  });
+
+  it("an_unavailable_retry_is_paused_too", () => {
+    const unavailable = run(initialConn, [
+      start(),
+      { t: "open" },
+      { t: "frame", msg: hello() },
+      { t: "frame", msg: { type: "error", message: "unavailable" } },
+    ]).state;
+    const sus = run(unavailable, [{ t: "suspend" }]);
+    expect(sus.state.suspended).toBe(true);
+    expect(run(sus.state, [{ t: "resume" }]).effects).toHaveLength(1);
   });
 });

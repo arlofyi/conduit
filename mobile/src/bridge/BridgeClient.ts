@@ -162,6 +162,22 @@ export class BridgeClient {
     this.send(inputMsg(sessionId, promptInput(text)));
   }
 
+  /** The app went to the background: close the socket and do not redial until `resume`. */
+  suspend() {
+    if (this.closedByUser) return;
+    this.apply({ t: "suspend" });
+    if (!this.state.suspended) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.dropSocket();
+  }
+
+  /** The app is back in front: redial through the normal reconnect path, if suspended. */
+  resume() {
+    if (this.closedByUser) return;
+    this.apply({ t: "resume" });
+  }
+
   close() {
     this.closedByUser = true;
     if (this.timer) clearTimeout(this.timer);

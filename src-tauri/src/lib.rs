@@ -39,6 +39,7 @@ mod fsops;
 mod git;
 mod git_mut;
 mod hermes;
+mod hook_wait;
 mod hookbus;
 mod hooks;
 mod hotexit;

@@ -21,7 +21,7 @@ import { acceptsFrame, frameSession, isSpawnError, PRIVATE_SESSION, refusesOpenC
 import { loopbackMac, type PairEndpoint } from "../logic/macs";
 import { addressesFor, confirmCode, makeNonce, type QrPayload } from "../logic/pairing";
 import { BridgeClient } from "./BridgeClient";
-import { initialConn, type ConnError, type ConnState } from "./connection";
+import { initialConn, lifecycleAction, type ConnError, type ConnState } from "./connection";
 import { appendWire, mapHistory, mapProjectsView, sameView, statusPatch, type LivePatch } from "./live";
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
 import { discoverMsg, pairMsg, spawnMsg, type ClientMsg, type WireMac } from "./protocol";
@@ -554,14 +554,22 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     [refreshMacs],
   );
 
-  // Track foreground/background: a backgrounded app polls nothing.
+  // Track foreground/background: a backgrounded app polls nothing, and closes its socket --
+  // iOS suspends it, and an open socket would keep the Mac holding questions for a phone
+  // that cannot show them. Back in front it redials (a fresh `ready` re-lists and re-attaches).
   useEffect(() => {
-    let was = AppState.currentState === "active";
+    let prev: string = AppState.currentState;
     const sub = AppState.addEventListener("change", (s) => {
       const active = s === "active";
-      // back in front: ask at once rather than wait out the interval
-      if (active && !was) clientRef.current?.list();
-      was = active;
+      const action = lifecycleAction(prev, s);
+      if (action === "suspend") clientRef.current?.suspend();
+      if (action === "resume") {
+        clientRef.current?.resume();
+        // back in front: ask at once rather than wait out the interval (a no-op while the
+        // socket is redialling; `ready` lists then)
+        clientRef.current?.list();
+      }
+      prev = s;
       setForeground(active);
     });
     return () => sub.remove();
