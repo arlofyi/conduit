@@ -73,6 +73,9 @@ mod updates;
 // Consumed by the mobile bridge in later tasks; only the two commands are wired yet.
 #[allow(dead_code)]
 mod tailscale;
+// Consumed by the bridge controller (Task 3) and pairing (Task 4); only commands are wired yet.
+#[allow(dead_code)]
+mod mobile_devices;
 mod usage_tally;
 mod window_registry;
 mod worktree;
@@ -3212,6 +3215,9 @@ pub fn run() {
         .manage(Arc::new(PtyManager::new()))
         .manage(crate::ide_host::IdeHost::new())
         .manage(Arc::new(Store::new()))
+        .manage(Arc::new(mobile_devices::MobileDevices::load(
+            store::data_dir().join("mobile-devices.json"),
+        )))
         .manage(Arc::new(HookState::default()))
         .manage(Arc::new(crate::fleet::FleetState::default()))
         .manage(Arc::new(crate::board::BoardState::default()))
@@ -3662,6 +3668,9 @@ pub fn run() {
             reveal_path,
             claude_status::fetch_claude_status,
             tailscale::tailscale_status,
+            mobile_devices::mobile_settings,
+            mobile_devices::mobile_set_enabled,
+            mobile_devices::mobile_revoke_device,
             tailscale::tailscale_open_app,
             claude_usage::fetch_claude_usage,
             transcript::session_transcript,
