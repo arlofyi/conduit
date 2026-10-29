@@ -341,14 +341,13 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_fire_is_auto() {
+    fn scheduled_fire_is_dropped() {
+        // The isMeta prompt that follows the fire is already an `auto` note; two notes per
+        // fire would say the same thing twice.
         let l = json!({"type":"system","subtype":"scheduled_task_fire",
             "content":"Running scheduled task (Sep 13 3:00am)"})
         .to_string();
-        let i = &parse_line(&l)[0];
-        assert_eq!(i["kind"], "auto");
-        assert_eq!(i["label"], "Running scheduled task (Sep 13 3:00am)");
-        assert_eq!(i["text"], "Running scheduled task (Sep 13 3:00am)");
+        assert!(parse_line(&l).is_empty());
     }
 
     #[test]

@@ -94,24 +94,31 @@ fn known_tag(t: &str) -> Option<Vec<Value>> {
             json!({ "kind": "command", "name": "!", "args": args }),
         ]);
     }
-    for (open, tag, stream) in [
-        ("<local-command-stdout>", "local-command-stdout", "stdout"),
-        ("<bash-stdout>", "bash-stdout", "stdout"),
-        ("<local-command-stderr>", "local-command-stderr", "stderr"),
-        ("<bash-stderr>", "bash-stderr", "stderr"),
-    ] {
-        if t.starts_with(open) {
-            let body = strip_ansi(&tag_text(t, tag).unwrap_or_default());
-            let body = body.trim();
-            if body.is_empty() {
-                return Some(vec![]);
-            }
-            return Some(vec![
-                json!({ "kind": "command_output", "text": body, "stream": stream }),
-            ]);
+    command_output(t)
+}
+
+/// A command's output as Claude Code writes it: ONE string holding the stdout tag and then
+/// the matching stderr tag (`<bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr>`).
+/// Each stream becomes its own item, stdout first, and only when it has visible text -- a
+/// failed `!` command routinely has empty stdout and its whole story in stderr.
+/// `t` must already be left-trimmed; `None` when it is not command output.
+fn command_output(t: &str) -> Option<Vec<Value>> {
+    let tags = if t.starts_with("<bash-stdout>") || t.starts_with("<bash-stderr>") {
+        ["bash-stdout", "bash-stderr"]
+    } else if t.starts_with("<local-command-stdout>") || t.starts_with("<local-command-stderr>") {
+        ["local-command-stdout", "local-command-stderr"]
+    } else {
+        return None;
+    };
+    let mut items = Vec::new();
+    for (tag, stream) in tags.into_iter().zip(["stdout", "stderr"]) {
+        let body = strip_ansi(&tag_text(t, tag).unwrap_or_default());
+        let body = body.trim();
+        if !body.is_empty() {
+            items.push(json!({ "kind": "command_output", "text": body, "stream": stream }));
         }
     }
-    None
+    Some(items)
 }
 
 /// Rules 3, 5-7, 10, 11 for one piece of non-human text (a string line or an array's text
@@ -242,7 +249,9 @@ pub fn parse_user(v: &Value) -> Vec<Value> {
             let name = path.rsplit(['/', '\\']).next().unwrap_or("");
             return vec![json!({ "kind": "skill", "name": name })];
         }
-        if text.trim().is_empty() {
+        // A pasted screenshot is followed by a sizing note meant for the model
+        // ("[Image: original 3600x1786, displayed at …"); the image itself is already shown.
+        if text.trim().is_empty() || trimmed.starts_with("[Image") {
             return vec![];
         }
         let label: String = text
@@ -281,7 +290,10 @@ pub fn parse_system(v: &Value) -> Vec<Value> {
             )]
         }
         "informational" => vec![divider(content, "info")],
-        "scheduled_task_fire" => vec![json!({ "kind": "auto", "label": content, "text": content })],
+        // A `/command`'s output carried on a system line instead of a user one.
+        "local_command" => command_output(content.trim_start()).unwrap_or_default(),
+        // Dropped: the isMeta prompt the fire injects right after is already an `auto` note.
+        "scheduled_task_fire" => vec![],
         _ => vec![],
     }
 }
@@ -372,11 +384,76 @@ mod tests {
     }
 
     #[test]
-    fn command_output_stderr_and_empty() {
-        let v = json!({"type":"user","message":{"content":"<bash-stderr>boom</bash-stderr>"}});
-        assert_eq!(parse_user(&v)[0]["stream"], "stderr");
+    fn bang_command_empty_stdout_keeps_stderr() {
+        let v = json!({"type":"user","message":{"content":"<bash-stdout></bash-stdout><bash-stderr>sudo: a terminal is required to read the password</bash-stderr>"}});
+        let items = parse_user(&v);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "command_output");
+        assert_eq!(items[0]["stream"], "stderr");
+        assert_eq!(
+            items[0]["text"],
+            "sudo: a terminal is required to read the password"
+        );
+    }
+
+    #[test]
+    fn bang_command_stdout_and_stderr_are_two_items_stdout_first() {
+        let v = json!({"type":"user","message":{"content":"<bash-stdout>ok\n</bash-stdout><bash-stderr>warning: x</bash-stderr>"}});
+        let items = parse_user(&v);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["stream"], "stdout");
+        assert_eq!(items[0]["text"], "ok");
+        assert_eq!(items[1]["stream"], "stderr");
+        assert_eq!(items[1]["text"], "warning: x");
+    }
+
+    #[test]
+    fn bang_command_both_streams_empty_is_nothing() {
+        let v = json!({"type":"user","message":{"content":"<bash-stdout></bash-stdout><bash-stderr></bash-stderr>"}});
+        assert!(parse_user(&v).is_empty());
         let v = json!({"type":"user","message":{"content":"<local-command-stdout></local-command-stdout>"}});
         assert!(parse_user(&v).is_empty());
+    }
+
+    #[test]
+    fn local_command_stdout_pairs_with_its_stderr() {
+        let v = json!({"type":"user","message":{"content":"<local-command-stdout></local-command-stdout><local-command-stderr>\u{1b}[31mfailed\u{1b}[0m</local-command-stderr>"}});
+        let items = parse_user(&v);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["stream"], "stderr");
+        assert_eq!(items[0]["text"], "failed");
+    }
+
+    #[test]
+    fn image_placeholder_meta_is_dropped() {
+        let text = "[Image: original 3600x1786, displayed at 2000x992. Multiply coordinates by 1.80 to map to the original image.]";
+        let v = json!({"type":"user","isMeta":true,"message":{"content":text}});
+        assert!(parse_user(&v).is_empty());
+        let v = json!({"type":"user","isMeta":true,"message":{"content":[{"type":"text","text":text}]}});
+        assert!(parse_user(&v).is_empty());
+    }
+
+    #[test]
+    fn system_local_command_maps_to_command_output() {
+        let v = json!({"type":"system","subtype":"local_command",
+            "content":"<local-command-stdout>Reloaded 3 plugins</local-command-stdout>"});
+        let items = parse_system(&v);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "command_output");
+        assert_eq!(items[0]["stream"], "stdout");
+        assert_eq!(items[0]["text"], "Reloaded 3 plugins");
+        let v = json!({"type":"system","subtype":"local_command",
+            "content":"<local-command-stdout></local-command-stdout><local-command-stderr>nope</local-command-stderr>"});
+        let items = parse_system(&v);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["stream"], "stderr");
+    }
+
+    #[test]
+    fn scheduled_task_fire_is_dropped() {
+        let v = json!({"type":"system","subtype":"scheduled_task_fire",
+            "content":"Running scheduled task (Sep 13 3:00am)"});
+        assert!(parse_system(&v).is_empty());
     }
 
     #[test]
