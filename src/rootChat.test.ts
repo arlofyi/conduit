@@ -26,6 +26,14 @@ describe("isRenderable", () => {
     expect(isRenderable({ kind: "event", event: "read", label: "read" })).toBe(true);
     expect(isRenderable({ kind: "usage", inputTokens: 5 })).toBe(false);
   });
+
+  it("hides every other transcript kind, since RootChatView draws only bubbles and events", () => {
+    // parse_line now emits the full kind set; a kind the view cannot draw must not count
+    // as shown, or the home state disappears behind an invisible row.
+    for (const kind of ["task", "command", "command_output", "auto", "note", "plan", "divider"]) {
+      expect(isRenderable({ kind, text: "x" } as unknown as ChatItem), kind).toBe(false);
+    }
+  });
 });
 
 describe("canSend", () => {
