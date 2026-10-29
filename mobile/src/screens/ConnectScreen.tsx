@@ -42,9 +42,11 @@ export function ConnectScreen({ navigation }: ConnectProps) {
   }, [ready, discover]);
 
   const otherSaved = macs.filter((m) => m.deviceId !== currentMac?.deviceId);
-  const isCurrent = (m: WireMac) =>
-    !!currentMac && ((m.dnsName && m.dnsName === currentMac.dnsName) || (m.ip && m.ip === currentMac.ip));
-  const tailnetMacs = (discovered ?? []).filter((m) => !isCurrent(m));
+  // A Mac this phone is already paired with is listed under "Paired" (or is the current
+  // one), never offered for pairing again.
+  const isPaired = (m: WireMac) =>
+    macs.some((s) => (!!m.dnsName && m.dnsName === s.dnsName) || (!!m.ip && m.ip === s.ip));
+  const tailnetMacs = (discovered ?? []).filter((m) => !isPaired(m));
 
   return (
     <View style={{ flex: 1, backgroundColor: p.panelBg }}>
@@ -286,13 +288,34 @@ function LoopbackSection() {
   const { probeLoopback, addLoopback } = useLive();
   const [found, setFound] = useState<LoopbackFound[] | null>(null);
   const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+  // The probe takes seconds; the screen may be gone (e.g. a pick switched Macs) by then.
+  const mounted = useRef(true);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+    },
+    [],
+  );
 
   const scan = async () => {
     setBusy(true);
+    setFailed(null);
     try {
-      setFound(await probeLoopback());
+      const r = await probeLoopback();
+      if (mounted.current) setFound(r);
+    } catch {
+      if (mounted.current) setFailed("Couldn't probe loopback.");
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  const pick = async (f: LoopbackFound) => {
+    try {
+      await addLoopback(f);
+    } catch {
+      if (mounted.current) setFailed(`Couldn't connect to ${f.macName}.`);
     }
   };
 
@@ -300,6 +323,7 @@ function LoopbackSection() {
     <>
       <SectionLabel>This Mac (simulator)</SectionLabel>
       <Button label="Find Conduit on this Mac" kind="secondary" busy={busy} onPress={scan} />
+      {failed ? <Notice text={failed} /> : null}
       {found && found.length === 0 ? (
         <Para style={{ color: p.textDim, marginTop: 10 }}>Nothing answered on 127.0.0.1:8455–8474.</Para>
       ) : null}
@@ -312,7 +336,7 @@ function LoopbackSection() {
                 first={i === 0}
                 title={f.macName}
                 subtitle={`Conduit ${f.conduitVersion} · port ${f.port}`}
-                onPress={() => addLoopback(f)}
+                onPress={() => pick(f)}
               />
             ))}
           </Card>

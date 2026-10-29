@@ -587,7 +587,9 @@ plus install/remove/status), and one listener in `App.tsx`.
   token (or `pair`/`discover`) within 5 s; the WebSocket upgrade itself has ONE 5 s overall deadline (a watchdog shuts the socket down, so a byte-dribbling peer cannot hold the thread). Pre-auth frames are capped at 4 KiB and the cap is
   lifted on auth. Success is acked with an `authOk` frame; a pair request waiting on the Mac
   sends `pairPending`. Failures answer one generic `unauthorized` (no oracle) and are
-  rate-limited 5 per 60 s per IP.
+  rate-limited 5 per 60 s per IP -- except an `auth` refused by the rate limit or the access
+  switch, which is decided BEFORE the token is checked and answers `unavailable`
+  (`auth_outcome`), because the phone forgets a Mac on `unauthorized`.
 - **`mobile-devices.json`, never `state.json`** (the orphan-sweep rule). It holds the switch,
   the port and SHA-256 token hashes; plaintext is returned once. An unparseable file is moved
   to `.bak.<secs>-<8 hex>` (a uuid fragment, so names never collide) and defaults load; if it cannot be

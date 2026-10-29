@@ -31,6 +31,8 @@ export function connErrorText(e: ConnError, macName = "your Mac"): string {
       return pairFailText(e.reason);
     case "notPaired":
       return `This phone isn't paired with ${e.macName || macName}.`;
+    case "unavailable":
+      return `${e.macName || macName} isn't accepting connections right now — mobile access may be off.`;
     case "closed":
       return `Couldn't reach ${macName}. Check that Tailscale is on.`;
   }
@@ -60,6 +62,8 @@ export function connStatus(c: ConnState, macName: string): { tone: ConnTone; tex
     case "idle":
       return { tone: "bad", text: "Not connected" };
     default:
+      // Retrying after the Mac refused: keep saying why rather than a bare "connecting".
+      if (c.error?.kind === "unavailable") return { tone: "bad", text: connErrorText(c.error, macName) };
       return { tone: "busy", text: `Connecting to ${macName}…` };
   }
 }

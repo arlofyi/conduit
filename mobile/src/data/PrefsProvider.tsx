@@ -30,14 +30,17 @@ export function PrefsProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  // The latest prefs, so a write is computed outside the (pure, possibly re-run) updater.
+  const latest = useRef(prefs);
+  latest.current = prefs;
+
   const setPrefs = useCallback((patch: Partial<Prefs>) => {
     touched.current = true;
-    setState((prev) => {
-      const next = { ...prev, ...patch };
-      prefsStore.save(next).catch(() => {
-        // Keychain write failed: the change still applies for this run.
-      });
-      return next;
+    const next = { ...latest.current, ...patch };
+    latest.current = next; // two calls in one tick must compose
+    setState(next);
+    prefsStore.save(next).catch(() => {
+      // Keychain write failed: the change still applies for this run.
     });
   }, []);
 

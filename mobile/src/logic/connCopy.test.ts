@@ -40,6 +40,9 @@ describe("connStatus", () => {
   it("phases", () => {
     expect(connStatus(at("ready"), "Studio")).toEqual({ tone: "ok", text: "Connected · Studio" });
     expect(connStatus(at("authing"), "Studio").tone).toBe("busy");
+    const unavailable = "Studio isn't accepting connections right now — mobile access may be off.";
+    expect(connErrorText({ kind: "unavailable", macName: "Studio" })).toBe(unavailable);
+    expect(connStatus(at("connecting", { kind: "unavailable" }), "Studio")).toEqual({ tone: "bad", text: unavailable });
     expect(connStatus(at("failed", { kind: "closed" }), "Studio")).toEqual({
       tone: "bad",
       text: "Couldn't reach Studio. Check that Tailscale is on.",

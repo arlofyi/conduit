@@ -1,6 +1,6 @@
 import type { SavedMac } from "../data/types";
 import {
-  awaitingHello,
+  handshaking,
   HELLO_TIMEOUT_MS,
   initialConn,
   step,
@@ -35,7 +35,7 @@ export class BridgeClient {
   private ws: WebSocket | null = null;
   private state: ConnState = initialConn;
   private timer: ReturnType<typeof setTimeout> | null = null;
-  /** connect + hello deadline for the current socket */
+  /** connect + hello + auth deadline for the current socket */
   private helloTimer: ReturnType<typeof setTimeout> | null = null;
   private closedByUser = false;
 
@@ -60,7 +60,7 @@ export class BridgeClient {
       if (e.k === "reconnect") this.scheduleReconnect(e.delayMs);
       else this.handlers.onEffect?.(e);
     }
-    if (!awaitingHello(this.state)) this.clearHelloTimer();
+    if (!handshaking(this.state)) this.clearHelloTimer();
     // A failed connection is terminal: drop the socket so the desktop sees it go.
     if (changed && this.state.phase === "failed") this.dropSocket();
     if (changed) this.handlers.onState?.(this.state);
@@ -99,7 +99,7 @@ export class BridgeClient {
     // A host that never answers (a dead tailnet route) must not hold the address list.
     this.helloTimer = setTimeout(() => {
       this.helloTimer = null;
-      if (this.ws !== ws || !awaitingHello(this.state)) return;
+      if (this.ws !== ws || !handshaking(this.state)) return;
       this.dropSocket();
       this.apply({ t: "close" });
     }, HELLO_TIMEOUT_MS);
@@ -133,6 +133,8 @@ export class BridgeClient {
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.timer = null;
+      if (this.closedByUser) return;
+      this.apply({ t: "dial" });
       this.connect();
     }, delayMs);
   }

@@ -16,6 +16,8 @@ export type ConnError =
   | { kind: "pairFailed"; reason: string }
   /** a Mac with no device token reached a non-loopback address (only loopback is trusted) */
   | { kind: "notPaired"; macName?: string }
+  /** the Mac refused to check the token (rate limit / mobile access off); retried, never forgets */
+  | { kind: "unavailable"; macName?: string }
   | { kind: "closed" };
 
 export interface ConnState {
@@ -35,7 +37,9 @@ export type ConnEvent =
   | { t: "open" }
   | { t: "close" }
   | { t: "frame"; msg: ServerMsg }
-  | { t: "start"; mac: SavedMac | null; addresses: string[]; pairing?: boolean };
+  | { t: "start"; mac: SavedMac | null; addresses: string[]; pairing?: boolean }
+  /** BridgeClient is about to open a socket for a scheduled reconnect */
+  | { t: "dial" };
 
 export type Effect =
   | { k: "forgetMac"; deviceId: string }
@@ -59,12 +63,14 @@ export const initialConn: ConnState = {
   pairing: false,
 };
 
-/** How long a socket may take to open AND say hello before it is dropped and the next
- * address is tried (BridgeClient enforces it; `awaitingHello` says when it applies). */
+/** How long a socket may take to open, say hello AND (with a token) answer auth before it
+ * is dropped and the next address is tried (BridgeClient enforces it; `handshaking` says
+ * when it applies). */
 export const HELLO_TIMEOUT_MS = 6000;
 
-/** True while the connection has not yet heard `hello` on the current socket. */
-export const awaitingHello = (s: ConnState): boolean => s.phase === "connecting" || s.phase === "hello";
+/** True while the current socket is still opening, waiting for hello, or authenticating. */
+export const handshaking = (s: ConnState): boolean =>
+  s.phase === "connecting" || s.phase === "hello" || s.phase === "authing";
 
 /** `ws://127.0.0.1:…` / `ws://localhost:…` / `ws://[::1]:…` — the only hosts the desktop
  * serves without a device token. */
@@ -93,6 +99,12 @@ export function step(state: ConnState, ev: ConnEvent): StepResult {
         backoffMs: BACKOFF_START_MS,
         pairing: !!ev.pairing,
       });
+
+    case "dial":
+      // A retry after `unavailable` starts a fresh handshake; the error stays visible until ready.
+      return state.phase === "failed" && state.error?.kind === "unavailable"
+        ? out({ ...state, phase: "connecting" })
+        : out(state);
 
     case "open":
       return state.phase === "connecting" ? out({ ...state, phase: "hello" }) : out(state);
@@ -153,14 +165,14 @@ function onFrame(state: ConnState, msg: ServerMsg): StepResult {
       }
       // No token (no Mac, or a saved loopback "Mac"): the desktop trusts loopback only.
       if (isLoopbackAddress(state.addresses[state.addressIndex])) {
-        return out({ ...state, phase: "ready", backoffMs: BACKOFF_START_MS });
+        return out({ ...state, phase: "ready", error: undefined, backoffMs: BACKOFF_START_MS });
       }
       return out({ ...state, phase: "failed", error: { kind: "notPaired", macName: msg.macName } });
     }
 
     case "authOk":
       if (state.phase !== "authing") return out(state);
-      return out({ ...state, phase: "ready", backoffMs: BACKOFF_START_MS });
+      return out({ ...state, phase: "ready", error: undefined, backoffMs: BACKOFF_START_MS });
 
     case "error":
       if (state.phase === "authing" && msg.message === "unauthorized" && state.mac) {
@@ -168,6 +180,19 @@ function onFrame(state: ConnState, msg: ServerMsg): StepResult {
           { ...state, phase: "failed", error: { kind: "revoked", macName: state.mac.macName } },
           [],
           [{ k: "forgetMac", deviceId: state.mac.deviceId }],
+        );
+      }
+      if (state.phase === "authing" && msg.message === "unavailable") {
+        // Refused before the token was checked: keep the Mac, retry the same address with backoff.
+        return out(
+          {
+            ...state,
+            phase: "failed",
+            error: { kind: "unavailable", macName: state.mac?.macName },
+            backoffMs: Math.min(state.backoffMs * 2, BACKOFF_MAX_MS),
+          },
+          [],
+          [{ k: "reconnect", addressIndex: state.addressIndex, delayMs: state.backoffMs }],
         );
       }
       return out(state);

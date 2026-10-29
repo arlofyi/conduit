@@ -1,5 +1,5 @@
 import type { SavedMac } from "../data/types";
-import { awaitingHello, initialConn, isLoopbackAddress, step, type ConnEvent, type ConnState } from "./connection";
+import { handshaking, initialConn, isLoopbackAddress, step, type ConnEvent, type ConnState } from "./connection";
 import type { ServerMsg } from "./protocol";
 
 const mac: SavedMac = {
@@ -160,13 +160,53 @@ describe("connection reducer", () => {
     expect(isLoopbackAddress(undefined)).toBe(false);
   });
 
-  it("awaiting_hello_only_before_hello", () => {
+  it("handshake_deadline_covers_connect_hello_and_auth", () => {
     const s0 = run(initialConn, [start()]).state;
-    expect(awaitingHello(s0)).toBe(true);
+    expect(handshaking(s0)).toBe(true);
     const s1 = run(s0, [{ t: "open" }]).state;
-    expect(awaitingHello(s1)).toBe(true);
+    expect(handshaking(s1)).toBe(true);
     const s2 = run(s1, [{ t: "frame", msg: hello() }]).state;
-    expect(awaitingHello(s2)).toBe(false);
+    expect(s2.phase).toBe("authing");
+    expect(handshaking(s2)).toBe(true);
+    const s3 = run(s2, [{ t: "frame", msg: { type: "authOk", deviceId: "dev1" } }]).state;
+    expect(handshaking(s3)).toBe(false);
+    // a pairing socket waits on a human after hello: no deadline
+    const p = run(initialConn, [
+      { t: "start", mac: null, addresses: ADDRS, pairing: true },
+      { t: "open" },
+      { t: "frame", msg: hello() },
+    ]).state;
+    expect(handshaking(p)).toBe(false);
+  });
+
+  it("unavailable_auth_retries_with_backoff_and_never_forgets", () => {
+    const authing = run(initialConn, [start(), { t: "open" }, { t: "frame", msg: hello() }]).state;
+    const r = run(authing, [{ t: "frame", msg: { type: "error", message: "unavailable" } }]);
+    expect(r.state.phase).toBe("failed");
+    expect(r.state.error).toEqual({ kind: "unavailable", macName: "Studio" });
+    expect(r.effects).toEqual([{ k: "reconnect", addressIndex: 0, delayMs: 500 }]);
+    // the desktop's close after the reply is ignored (the retry is already scheduled)
+    expect(step(r.state, { t: "close" }).effects).toEqual([]);
+    // the scheduled retry starts a fresh handshake, error still shown until ready
+    const d = run(r.state, [{ t: "dial" }, { t: "open" }, { t: "frame", msg: hello() }]);
+    expect(d.state.phase).toBe("authing");
+    expect(d.state.error?.kind).toBe("unavailable");
+    const again = step(d.state, { t: "frame", msg: { type: "error", message: "unavailable" } });
+    expect(again.effects).toEqual([{ k: "reconnect", addressIndex: 0, delayMs: 1000 }]);
+    const ok = run(d.state, [{ t: "frame", msg: { type: "authOk", deviceId: "dev1" } }]);
+    expect(ok.state.phase).toBe("ready");
+    expect(ok.state.error).toBeUndefined();
+    expect(ok.state.backoffMs).toBe(500);
+  });
+
+  it("dial_does_not_revive_other_failures", () => {
+    const revoked = run(initialConn, [
+      start(),
+      { t: "open" },
+      { t: "frame", msg: hello() },
+      { t: "frame", msg: { type: "error", message: "unauthorized" } },
+    ]).state;
+    expect(step(revoked, { t: "dial" }).state.phase).toBe("failed");
   });
 
   it("pairing_falls_through_addresses_before_hello_then_fails", () => {

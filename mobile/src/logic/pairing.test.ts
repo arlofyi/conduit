@@ -66,9 +66,11 @@ describe("parseQr", () => {
 
 describe("addressesFor", () => {
   const mac: SavedMac = { deviceId: "d", token: "t", macName: "m", dnsName: "studio.ts.net", ip: "100.64.0.2", port: 8460, pairedAt: 1 };
-  it("addresses_dns_then_ip_then_loopback_in_sim", () => {
+  it("addresses_dns_then_ip_then_loopback_in_sim_only_without_a_token", () => {
     expect(addressesFor(mac, { simulator: false })).toEqual(["ws://studio.ts.net:8460", "ws://100.64.0.2:8460"]);
-    expect(addressesFor(mac, { simulator: true })).toEqual([
+    // a paired Mac (has a token) never falls back to loopback
+    expect(addressesFor(mac, { simulator: true })).toEqual(["ws://studio.ts.net:8460", "ws://100.64.0.2:8460"]);
+    expect(addressesFor({ ...mac, token: "" }, { simulator: true })).toEqual([
       "ws://studio.ts.net:8460",
       "ws://100.64.0.2:8460",
       "ws://127.0.0.1:8460",

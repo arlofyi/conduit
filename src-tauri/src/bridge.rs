@@ -358,10 +358,39 @@ fn read_lines(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The generic failure reply. Identical for a wrong token, a revoked device, a
-/// rate-limited peer, a bad or spent pairing secret and a pre-auth `discover` -- no oracle.
+/// The generic failure reply. Identical for a wrong token, a revoked device, a bad or
+/// spent pairing secret and a pre-auth `discover` -- no oracle.
 fn unauthorized() -> serde_json::Value {
     json!({ "type": "error", "message": "unauthorized" })
+}
+
+/// Reply to an `auth` this Mac will not even check right now (peer rate-limited, or
+/// mobile access off). Decided BEFORE the token is looked at, so it says nothing about
+/// the token -- and it tells the phone not to forget a Mac that never judged its token.
+fn unavailable() -> serde_json::Value {
+    json!({ "type": "error", "message": "unavailable" })
+}
+
+/// What an `auth` frame gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthOutcome {
+    Accepted,
+    /// gates refused before the token was examined
+    Unavailable,
+    /// the token was examined and is not a paired device's
+    Unauthorized,
+}
+
+/// The gates come first: `verified` only counts once the peer is under its rate limit
+/// and mobile access is on. Callers must not run `verify` unless both pass.
+fn auth_outcome(rate_ok: bool, enabled: bool, verified: bool) -> AuthOutcome {
+    if !rate_ok || !enabled {
+        AuthOutcome::Unavailable
+    } else if verified {
+        AuthOutcome::Accepted
+    } else {
+        AuthOutcome::Unauthorized
+    }
 }
 
 /// First frame to every peer, before auth.
@@ -922,15 +951,19 @@ impl BridgeController {
     }
 
     /// Verify a device token from `peer`. None for every failure, alike.
-    fn authenticate(&self, peer: IpAddr, token: &str) -> Option<String> {
-        if !self.auth_allowed(peer) || !self.devices.enabled() {
-            return None;
+    fn authenticate(&self, peer: IpAddr, token: &str) -> Result<String, AuthOutcome> {
+        let (rate_ok, enabled) = (self.auth_allowed(peer), self.devices.enabled());
+        if auth_outcome(rate_ok, enabled, false) == AuthOutcome::Unavailable {
+            return Err(AuthOutcome::Unavailable);
         }
         let id = self.devices.verify(token);
-        if id.is_none() {
-            self.record_auth_failure(peer);
+        match (auth_outcome(rate_ok, enabled, id.is_some()), id) {
+            (AuthOutcome::Accepted, Some(id)) => Ok(id),
+            (outcome, _) => {
+                self.record_auth_failure(peer);
+                Err(outcome)
+            }
         }
-        id
     }
 }
 
@@ -1047,9 +1080,14 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                 // (device id, came from `auth` -- which is acked with `authOk`).
                 let newly_authed = match parse_client_msg(&text) {
                     Some(ClientMsg::Auth { token }) => match ctrl.authenticate(peer, &token) {
-                        Some(id) => Some((id, true)),
-                        None => {
-                            let _ = ws.send(Message::Text(unauthorized().to_string()));
+                        Ok(id) => Some((id, true)),
+                        Err(outcome) => {
+                            let reply = if outcome == AuthOutcome::Unavailable {
+                                unavailable()
+                            } else {
+                                unauthorized()
+                            };
+                            let _ = ws.send(Message::Text(reply.to_string()));
                             let _ = ws.close(None);
                             let _ = ws.flush();
                             break;
@@ -1429,6 +1467,29 @@ fn detach(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_gates_refuse_before_the_token_is_judged() {
+        // Rate-limited or switched off: unavailable, whatever the token is.
+        for verified in [true, false] {
+            assert_eq!(
+                auth_outcome(false, true, verified),
+                AuthOutcome::Unavailable
+            );
+            assert_eq!(
+                auth_outcome(true, false, verified),
+                AuthOutcome::Unavailable
+            );
+            assert_eq!(
+                auth_outcome(false, false, verified),
+                AuthOutcome::Unavailable
+            );
+        }
+        assert_eq!(auth_outcome(true, true, true), AuthOutcome::Accepted);
+        assert_eq!(auth_outcome(true, true, false), AuthOutcome::Unauthorized);
+        assert_eq!(unavailable()["message"], "unavailable");
+        assert_eq!(unauthorized()["message"], "unauthorized");
+    }
 
     fn sorted_keys(v: &serde_json::Value) -> Vec<String> {
         let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();

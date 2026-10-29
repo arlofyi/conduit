@@ -90,7 +90,9 @@ export async function confirmCode(
 /** Hosts to try in order: dnsName, ip, then (Simulator/dev only) loopback. */
 export function addressesFor(mac: SavedMac, opts: { simulator: boolean }): string[] {
   const hosts = [mac.dnsName, mac.ip];
-  if (opts.simulator) hosts.push("127.0.0.1");
+  // Loopback is only for a token-less (loopback / pairing) Mac: a paired Mac's token is
+  // never offered to whatever happens to listen on this machine's loopback.
+  if (opts.simulator && !mac.token) hosts.push("127.0.0.1");
   const urls = hosts.filter((h) => h.length > 0).map((h) => `ws://${h}:${mac.port}`);
   return [...new Set(urls)];
 }

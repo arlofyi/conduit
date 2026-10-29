@@ -351,7 +351,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
             }
           },
           onEffect: (e) => {
-            if (e.k !== "saveToken" || !isCurrent()) return;
+            // A token the Mac issued is always kept, even if the attempt was abandoned:
+            // dropping it would leave a paired device on the Mac this phone cannot use.
+            if (e.k !== "saveToken") return;
             const mac: SavedMac = {
               deviceId: e.deviceId,
               token: e.token,
@@ -371,10 +373,12 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                 return;
               }
               client.close();
-              if (!isCurrent()) return;
-              pairClientRef.current = null;
+              // The token is persisted: finish selecting this Mac even if the user left Pair
+              // meanwhile (pairGen only guards the Pair screen's own state).
+              if (pairClientRef.current === client) pairClientRef.current = null;
               await refreshMacs();
               patch({ phase: "done" });
+              setNotice(null);
               setCurrentMac(mac);
             })();
           },
