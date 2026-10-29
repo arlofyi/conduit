@@ -1298,7 +1298,7 @@ own id names a conversation it has left (see "Where conversation continuity live
 BACKWARDS with a substring pre-filter and reads only the trailing 1 MB; the window is resolved
 by model FAMILY because Claude Code runs opus/sonnet at 1M while the id stays bare), `subagents.rs` (the right panel's
 Agents tab), and `transcript_index.rs` (palette search over past conversations). All are
-read-only and degrade to "show less" rather than erroring.
+read-only and degrade to "show less" rather than erroring. Tool results arrive as separate `result` items paired to their call by `toolUseId` in each renderer's grouping function, and the quiet-fold rule (and the running/unknown rule for a call with no result) must stay identical in `src/chatItems.ts` and `mobile/src/logic/feed.ts`.
 
 **User/system lines are classified in one place:** `transcript_user.rs` decides whether a
 `user` record is a real prompt or a notice/command/skill/etc. Its item kinds are pinned by
