@@ -9,7 +9,12 @@
 //! Either way the Mac shows a prompt (`pair-request`, mirroring the `/ask` flow in
 //! `asks.rs` + `hooks.rs`) with a 4-digit code both sides derive from the same inputs, and
 //! the human allows or declines. A request waits [`REQUEST_WAIT`] and then resolves as
-//! declined; there is at most one outstanding request per peer IP.
+//! declined; there is at most one outstanding request per peer IP (a newer one from the
+//! same IP replaces the older, which is usually a half-open socket).
+//!
+//! Turning mobile access off ends pairing outright: [`Pairing::clear`] drops the QR secret
+//! and resolves every waiting request as `off`, and the waiter re-checks the switch before
+//! it persists a device ([`decide`]).
 //!
 //! Nothing here logs a secret, nonce or token. Types carrying a secret deliberately do not
 //! derive `Debug`.
@@ -118,10 +123,56 @@ pub fn nonce_ok(nonce: &str) -> bool {
     !nonce.is_empty() && nonce.len() <= MAX_NONCE
 }
 
+/// How a parked request was resolved by someone other than the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    Allow,
+    Decline,
+    /// A newer request from the same peer IP took its slot.
+    Replaced,
+    /// Mobile access was turned off.
+    Off,
+}
+
+/// How the waiting connection's wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitEnd {
+    Resolved(Resolution),
+    /// No answer within [`REQUEST_WAIT`] (or the request was swept).
+    Expired,
+    /// The phone closed its socket.
+    Gone,
+}
+
+/// What the waiter does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Persist the device and send its token.
+    Pair,
+    /// Reply `pairResult ok:false` with this reason (also the `pair-resolved` how).
+    Refuse(&'static str),
+    /// Nobody is listening; reply nothing.
+    Cancelled,
+}
+
+/// Pure: the waiter's verdict. `enabled` is read immediately before acting, so an Allow
+/// that lands after mobile access was turned off never persists a device.
+pub fn decide(end: WaitEnd, enabled: bool) -> Decision {
+    match end {
+        WaitEnd::Gone => Decision::Cancelled,
+        _ if !enabled => Decision::Refuse("off"),
+        WaitEnd::Resolved(Resolution::Allow) => Decision::Pair,
+        WaitEnd::Resolved(Resolution::Decline) => Decision::Refuse("declined"),
+        WaitEnd::Resolved(Resolution::Replaced) => Decision::Refuse("replaced"),
+        WaitEnd::Resolved(Resolution::Off) => Decision::Refuse("off"),
+        WaitEnd::Expired => Decision::Refuse("expired"),
+    }
+}
+
 struct Pending {
     view: PairRequestView,
     peer: IpAddr,
-    tx: SyncSender<bool>,
+    tx: SyncSender<Resolution>,
 }
 
 struct Inner {
@@ -204,16 +255,21 @@ impl Pairing {
         ok
     }
 
-    /// Does this peer already have a request waiting?
-    pub fn busy(&self, peer: IpAddr) -> bool {
-        self.swept().0.pending.values().any(|p| p.peer == peer)
-    }
-
-    /// Park a request for the human. `None` when this peer already has one outstanding.
-    pub fn register(&self, req: PairRequest) -> Option<(String, Receiver<bool>)> {
+    /// Park a request for the human. A request already waiting from the same peer IP is
+    /// resolved as [`Resolution::Replaced`] (its waiter reports it), so a phone whose old
+    /// socket went half-open can simply ask again.
+    pub fn register(&self, req: PairRequest) -> (String, Receiver<Resolution>) {
         let (mut g, now) = self.swept();
-        if g.pending.values().any(|p| p.peer == req.peer) {
-            return None;
+        let stale: Vec<String> = g
+            .pending
+            .iter()
+            .filter(|(_, p)| p.peer == req.peer)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for old in stale {
+            if let Some(p) = g.pending.remove(&old) {
+                let _ = p.tx.try_send(Resolution::Replaced);
+            }
         }
         let id = uuid::Uuid::new_v4().simple().to_string();
         let code_input = match req.via {
@@ -238,7 +294,7 @@ impl Pairing {
                 tx,
             },
         );
-        Some((id, rx))
+        (id, rx)
     }
 
     /// First responder wins: the entry is removed and the answer sent under one lock, so
@@ -247,10 +303,42 @@ impl Pairing {
         let (mut g, _) = self.swept();
         match g.pending.remove(id) {
             Some(p) => {
-                let _ = p.tx.try_send(allow);
+                let answer = if allow {
+                    Resolution::Allow
+                } else {
+                    Resolution::Decline
+                };
+                let _ = p.tx.try_send(answer);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Mobile access went off: drop the QR secret and resolve every waiting request as
+    /// [`Resolution::Off`]. Returns the ids it resolved.
+    pub fn clear(&self) -> Vec<String> {
+        let (mut g, _) = self.swept();
+        g.secret = None;
+        g.pending
+            .drain()
+            .map(|(id, p)| {
+                let _ = p.tx.try_send(Resolution::Off);
+                id
+            })
+            .collect()
+    }
+
+    /// [`Pairing::clear`] plus a `pair-resolved {id, how:"off"}` per request so every open
+    /// prompt closes. The waiter reports the same id and how too; the frontend's removal by
+    /// id is idempotent.
+    pub fn clear_and_announce(&self, app: &tauri::AppHandle) {
+        use tauri::Emitter;
+        for id in self.clear() {
+            let _ = app.emit(
+                "pair-resolved",
+                serde_json::json!({ "id": id, "how": "off" }),
+            );
         }
     }
 
@@ -340,40 +428,65 @@ fn probe(ip: Ipv4Addr, budget: Duration) -> Option<(u16, String, String)> {
     None
 }
 
-/// The `macs` reply: every same-user online peer whose bridge answered. Blocks for about
-/// [`PROBE_BUDGET`] (peers are probed in parallel), so call it off the connection loop.
-pub fn discover_macs() -> serde_json::Value {
+/// One Mac in a `macs` reply.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MacEntry {
+    pub name: String,
+    pub dns_name: String,
+    pub ip: String,
+    pub port: u16,
+    pub online: bool,
+    pub conduit_version: String,
+}
+
+/// The `macs` wire frame.
+pub fn macs_reply(macs: &[MacEntry]) -> serde_json::Value {
+    serde_json::json!({ "type": "macs", "macs": macs })
+}
+
+/// Pure: may this requester see the owner's Macs? Only when Tailscale says the phone
+/// belongs to the same user as this Mac. An unknown owner (whois failed) is a no.
+pub fn same_tailnet_user(self_user: u64, requester: Option<u64>) -> bool {
+    requester == Some(self_user)
+}
+
+/// The `macs` reply: every same-user online peer whose bridge answered. `requester` gives
+/// the asking phone's Tailscale user id (called with Self's, so loopback can answer "me");
+/// a phone owned by anyone else gets an empty list. Blocks for about [`PROBE_BUDGET`]
+/// (peers are probed in parallel), so call it off the connection loop.
+pub fn discover_macs(requester: impl FnOnce(u64) -> Option<u64>) -> serde_json::Value {
     let (self_user, self_ip) = match crate::tailscale::status() {
         TailscaleState::Running { user_id, ipv4, .. } => (user_id, ipv4),
-        _ => return serde_json::json!({ "type": "macs", "macs": [] }),
+        _ => return macs_reply(&[]),
     };
+    if !same_tailnet_user(self_user, requester(self_user)) {
+        return macs_reply(&[]);
+    }
     let handles: Vec<_> = discover_candidates(self_user, self_ip, crate::tailscale::peers())
         .into_iter()
         .map(|(peer, ip)| {
             std::thread::spawn(move || {
-                probe(ip, PROBE_BUDGET).map(|(port, name, version)| {
-                    let name = if name.trim().is_empty() {
+                probe(ip, PROBE_BUDGET).map(|(port, name, version)| MacEntry {
+                    name: if name.trim().is_empty() {
                         peer.name.clone()
                     } else {
                         name
-                    };
-                    serde_json::json!({
-                        "name": name,
-                        "dnsName": peer.dns_name,
-                        "ip": ip.to_string(),
-                        "port": port,
-                        "online": peer.online,
-                        "conduitVersion": version,
-                    })
+                    },
+                    dns_name: peer.dns_name,
+                    ip: ip.to_string(),
+                    port,
+                    online: peer.online,
+                    conduit_version: version,
                 })
             })
         })
         .collect();
-    let macs: Vec<serde_json::Value> = handles
+    let macs: Vec<MacEntry> = handles
         .into_iter()
         .filter_map(|h| h.join().ok().flatten())
         .collect();
-    serde_json::json!({ "type": "macs", "macs": macs })
+    macs_reply(&macs)
 }
 
 // ---------------------------------------------------------------- commands
@@ -398,9 +511,11 @@ pub fn pair_start(
     else {
         return Err("Tailscale is not running".into());
     };
+    // The QR must name an address the bridge is actually listening on, not merely the
+    // one Tailscale reports (the 30 s reconcile may not have bound it yet).
     let port = bridge.current_port();
-    if port == 0 {
-        return Err("The mobile bridge is not listening".into());
+    if port == 0 || bridge.tailnet_addr() != Some(ip) {
+        return Err("The mobile bridge is not listening on Tailscale yet".into());
     }
     let mac = MacInfo {
         name: self_name,
@@ -523,27 +638,27 @@ mod tests {
         let mut r = req("100.64.0.2", Via::Secret);
         r.secret = Some("secret-abc".into());
         r.nonce = "nonce-123".into();
-        let (id, _rx) = p.register(r).unwrap();
+        let (id, _rx) = p.register(r);
         assert_eq!(p.get(&id).unwrap().code, "8754");
 
-        let (id2, _rx2) = p.register(req("100.64.0.3", Via::Request)).unwrap();
+        let (id2, _rx2) = p.register(req("100.64.0.3", Via::Request));
         assert_eq!(p.get(&id2).unwrap().code, confirm_code(&id2, "nonce-xyz"));
     }
 
     #[test]
     fn resolve_first_responder_wins() {
         let (p, _) = clocked(0);
-        let (id, rx) = p.register(req("100.64.0.2", Via::Request)).unwrap();
+        let (id, rx) = p.register(req("100.64.0.2", Via::Request));
         assert!(p.resolve(&id, true));
         assert!(!p.resolve(&id, false), "second responder finds nothing");
-        assert_eq!(rx.try_recv(), Ok(true));
+        assert_eq!(rx.try_recv(), Ok(Resolution::Allow));
         assert!(p.pending().is_empty());
     }
 
     #[test]
     fn request_expires_as_declined() {
         let (p, t) = clocked(500);
-        let (id, rx) = p.register(req("100.64.0.2", Via::Request)).unwrap();
+        let (id, rx) = p.register(req("100.64.0.2", Via::Request));
         assert_eq!(p.get(&id).unwrap().expires_at, 620);
         t.store(500 + 119, Ordering::SeqCst);
         assert_eq!(p.pending().len(), 1);
@@ -552,19 +667,112 @@ mod tests {
         assert!(!p.resolve(&id, true), "too late to allow");
         // The waiter never sees an allow: its sender is gone.
         assert!(rx.try_recv().is_err());
+        assert_eq!(decide(WaitEnd::Expired, true), Decision::Refuse("expired"));
     }
 
     #[test]
     fn one_outstanding_request_per_peer() {
         let (p, _) = clocked(0);
-        let (id, _rx) = p.register(req("100.64.0.2", Via::Request)).unwrap();
-        assert!(p.busy("100.64.0.2".parse().unwrap()));
-        assert!(p.register(req("100.64.0.2", Via::Request)).is_none());
-        // Another peer is unaffected.
-        assert!(p.register(req("100.64.0.3", Via::Request)).is_some());
-        // Once answered, the peer may ask again.
-        p.forget(&id);
-        assert!(p.register(req("100.64.0.2", Via::Request)).is_some());
+        let (a, _rxa) = p.register(req("100.64.0.2", Via::Request));
+        let (b, _rxb) = p.register(req("100.64.0.3", Via::Request));
+        let (c, _rxc) = p.register(req("100.64.0.2", Via::Request));
+        let mut ids: Vec<String> = p.pending().into_iter().map(|v| v.id).collect();
+        ids.sort();
+        let mut want = vec![b, c];
+        want.sort();
+        assert_eq!(ids, want, "one per peer IP; other peers unaffected");
+        assert!(p.get(&a).is_none());
+    }
+
+    #[test]
+    fn new_request_from_same_peer_replaces_old() {
+        let (p, _) = clocked(0);
+        let (old, old_rx) = p.register(req("100.64.0.2", Via::Request));
+        let (new, _new_rx) = p.register(req("100.64.0.2", Via::Request));
+        assert_ne!(old, new);
+        // The old waiter is told why, and a late answer to it reaches nobody.
+        assert_eq!(old_rx.try_recv(), Ok(Resolution::Replaced));
+        assert!(!p.resolve(&old, true));
+        assert_eq!(
+            decide(WaitEnd::Resolved(Resolution::Replaced), true),
+            Decision::Refuse("replaced")
+        );
+        assert!(p.get(&new).is_some());
+    }
+
+    #[test]
+    fn clear_drops_secret_and_pending() {
+        let (p, _) = clocked(0);
+        let qr = p.start_qr(&mac(), 8455);
+        let (a, rx_a) = p.register(req("100.64.0.2", Via::Request));
+        let (b, rx_b) = p.register(req("100.64.0.3", Via::Request));
+        let mut cleared = p.clear();
+        cleared.sort();
+        let mut want = vec![a.clone(), b];
+        want.sort();
+        assert_eq!(cleared, want);
+        assert!(p.pending().is_empty());
+        assert!(!p.consume_secret(&qr.secret), "the QR dies with the switch");
+        assert_eq!(rx_a.try_recv(), Ok(Resolution::Off));
+        assert_eq!(rx_b.try_recv(), Ok(Resolution::Off));
+        assert!(
+            !p.resolve(&a, true),
+            "an Allow after the switch reaches nobody"
+        );
+        assert!(p.clear().is_empty());
+    }
+
+    #[test]
+    fn allow_after_access_off_refuses() {
+        let allow = WaitEnd::Resolved(Resolution::Allow);
+        assert_eq!(decide(allow, true), Decision::Pair);
+        // The switch is read right before acting: an Allow that lands after "off" pairs nothing.
+        assert_eq!(decide(allow, false), Decision::Refuse("off"));
+        assert_eq!(
+            decide(WaitEnd::Resolved(Resolution::Off), true),
+            Decision::Refuse("off")
+        );
+        assert_eq!(
+            decide(WaitEnd::Resolved(Resolution::Decline), true),
+            Decision::Refuse("declined")
+        );
+        // A phone that hung up gets no reply, whatever the switch says.
+        assert_eq!(decide(WaitEnd::Gone, false), Decision::Cancelled);
+    }
+
+    #[test]
+    fn macs_reply_shape() {
+        let v = macs_reply(&[MacEntry {
+            name: "Studio".into(),
+            dns_name: "studio.tailc7b992.ts.net".into(),
+            ip: "100.64.0.2".into(),
+            port: 8455,
+            online: true,
+            conduit_version: "0.47.0".into(),
+        }]);
+        let mut top: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        top.sort();
+        assert_eq!(top, ["macs", "type"]);
+        assert_eq!(v["type"], "macs");
+        let mut keys: Vec<&str> = v["macs"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["conduitVersion", "dnsName", "ip", "name", "online", "port"]
+        );
+        assert_eq!(macs_reply(&[])["macs"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn discover_requires_same_tailnet_user() {
+        assert!(same_tailnet_user(7, Some(7)));
+        assert!(!same_tailnet_user(7, Some(8)), "another user's phone");
+        assert!(!same_tailnet_user(7, None), "unknown owner is a no");
     }
 
     #[test]
@@ -589,7 +797,7 @@ mod tests {
         let (p, _) = clocked(10);
         let mut r = req("100.64.0.2", Via::Secret);
         r.secret = Some("top-secret".into());
-        let (id, _rx) = p.register(r).unwrap();
+        let (id, _rx) = p.register(r);
         let v = serde_json::to_value(p.get(&id).unwrap()).unwrap();
         let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
         keys.sort();

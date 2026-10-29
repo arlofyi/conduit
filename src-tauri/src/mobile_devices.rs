@@ -265,9 +265,15 @@ pub fn mobile_settings(state: tauri::State<'_, Arc<MobileDevices>>) -> MobileSet
 pub fn mobile_set_enabled(
     state: tauri::State<'_, Arc<MobileDevices>>,
     bridge: tauri::State<'_, Arc<crate::bridge::BridgeController>>,
+    pairing: tauri::State<'_, Arc<crate::pairing::Pairing>>,
+    app: tauri::AppHandle,
     on: bool,
 ) -> Result<(), String> {
     state.set_enabled(on).map_err(|e| e.to_string())?;
+    if !on {
+        // Off ends pairing at once: the QR secret and every waiting request.
+        pairing.clear_and_announce(&app);
+    }
     bridge.reconcile();
     Ok(())
 }

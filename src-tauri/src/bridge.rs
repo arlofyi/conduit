@@ -39,7 +39,7 @@ use tungstenite::{accept_hdr_with_config, Message, WebSocket};
 
 use crate::hookbus::HookBus;
 use crate::mobile_devices::MobileDevices;
-use crate::pairing::{self, PairRequest, Pairing, Via};
+use crate::pairing::{self, Decision, PairRequest, Pairing, Resolution, Via, WaitEnd};
 use crate::pty::PtyManager;
 use crate::store::Store;
 use crate::tailscale::{self, TailscaleState};
@@ -456,49 +456,56 @@ fn lift_preauth_cap(ws: &mut WebSocket<TcpStream>) {
     });
 }
 
-/// How a parked pair request ended, from the waiting connection's side.
-enum PairWait {
-    Answer(bool),
-    /// No answer within [`pairing::REQUEST_WAIT`] (or the request was swept).
-    Expired,
-    /// The phone closed its socket while waiting.
-    Gone,
-}
-
 /// Block this connection (it has nothing else to do pre-auth) until the Mac answers, the
-/// request expires, or the phone hangs up. The pre-auth deadline does not apply here: the
-/// loop that enforces it is parked in this call.
+/// request expires, mobile access goes off, or the phone hangs up. The pre-auth deadline
+/// does not apply here: the loop that enforces it is parked in this call.
 fn wait_for_pair_answer(
     ws: &mut WebSocket<TcpStream>,
-    rx: &std::sync::mpsc::Receiver<bool>,
-) -> PairWait {
+    rx: &std::sync::mpsc::Receiver<Resolution>,
+    enabled: impl Fn() -> bool,
+) -> WaitEnd {
     use std::sync::mpsc::RecvTimeoutError;
     let end = Instant::now() + pairing::REQUEST_WAIT;
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(allow) => return PairWait::Answer(allow),
-            Err(RecvTimeoutError::Disconnected) => return PairWait::Expired,
+            Ok(r) => return WaitEnd::Resolved(r),
+            Err(RecvTimeoutError::Disconnected) => return WaitEnd::Expired,
             Err(RecvTimeoutError::Timeout) => {}
         }
+        // Belt and braces with `Pairing::clear`: the switch going off ends the wait.
+        if !enabled() {
+            return WaitEnd::Resolved(Resolution::Off);
+        }
         if Instant::now() >= end {
-            return PairWait::Expired;
+            return WaitEnd::Expired;
         }
         // Notice a hang-up so the request (and the peer's one slot) is freed at once.
         match ws.read() {
-            Ok(Message::Close(_)) => return PairWait::Gone,
+            Ok(Message::Close(_)) => return WaitEnd::Gone,
             Ok(_) => {} // nothing else is meaningful while waiting
             Err(tungstenite::Error::Io(e))
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(_) => return PairWait::Gone,
+            Err(_) => return WaitEnd::Gone,
         }
     }
 }
 
-fn pair_result_failed(reason: &str) -> serde_json::Value {
+/// `pairResult` on success: the device token (shown once) and the new device's id.
+fn pair_result_ok(token: &str, device_id: &str) -> serde_json::Value {
+    json!({ "type": "pairResult", "ok": true, "token": token, "deviceId": device_id })
+}
+
+/// `pairResult` on failure: declined | expired | replaced | off | error.
+fn pair_result_err(reason: &str) -> serde_json::Value {
     json!({ "type": "pairResult", "ok": false, "reason": reason })
+}
+
+/// Sent once a request is parked: on the request path the id is the code's input.
+fn pair_pending(request_id: &str) -> serde_json::Value {
+    json!({ "type": "pairPending", "requestId": request_id })
 }
 
 /// Handle one `pair` frame end to end: gate, consume the QR secret or accept a request,
@@ -523,13 +530,9 @@ fn pair_flow(
         let _ = ws.send(Message::Text(unauthorized().to_string()));
         None
     };
-    // Pairing exists only while mobile access is on. Then: under the per-IP limit, a nonce
-    // the code can bind to, and no request already waiting for this peer.
-    if !ctrl.devices.enabled()
-        || !ctrl.auth_allowed(peer)
-        || !pairing::nonce_ok(nonce)
-        || pairing.busy(peer)
-    {
+    // Pairing exists only while mobile access is on. Then: under the per-IP limit and a
+    // nonce the code can bind to. A request already waiting from this IP is replaced.
+    if !ctrl.devices.enabled() || !ctrl.auth_allowed(peer) || !pairing::nonce_ok(nonce) {
         return refuse(ws);
     }
     let (via, secret) = match (secret, request) {
@@ -549,42 +552,43 @@ fn pair_flow(
     } else {
         tailscale::whois(peer).map(|w| w.login_name)
     };
-    let Some((id, rx)) = pairing.register(PairRequest {
+    let (id, rx) = pairing.register(PairRequest {
         peer,
         device_name: device_name.clone(),
         nonce: nonce.to_string(),
         via,
         login: login.clone(),
         secret,
-    }) else {
-        return refuse(ws); // lost a race for this peer's one slot
-    };
+    });
     if let Some(view) = pairing.get(&id) {
         let _ = app.emit("pair-request", &view);
     }
-    // The phone needs the request id: on the request path it is the code's input.
-    let pending = json!({ "type": "pairPending", "requestId": id });
-    let wait = if ws.send(Message::Text(pending.to_string())).is_err() {
-        PairWait::Gone
+    let end = if ws
+        .send(Message::Text(pair_pending(&id).to_string()))
+        .is_err()
+    {
+        WaitEnd::Gone
     } else {
-        wait_for_pair_answer(ws, &rx)
+        wait_for_pair_answer(ws, &rx, || ctrl.devices.enabled())
     };
     // Forget FIRST, then drain once (the asks.rs rule): a `pair_respond` either landed
     // before the forget and is seen here, or finds nothing and reports false to its card.
     pairing.forget(&id);
-    let wait = match wait {
-        PairWait::Expired => rx.try_recv().map_or(PairWait::Expired, PairWait::Answer),
+    let end = match end {
+        WaitEnd::Expired => rx.try_recv().map_or(WaitEnd::Expired, WaitEnd::Resolved),
         other => other,
     };
-    let (how, device) = match wait {
-        PairWait::Answer(true) => match ctrl.devices.add_device(&device_name, login) {
+    // The switch is read right before acting, so an Allow after "off" persists nothing.
+    let (how, device) = match pairing::decide(end, ctrl.devices.enabled()) {
+        Decision::Pair => match ctrl.devices.add_device(&device_name, login) {
+            // Re-check after the write: a switch flipped during it must not hand out a token.
+            Ok((device, _)) if !ctrl.devices.enabled() => {
+                let _ = ctrl.devices.revoke(&device.id);
+                let _ = ws.send(Message::Text(pair_result_err("off").to_string()));
+                ("off", None)
+            }
             Ok((device, token)) => {
-                let ok = json!({
-                    "type": "pairResult",
-                    "ok": true,
-                    "token": token,
-                    "deviceId": device.id,
-                });
+                let ok = pair_result_ok(&token, &device.id);
                 if ws.send(Message::Text(ok.to_string())).is_ok() {
                     ("allowed", Some(device.id))
                 } else {
@@ -595,23 +599,21 @@ fn pair_flow(
             }
             Err(e) => {
                 eprintln!("conduit: could not save paired phone: {e}");
-                let _ = ws.send(Message::Text(pair_result_failed("error").to_string()));
+                let _ = ws.send(Message::Text(pair_result_err("error").to_string()));
                 ("failed", None)
             }
         },
-        PairWait::Answer(false) => {
-            let _ = ws.send(Message::Text(pair_result_failed("declined").to_string()));
-            ("declined", None)
+        Decision::Refuse(reason) => {
+            let _ = ws.send(Message::Text(pair_result_err(reason).to_string()));
+            // Only a human "no" or silence counts toward the per-IP limit; a replaced or
+            // switched-off request is not the phone's failure.
+            if matches!(reason, "declined" | "expired") {
+                ctrl.record_auth_failure(peer);
+            }
+            (reason, None)
         }
-        PairWait::Expired => {
-            let _ = ws.send(Message::Text(pair_result_failed("expired").to_string()));
-            ("expired", None)
-        }
-        PairWait::Gone => ("cancelled", None),
+        Decision::Cancelled => ("cancelled", None),
     };
-    if device.is_none() {
-        ctrl.record_auth_failure(peer);
-    }
     let _ = app.emit("pair-resolved", json!({ "id": id, "how": how }));
     device
 }
@@ -734,6 +736,11 @@ impl BridgeController {
             }
             // Remote access is going away (or moving): end every phone's socket.
             self.disconnect_all_devices();
+            // Going away (not merely moving): pairing ends with it -- the QR secret and
+            // every waiting request, so a late Allow persists nothing.
+            if plan.bind.is_none() {
+                app.state::<Arc<Pairing>>().clear_and_announce(app);
+            }
         }
         if let Some(ip) = plan.bind {
             match bind_with_retry(ip, port) {
@@ -771,6 +778,12 @@ impl BridgeController {
 
     pub fn current_port(&self) -> u16 {
         self.port.load(Ordering::SeqCst)
+    }
+
+    /// The Tailscale address the bridge is listening on right now, if any. Waits behind
+    /// a reconcile in progress (which holds this lock across its CLI call).
+    pub fn tailnet_addr(&self) -> Option<Ipv4Addr> {
+        lock(&self.tailnet).as_ref().map(|(ip, _)| *ip)
     }
 
     fn mac_name(&self) -> String {
@@ -923,6 +936,8 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     // A `discover` probe's reply, produced on its own thread. One probe at a time.
     let (macs_tx, macs_rx) = std::sync::mpsc::channel::<String>();
     let mut discovering = false;
+    // The phone's Tailscale user id, from one `whois` the first time it is needed.
+    let peer_owner: Arc<OnceLock<Option<u64>>> = Arc::new(OnceLock::new());
 
     loop {
         // 0. Gates: an unauthenticated peer gets AUTH_DEADLINE; a revoked device is
@@ -1131,13 +1146,22 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         let _ = ws.send(Message::Text(unauthorized().to_string()));
                     }
                 }
-                // Probe the tailnet off this thread; the reply arrives via `macs_rx`.
+                // Probe the tailnet off this thread; the reply arrives via `macs_rx`. Only
+                // a phone owned by this Mac's Tailscale user may see the owner's Macs; its
+                // owner is looked up once per connection (loopback is the owner).
                 Some(ClientMsg::Discover) => {
                     if !discovering {
                         discovering = true;
-                        let tx = macs_tx.clone();
+                        let (tx, owner) = (macs_tx.clone(), peer_owner.clone());
                         thread::spawn(move || {
-                            let _ = tx.send(pairing::discover_macs().to_string());
+                            let reply = pairing::discover_macs(|self_user| {
+                                if loopback {
+                                    Some(self_user)
+                                } else {
+                                    *owner.get_or_init(|| tailscale::whois(peer).map(|w| w.user_id))
+                                }
+                            });
+                            let _ = tx.send(reply.to_string());
                         });
                     }
                 }
@@ -1281,6 +1305,39 @@ fn detach(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sorted_keys(v: &serde_json::Value) -> Vec<String> {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn pair_result_ok_shape() {
+        let v = pair_result_ok("tok", "dev-1");
+        assert_eq!(sorted_keys(&v), ["deviceId", "ok", "token", "type"]);
+        assert_eq!(v["type"], "pairResult");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["token"], "tok");
+        assert_eq!(v["deviceId"], "dev-1");
+    }
+
+    #[test]
+    fn pair_result_err_shape() {
+        let v = pair_result_err("declined");
+        assert_eq!(sorted_keys(&v), ["ok", "reason", "type"]);
+        assert_eq!(v["type"], "pairResult");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["reason"], "declined");
+    }
+
+    #[test]
+    fn pair_pending_shape() {
+        let v = pair_pending("req-1");
+        assert_eq!(sorted_keys(&v), ["requestId", "type"]);
+        assert_eq!(v["type"], "pairPending");
+        assert_eq!(v["requestId"], "req-1");
+    }
 
     #[test]
     fn projects_message_marks_running_sessions() {
