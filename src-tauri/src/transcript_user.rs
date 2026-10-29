@@ -265,6 +265,27 @@ pub fn parse_user(v: &Value) -> Vec<Value> {
     }
 }
 
+/// Classify a `type == "system"` line by `subtype`. Only the ones a reader should see map to
+/// an item; hook summaries, timings and the like are machinery and produce nothing.
+pub fn parse_system(v: &Value) -> Vec<Value> {
+    let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let divider =
+        |label: &str, tone: &str| json!({ "kind": "divider", "label": label, "tone": tone });
+    match v.get("subtype").and_then(|s| s.as_str()).unwrap_or("") {
+        "compact_boundary" => vec![divider("Conversation compacted", "info")],
+        // The first paragraph is the human sentence; what follows is diagnostic detail.
+        "model_refusal_fallback" => {
+            vec![divider(
+                content.split("\n\n").next().unwrap_or(""),
+                "warning",
+            )]
+        }
+        "informational" => vec![divider(content, "info")],
+        "scheduled_task_fire" => vec![json!({ "kind": "auto", "label": content, "text": content })],
+        _ => vec![],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

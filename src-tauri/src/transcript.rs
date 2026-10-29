@@ -4,6 +4,12 @@
 
 use serde_json::{json, Value};
 
+/// Every item `kind` this parser can emit, shared with the mobile client so it can tell a
+/// kind it renders from one it must ignore. A test keeps it in step with the parser.
+// Read only by the manifest test until the bridge serves it to the mobile client.
+#[allow(dead_code)]
+pub const ITEM_KINDS_JSON: &str = include_str!("transcript_item_kinds.json");
+
 /// Map a Claude tool name to the RN timeline event kind + verb (mirror of
 /// mobile/src/logic/status.ts `eventKindFor` / labels).
 fn tool_event(name: &str, input: &Value) -> Value {
@@ -25,10 +31,51 @@ fn tool_event(name: &str, input: &Value) -> Value {
             input.get("pattern").and_then(|v| v.as_str()),
         ),
         "WebFetch" | "WebSearch" => ("web", "browsed", input.get("url").and_then(|v| v.as_str())),
-        "Task" => ("subagent", "ran a subagent", None),
+        "Agent" | "Task" => (
+            "subagent",
+            "subagent",
+            input.get("description").and_then(|v| v.as_str()),
+        ),
         _ => ("generic", "used a tool", None),
     };
     json!({ "kind": "event", "event": kind, "label": label, "mono": mono })
+}
+
+/// `AskUserQuestion` → a `question` item, copied from `input.questions` with every field
+/// defaulted so a half-written call still renders.
+fn question_item(id: &str, input: &Value) -> Value {
+    let str_of = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let questions: Vec<Value> = input
+        .get("questions")
+        .and_then(|q| q.as_array())
+        .map(|qs| {
+            qs.iter()
+                .map(|q| {
+                    let options: Vec<Value> = q
+                        .get("options")
+                        .and_then(|o| o.as_array())
+                        .map(|os| {
+                            os.iter()
+                                .map(|o| {
+                                    json!({
+                                        "label": str_of(o, "label"),
+                                        "description": str_of(o, "description"),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!({
+                        "question": str_of(q, "question"),
+                        "header": str_of(q, "header"),
+                        "multiSelect": q.get("multiSelect").and_then(|b| b.as_bool()).unwrap_or(false),
+                        "options": options,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({ "kind": "question", "toolUseId": id, "questions": questions })
 }
 
 /// Parse one transcript line into chat items (possibly empty).
@@ -75,13 +122,24 @@ pub fn parse_line(line: &str) -> Vec<Value> {
                             let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
                             let empty = json!({});
                             let input = block.get("input").unwrap_or(&empty);
-                            out.push(tool_event(name, input));
+                            out.push(match name {
+                                "AskUserQuestion" => question_item(
+                                    block.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                                    input,
+                                ),
+                                "ExitPlanMode" => json!({
+                                    "kind": "plan",
+                                    "markdown": input.get("plan").and_then(|p| p.as_str()).unwrap_or(""),
+                                }),
+                                _ => tool_event(name, input),
+                            });
                         }
                         _ => {}
                     }
                 }
             }
         }
+        "system" => out.extend(crate::transcript_user::parse_system(&v)),
         _ => {}
     }
     out
@@ -248,5 +306,157 @@ mod tests {
         .is_empty());
         assert!(parse_line("not json").is_empty());
         assert!(parse_line(&json!({"type":"summary"}).to_string()).is_empty());
+    }
+
+    #[test]
+    fn compact_boundary_is_divider() {
+        let l = json!({"type":"system","subtype":"compact_boundary","content":"Conversation compacted","level":"info"}).to_string();
+        let i = &parse_line(&l)[0];
+        assert_eq!(i["kind"], "divider");
+        assert_eq!(i["label"], "Conversation compacted");
+        assert_eq!(i["tone"], "info");
+    }
+
+    #[test]
+    fn refusal_fallback_is_warning_divider() {
+        let l = json!({"type":"system","subtype":"model_refusal_fallback",
+            "content":"Opus 5.5's safeguards flagged this session. Continuing on Sonnet.\n\nDetails: `[cyber]`"})
+        .to_string();
+        let i = &parse_line(&l)[0];
+        assert_eq!(i["kind"], "divider");
+        assert_eq!(i["tone"], "warning");
+        let label = i["label"].as_str().unwrap();
+        assert!(label.starts_with("Opus 5.5's safeguards"));
+        assert!(!label.contains("Details"));
+    }
+
+    #[test]
+    fn informational_is_info_divider() {
+        let l = json!({"type":"system","subtype":"informational","content":"Switched model"})
+            .to_string();
+        let i = &parse_line(&l)[0];
+        assert_eq!(i["kind"], "divider");
+        assert_eq!(i["label"], "Switched model");
+        assert_eq!(i["tone"], "info");
+    }
+
+    #[test]
+    fn scheduled_fire_is_auto() {
+        let l = json!({"type":"system","subtype":"scheduled_task_fire",
+            "content":"Running scheduled task (Sep 13 3:00am)"})
+        .to_string();
+        let i = &parse_line(&l)[0];
+        assert_eq!(i["kind"], "auto");
+        assert_eq!(i["label"], "Running scheduled task (Sep 13 3:00am)");
+        assert_eq!(i["text"], "Running scheduled task (Sep 13 3:00am)");
+    }
+
+    #[test]
+    fn noise_system_lines_are_dropped() {
+        for st in ["stop_hook_summary", "turn_duration", "away_summary"] {
+            let l = json!({"type":"system","subtype":st,"content":"x"}).to_string();
+            assert!(parse_line(&l).is_empty(), "{st}");
+        }
+    }
+
+    fn tool_line(name: &str, input: Value) -> String {
+        json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"toolu_01Bw","name":name,"input":input}]}})
+        .to_string()
+    }
+
+    #[test]
+    fn ask_user_question_becomes_question() {
+        let l = tool_line(
+            "AskUserQuestion",
+            json!({"questions":[{"question":"What do you see in the menu bar right now?",
+                "header":"Symptom","multiSelect":false,
+                "options":[{"label":"No icon at all","description":"The ring is gone"}]}]}),
+        );
+        let i = &parse_line(&l)[0];
+        assert_eq!(i["kind"], "question");
+        assert_eq!(i["toolUseId"], "toolu_01Bw");
+        assert_eq!(i["questions"][0]["header"], "Symptom");
+        assert_eq!(i["questions"][0]["multiSelect"], false);
+        assert_eq!(i["questions"][0]["options"][0]["label"], "No icon at all");
+        assert_eq!(
+            i["questions"][0]["options"][0]["description"],
+            "The ring is gone"
+        );
+    }
+
+    #[test]
+    fn ask_user_question_defaults_missing_fields() {
+        let i = &parse_line(&tool_line("AskUserQuestion", json!({"questions":[{}]})))[0];
+        let q = &i["questions"][0];
+        assert_eq!(q["question"], "");
+        assert_eq!(q["header"], "");
+        assert_eq!(q["multiSelect"], false);
+        assert_eq!(q["options"], json!([]));
+    }
+
+    #[test]
+    fn exit_plan_mode_becomes_plan() {
+        let i = &parse_line(&tool_line("ExitPlanMode", json!({"plan":"# Plan\n- a"})))[0];
+        assert_eq!(i["kind"], "plan");
+        assert_eq!(i["markdown"], "# Plan\n- a");
+        let i = &parse_line(&tool_line("ExitPlanMode", json!({})))[0];
+        assert_eq!(i["markdown"], "");
+    }
+
+    #[test]
+    fn agent_tool_is_subagent_event() {
+        for name in ["Agent", "Task"] {
+            let i = &parse_line(&tool_line(name, json!({"description":"Builder check"})))[0];
+            assert_eq!(i["kind"], "event");
+            assert_eq!(i["event"], "subagent");
+            assert_eq!(i["label"], "subagent");
+            assert_eq!(i["mono"], "Builder check");
+        }
+    }
+
+    #[test]
+    fn thinking_blocks_are_dropped() {
+        let l =
+            json!({"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hm"}]}})
+                .to_string();
+        assert!(parse_line(&l).is_empty());
+    }
+
+    #[test]
+    fn every_emitted_kind_is_in_the_manifest() {
+        let kinds: Vec<String> = serde_json::from_str(ITEM_KINDS_JSON).unwrap();
+        let fixtures: Vec<String> = vec![
+            json!({"type":"user","message":{"content":"add rate limiting"}}),
+            json!({"type":"assistant","message":{"usage":{"input_tokens":1},"content":[]}}),
+            json!({"type":"user","message":{"content":"<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>"}}),
+            json!({"type":"user","isMeta":true,"origin":{"kind":"peer","name":"general-purpose","body":"hi"},"message":{"content":"hi"}}),
+            json!({"type":"user","isMeta":true,"message":{"content":"CONTINUITY RELAY TICK"}}),
+            json!({"type":"user","message":{"content":"<command-name>/compact</command-name>"}}),
+            json!({"type":"user","message":{"content":"<local-command-stdout>ok</local-command-stdout>"}}),
+            json!({"type":"user","isMeta":true,"message":{"content":[{"type":"text","text":"Base directory for this skill: /x/skills/brainstorming\n\n# B"}]}}),
+            json!({"type":"user","origin":{"kind":"human"},"message":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}}),
+            json!({"type":"system","subtype":"compact_boundary","content":"Conversation compacted"}),
+            json!({"type":"user","message":{"content":"<weird-tag>x</weird-tag>"}}),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .chain([
+            tool_line("Bash", json!({"command":"ls"})),
+            tool_line("AskUserQuestion", json!({"questions":[]})),
+            tool_line("ExitPlanMode", json!({"plan":"p"})),
+        ])
+        .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for f in &fixtures {
+            for item in parse_line(f) {
+                let k = item["kind"].as_str().unwrap().to_string();
+                assert!(kinds.contains(&k), "kind {k} missing from manifest");
+                seen.insert(k);
+            }
+        }
+        for k in &kinds {
+            assert!(seen.contains(k), "manifest kind {k} never produced");
+        }
     }
 }
