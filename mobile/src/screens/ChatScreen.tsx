@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Image,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -13,7 +14,19 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Markdown from "react-native-markdown-display";
 import { useLive } from "../bridge/LiveProvider";
 import { NeedsPill, ThemeButton } from "../components/atoms";
-import type { ApprovalItem, BubbleItem, EventItem, TodosItem } from "../data/types";
+import type {
+  ApprovalItem,
+  BubbleItem,
+  CommandItem,
+  DividerItem,
+  EventItem,
+  ImageItem,
+  NoticeItem,
+  PlanItem,
+  QuestionItem,
+  TodosItem,
+} from "../data/types";
+import { imageDataUri } from "../logic/image";
 import { groupFeed, type FeedRow } from "../logic/feed";
 import type { ChatProps } from "../navigation";
 import type { Palette } from "../theme/palettes";
@@ -188,7 +201,159 @@ function FeedRowView({
       return <TodosCard item={item} />;
     case "approval":
       return <ApprovalCard item={item} onDecide={onDecide} />;
+    case "notice":
+      return <NoticePill item={item} />;
+    case "divider":
+      return <DividerRow item={item} />;
+    case "command":
+      return <CommandChip item={item} />;
+    case "image":
+      return <ImageRow item={item} />;
+    case "question":
+      return <QuestionCard item={item} />;
+    case "plan":
+      return <PlanCard item={item} />;
   }
+}
+
+function NoticePill({ item }: { item: NoticeItem }) {
+  const { palette: p } = useTheme();
+  const [open, setOpen] = useState(false);
+  const color = item.tone === "ok" ? p.green : item.tone === "bad" ? p.red : p.textMid;
+  return (
+    <View style={{ alignSelf: "center", maxWidth: "92%", alignItems: "center", gap: 4 }}>
+      <Pressable
+        disabled={!item.detail}
+        onPress={() => setOpen((o) => !o)}
+        style={{
+          backgroundColor: p.chipBg,
+          borderRadius: 12,
+          paddingHorizontal: 12,
+          paddingVertical: 5,
+        }}
+      >
+        <Text style={{ color, fontSize: TYPE.footnote }}>
+          {item.text}
+          {item.detail ? (open ? " ▾" : " ▸") : ""}
+        </Text>
+      </Pressable>
+      {open && item.detail ? (
+        <Text style={{ color: p.textMid, fontSize: TYPE.footnote, fontFamily: MONO }}>{item.detail}</Text>
+      ) : null}
+    </View>
+  );
+}
+
+function DividerRow({ item }: { item: DividerItem }) {
+  const { palette: p } = useTheme();
+  const color = item.tone === "warning" ? p.amber : p.textMid;
+  const line = { flex: 1, height: StyleSheet.hairlineWidth, backgroundColor: color, opacity: 0.6 };
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginVertical: 4 }}>
+      <View style={line} />
+      <Text style={{ color, fontSize: TYPE.caption }}>{item.label}</Text>
+      <View style={line} />
+    </View>
+  );
+}
+
+function CommandChip({ item }: { item: CommandItem }) {
+  const { palette: p } = useTheme();
+  const [open, setOpen] = useState(false);
+  return (
+    <View style={{ alignSelf: "flex-end", maxWidth: "84%", alignItems: "flex-end", gap: 4 }}>
+      <Pressable
+        disabled={!item.output}
+        onPress={() => setOpen((o) => !o)}
+        style={{ backgroundColor: p.chipBg, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 6 }}
+      >
+        <Text style={{ color: p.chipText, fontFamily: MONO, fontSize: TYPE.footnote }}>
+          {item.name}
+          {item.args ? ` ${item.args}` : ""}
+          {item.output ? (open ? " ▾" : " ▸") : ""}
+        </Text>
+      </Pressable>
+      {open && item.output ? (
+        <Text style={{ color: p.textMid, fontFamily: MONO, fontSize: TYPE.footnote }}>{item.output}</Text>
+      ) : null}
+    </View>
+  );
+}
+
+function ImageRow({ item }: { item: ImageItem }) {
+  const { palette: p } = useTheme();
+  const uri = imageDataUri(item.mediaType, item.data);
+  if (uri) {
+    return (
+      <Image
+        source={{ uri }}
+        resizeMode="contain"
+        accessibilityLabel="Image"
+        style={{ alignSelf: "flex-end", width: 220, height: 220, borderRadius: 10 }}
+      />
+    );
+  }
+  return (
+    <View
+      style={{
+        alignSelf: "flex-end",
+        backgroundColor: p.chipBg,
+        borderRadius: 10,
+        paddingHorizontal: 11,
+        paddingVertical: 6,
+      }}
+    >
+      <Text style={{ color: p.chipText, fontSize: TYPE.footnote }}>Image</Text>
+    </View>
+  );
+}
+
+function QuestionCard({ item }: { item: QuestionItem }) {
+  const { palette: p } = useTheme();
+  return (
+    <View
+      style={{
+        backgroundColor: p.needsBg,
+        borderWidth: 1,
+        borderColor: p.amber,
+        borderLeftWidth: 3,
+        borderRadius: 11,
+        padding: 13,
+        gap: 10,
+      }}
+    >
+      {item.questions.map((q, i) => (
+        <View key={i} style={{ gap: 5 }}>
+          <Text style={{ color: p.textBright, fontWeight: "700", fontSize: TYPE.callout }}>{q.question}</Text>
+          {q.options.map((o, j) => (
+            <Text key={j} style={{ color: p.textMid, fontSize: TYPE.subhead }}>
+              {q.multiSelect ? "☐" : "○"} {o.label}
+              {o.description ? ` — ${o.description}` : ""}
+            </Text>
+          ))}
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function PlanCard({ item }: { item: PlanItem }) {
+  const { palette: p } = useTheme();
+  return (
+    <View
+      style={{
+        backgroundColor: p.sidebarBg,
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: p.border,
+        borderRadius: 12,
+        padding: 13,
+        gap: 7,
+      }}
+    >
+      <Text style={{ fontSize: TYPE.subhead, fontWeight: "700", color: p.textBright }}>Plan</Text>
+      <Text style={{ color: p.textBright, fontSize: TYPE.subhead, lineHeight: 20 }}>{item.markdown}</Text>
+    </View>
+  );
 }
 
 function Bubble({ item }: { item: BubbleItem }) {

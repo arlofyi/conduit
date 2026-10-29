@@ -1300,6 +1300,12 @@ by model FAMILY because Claude Code runs opus/sonnet at 1M while the id stays ba
 Agents tab), and `transcript_index.rs` (palette search over past conversations). All are
 read-only and degrade to "show less" rather than erroring.
 
+**User/system lines are classified in one place:** `transcript_user.rs` decides whether a
+`user` record is a real prompt or a notice/command/skill/etc. Its item kinds are pinned by
+`src-tauri/src/transcript_item_kinds.json`, checked by Rust, desktop (vitest) and mobile
+(jest) tests -- the phone keeps a literal list because Metro cannot bundle files outside
+`mobile/`. `origin.kind == "human"` is always a user bubble, whatever the text looks like.
+
 ## Where conversation continuity lives
 
 A Claude session's FIRST conversation is pinned to `Session.id` (`--session-id`), but it does

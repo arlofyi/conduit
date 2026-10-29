@@ -5,6 +5,9 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — Session chat no longer shows Claude's own messages as yours.** Background-task notices, messages from other sessions, scheduled check-ins, slash commands and loaded skills now appear as small notes instead of chat bubbles from you.
+- **Added — Session chat shows compaction, questions and plans.** "Conversation compacted" and interruptions appear as dividers, AskUserQuestion prompts show their options, plans render as a card, and runs of tool calls collapse into one expandable line.
+
 ## 0.46.1 — 2026-10-29
 
 - **Fixed — idle auto-stop no longer stops a session whose subagents are still working.**
