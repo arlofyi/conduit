@@ -228,47 +228,10 @@ fn take_prompt_slot(prompts: &Mutex<HashMap<String, VecDeque<Instant>>>, ip: IpA
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 /// How often the tailnet listener is re-planned against Tailscale's state.
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
+/// How often the attached session's context meter is re-sent.
+const CONTEXT_EVERY: Duration = Duration::from_secs(15);
 /// Wire protocol version announced in `hello`.
 const PROTOCOL_VERSION: u32 = 1;
-
-/// Build the `projects` payload: the persisted tree with a `running` flag per session.
-fn projects_payload(
-    projects: &[serde_json::Value],
-    running: &HashSet<String>,
-) -> serde_json::Value {
-    let with_flags: Vec<serde_json::Value> = projects
-        .iter()
-        .map(|p| {
-            let sessions: Vec<serde_json::Value> = p
-                .get("sessions")
-                .and_then(|s| s.as_array())
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|mut s| {
-                    let id = s
-                        .get("id")
-                        .and_then(|i| i.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(obj) = s.as_object_mut() {
-                        obj.insert(
-                            "running".into(),
-                            serde_json::Value::Bool(running.contains(&id)),
-                        );
-                    }
-                    s
-                })
-                .collect();
-            let mut p = p.clone();
-            if let Some(obj) = p.as_object_mut() {
-                obj.insert("sessions".into(), serde_json::Value::Array(sessions));
-            }
-            p
-        })
-        .collect();
-    json!({ "type": "projects", "projects": with_flags })
-}
 
 /// Build a forwarded hook-status frame.
 fn status_payload(event: &str, body: &serde_json::Value) -> serde_json::Value {
@@ -1052,6 +1015,10 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut attached: Option<(String, u64, std::sync::mpsc::Receiver<String>)> = None;
     // (transcript path, lines already sent) — set on attach, advanced while tailing.
     let mut transcript: Option<(PathBuf, usize)> = None;
+    // Transcript of the attached session when it is a Claude one (the only agent with a
+    // context meter), and when the next `context` frame is due.
+    let mut context_path: Option<PathBuf> = None;
+    let mut next_context = Instant::now();
     // A `discover` probe's reply, produced on its own thread. One probe at a time.
     let (macs_tx, macs_rx) = std::sync::mpsc::channel::<String>();
     let mut discovering = false;
@@ -1149,17 +1116,22 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             Ok(Message::Binary(_)) if !authed => break,
             Ok(Message::Text(text)) => match parse_client_msg(&text) {
                 Some(ClientMsg::List) => {
-                    // Real project tree (names + branches) with a per-session running flag.
+                    // Typed, whitelisted tree (see `bridge_view`); never the raw `Project`s.
                     let running: HashSet<String> = pty.session_ids().into_iter().collect();
                     // Store is managed as Arc<Store> (lib.rs .manage(Arc::new(Store::new()))) —
                     // state::<Store>() panics the connection thread on the first `list`.
-                    let projects = serde_json::to_value(app.state::<Arc<Store>>().list())
-                        .ok()
-                        .and_then(|v| v.as_array().cloned())
-                        .unwrap_or_default();
-                    let _ = ws.send(Message::Text(
-                        projects_payload(&projects, &running).to_string(),
-                    ));
+                    let store = app.state::<Arc<Store>>();
+                    let fleet = app.state::<Arc<crate::fleet::FleetState>>().snapshot();
+                    let asks = app.state::<Arc<crate::asks::Asks>>().pending();
+                    let view = crate::bridge_view::projects_view(
+                        &store.list(),
+                        &store.list_profiles(),
+                        store.active_profile().as_deref(),
+                        &fleet,
+                        &running,
+                        &asks,
+                    );
+                    let _ = ws.send(Message::Text(view.to_string()));
                 }
                 Some(ClientMsg::Attach { session_id }) => {
                     // Auto-wake: an idle session has no live PTY (Conduit spawns it
@@ -1191,14 +1163,26 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         // moves off the pinned id (see `Store::claude_conversation_id`).
                         let store = app.state::<Arc<Store>>();
                         let conversation = store.claude_conversation_id(&session_id);
+                        transcript = None;
+                        context_path = None;
                         if let Some(dir) = crate::pty::session_projects_dir(&store, &session_id) {
                             if let Some(path) = crate::pty::transcript_path(&conversation, &dir) {
                                 let lines = read_lines(&path);
                                 let _ = ws.send(Message::Text(history_payload(&lines).to_string()));
-                                transcript = Some((path, lines.len()));
+                                transcript = Some((path.clone(), lines.len()));
+                                if is_claude(&store, &session_id) {
+                                    context_path = Some(path);
+                                }
                             }
                         }
-                        attached = Some((session_id, sub_id, rx));
+                        // Re-attach: release the subscription this socket already held.
+                        if let Some((old_sid, old_sub)) = crate::bridge_view::replace_attached(
+                            &mut attached,
+                            (session_id.clone(), sub_id, rx),
+                        ) {
+                            pty.unsubscribe(&old_sid, old_sub);
+                        }
+                        next_context = Instant::now();
                     } else {
                         let _ = ws.send(Message::Text(
                             json!({ "type": "error", "message": "no such session" }).to_string(),
@@ -1354,6 +1338,17 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             while bus_rx.try_recv().is_ok() {}
         }
 
+        // 5. Context meter for the attached session: on attach, then every CONTEXT_EVERY.
+        if let (Some((sid, _, _)), Some(path)) = (attached.as_ref(), context_path.as_ref()) {
+            if Instant::now() >= next_context {
+                next_context = Instant::now() + CONTEXT_EVERY;
+                if let Some(u) = crate::context_window::for_transcript(path) {
+                    let frame = crate::bridge_view::context_frame(sid, &u);
+                    let _ = ws.send(Message::Text(frame.to_string()));
+                }
+            }
+        }
+
         // 4. Tail the transcript for appended lines -> chat items.
         if let Some((path, cursor)) = transcript.as_mut() {
             let lines = read_lines(path);
@@ -1410,6 +1405,16 @@ impl Drop for LiveConn {
     fn drop(&mut self) {
         self.ctrl.unregister_live(&self.device_id, &self.flag);
     }
+}
+
+/// Whether a session runs the Claude adapter (the only one with a transcript context meter).
+fn is_claude(store: &Store, session_id: &str) -> bool {
+    store
+        .list()
+        .iter()
+        .flat_map(|p| p.sessions.iter())
+        .find(|s| s.id == session_id)
+        .is_some_and(|s| s.agent == crate::agent::AgentId::Claude)
 }
 
 fn detach(
@@ -1473,18 +1478,6 @@ mod tests {
         assert_eq!(sorted_keys(&v), ["requestId", "type"]);
         assert_eq!(v["type"], "pairPending");
         assert_eq!(v["requestId"], "req-1");
-    }
-
-    #[test]
-    fn projects_message_marks_running_sessions() {
-        let projects = vec![serde_json::json!({
-            "id": "p1", "name": "Conduit", "path": "/repo",
-            "sessions": [ { "id": "s1", "name": "auth", "branch": "feat/x", "agent": "claude" } ]
-        })];
-        let running: std::collections::HashSet<String> = ["s1".to_string()].into_iter().collect();
-        let msg = projects_payload(&projects, &running);
-        assert_eq!(msg["type"], "projects");
-        assert_eq!(msg["projects"][0]["sessions"][0]["running"], true);
     }
 
     #[test]

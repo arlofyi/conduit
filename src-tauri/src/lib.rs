@@ -11,6 +11,7 @@ mod agy_usage;
 mod asks;
 mod board;
 mod bridge;
+mod bridge_view;
 mod broker;
 mod claude_status;
 mod claude_usage;
