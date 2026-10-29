@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { answerSummary, askGateOpen, askResolvedToast, askShouldHandOff, buildAnswers, sessionsAwaitingAnswer, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "./asks";
+import { answerSummary, askGateOpen, askResolvedPlan, askResolvedToast, askShouldHandOff, buildAnswers, sessionsAwaitingAnswer, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "./asks";
 import { MULTISELECT_JOIN } from "./askProtocol";
 
 const ask: PendingAsk = {
@@ -104,5 +104,30 @@ describe("askResolvedToast", () => {
     expect(askResolvedToast("timeout", false)).toBe(false);
     expect(askResolvedToast("handoff", true)).toBe(false);
     expect(askResolvedToast("answered", true)).toBe(false);
+  });
+});
+
+describe("askResolvedPlan", () => {
+  const base = { shown: true, handedOffHere: false };
+  it("removes a cancelled question silently", () => {
+    expect(askResolvedPlan({ how: "cancelled", by: "cancelled", ...base })).toEqual({ hold: false, answered: false, note: null, toast: false });
+  });
+  it("keeps the timeout toast and drops the card", () => {
+    expect(askResolvedPlan({ how: "timeout", by: "timeout", ...base })).toEqual({ hold: false, answered: false, note: null, toast: true });
+    expect(askResolvedPlan({ how: "timeout", by: "timeout", shown: false, handedOffHere: false }).toast).toBe(false);
+  });
+  it("says the phone answered, not 'Sent to …'", () => {
+    expect(askResolvedPlan({ how: "answered", by: "phone", ...base })).toEqual({ hold: true, answered: true, note: "phone", toast: false });
+  });
+  it("holds a desktop answer so the card's own confirmation can show", () => {
+    expect(askResolvedPlan({ how: "answered", by: "desktop", ...base })).toEqual({ hold: true, answered: true, note: "desktop", toast: false });
+  });
+  it("treats an answer with no resolver as before", () => {
+    expect(askResolvedPlan({ how: "answered", by: null, ...base })).toEqual({ hold: true, answered: true, note: null, toast: false });
+  });
+  it("drops a hand-off this window made, but says so when the terminal answered on its own", () => {
+    expect(askResolvedPlan({ how: "handoff", by: "terminal", shown: true, handedOffHere: true }).hold).toBe(false);
+    expect(askResolvedPlan({ how: "handoff", by: "terminal", shown: false, handedOffHere: false }).hold).toBe(false);
+    expect(askResolvedPlan({ how: "handoff", by: "terminal", ...base })).toEqual({ hold: true, answered: false, note: "terminal", toast: false });
   });
 });

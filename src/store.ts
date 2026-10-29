@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { PendingAsk } from "./asks";
 import type { PairRequest } from "./mobilePairing";
+import type { PendingPermission, ResolvedBy } from "./permissionView";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir as getHomeDir } from "@tauri-apps/api/path";
 import {
@@ -1916,6 +1917,18 @@ interface AppState {
   addPairRequest: (r: PairRequest) => void;
   removePairRequest: (id: string) => void;
   markAskAnswered: (id: string) => void;
+  /** Who resolved an ask whose card is still up for its short hold (`ask-resolved.by`), so
+   *  the card can say "Answered on your phone" rather than its own "Sent to …". */
+  askResolvedBy: Record<string, ResolvedBy>;
+  noteAskResolved: (id: string, by: ResolvedBy) => void;
+  /** Tool permissions held open by Rust (broker.rs), keyed by id. */
+  permissions: Record<string, PendingPermission>;
+  /** Who resolved a permission whose card is still up for its short hold. */
+  permissionResolvedBy: Record<string, ResolvedBy>;
+  addPermission: (p: PendingPermission) => void;
+  /** Idempotent: `permission-resolved` and the card's own fallback both remove. */
+  removePermission: (id: string) => void;
+  notePermissionResolved: (id: string, by: ResolvedBy) => void;
   /** Conduit session ids the open Continuity view draws as nodes (a raw map, replaced
    *  only when the set changes). An ask whose session is NOT in here has no card in the
    *  graph, so the dock must show it even while the view is visible. */
@@ -4342,10 +4355,33 @@ export const useStore = create<AppState>((set, get) => {
         delete next[id];
         const answered = { ...s.answeredAsks };
         delete answered[id];
-        return { asks: next, answeredAsks: answered };
+        const by = { ...s.askResolvedBy };
+        delete by[id];
+        return { asks: next, answeredAsks: answered, askResolvedBy: by };
       }),
     markAskAnswered: (id) =>
       set((s) => (s.answeredAsks[id] || !(id in s.asks) ? s : { answeredAsks: { ...s.answeredAsks, [id]: true } })),
+    askResolvedBy: {},
+    noteAskResolved: (id, by) =>
+      set((s) => (!(id in s.asks) || s.askResolvedBy[id] === by ? s : { askResolvedBy: { ...s.askResolvedBy, [id]: by } })),
+    permissions: {},
+    permissionResolvedBy: {},
+    addPermission: (p) => set((s) => (p.id in s.permissions ? s : { permissions: { ...s.permissions, [p.id]: p } })),
+    removePermission: (id) =>
+      set((s) => {
+        if (!(id in s.permissions) && !(id in s.permissionResolvedBy)) return s;
+        const next = { ...s.permissions };
+        delete next[id];
+        const by = { ...s.permissionResolvedBy };
+        delete by[id];
+        return { permissions: next, permissionResolvedBy: by };
+      }),
+    notePermissionResolved: (id, by) =>
+      set((s) =>
+        !(id in s.permissions) || s.permissionResolvedBy[id] === by
+          ? s
+          : { permissionResolvedBy: { ...s.permissionResolvedBy, [id]: by } },
+      ),
     setWindowFocused: (v) => set({ windowFocused: v }),
     continuityRendered: {},
     setContinuityRendered: (ids) =>
