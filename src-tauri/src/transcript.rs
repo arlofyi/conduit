@@ -191,7 +191,7 @@ pub fn session_transcript(
 
 /// Stamp each item with `seq`, its absolute index in the whole parsed conversation.
 ///
-/// Done BEFORE `tail`, so an item keeps its number as the 400-item window slides forward on
+/// Done BEFORE `tail`, so an item keeps its number as the 800-item window slides forward on
 /// each poll. An index into the tail shifts every row once a session passes the limit, and
 /// the view's per-row state (an expanded tool run) then lands on the wrong row.
 fn stamp_seq(mut items: Vec<Value>) -> Vec<Value> {

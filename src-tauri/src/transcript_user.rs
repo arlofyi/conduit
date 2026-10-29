@@ -186,13 +186,32 @@ const MAX_DIFF_LINES: usize = 16;
 /// nothing on its own) unless nothing else follows it. Cut to `MAX_ERROR_TEXT` chars.
 fn error_text(content: &Value) -> Option<String> {
     let text = flat_text(content);
+    let text = text.trim();
+    let text = text.strip_prefix("<tool_use_error>").unwrap_or(text);
+    let text = text.strip_suffix("</tool_use_error>").unwrap_or(text);
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.next()?;
     let is_exit = first
         .strip_prefix("Exit code ")
         .is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit() || c == '-'));
     let pick = if is_exit {
-        lines.next().unwrap_or(first)
+        // A shell failure's first stdout line is rarely the error: prefer a line that
+        // reads like one, else the last line (where tools print what went wrong).
+        const MARKERS: [&str; 7] = [
+            "Error",
+            "error:",
+            "fatal:",
+            "denied",
+            "not found",
+            "No such file",
+            "failed",
+        ];
+        let rest: Vec<&str> = lines.collect();
+        rest.iter()
+            .find(|l| MARKERS.iter().any(|m| l.contains(m)))
+            .or(rest.last())
+            .copied()
+            .unwrap_or(first)
     } else {
         first
     };
@@ -285,6 +304,11 @@ fn diff_from(r: &Value) -> Option<Value> {
             rendered.push(row);
         }
     }
+    while rendered.last().is_some_and(|r| r.0 == "gap") {
+        rendered.pop();
+    }
+    let lead = rendered.iter().take_while(|r| r.0 == "gap").count();
+    rendered.drain(..lead);
     let more = rendered.len().saturating_sub(MAX_DIFF_LINES);
     let lines: Vec<Value> = rendered
         .into_iter()
@@ -708,6 +732,54 @@ mod tests {
     }
 
     #[test]
+    fn bash_error_prefers_error_line() {
+        let i = res(
+            json!("Exit code 1\n=== package.json ===\n{}\nnpm ERR! missing script: test"),
+            Some(true),
+            None,
+        );
+        assert_eq!(i["errorText"], "npm ERR! missing script: test");
+    }
+
+    #[test]
+    fn bash_error_takes_matching_line() {
+        let i = res(
+            json!("Exit code 2\nSwitched to a new branch 'x'\nfatal: not a repository\nlast"),
+            Some(true),
+            None,
+        );
+        assert_eq!(i["errorText"], "fatal: not a repository");
+    }
+
+    #[test]
+    fn bash_traceback_takes_last_line() {
+        let i = res(
+            json!("Exit code 1\nTraceback (most recent call last):\n  File \"x.py\", line 3\nAssertionError: MISSING: call-one"),
+            Some(true),
+            None,
+        );
+        assert_eq!(i["errorText"], "AssertionError: MISSING: call-one");
+    }
+
+    #[test]
+    fn tool_use_error_tags_are_stripped() {
+        let i = res(
+            json!(
+                "<tool_use_error>String to replace not found in file.\nString: x</tool_use_error>"
+            ),
+            Some(true),
+            None,
+        );
+        assert_eq!(i["errorText"], "String to replace not found in file.");
+        let i = res(
+            json!("<tool_use_error>No scheduled job with id 'abc'</tool_use_error>"),
+            Some(true),
+            None,
+        );
+        assert_eq!(i["errorText"], "No scheduled job with id 'abc'");
+    }
+
+    #[test]
     fn error_text_from_block_array() {
         let i = res(
             json!([{"type":"image","source":{}},{"type":"text","text":"\nboom\nmore"}]),
@@ -735,14 +807,24 @@ mod tests {
         assert_eq!(d["created"], false);
         assert_eq!(d["more"], 0);
         let want = json!([
-            {"kind":"gap","text":"","oldNo":null,"newNo":null},
             {"kind":"ctx","text":"b","oldNo":62,"newNo":62},
             {"kind":"del","text":"c","oldNo":63,"newNo":null},
             {"kind":"add","text":"C","oldNo":null,"newNo":63},
             {"kind":"ctx","text":"d","oldNo":64,"newNo":64},
-            {"kind":"gap","text":"","oldNo":null,"newNo":null},
         ]);
         assert_eq!(d["lines"], want);
+    }
+
+    #[test]
+    fn diff_has_no_edge_gaps_but_keeps_inner_ones() {
+        let tur = json!({"filePath":"/a","structuredPatch":[
+            {"oldStart":1,"newStart":1,"lines":[" a","-b","+B"," c"," d"]},
+            {"oldStart":50,"newStart":50,"lines":[" e"," f"," g","-h"," i"]}]});
+        let i = res(json!("ok"), None, Some(tur));
+        let l = i["diff"]["lines"].as_array().unwrap();
+        assert_ne!(l.first().unwrap()["kind"], "gap");
+        assert_ne!(l.last().unwrap()["kind"], "gap");
+        assert!(l.iter().any(|r| r["kind"] == "gap"));
     }
 
     #[test]
