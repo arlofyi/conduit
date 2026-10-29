@@ -1,4 +1,4 @@
-import { mapChatItem, mapProjects, statusPatch } from "./live";
+import { PHONE_KINDS, mapChatItem, mapHistory, mapProjects, statusPatch } from "./live";
 import type { WireChatItem, WireProject } from "./protocol";
 
 describe("mapChatItem", () => {
@@ -16,7 +16,30 @@ describe("mapChatItem", () => {
     expect(mapChatItem({ kind: "event", event: "weird", label: "did" })).toMatchObject({ event: "generic" });
   });
   it("assigns an id", () => {
-    expect(mapChatItem({ kind: "bubble", role: "assistant", text: "yo" }).id).toBeTruthy();
+    expect(mapChatItem({ kind: "bubble", role: "assistant", text: "yo" })?.id).toBeTruthy();
+  });
+});
+
+const kinds: string[] = require("../../../src-tauri/src/transcript_item_kinds.json");
+describe("phone item mapping", () => {
+  it("handles every kind Rust can emit except usage", () => {
+    expect([...PHONE_KINDS].sort()).toEqual(kinds.filter((k) => k !== "usage").sort());
+  });
+  it("mapChatItem drops usage and unknown kinds", () => {
+    expect(mapChatItem({ kind: "usage" } as never)).toBeNull();
+    expect(mapChatItem({ kind: "from-the-future" } as never)).toBeNull();
+  });
+  it("task becomes an ok notice with the summary as detail", () => {
+    const n = mapChatItem({ kind: "task", taskId: "b1", status: "completed", summary: "exit 0" });
+    expect(n).toMatchObject({ kind: "notice", tone: "ok", text: "Background task finished", detail: "exit 0" });
+  });
+  it("mapHistory folds command output into its command", () => {
+    const out = mapHistory([
+      { kind: "command", name: "/compact", args: "" },
+      { kind: "command_output", text: "Compacted", stream: "stdout" },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ kind: "command", name: "/compact", output: "Compacted" });
   });
 });
 
