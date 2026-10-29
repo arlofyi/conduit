@@ -174,15 +174,10 @@ impl Broker {
         ids
     }
 
-    /// The session's turn moved on (`hooks::turn_moved_on`): its open requests are dead.
-    /// After a terminal "Yes" this is what clears the card -- the hook is left running and
-    /// its reply ignored, but `PostToolUse` / `Stop` follow.
-    pub fn cancel_session(&self, session: &str) -> Vec<String> {
-        self.cancel_session_where(session, |_| true)
-    }
-
-    /// [`Self::cancel_session`], only for the session's requests whose tool name passes
-    /// `tool_matches` (`hooks::permission_moved_on`: a finished tool clears only its own).
+    /// The session's turn moved on (`hooks::permission_moved_on`): its open requests whose
+    /// tool name passes `tool_matches` are dead -- all of them for a turn-level event, only
+    /// the finished tool's own for a PostToolUse. After a terminal "Yes" this is what clears
+    /// the card: the hook is left running and its reply ignored, but `PostToolUse` follows.
     pub fn cancel_session_where(
         &self,
         session: &str,
@@ -324,7 +319,7 @@ mod tests {
         let (a, rx_a) = reg(&b, "s1", 1);
         let (other, rx_other) = reg(&b, "s2", 2);
         let (c, rx_c) = reg(&b, "s1", 3);
-        let mut gone = b.cancel_session("s1");
+        let mut gone = b.cancel_session_where("s1", |_| true);
         gone.sort();
         let mut want = vec![a.clone(), c.clone()];
         want.sort();
