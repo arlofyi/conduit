@@ -25,7 +25,30 @@ fn sync_wdio_capability() {
     }
 }
 
+/// tauri-build embeds the Windows app manifest (the Common-Controls v6 dependency) into
+/// the app BINARY only, through its resource file. The lib's unit-test executable gets no
+/// manifest, so the moment test-reachable code links a v6-only comctl32 symbol the test exe
+/// fails to load with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) before a single test runs.
+/// So the manifest is embedded by the linker for EVERY target instead, and tauri-build is
+/// told not to add its own (two manifests in one binary is a link error). Same content as
+/// tauri-build's default, so the shipped app is unchanged.
+fn embed_windows_manifest() -> tauri_build::Attributes {
+    let target_windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    if !(target_windows && msvc) {
+        return tauri_build::Attributes::new();
+    }
+    let manifest =
+        Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("windows-app-manifest.xml");
+    println!("cargo:rerun-if-changed=windows-app-manifest.xml");
+    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
+    tauri_build::Attributes::new()
+        .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest())
+}
+
 fn main() {
     sync_wdio_capability();
-    tauri_build::build()
+    let attrs = embed_windows_manifest();
+    tauri_build::try_build(attrs).expect("failed to run tauri-build");
 }
