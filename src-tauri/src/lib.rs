@@ -44,9 +44,11 @@ mod hotexit;
 pub mod ide_host;
 mod local_llm;
 mod menu;
+mod mobile_devices;
 mod notify;
 mod openrouter_usage;
 mod orchestration_policy;
+mod pairing;
 mod plugins;
 mod project_new;
 mod proposals;
@@ -62,6 +64,7 @@ mod session_files;
 mod status_rules;
 mod store;
 mod subagents;
+mod tailscale;
 mod tasks;
 mod telemetry;
 #[cfg_attr(windows, allow(dead_code))]
@@ -70,12 +73,6 @@ mod transcript;
 mod transcript_index;
 mod transcript_user;
 mod updates;
-// Consumed by the mobile bridge in later tasks; only the two commands are wired yet.
-#[allow(dead_code)]
-mod tailscale;
-// Consumed by the bridge controller (Task 3) and pairing (Task 4); only commands are wired yet.
-#[allow(dead_code)]
-mod mobile_devices;
 mod usage_tally;
 mod window_registry;
 mod worktree;
@@ -3224,6 +3221,7 @@ pub fn run() {
             mobile_devices.clone(),
         )))
         .manage(mobile_devices)
+        .manage(Arc::new(pairing::Pairing::default()))
         .manage(Arc::new(HookState::default()))
         .manage(Arc::new(crate::fleet::FleetState::default()))
         .manage(Arc::new(crate::board::BoardState::default()))
@@ -3679,6 +3677,9 @@ pub fn run() {
             mobile_devices::mobile_settings,
             mobile_devices::mobile_set_enabled,
             mobile_devices::mobile_revoke_device,
+            pairing::pair_start,
+            pairing::pair_pending,
+            pairing::pair_respond,
             tailscale::tailscale_open_app,
             claude_usage::fetch_claude_usage,
             transcript::session_transcript,

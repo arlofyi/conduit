@@ -39,6 +39,7 @@ use tungstenite::{accept_hdr_with_config, Message, WebSocket};
 
 use crate::hookbus::HookBus;
 use crate::mobile_devices::MobileDevices;
+use crate::pairing::{self, PairRequest, Pairing, Via};
 use crate::pty::PtyManager;
 use crate::store::Store;
 use crate::tailscale::{self, TailscaleState};
@@ -305,7 +306,7 @@ fn read_lines(path: &Path) -> Vec<String> {
 }
 
 /// The generic failure reply. Identical for a wrong token, a revoked device, a
-/// rate-limited peer and a pairing frame not yet handled -- no oracle.
+/// rate-limited peer, a bad or spent pairing secret and a pre-auth `discover` -- no oracle.
 fn unauthorized() -> serde_json::Value {
     json!({ "type": "error", "message": "unauthorized" })
 }
@@ -455,27 +456,164 @@ fn lift_preauth_cap(ws: &mut WebSocket<TcpStream>) {
     });
 }
 
-/// What a `pair`/`discover` frame produced: the reply to send, and -- when pairing
-/// succeeded -- the device the connection is now authenticated as.
-struct PairingOutcome {
-    reply: serde_json::Value,
-    authed_device: Option<String>,
+/// How a parked pair request ended, from the waiting connection's side.
+enum PairWait {
+    Answer(bool),
+    /// No answer within [`pairing::REQUEST_WAIT`] (or the request was swept).
+    Expired,
+    /// The phone closed its socket while waiting.
+    Gone,
 }
 
-/// SEAM for Task 4 (`pairing.rs`): `pair` and `discover` frames, pre- or post-auth, are
-/// routed to this one function; `authed` says which (so e.g. `discover` can be refused
-/// pre-auth). Until pairing exists every such frame gets the generic error, so nothing
-/// about the device list leaks.
-fn pairing_reply(
-    _ctrl: &BridgeController,
-    _peer: IpAddr,
-    _authed: bool,
-    _msg: ClientMsg,
-) -> PairingOutcome {
-    PairingOutcome {
-        reply: unauthorized(),
-        authed_device: None,
+/// Block this connection (it has nothing else to do pre-auth) until the Mac answers, the
+/// request expires, or the phone hangs up. The pre-auth deadline does not apply here: the
+/// loop that enforces it is parked in this call.
+fn wait_for_pair_answer(
+    ws: &mut WebSocket<TcpStream>,
+    rx: &std::sync::mpsc::Receiver<bool>,
+) -> PairWait {
+    use std::sync::mpsc::RecvTimeoutError;
+    let end = Instant::now() + pairing::REQUEST_WAIT;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(allow) => return PairWait::Answer(allow),
+            Err(RecvTimeoutError::Disconnected) => return PairWait::Expired,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        if Instant::now() >= end {
+            return PairWait::Expired;
+        }
+        // Notice a hang-up so the request (and the peer's one slot) is freed at once.
+        match ws.read() {
+            Ok(Message::Close(_)) => return PairWait::Gone,
+            Ok(_) => {} // nothing else is meaningful while waiting
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return PairWait::Gone,
+        }
     }
+}
+
+fn pair_result_failed(reason: &str) -> serde_json::Value {
+    json!({ "type": "pairResult", "ok": false, "reason": reason })
+}
+
+/// Handle one `pair` frame end to end: gate, consume the QR secret or accept a request,
+/// prompt the Mac (`pair-request`), wait, and on allow mint the device. Sends every reply
+/// itself. Returns the new device id when the phone is now paired; `None` for every
+/// failure (the caller closes a pre-auth socket). Never logs the secret, nonce or token.
+#[allow(clippy::too_many_arguments)]
+fn pair_flow(
+    ctrl: &BridgeController,
+    app: &AppHandle,
+    ws: &mut WebSocket<TcpStream>,
+    peer: IpAddr,
+    secret: Option<String>,
+    request: bool,
+    device_name: &str,
+    nonce: &str,
+) -> Option<String> {
+    use tauri::Emitter;
+    let pairing = app.state::<Arc<Pairing>>().inner().clone();
+    let refuse = |ws: &mut WebSocket<TcpStream>| {
+        ctrl.record_auth_failure(peer);
+        let _ = ws.send(Message::Text(unauthorized().to_string()));
+        None
+    };
+    // Pairing exists only while mobile access is on. Then: under the per-IP limit, a nonce
+    // the code can bind to, and no request already waiting for this peer.
+    if !ctrl.devices.enabled()
+        || !ctrl.auth_allowed(peer)
+        || !pairing::nonce_ok(nonce)
+        || pairing.busy(peer)
+    {
+        return refuse(ws);
+    }
+    let (via, secret) = match (secret, request) {
+        (Some(s), _) => {
+            if !pairing.consume_secret(&s) {
+                return refuse(ws);
+            }
+            (Via::Secret, Some(s))
+        }
+        (None, true) => (Via::Request, None),
+        (None, false) => return refuse(ws),
+    };
+    let device_name = pairing::clean_device_name(device_name);
+    // Who owns the phone, per Tailscale. Only here, never in a tick; loopback has no owner.
+    let login = if peer.is_loopback() {
+        None
+    } else {
+        tailscale::whois(peer).map(|w| w.login_name)
+    };
+    let Some((id, rx)) = pairing.register(PairRequest {
+        peer,
+        device_name: device_name.clone(),
+        nonce: nonce.to_string(),
+        via,
+        login: login.clone(),
+        secret,
+    }) else {
+        return refuse(ws); // lost a race for this peer's one slot
+    };
+    if let Some(view) = pairing.get(&id) {
+        let _ = app.emit("pair-request", &view);
+    }
+    // The phone needs the request id: on the request path it is the code's input.
+    let pending = json!({ "type": "pairPending", "requestId": id });
+    let wait = if ws.send(Message::Text(pending.to_string())).is_err() {
+        PairWait::Gone
+    } else {
+        wait_for_pair_answer(ws, &rx)
+    };
+    // Forget FIRST, then drain once (the asks.rs rule): a `pair_respond` either landed
+    // before the forget and is seen here, or finds nothing and reports false to its card.
+    pairing.forget(&id);
+    let wait = match wait {
+        PairWait::Expired => rx.try_recv().map_or(PairWait::Expired, PairWait::Answer),
+        other => other,
+    };
+    let (how, device) = match wait {
+        PairWait::Answer(true) => match ctrl.devices.add_device(&device_name, login) {
+            Ok((device, token)) => {
+                let ok = json!({
+                    "type": "pairResult",
+                    "ok": true,
+                    "token": token,
+                    "deviceId": device.id,
+                });
+                if ws.send(Message::Text(ok.to_string())).is_ok() {
+                    ("allowed", Some(device.id))
+                } else {
+                    // The token never reached the phone: leave no device nobody holds.
+                    let _ = ctrl.devices.revoke(&device.id);
+                    ("cancelled", None)
+                }
+            }
+            Err(e) => {
+                eprintln!("conduit: could not save paired phone: {e}");
+                let _ = ws.send(Message::Text(pair_result_failed("error").to_string()));
+                ("failed", None)
+            }
+        },
+        PairWait::Answer(false) => {
+            let _ = ws.send(Message::Text(pair_result_failed("declined").to_string()));
+            ("declined", None)
+        }
+        PairWait::Expired => {
+            let _ = ws.send(Message::Text(pair_result_failed("expired").to_string()));
+            ("expired", None)
+        }
+        PairWait::Gone => ("cancelled", None),
+    };
+    if device.is_none() {
+        ctrl.record_auth_failure(peer);
+    }
+    let _ = app.emit("pair-resolved", json!({ "id": id, "how": how }));
+    device
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -782,6 +920,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut attached: Option<(String, u64, std::sync::mpsc::Receiver<String>)> = None;
     // (transcript path, lines already sent) — set on attach, advanced while tailing.
     let mut transcript: Option<(PathBuf, usize)> = None;
+    // A `discover` probe's reply, produced on its own thread. One probe at a time.
+    let (macs_tx, macs_rx) = std::sync::mpsc::channel::<String>();
+    let mut discovering = false;
 
     loop {
         // 0. Gates: an unauthenticated peer gets AUTH_DEADLINE; a revoked device is
@@ -813,10 +954,37 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             break;
                         }
                     },
-                    Some(msg @ (ClientMsg::Pair { .. } | ClientMsg::Discover)) => {
-                        let out = pairing_reply(&ctrl, peer, false, msg);
-                        let _ = ws.send(Message::Text(out.reply.to_string()));
-                        out.authed_device.map(|id| (id, false))
+                    Some(ClientMsg::Pair {
+                        secret,
+                        request,
+                        device_name,
+                        nonce,
+                    }) => {
+                        let paired = pair_flow(
+                            &ctrl,
+                            &app,
+                            &mut ws,
+                            peer,
+                            secret,
+                            request.unwrap_or(false),
+                            &device_name,
+                            &nonce,
+                        );
+                        match paired {
+                            Some(id) => Some((id, false)),
+                            None => {
+                                let _ = ws.close(None);
+                                let _ = ws.flush();
+                                break;
+                            }
+                        }
+                    }
+                    // Listing Macs is for paired phones only.
+                    Some(ClientMsg::Discover) => {
+                        let _ = ws.send(Message::Text(unauthorized().to_string()));
+                        let _ = ws.close(None);
+                        let _ = ws.flush();
+                        break;
                     }
                     // Anything else before auth ends the connection.
                     _ => break,
@@ -940,9 +1108,38 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                     // Esc is Claude's interrupt key (spec §6 "Stop").
                     let _ = pty.write(&session_id, "\x1b");
                 }
-                Some(msg @ (ClientMsg::Pair { .. } | ClientMsg::Discover)) => {
-                    let out = pairing_reply(&ctrl, peer, true, msg);
-                    let _ = ws.send(Message::Text(out.reply.to_string()));
+                // Pairing again from a trusted socket: only loopback (the simulator) may,
+                // since a parked wait would also park a remote device's revoke check.
+                Some(ClientMsg::Pair {
+                    secret,
+                    request,
+                    device_name,
+                    nonce,
+                }) => {
+                    if loopback {
+                        let _ = pair_flow(
+                            &ctrl,
+                            &app,
+                            &mut ws,
+                            peer,
+                            secret,
+                            request.unwrap_or(false),
+                            &device_name,
+                            &nonce,
+                        );
+                    } else {
+                        let _ = ws.send(Message::Text(unauthorized().to_string()));
+                    }
+                }
+                // Probe the tailnet off this thread; the reply arrives via `macs_rx`.
+                Some(ClientMsg::Discover) => {
+                    if !discovering {
+                        discovering = true;
+                        let tx = macs_tx.clone();
+                        thread::spawn(move || {
+                            let _ = tx.send(pairing::discover_macs().to_string());
+                        });
+                    }
                 }
                 // Already authenticated (or loopback): a repeat `auth` changes nothing.
                 Some(ClientMsg::Auth { .. }) | None => {}
@@ -975,6 +1172,14 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                     }
                     Err(_) => break,
                 }
+            }
+        }
+
+        // 2b. A finished `discover` probe.
+        if let Ok(macs) = macs_rx.try_recv() {
+            discovering = false;
+            if ws.send(Message::Text(macs)).is_err() {
+                break;
             }
         }
 
