@@ -29,8 +29,9 @@ export type Diff = {
 
 /** Fields every item may carry. `seq` is the item's absolute index in the whole parsed
  *  conversation, stamped by `session_transcript` BEFORE it tails to the view limit -- a
- *  stable row key as the window slides. Absent on the bridge and root-chat paths. */
-type ItemBase = { seq?: number };
+ *  stable row key as the window slides. Absent on the bridge and root-chat paths.
+ *  `at` is the transcript line's ISO-8601 timestamp, absent when the line had none. */
+type ItemBase = { seq?: number; at?: string };
 
 type ItemBody =
   | { kind: "bubble"; role: "user" | "assistant"; text: string }

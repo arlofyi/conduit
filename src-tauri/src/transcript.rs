@@ -142,6 +142,15 @@ pub fn parse_line(line: &str) -> Vec<Value> {
         "system" => out.extend(crate::transcript_user::parse_system(&v)),
         _ => {}
     }
+    // The line's own clock, so a reader can show message times. A field on every item,
+    // not a new kind; absent when the line carries none.
+    if let Some(at) = v.get("timestamp").and_then(|t| t.as_str()) {
+        for item in out.iter_mut() {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("at".into(), json!(at));
+            }
+        }
+    }
     out
 }
 
@@ -241,6 +250,58 @@ mod tests {
         // 0 means "no cap" rather than "show nothing": a caller passing zero has almost
         // certainly forgotten to supply one, and an empty pane hides that mistake.
         assert_eq!(tail(items, 0).len(), 3);
+    }
+
+    #[test]
+    fn items_carry_timestamp() {
+        let ts = "2026-10-29T20:11:42.123Z";
+        let a = parse_line(
+            &json!({"type":"assistant","timestamp":ts,"message":{"content":[
+                {"type":"text","text":"hi"}]}})
+            .to_string(),
+        );
+        assert_eq!(a[0]["at"], ts);
+        let u = parse_line(
+            &json!({"type":"user","timestamp":ts,"message":{"content":"yo"}}).to_string(),
+        );
+        assert_eq!(u[0]["at"], ts);
+        let none = parse_line(&json!({"type":"user","message":{"content":"yo"}}).to_string());
+        assert!(none[0].get("at").is_none());
+    }
+
+    #[test]
+    fn system_reminder_only_is_hidden() {
+        let line = r#"{"type":"user","isMeta":true,"origin":null,"message":{"content":"<system-reminder>\n<tools-used-before-summary>TaskStop</tools-used-before-summary>\n</system-reminder>"}}"#;
+        assert!(parse_line(line).is_empty());
+        let two = json!({"type":"user","message":{"content":[
+            {"type":"text","text":"<system-reminder>a</system-reminder>"},
+            {"type":"text","text":"<system-reminder>b</system-reminder>"}]}})
+        .to_string();
+        assert!(parse_line(&two).is_empty());
+    }
+
+    #[test]
+    fn reminder_then_text_keeps_text() {
+        let line = json!({"type":"user","message":{"content":
+            "<system-reminder>a</system-reminder>\nfix the bug"}})
+        .to_string();
+        let items = parse_line(&line);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]["kind"], "note",
+            "classified as before the hide rule"
+        );
+        assert!(items[0]["text"].as_str().unwrap().contains("fix the bug"));
+    }
+
+    #[test]
+    fn human_reminder_text_stays_bubble() {
+        let line = json!({"type":"user","origin":{"kind":"human"},"message":{"content":
+            "<system-reminder>typed by me</system-reminder>"}})
+        .to_string();
+        let items = parse_line(&line);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "bubble");
     }
 
     #[test]

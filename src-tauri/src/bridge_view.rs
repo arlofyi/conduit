@@ -6,13 +6,17 @@
 //! needs and some of which must not leave the Mac.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
 use crate::asks::AskView;
 use crate::context_window::ContextUsage;
 use crate::fleet::FleetStatus;
-use crate::store::{Profile, Project};
+use crate::store::{Profile, Project, Session};
 
 /// Longest `needs.text` the phone is sent.
 const NEEDS_TEXT_MAX: usize = 120;
@@ -32,7 +36,159 @@ fn first_question(ask: &AskView) -> Option<String> {
         .map(clip)
 }
 
-/// The `projects` frame.
+/// Longest `lastMessage.text` the phone is sent.
+const LAST_TEXT_MAX: usize = 160;
+/// How much of a transcript's end is read to find its last bubble.
+const TAIL_BYTES: u64 = 256 * 1024;
+
+/// A bubble's text as one readable line: markdown marks dropped, links reduced to their
+/// text, whitespace collapsed, a leading `★ Insight` rule block removed. Clipped to
+/// [`LAST_TEXT_MAX`] characters.
+pub fn plain_text(md: &str) -> String {
+    let is_rule = |l: &str| {
+        let t = l.trim();
+        !t.is_empty() && t.chars().all(|c| c == '─' || c == '`' || c == '-')
+    };
+    let mut lines: Vec<&str> = md.lines().collect();
+    while lines.first().is_some_and(|l| l.trim().is_empty()) {
+        lines.remove(0);
+    }
+    if lines.first().is_some_and(|l| l.contains("★ Insight")) {
+        lines.remove(0);
+        while lines.first().is_some_and(|l| is_rule(l)) {
+            lines.remove(0);
+        }
+    }
+    let mut out = String::new();
+    for line in lines {
+        if is_rule(line) {
+            continue;
+        }
+        out.push_str(line.trim_start().trim_start_matches('#').trim_start());
+        out.push(' ');
+    }
+    // Links `[text](url)` (and images `![alt](url)`) -> their text.
+    let mut flat = String::with_capacity(out.len());
+    let chars: Vec<char> = out.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            if let Some(close) = chars[i..].iter().position(|&c| c == ']') {
+                let c = i + close;
+                if chars.get(c + 1) == Some(&'(') {
+                    if let Some(p) = chars[c..].iter().position(|&c| c == ')') {
+                        flat.extend(&chars[i + 1..c]);
+                        i = c + p + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        flat.push(chars[i]);
+        i += 1;
+    }
+    let flat = flat.replace("**", "").replace("__", "").replace('`', "");
+    let collapsed = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(LAST_TEXT_MAX).collect()
+}
+
+/// The `lastMessage` value for the last bubble in `body` (a transcript tail), or null.
+pub fn last_message_from_text(body: &str) -> Value {
+    for line in body.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        for item in crate::transcript::parse_line(line).into_iter().rev() {
+            if item.get("kind").and_then(|k| k.as_str()) != Some("bubble") {
+                continue;
+            }
+            let text = plain_text(item.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+            if text.is_empty() {
+                continue;
+            }
+            return json!({
+                "role": item.get("role").and_then(|r| r.as_str()).unwrap_or("assistant"),
+                "text": text,
+                "at": item.get("at").cloned().unwrap_or(Value::Null),
+            });
+        }
+    }
+    Value::Null
+}
+
+/// Read the last [`TAIL_BYTES`] of a transcript and extract its last message. Any I/O
+/// problem is null: a preview must never fail a `list`.
+pub fn read_last_message(path: &Path) -> Value {
+    let read = || -> std::io::Result<String> {
+        let mut f = std::fs::File::open(path)?;
+        let len = f.metadata()?.len();
+        let start = len.saturating_sub(TAIL_BYTES);
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = Vec::new();
+        f.take(TAIL_BYTES).read_to_end(&mut buf)?;
+        let mut text = String::from_utf8_lossy(&buf).into_owned();
+        if start > 0 {
+            // Began mid-line: drop the partial first line.
+            text = text
+                .split_once('\n')
+                .map(|x| x.1.to_string())
+                .unwrap_or_default();
+        }
+        Ok(text)
+    };
+    read()
+        .map(|t| last_message_from_text(&t))
+        .unwrap_or(Value::Null)
+}
+
+/// Last-message previews keyed by `(path, len, mtime)`: a `list` with nothing new on disk
+/// does no transcript reads, only a `stat`.
+#[derive(Default)]
+pub struct LastMessageCache {
+    inner: Mutex<HashMap<PathBuf, CacheEntry>>,
+}
+
+/// `(len, mtime, preview)` of a transcript when it was last read.
+type CacheEntry = (u64, Option<SystemTime>, Value);
+
+impl LastMessageCache {
+    /// The cached value if `(len, mtime)` still match, else `read()` and remember it.
+    pub fn get_or_read(
+        &self,
+        path: &Path,
+        len: u64,
+        mtime: Option<SystemTime>,
+        read: impl FnOnce() -> Value,
+    ) -> Value {
+        {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((l, m, v)) = g.get(path) {
+                if *l == len && *m == mtime {
+                    return v.clone();
+                }
+            }
+        }
+        let v = read();
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf(), (len, mtime, v.clone()));
+        v
+    }
+
+    /// Cached preview for a transcript file; null when it cannot be statted.
+    pub fn for_path(&self, path: &Path) -> Value {
+        let Ok(md) = std::fs::metadata(path) else {
+            return Value::Null;
+        };
+        self.get_or_read(path, md.len(), md.modified().ok(), || {
+            read_last_message(path)
+        })
+    }
+}
+
+/// The `projects` frame. `last_message` resolves a (non-silo, Claude) session's preview;
+/// it is never called for a silo'd or non-Claude session.
 pub fn projects_view(
     projects: &[Project],
     profiles: &[Profile],
@@ -40,6 +196,7 @@ pub fn projects_view(
     fleet: &HashMap<String, FleetStatus>,
     running: &HashSet<String>,
     asks: &[AskView],
+    last_message: &dyn Fn(&Session) -> Value,
 ) -> Value {
     let mut profile_list = vec![json!({ "id": Value::Null, "name": "Default" })];
     profile_list.extend(
@@ -72,6 +229,11 @@ pub fn projects_view(
                     } else {
                         live.and_then(|f| f.activity.clone())
                     };
+                    let last = if silo || s.agent != crate::agent::AgentId::Claude {
+                        Value::Null
+                    } else {
+                        last_message(s)
+                    };
                     let updated_at = live.map(|f| f.updated_at).filter(|t| *t > 0);
                     json!({
                         "id": s.id,
@@ -86,6 +248,7 @@ pub fn projects_view(
                         "activity": activity,
                         "updatedAt": updated_at,
                         "needs": needs,
+                        "lastMessage": last,
                     })
                 })
                 .collect();
@@ -156,7 +319,7 @@ mod tests {
     }
 
     fn view(p: &[Project], fleet: &HashMap<String, FleetStatus>, asks: &[AskView]) -> Value {
-        projects_view(p, &[], None, fleet, &HashSet::new(), asks)
+        projects_view(p, &[], None, fleet, &HashSet::new(), asks, &|_| Value::Null)
     }
 
     #[test]
@@ -177,6 +340,7 @@ mod tests {
                 "agent",
                 "branch",
                 "id",
+                "lastMessage",
                 "model",
                 "name",
                 "needs",
@@ -194,6 +358,89 @@ mod tests {
     }
 
     #[test]
+    fn last_message_plain_text_and_clip() {
+        let md = "`★ Insight ─────`\n**Bold** and __more__ with `code` and [a link](http://x.y)\n\n# Head\nline";
+        assert_eq!(
+            plain_text(md),
+            "Bold and more with code and a link Head line"
+        );
+        assert_eq!(plain_text(&"a".repeat(500)).chars().count(), 160);
+        let body = [
+            json!({"type":"user","timestamp":"2026-10-29T20:00:00Z","message":{"content":"first"}}),
+            json!({"type":"assistant","timestamp":"2026-10-29T20:01:00Z","message":{"content":[
+                {"type":"text","text":"**done** it"},
+                {"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        assert_eq!(
+            last_message_from_text(&body),
+            json!({"role":"assistant","text":"done it","at":"2026-10-29T20:01:00Z"})
+        );
+        assert!(last_message_from_text("not json\n").is_null());
+    }
+
+    #[test]
+    fn last_message_cache_reads_once_until_file_changes() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let cache = LastMessageCache::default();
+        let calls = Cell::new(0);
+        let p = Path::new("/t/a.jsonl");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let t1 = t0 + Duration::from_secs(1);
+        let read = || {
+            calls.set(calls.get() + 1);
+            json!({ "n": calls.get() })
+        };
+        assert_eq!(cache.get_or_read(p, 5, Some(t0), read)["n"], 1);
+        assert_eq!(cache.get_or_read(p, 5, Some(t0), read)["n"], 1);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cache.get_or_read(p, 6, Some(t0), read)["n"], 2);
+        assert_eq!(cache.get_or_read(p, 6, Some(t1), read)["n"], 3);
+        assert_eq!(cache.get_or_read(p, 6, Some(t1), read)["n"], 3);
+    }
+
+    #[test]
+    fn silo_last_message_null_without_read() {
+        let mut silo = sess("a");
+        silo.silo = true;
+        let mut local = sess("b");
+        local.local_only = true;
+        let mut other = sess("c");
+        other.agent = crate::agent::AgentId::Hermes;
+        let v = projects_view(
+            &[project("p1", vec![silo, local, other])],
+            &[],
+            None,
+            &HashMap::new(),
+            &HashSet::new(),
+            &[],
+            &|s| panic!("read attempted for {}", s.id),
+        );
+        for i in 0..3 {
+            assert!(v["projects"][0]["sessions"][i]["lastMessage"].is_null());
+        }
+    }
+
+    #[test]
+    fn projects_view_carries_last_message() {
+        let v = projects_view(
+            &[project("p1", vec![sess("a")])],
+            &[],
+            None,
+            &HashMap::new(),
+            &HashSet::new(),
+            &[],
+            &|s| json!({ "role": "user", "text": s.id, "at": null }),
+        );
+        assert_eq!(
+            v["projects"][0]["sessions"][0]["lastMessage"],
+            json!({ "role": "user", "text": "a", "at": null })
+        );
+    }
+
+    #[test]
     fn projects_view_default_profile_first() {
         let profiles = vec![Profile {
             id: "w".into(),
@@ -206,12 +453,21 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &[],
+            &|_| Value::Null,
         );
         assert_eq!(v["type"], "projects");
         assert_eq!(v["profiles"][0], json!({ "id": null, "name": "Default" }));
         assert_eq!(v["profiles"][1], json!({ "id": "w", "name": "Work" }));
         assert_eq!(v["activeProfileId"], "w");
-        let none = projects_view(&[], &[], None, &HashMap::new(), &HashSet::new(), &[]);
+        let none = projects_view(
+            &[],
+            &[],
+            None,
+            &HashMap::new(),
+            &HashSet::new(),
+            &[],
+            &|_| Value::Null,
+        );
         assert!(none["activeProfileId"].is_null());
     }
 

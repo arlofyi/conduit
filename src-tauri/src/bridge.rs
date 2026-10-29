@@ -797,6 +797,8 @@ pub struct BridgeController {
     auth_failures: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Pair prompts raised per peer IP (a budget separate from failures).
     pair_prompts: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// Last-message previews for the `projects` frame, keyed by transcript file state.
+    last_messages: crate::bridge_view::LastMessageCache,
 }
 
 impl BridgeController {
@@ -811,6 +813,7 @@ impl BridgeController {
             live: Mutex::new(HashMap::new()),
             auth_failures: Mutex::new(HashMap::new()),
             pair_prompts: Mutex::new(HashMap::new()),
+            last_messages: Default::default(),
         }
     }
 
@@ -1228,6 +1231,15 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         &fleet,
                         &running,
                         &asks,
+                        // Resolved exactly as `attach` resolves a transcript; any miss is null.
+                        &|s| {
+                            let conversation = store.claude_conversation_id(&s.id);
+                            crate::pty::session_projects_dir(&store, &s.id)
+                                .and_then(|dir| crate::pty::transcript_path(&conversation, &dir))
+                                .map_or(serde_json::Value::Null, |p| {
+                                    ctrl.last_messages.for_path(&p)
+                                })
+                        },
                     );
                     let _ = ws.send(Message::Text(view.to_string()));
                 }

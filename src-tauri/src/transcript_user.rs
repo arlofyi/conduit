@@ -69,6 +69,27 @@ fn flat_text(content: &Value) -> String {
     }
 }
 
+/// True when `text` is one or more `<system-reminder>…</system-reminder>` blocks and
+/// nothing else (whitespace between them allowed).
+fn only_system_reminders(text: &str) -> bool {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut rest = text.trim();
+    if !rest.starts_with(OPEN) {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(after) = rest.strip_prefix(OPEN) else {
+            return false;
+        };
+        let Some(end) = after.find(CLOSE) else {
+            return false;
+        };
+        rest = after[end + CLOSE.len()..].trim_start();
+    }
+    true
+}
+
 fn bubble(text: &str) -> Value {
     json!({ "kind": "bubble", "role": "user", "text": text })
 }
@@ -353,6 +374,10 @@ pub fn parse_user(v: &Value) -> Vec<Value> {
             (_, Some(blocks)) => parse_blocks(blocks, false, None),
             _ => vec![],
         };
+    }
+    // 1b. A line that is nothing but injected `<system-reminder>` blocks is machinery.
+    if only_system_reminders(&flat_text(content)) {
+        return vec![];
     }
     // 2. The compact_boundary system line draws the divider; the summary text is noise.
     if flag("isCompactSummary") {
@@ -862,11 +887,11 @@ mod tests {
 
     #[test]
     fn array_text_with_unknown_tag_is_note() {
-        let v = json!({"type":"user","message":{"content":[{"type":"text","text":"<system-reminder>x</system-reminder>"}]}});
+        let v = json!({"type":"user","message":{"content":[{"type":"text","text":"<ide-thing>x</ide-thing>"}]}});
         let items = parse_user(&v);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["kind"], "note");
-        assert_eq!(items[0]["tag"], "system-reminder");
+        assert_eq!(items[0]["tag"], "ide-thing");
     }
 
     #[test]
