@@ -16,8 +16,16 @@ import { bannerFromPending, bannerFromStatus, bannersFromView, type Banner, type
 import type { ContextInfo } from "../logic/chatHeader";
 import { chatUnread, nextUnread } from "../logic/chatList";
 import { connErrorText } from "../logic/connCopy";
-import { capFeed } from "../logic/feed";
-import { acceptsFrame, frameSession, isSpawnError, PRIVATE_SESSION, refusesOpenChat, spawnErrorText } from "../logic/frames";
+import { capFeed, genId } from "../logic/feed";
+import {
+  acceptsFrame,
+  frameSession,
+  isSpawnError,
+  PRIVATE_SESSION,
+  refusesOpenChat,
+  spawnErrorText,
+  trustStallNotice,
+} from "../logic/frames";
 import { loopbackMac, type PairEndpoint } from "../logic/macs";
 import { addressesFor, confirmCode, makeNonce, type QrPayload } from "../logic/pairing";
 import { emptyPending, fromWire, pendingReducer, type Mine, type PendingEvent, type PendingState } from "../logic/pending";
@@ -333,7 +341,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                 clientRef.current?.list(); // the new session belongs in the list now
               }
               break;
-            case "error":
+            case "error": {
+              // A chat this phone started, stuck on the Mac's folder-trust prompt (null otherwise).
+              const stall = trustStallNotice(m.message, m.sessionId, attachedRef.current, genId("n"));
               if (m.message === PRIVATE_SESSION) {
                 // The Mac refused the chat that is open (at attach, or because it was made
                 // private while streaming): say so instead of an empty feed. A refusal for a
@@ -341,6 +351,10 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                 if (refusesOpenChat(m.message, m.sessionId, attachedRef.current)) {
                   setSessionLive({ ...EMPTY_LIVE, refused: "private" });
                 }
+              } else if (stall) {
+                // Say so in that chat rather than leave it reading "working…". The Mac re-sends
+                // `history` once Claude does start, which replaces this notice with the real feed.
+                setSessionLive((prev) => ({ ...prev, feed: capFeed([...prev.feed, stall]) }));
               } else if (spawnPending.current && isSpawnError(m.message)) {
                 // Only the spawn's own errors answer a spawn; anything else is about another request.
                 spawnPending.current = false;
@@ -348,6 +362,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                 setSpawnState({ phase: "failed", message: spawnErrorText(m.message) });
               }
               break;
+            }
             case "macs":
               setDiscovered(m.macs);
               break;

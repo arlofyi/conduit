@@ -1,4 +1,13 @@
-import { acceptsFrame, frameSession, isSpawnError, refusesOpenChat, SPAWN_ERRORS, spawnErrorText } from "./frames";
+import {
+  acceptsFrame,
+  frameSession,
+  isSpawnError,
+  refusesOpenChat,
+  SPAWN_ERRORS,
+  spawnErrorText,
+  TRUST_STALL,
+  trustStallNotice,
+} from "./frames";
 
 describe("session-tagged frames", () => {
   it("keeps frames for the open chat and drops the one the reader left", () => {
@@ -43,5 +52,28 @@ describe("spawn errors", () => {
   it("has a sentence for each", () => {
     expect(spawnErrorText("too many new chats — try again later")).toMatch(/try again later/);
     expect(spawnErrorText("could not create session")).toMatch(/couldn't start/);
+  });
+});
+
+describe("a new chat waiting on the Mac's folder-trust prompt", () => {
+  it("matches bridge.rs TRUST_STALL_MESSAGE exactly", () => {
+    expect(TRUST_STALL).toBe("Claude is waiting on your Mac \u2014 open this folder there once to trust it");
+  });
+  it("becomes a notice in the chat it names, and only there", () => {
+    expect(trustStallNotice(TRUST_STALL, "s1", "s1", "n-1")).toEqual({
+      kind: "notice",
+      id: "n-1",
+      tone: "info",
+      text: "Claude is waiting on your Mac",
+      detail: "Open this folder there once to trust it.",
+    });
+    expect(trustStallNotice(TRUST_STALL, "s1", "other", "n-1")).toBeNull();
+    expect(trustStallNotice(TRUST_STALL, "s1", null, "n-1")).toBeNull();
+    expect(trustStallNotice("private session", "s1", "s1", "n-1")).toBeNull();
+    // It always names its session: an untagged one cannot be placed.
+    expect(trustStallNotice(TRUST_STALL, undefined, "s1", "n-1")).toBeNull();
+  });
+  it("is never mistaken for a spawn failure", () => {
+    expect(isSpawnError(TRUST_STALL)).toBe(false);
   });
 });

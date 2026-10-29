@@ -4,6 +4,7 @@
  * chat the reader just left; the Mac tags `chat`/`history`/`status` with `sessionId` so the
  * phone can drop those. Older desktops send no tag, and their frames are accepted as before.
  */
+import type { NoticeItem } from "../data/types";
 
 /** The Mac's refusal for a silo'd or local-only session (bridge_view.rs `private_session_error`). */
 export const PRIVATE_SESSION = "private session";
@@ -42,6 +43,29 @@ export const SPAWN_ERRORS: readonly string[] = [
  * private session) is about something else and must not fail the new-chat sheet. */
 export function isSpawnError(message: string): boolean {
   return SPAWN_ERRORS.includes(message);
+}
+
+/** The Mac's word that a chat this phone started has not begun: Claude is on its "trust this
+ * folder?" prompt, which only the Mac can answer (bridge.rs `TRUST_STALL_MESSAGE`). Sent once,
+ * tagged with the new session, about 20 s after the spawn if no `sessionstart` hook came. */
+export const TRUST_STALL = "Claude is waiting on your Mac — open this folder there once to trust it";
+
+/** The notice that error becomes in the chat it names, or null when it is not that error or
+ * is about a chat other than the open one. */
+export function trustStallNotice(
+  message: string,
+  frameSessionId: unknown,
+  open: string | null,
+  id: string,
+): NoticeItem | null {
+  if (message !== TRUST_STALL || typeof frameSessionId !== "string" || frameSessionId !== open) return null;
+  return {
+    kind: "notice",
+    id,
+    tone: "info",
+    text: "Claude is waiting on your Mac",
+    detail: "Open this folder there once to trust it.",
+  };
 }
 
 /** The sheet's sentence for a spawn error. */
