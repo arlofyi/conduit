@@ -5661,6 +5661,7 @@ input[type="number"]:focus {
   --hq-rose: var(--accent); --hq-rose-2: color-mix(in srgb, var(--accent) 85%, #000);
   --hq-rose-soft: color-mix(in srgb, var(--accent) 18%, transparent);
   --hq-rose-line: color-mix(in srgb, var(--accent) 34%, transparent);
+  --hq-warn: var(--amber); --hq-ok: var(--green); --hq-bad: var(--red);
   /* --hq-grid-line is a theme token now (defined at :root / [data-theme="warm-light"]
      below) so the Continuity graph surface can use it outside .hq-* scopes. */
 }
@@ -5802,6 +5803,74 @@ input[type="number"]:focus {
   font-family: var(--mono-font); font-size: 11px; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; color: var(--hq-ink-3);
 }
+.hq-tool-toggle { background: none; border: 0; padding: 0; cursor: pointer; text-align: left; font-family: inherit; }
+.hq-tool-toggle:hover { color: var(--hq-ink-2); }
+.hq-tool-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hq-tool-list { display: flex; flex-direction: column; gap: 3px; padding: 4px 0 0 16px; }
+.hq-note-wrap { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.hq-note {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  padding: 3px 12px; border-radius: 999px; font-family: inherit;
+  font-size: 11.5px; color: var(--hq-ink-3);
+  background: color-mix(in srgb, var(--hq-surface-2) 40%, transparent);
+  border: 1px solid color-mix(in srgb, var(--hq-line) 60%, transparent);
+}
+button.hq-note { cursor: pointer; }
+button.hq-note:hover { color: var(--hq-ink-2); border-color: var(--hq-line-2); }
+.hq-note-mark.ok { color: var(--hq-ok); }
+.hq-note-mark.bad { color: var(--hq-bad); }
+.hq-note-mark.info { color: var(--hq-ink-3); }
+.hq-note-body {
+  align-self: stretch; white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: 12px; color: var(--hq-ink-2); padding: 6px 12px;
+  border-left: 1px solid var(--hq-line-2);
+}
+.hq-command-row { display: flex; justify-content: flex-end; }
+.hq-command {
+  font-family: var(--mono-font); font-size: 12px; color: var(--hq-rose);
+  background: var(--hq-rose-soft); border: 1px solid var(--hq-rose-line);
+  border-radius: 8px; padding: 3px 10px; overflow-wrap: anywhere;
+}
+.hq-command-output {
+  display: block; width: 100%; text-align: left; font-family: inherit;
+  background: color-mix(in srgb, var(--hq-surface) 70%, transparent);
+  border: 1px solid var(--hq-line); border-radius: 8px; padding: 6px 10px;
+  color: var(--hq-ink-2); cursor: pointer;
+}
+.hq-command-output:disabled { cursor: default; }
+.hq-command-output.stderr { color: var(--hq-bad); }
+.hq-command-output pre {
+  margin: 0; font-family: var(--mono-font); font-size: 11.5px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.hq-command-more { font-size: 10.5px; color: var(--hq-ink-3); }
+.hq-image { max-width: 240px; border-radius: 8px; border: 1px solid var(--hq-line); align-self: flex-end; }
+.hq-divider {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  font-size: 11px; color: var(--hq-ink-3);
+}
+.hq-divider::before, .hq-divider::after { content: ""; flex: 1; height: 1px; background: var(--hq-line); }
+.hq-divider.warning { color: var(--hq-warn); }
+.hq-divider.warning::before, .hq-divider.warning::after { background: color-mix(in srgb, var(--hq-warn) 40%, transparent); }
+.hq-question, .hq-plan {
+  border: 1px solid var(--hq-line); border-radius: 10px; padding: 10px 14px;
+  background: color-mix(in srgb, var(--hq-surface-2) 35%, transparent);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.hq-question-header, .hq-plan-title {
+  align-self: flex-start; font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--hq-rose); background: var(--hq-rose-soft); border-radius: 999px; padding: 1px 8px;
+}
+.hq-question-text { font-size: 13.5px; color: var(--hq-ink); }
+.hq-question-options { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.hq-question-options li { display: flex; gap: 10px; align-items: baseline; }
+.hq-option-num { flex: none; font-family: var(--mono-font); font-size: 11px; color: var(--hq-ink-3); width: 14px; }
+.hq-option-label { font-size: 13px; color: var(--hq-ink); }
+.hq-option-tag {
+  margin-left: 8px; font-size: 10px; color: var(--hq-rose);
+  border: 1px solid var(--hq-rose-line); border-radius: 999px; padding: 0 6px;
+}
+.hq-option-desc { font-size: 12px; color: var(--hq-ink-3); }
 .hq-pulse {
   width: 8px; height: 8px; border-radius: 999px; background: var(--hq-rose);
   animation: hq-pulse 1.2s ease-in-out infinite;
