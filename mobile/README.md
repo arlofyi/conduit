@@ -12,7 +12,7 @@ by `LiveProvider`: it lists the desktop's projects and sessions, attaches to a s
 its transcript history and live tail, and sends prompts into the real PTY. The chat feed
 renders the full transcript item set: bubbles, tool-event rails, to-dos, approvals,
 notices, dividers (compaction/interrupts), slash-command chips, images, AskUserQuestion
-cards (read-only) and plans (plain text). The mock data in `src/data/mock.ts` remains for
+cards (read-only) and plans (Markdown, as on desktop). The mock data in `src/data/mock.ts` remains for
 tests and offline UI work only.
 
 Not done yet: connecting from a phone off the desktop's loopback. Reaching the bridge over

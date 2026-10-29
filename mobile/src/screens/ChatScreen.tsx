@@ -26,6 +26,7 @@ import type {
   QuestionItem,
   TodosItem,
 } from "../data/types";
+import { outputPreview, splitRecommended } from "../logic/chatView";
 import { imageDataUri } from "../logic/image";
 import { groupFeed, type FeedRow } from "../logic/feed";
 import type { ChatProps } from "../navigation";
@@ -257,26 +258,55 @@ function DividerRow({ item }: { item: DividerItem }) {
   );
 }
 
+/** A slash/`!` command chip with its output beneath. A nameless command is output that
+ * arrived without one (e.g. a `!` command's stderr), so it draws only the output block. */
 function CommandChip({ item }: { item: CommandItem }) {
   const { palette: p } = useTheme();
-  const [open, setOpen] = useState(false);
   return (
     <View style={{ alignSelf: "flex-end", maxWidth: "84%", alignItems: "flex-end", gap: 4 }}>
-      <Pressable
-        disabled={!item.output}
-        onPress={() => setOpen((o) => !o)}
-        style={{ backgroundColor: p.chipBg, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 6 }}
-      >
-        <Text style={{ color: p.chipText, fontFamily: MONO, fontSize: TYPE.footnote }}>
-          {item.name}
-          {item.args ? ` ${item.args}` : ""}
-          {item.output ? (open ? " ▾" : " ▸") : ""}
-        </Text>
-      </Pressable>
-      {open && item.output ? (
-        <Text style={{ color: p.textMid, fontFamily: MONO, fontSize: TYPE.footnote }}>{item.output}</Text>
+      {item.name ? (
+        <View style={{ backgroundColor: p.chipBg, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 6 }}>
+          <Text style={{ color: p.chipText, fontFamily: MONO, fontSize: TYPE.footnote }}>
+            {item.name}
+            {item.args ? ` ${item.args}` : ""}
+          </Text>
+        </View>
       ) : null}
+      {item.output ? <CommandOutput text={item.output} /> : null}
     </View>
+  );
+}
+
+/** Output collapsed to its first lines with a tap to expand, as desktop shows it. */
+function CommandOutput({ text }: { text: string }) {
+  const { palette: p } = useTheme();
+  const [open, setOpen] = useState(false);
+  const view = outputPreview(text, open);
+  const long = open || view.hidden > 0;
+  return (
+    <Pressable
+      disabled={!long}
+      onPress={() => setOpen((o) => !o)}
+      accessibilityRole={long ? "button" : undefined}
+      accessibilityState={long ? { expanded: open } : undefined}
+      style={{
+        alignSelf: "stretch",
+        backgroundColor: p.panelBg,
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: p.border,
+        borderRadius: 8,
+        paddingHorizontal: 10,
+        paddingVertical: 8,
+        gap: 4,
+      }}
+    >
+      <Text style={{ color: p.textMid, fontFamily: MONO, fontSize: TYPE.footnote }}>{view.text}</Text>
+      {long ? (
+        <Text style={{ color: p.accent, fontSize: TYPE.caption }}>
+          {open ? "Show less" : `… ${view.hidden} more lines`}
+        </Text>
+      ) : null}
+    </Pressable>
   );
 }
 
@@ -308,50 +338,84 @@ function ImageRow({ item }: { item: ImageItem }) {
   );
 }
 
+/** A question Claude asked earlier in the transcript. Neutral, not amber: this is history,
+ * not a pending prompt (answering from the phone arrives with the broker). */
 function QuestionCard({ item }: { item: QuestionItem }) {
   const { palette: p } = useTheme();
-  return (
-    <View
-      style={{
-        backgroundColor: p.needsBg,
-        borderWidth: 1,
-        borderColor: p.amber,
-        borderLeftWidth: 3,
-        borderRadius: 11,
-        padding: 13,
-        gap: 10,
-      }}
-    >
-      {item.questions.map((q, i) => (
-        <View key={i} style={{ gap: 5 }}>
-          <Text style={{ color: p.textBright, fontWeight: "700", fontSize: TYPE.callout }}>{q.question}</Text>
-          {q.options.map((o, j) => (
-            <Text key={j} style={{ color: p.textMid, fontSize: TYPE.subhead }}>
-              {q.multiSelect ? "☐" : "○"} {o.label}
-              {o.description ? ` — ${o.description}` : ""}
-            </Text>
-          ))}
-        </View>
-      ))}
-    </View>
-  );
-}
-
-function PlanCard({ item }: { item: PlanItem }) {
-  const { palette: p } = useTheme();
+  const chip = {
+    alignSelf: "flex-start" as const,
+    backgroundColor: p.chipBg,
+    borderRadius: 6,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+  };
   return (
     <View
       style={{
         backgroundColor: p.sidebarBg,
         borderWidth: StyleSheet.hairlineWidth,
         borderColor: p.border,
-        borderRadius: 12,
+        borderRadius: 11,
         padding: 13,
-        gap: 7,
+        gap: 12,
+      }}
+    >
+      {item.questions.map((q, i) => (
+        <View key={i} style={{ gap: 6 }}>
+          {q.header ? (
+            <View style={chip}>
+              <Text style={{ color: p.chipText, fontSize: TYPE.caption, fontWeight: "600" }}>{q.header}</Text>
+            </View>
+          ) : null}
+          <Text style={{ color: p.textBright, fontWeight: "700", fontSize: TYPE.callout }}>{q.question}</Text>
+          {q.options.map((o, j) => {
+            const { label, recommended } = splitRecommended(o.label);
+            return (
+              <View key={j} style={{ flexDirection: "row", gap: 8 }}>
+                <Text style={{ color: p.textDim, fontSize: TYPE.subhead, fontFamily: MONO, width: 16 }}>
+                  {j + 1}
+                </Text>
+                <View style={{ flex: 1, gap: 2 }}>
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+                    <Text style={{ color: p.textBright, fontSize: TYPE.subhead }}>{label}</Text>
+                    {recommended ? (
+                      <View style={chip}>
+                        <Text style={{ color: p.chipText, fontSize: TYPE.caption }}>Recommended</Text>
+                      </View>
+                    ) : null}
+                  </View>
+                  {o.description ? (
+                    <Text style={{ color: p.textMid, fontSize: TYPE.footnote }}>{o.description}</Text>
+                  ) : null}
+                </View>
+              </View>
+            );
+          })}
+        </View>
+      ))}
+    </View>
+  );
+}
+
+/** An ExitPlanMode plan, rendered as Markdown in an assistant-style bubble (desktop's
+ * PlanCard renders the same markdown). */
+function PlanCard({ item }: { item: PlanItem }) {
+  const { palette: p } = useTheme();
+  return (
+    <View
+      style={{
+        maxWidth: "94%",
+        alignSelf: "flex-start",
+        backgroundColor: p.selectionBg,
+        borderRadius: 16,
+        borderBottomLeftRadius: 5,
+        paddingHorizontal: 14,
+        paddingTop: 10,
+        paddingBottom: 4,
       }}
     >
       <Text style={{ fontSize: TYPE.subhead, fontWeight: "700", color: p.textBright }}>Plan</Text>
-      <Text style={{ color: p.textBright, fontSize: TYPE.subhead, lineHeight: 20 }}>{item.markdown}</Text>
+      <Markdown style={mdStyles(p)}>{item.markdown}</Markdown>
     </View>
   );
 }
