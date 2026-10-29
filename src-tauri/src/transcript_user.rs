@@ -73,8 +73,71 @@ fn bubble(text: &str) -> Value {
     json!({ "kind": "bubble", "role": "user", "text": text })
 }
 
-/// Items for an array of content blocks (typed text, pasted images, interrupts).
-fn parse_blocks(blocks: &[Value]) -> Vec<Value> {
+/// Rules 5-7: caveat preamble (dropped), slash/bash commands, command output.
+/// `t` must already be left-trimmed.
+fn known_tag(t: &str) -> Option<Vec<Value>> {
+    if t.starts_with("<local-command-caveat>") {
+        return Some(vec![]);
+    }
+    if t.starts_with("<command-name>") || t.starts_with("<command-message>") {
+        let name = tag_text(t, "command-name")
+            .or_else(|| tag_text(t, "command-message").map(|m| format!("/{m}")))
+            .unwrap_or_default();
+        let args = tag_text(t, "command-args").unwrap_or_default();
+        return Some(vec![
+            json!({ "kind": "command", "name": name, "args": args }),
+        ]);
+    }
+    if t.starts_with("<bash-input>") {
+        let args = tag_text(t, "bash-input").unwrap_or_default();
+        return Some(vec![
+            json!({ "kind": "command", "name": "!", "args": args }),
+        ]);
+    }
+    for (open, tag, stream) in [
+        ("<local-command-stdout>", "local-command-stdout", "stdout"),
+        ("<bash-stdout>", "bash-stdout", "stdout"),
+        ("<local-command-stderr>", "local-command-stderr", "stderr"),
+        ("<bash-stderr>", "bash-stderr", "stderr"),
+    ] {
+        if t.starts_with(open) {
+            let body = strip_ansi(&tag_text(t, tag).unwrap_or_default());
+            let body = body.trim();
+            if body.is_empty() {
+                return Some(vec![]);
+            }
+            return Some(vec![
+                json!({ "kind": "command_output", "text": body, "stream": stream }),
+            ]);
+        }
+    }
+    None
+}
+
+/// Rules 3, 5-7, 10, 11 for one piece of non-human text (a string line or an array's text
+/// block): injected tags are classified, anything else is a typed prompt.
+fn classify_text(t: &str) -> Vec<Value> {
+    let lt = t.trim_start();
+    if lt.starts_with("<task-notification>") {
+        return vec![task_item(lt)];
+    }
+    if let Some(items) = known_tag(lt) {
+        return items;
+    }
+    // 10. An unrecognised leading tag with no human origin is injected, not typed.
+    if let Some(tag) = leading_tag(lt) {
+        return vec![json!({ "kind": "note", "tag": tag, "text": t })];
+    }
+    if t.trim().is_empty() {
+        return vec![];
+    }
+    // 11. Plain text: an older transcript's typed prompt.
+    vec![bubble(t)]
+}
+
+/// Items for an array of content blocks. `classify` is false for a human origin, whose
+/// text is taken verbatim; otherwise each text block goes through the tag rules.
+fn parse_blocks(blocks: &[Value], classify: bool) -> Vec<Value> {
     let mut out = Vec::new();
     for b in blocks {
         match b.get("type").and_then(|t| t.as_str()) {
@@ -82,6 +145,8 @@ fn parse_blocks(blocks: &[Value]) -> Vec<Value> {
                 let t = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 if t.starts_with("[Request interrupted by user") {
                     out.push(json!({ "kind": "divider", "label": "Interrupted", "tone": "info" }));
+                } else if classify {
+                    out.extend(classify_text(t));
                 } else if !t.trim().is_empty() {
                     out.push(bubble(t));
                 }
@@ -133,7 +198,7 @@ pub fn parse_user(v: &Value) -> Vec<Value> {
     if origin_kind == "human" {
         return match (s, content.as_array()) {
             (Some(t), _) => vec![bubble(t)],
-            (_, Some(blocks)) => parse_blocks(blocks),
+            (_, Some(blocks)) => parse_blocks(blocks, false),
             _ => vec![],
         };
     }
@@ -159,38 +224,10 @@ pub fn parse_user(v: &Value) -> Vec<Value> {
             .unwrap_or(&text);
         return vec![json!({ "kind": "peer", "from": from, "text": body })];
     }
+    // 5-7. Caveat, commands, command output (string content only; arrays go via rule 9).
     if let Some(t) = s {
-        // 5. Caveat preamble for local commands.
-        if t.starts_with("<local-command-caveat>") {
-            return vec![];
-        }
-        // 6. Slash commands and `!` bash input.
-        if t.starts_with("<command-name>") || t.starts_with("<command-message>") {
-            let name = tag_text(t, "command-name")
-                .or_else(|| tag_text(t, "command-message").map(|m| format!("/{m}")))
-                .unwrap_or_default();
-            let args = tag_text(t, "command-args").unwrap_or_default();
-            return vec![json!({ "kind": "command", "name": name, "args": args })];
-        }
-        if t.starts_with("<bash-input>") {
-            let args = tag_text(t, "bash-input").unwrap_or_default();
-            return vec![json!({ "kind": "command", "name": "!", "args": args })];
-        }
-        // 7. Command output.
-        for (open, tag, stream) in [
-            ("<local-command-stdout>", "local-command-stdout", "stdout"),
-            ("<bash-stdout>", "bash-stdout", "stdout"),
-            ("<local-command-stderr>", "local-command-stderr", "stderr"),
-            ("<bash-stderr>", "bash-stderr", "stderr"),
-        ] {
-            if t.starts_with(open) {
-                let body = strip_ansi(&tag_text(t, tag).unwrap_or_default());
-                let body = body.trim();
-                if body.is_empty() {
-                    return vec![];
-                }
-                return vec![json!({ "kind": "command_output", "text": body, "stream": stream })];
-            }
+        if let Some(items) = known_tag(t.trim_start()) {
+            return items;
         }
     }
     // 8. Meta lines: skill bodies, otherwise a prompt Claude Code injected itself.
@@ -220,15 +257,12 @@ pub fn parse_user(v: &Value) -> Vec<Value> {
     }
     // 9. Array content: typed text, images, interrupts; tool results are dropped.
     if let Some(blocks) = content.as_array() {
-        return parse_blocks(blocks);
+        return parse_blocks(blocks, true);
     }
-    let Some(t) = s else { return vec![] };
-    // 10. An unrecognised leading tag with no human origin is injected, not typed.
-    if let Some(tag) = leading_tag(t) {
-        return vec![json!({ "kind": "note", "tag": tag, "text": t })];
+    match s {
+        Some(t) => classify_text(t),
+        None => vec![],
     }
-    // 11. Plain string: an older transcript's typed prompt.
-    vec![bubble(t)]
 }
 
 #[cfg(test)]
@@ -410,6 +444,41 @@ mod tests {
         let v =
             json!({"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}});
         assert!(parse_user(&v).is_empty());
+    }
+
+    #[test]
+    fn array_text_with_unknown_tag_is_note() {
+        let v = json!({"type":"user","message":{"content":[{"type":"text","text":"<system-reminder>x</system-reminder>"}]}});
+        let items = parse_user(&v);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "note");
+        assert_eq!(items[0]["tag"], "system-reminder");
+    }
+
+    #[test]
+    fn array_task_notification_is_task() {
+        let v = json!({"type":"user","message":{"content":[{"type":"text","text":TASK}]}});
+        let items = parse_user(&v);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "task");
+        assert_eq!(items[0]["taskId"], "b1276wxdl");
+    }
+
+    #[test]
+    fn human_array_with_tag_stays_bubble() {
+        let v = json!({"type":"user","origin":{"kind":"human"},"message":{"content":[{"type":"text","text":"<system-reminder>x</system-reminder>"}]}});
+        let items = parse_user(&v);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "bubble");
+    }
+
+    #[test]
+    fn leading_whitespace_before_command_tag() {
+        let v =
+            json!({"type":"user","message":{"content":"\n  <command-name>/clear</command-name>"}});
+        let i = &parse_user(&v)[0];
+        assert_eq!(i["kind"], "command");
+        assert_eq!(i["name"], "/clear");
     }
 
     #[test]
