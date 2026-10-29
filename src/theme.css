@@ -3570,23 +3570,31 @@ button {
 }
 .setting-row.disabled .setting-row-label {
   opacity: 0.5;
-  cursor: not-allowed;
 }
 .setting-row-head {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 12px;
+  min-height: 26px;
 }
 .setting-row-label {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
   flex: 1;
+}
+.setting-row-trailing {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+label.setting-row-title {
   cursor: pointer;
 }
-.setting-row-label:not(label) {
-  cursor: default;
+.setting-row.disabled label.setting-row-title {
+  cursor: not-allowed;
 }
 .setting-row-title {
   font-size: 12.5px;
@@ -3625,13 +3633,8 @@ button {
   outline: 1px solid var(--accent);
   outline-offset: 1px;
 }
-/* Status + detail + control share the title's left edge (checkbox 15px + 8px gap),
-   so everything under a title reads as one column. */
-.setting-status,
-.setting-control,
-.setting-detail {
-  padding-left: 23px;
-}
+/* Status + detail + control share the title's left edge (the switch sits at the row's
+   right end), so everything under a title reads as one column. */
 .setting-status {
   font-size: 11.5px;
   color: var(--text-mid);
@@ -6975,3 +6978,318 @@ button.hq-note:hover { color: var(--hq-ink-2); border-color: var(--hq-line-2); }
   font-size: 11.5px;
   color: var(--text-mid);
 }
+
+/* ══ Settings vocabulary (src/components/ui.tsx) ═══════════════════════════════
+   One button, one switch, one segmented picker, one badge, one input, one section
+   surface. Sized to match .dd-trigger (12px / 26px tall / 6px radius) so a row holding a
+   Dropdown, a number and a button lines up on one baseline. Everything derives from the
+   theme tokens, so all three themes get it for free. */
+.ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 120ms ease-out, border-color 120ms ease-out, color 120ms ease-out;
+}
+.ui-btn-sm { height: 26px; padding: 0 10px; }
+.ui-btn-md { height: 30px; padding: 0 14px; font-size: 12.5px; }
+.ui-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: 1px;
+}
+.ui-btn:disabled { opacity: 0.45; cursor: default; }
+
+.ui-btn-secondary {
+  color: var(--text-bright);
+  background: var(--sidebar-bg);
+  border-color: var(--border);
+}
+.ui-btn-secondary:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--sidebar-bg));
+}
+.ui-btn-primary {
+  color: var(--panel-bg);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 500;
+}
+.ui-btn-primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--accent) 88%, var(--text-bright));
+}
+.ui-btn-ghost {
+  color: var(--text-mid);
+  background: transparent;
+}
+.ui-btn-ghost:not(:disabled):hover {
+  color: var(--text-bright);
+  background: var(--selection-bg);
+}
+.ui-btn-danger {
+  color: var(--red);
+  background: transparent;
+}
+.ui-btn-danger:not(:disabled):hover {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  border-color: color-mix(in srgb, var(--red) 35%, transparent);
+}
+.ui-btn-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-btn-row-end { justify-content: flex-end; }
+.ui-btn-row-start { justify-content: flex-start; }
+
+/* Switch: 28x16 track, thumb slides 12px. The track is the panel colour off, accent on —
+   the same fill rule the checkbox uses, so on/off reads identically across controls. */
+.ui-switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 28px;
+  height: 16px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--text-dim) 35%, var(--sidebar-bg));
+  cursor: pointer;
+  transition: background 160ms ease-out, border-color 160ms ease-out;
+}
+.ui-switch-thumb {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-bright);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ui-switch.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.ui-switch.on .ui-switch-thumb {
+  transform: translateX(12px);
+  background: var(--panel-bg);
+}
+.ui-switch:not(:disabled):hover { border-color: color-mix(in srgb, var(--accent) 70%, var(--border)); }
+.ui-switch:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: 2px;
+}
+.ui-switch:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Segmented: one track, the chosen segment raised inside it. */
+.ui-seg {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  max-width: 100%;
+  overflow-x: auto;
+}
+.ui-seg-item {
+  font: inherit;
+  font-size: 12px;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 5px;
+  color: var(--text-mid);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms ease-out, color 120ms ease-out;
+}
+.ui-seg-item:not(:disabled):not(.on):hover { color: var(--text-bright); background: var(--hover); }
+.ui-seg-item.on {
+  color: var(--text-bright);
+  background: var(--selection-bg);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+.ui-seg-item:disabled { opacity: 0.4; cursor: default; }
+.ui-seg-item:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent); outline-offset: -1px; }
+
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  height: 17px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 1;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  color: var(--text-mid);
+}
+.ui-badge-muted { color: var(--text-dim); border-color: color-mix(in srgb, var(--border) 70%, transparent); }
+.ui-badge-accent {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.ui-badge-good { color: var(--green); border-color: color-mix(in srgb, var(--green) 40%, transparent); }
+.ui-badge-warn { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
+.ui-badge-bad { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+
+/* Inputs. `.ui-input` is the text/number field; `.ui-textarea` the multi-line one. */
+.ui-input,
+.ui-textarea {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-bright);
+  background: var(--sidebar-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  min-width: 0;
+  transition: border-color 120ms ease-out;
+  -webkit-user-select: text;
+  user-select: text;
+}
+.ui-input { height: 26px; padding: 0 8px; }
+.ui-input[type="number"] { width: 84px; font-variant-numeric: tabular-nums; }
+.ui-input.mono,
+.ui-textarea { font-family: var(--mono-font); }
+.ui-textarea { width: 100%; padding: 8px 10px; line-height: 1.5; resize: vertical; font-size: 11.5px; }
+.ui-input::placeholder,
+.ui-textarea::placeholder { color: var(--text-dim); }
+.ui-input:hover:not(:disabled),
+.ui-textarea:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.ui-input:focus,
+.ui-textarea:focus { outline: none; border-color: var(--accent); }
+.ui-input:disabled,
+.ui-textarea:disabled { opacity: 0.5; }
+
+/* Section: heading + one line of scope + a grouped surface of rows. */
+.ui-section { display: flex; flex-direction: column; gap: 6px; }
+.ui-section + .ui-section { margin-top: 14px; }
+.ui-section-head { display: flex; align-items: center; gap: 8px; min-height: 22px; }
+.ui-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-bright);
+  flex: 1;
+  min-width: 0;
+}
+.ui-section-actions { display: flex; align-items: center; gap: 6px; }
+.ui-section-desc {
+  font-size: 11.5px;
+  color: var(--text-mid);
+  line-height: 1.5;
+  max-width: 68ch;
+  -webkit-user-select: text;
+  user-select: text;
+}
+.ui-section-body {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--sidebar-bg) 55%, transparent);
+  padding: 2px;
+}
+.ui-section-body > .setting-row { border-radius: 6px; }
+.ui-section-body > .setting-row + .setting-row {
+  box-shadow: 0 -1px 0 0 color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.ui-notice {
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--text-mid);
+  -webkit-user-select: text;
+  user-select: text;
+}
+.ui-notice-warn { color: var(--text-bright); border-color: color-mix(in srgb, var(--amber) 45%, var(--border)); background: color-mix(in srgb, var(--amber) 8%, transparent); }
+.ui-notice-error { color: var(--text-bright); border-color: color-mix(in srgb, var(--red) 50%, var(--border)); background: color-mix(in srgb, var(--red) 9%, transparent); }
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-btn, .ui-switch, .ui-switch-thumb, .ui-seg-item, .ui-input, .ui-textarea { transition: none; }
+}
+
+/* ---- Settings > Orchestration ---- */
+.orch-panel { display: flex; flex-direction: column; gap: 12px; }
+.orch-scope { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.orch-scope-hint { font-size: 11.5px; color: var(--text-mid); }
+.orch-value {
+  font-size: 12px;
+  color: var(--text-mid);
+  font-variant-numeric: tabular-nums;
+}
+.orch-disclosure {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 22px;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.orch-disclosure .ui-section-title { flex: 0 1 auto; }
+.orch-disclosure-caret { color: var(--text-dim); transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1); }
+.orch-disclosure.open .orch-disclosure-caret { transform: rotate(90deg); }
+.orch-disclosure:hover .orch-disclosure-caret,
+.orch-disclosure:hover .ui-section-title { color: var(--text-bright); }
+.orch-disclosure:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent); outline-offset: 2px; border-radius: 4px; }
+.orch-planned {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 4px;
+  padding-left: 14px;
+  border-left: 1px solid var(--border);
+}
+.orch-planned .ui-section + .ui-section { margin-top: 0; }
+.orch-planned .ui-section-title { font-weight: 500; color: var(--text-mid); }
+.orch-planned .setting-row { padding-block: 6px; }
+.orch-file-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.orch-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--sidebar-bg) 55%, transparent);
+}
+.orch-diff-head { font-size: 11.5px; font-weight: 600; color: var(--text-bright); }
+.orch-diff-empty { font-size: 11.5px; color: var(--text-mid); }
+.orch-diff-list { list-style: none; display: flex; flex-direction: column; max-height: 220px; overflow-y: auto; }
+.orch-diff-row {
+  display: grid;
+  grid-template-columns: minmax(60px, 0.6fr) minmax(0, 1.4fr) auto;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 2px;
+  font-size: 11.5px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+}
+.orch-diff-row:first-child { border-top: none; }
+.orch-diff-scope { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.orch-diff-label { color: var(--text-bright); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.orch-diff-values { display: inline-flex; gap: 6px; font-variant-numeric: tabular-nums; color: var(--text-dim); }
+.orch-diff-values s { color: var(--text-dim); }
+.orch-diff-values strong { color: var(--accent); font-weight: 500; }
+.orch-footnote {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-mid);
+}
+@media (prefers-reduced-motion: reduce) { .orch-disclosure-caret { transition: none; } }

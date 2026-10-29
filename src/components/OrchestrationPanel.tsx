@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useStore } from "../store";
+import { AGENTS } from "../agents";
+import { ChevronRightIcon } from "./Icons";
+import { Badge, Button, ButtonRow, Notice, Segmented, SettingRow, SettingsSection } from "./ui";
 
 type Field =
   | "contextDisplay" | "contextWarningTarget" | "contextHardCap" | "checkpointIntervalMinutes"
@@ -18,43 +21,85 @@ interface PolicyView {
 interface PolicyDocument { version: number; global: Overlay; projects: Record<string, Overlay> }
 interface ImportPreview { current: PolicyDocument; proposed: PolicyDocument }
 
-function importChanges(preview: ImportPreview): string[] {
+type Kind = "bool" | "number" | "agent";
+interface FieldDef { key: Field; label: string; kind: Kind }
+
+/** The one field that controls sessions today. */
+const LIVE: FieldDef[] = [{ key: "contextDisplay", label: "Show context readings", kind: "bool" }];
+
+/**
+ * Saved now, enforced by a later phase. Grouped by the phase that will read them, so the
+ * page says "Phase 3" once over its seven fields instead of seven times.
+ */
+const PLANNED: Array<{ phase: string; title: string; fields: FieldDef[] }> = [
+  {
+    phase: "Phase 2",
+    title: "Context budget",
+    fields: [
+      { key: "contextWarningTarget", label: "Warning target (tokens)", kind: "number" },
+      { key: "contextHardCap", label: "Hard cap (tokens)", kind: "number" },
+      { key: "checkpointIntervalMinutes", label: "Checkpoint interval (minutes)", kind: "number" },
+    ],
+  },
+  {
+    phase: "Phase 3",
+    title: "Fleet limits",
+    fields: [
+      { key: "fleetTotal", label: "Fleet total", kind: "number" },
+      { key: "writersPerRepo", label: "Writers per repository", kind: "number" },
+      { key: "readers", label: "Readers", kind: "number" },
+      { key: "critics", label: "Critics", kind: "number" },
+      { key: "retryRounds", label: "Failed rounds", kind: "number" },
+      { key: "requireWriterWorktree", label: "Require writer worktree", kind: "bool" },
+      { key: "quotaPausePercent", label: "Pause below quota (%)", kind: "number" },
+    ],
+  },
+  {
+    phase: "Phases 4–5",
+    title: "Lead agents",
+    fields: [
+      { key: "conductorAgent", label: "Conductor agent", kind: "agent" },
+      { key: "frontChatAgent", label: "Front chat agent", kind: "agent" },
+    ],
+  },
+  {
+    phase: "Phase 6",
+    title: "Review",
+    fields: [
+      { key: "differentReviewProvider", label: "Different review provider", kind: "bool" },
+      { key: "requireReview", label: "Require review", kind: "bool" },
+    ],
+  },
+  {
+    phase: "Phase 7",
+    title: "Portability",
+    fields: [{ key: "portabilityEnabled", label: "Portable context", kind: "bool" }],
+  },
+];
+
+const ALL_FIELDS: FieldDef[] = [...LIVE, ...PLANNED.flatMap((g) => g.fields)];
+
+interface ImportChange { scope: string; label: string; before: string; after: string }
+
+function importChanges(preview: ImportPreview): ImportChange[] {
   const scopes = ["global", ...new Set([...Object.keys(preview.current.projects), ...Object.keys(preview.proposed.projects)])];
-  const changes: string[] = [];
+  const changes: ImportChange[] = [];
   for (const scope of scopes) {
     const before = scope === "global" ? preview.current.global : preview.current.projects[scope] ?? {};
     const after = scope === "global" ? preview.proposed.global : preview.proposed.projects[scope] ?? {};
-    for (const { key, label } of FIELDS) {
-      if (before[key] !== after[key]) changes.push(`${scope} · ${label}: ${effectiveLabel(before[key])} → ${effectiveLabel(after[key])}`);
+    for (const { key, label } of ALL_FIELDS) {
+      if (before[key] !== after[key]) changes.push({ scope, label, before: valueLabel(before[key]), after: valueLabel(after[key]) });
     }
   }
   return changes;
 }
 
-const FIELDS: Array<{ key: Field; label: string; kind: "bool" | "number" | "agent"; phase: string; available: boolean }> = [
-  { key: "contextDisplay", label: "Show context readings", kind: "bool", phase: "P1", available: true },
-  { key: "contextWarningTarget", label: "Warning target (tokens)", kind: "number", phase: "P2", available: false },
-  { key: "contextHardCap", label: "Hard cap (tokens)", kind: "number", phase: "P2", available: false },
-  { key: "checkpointIntervalMinutes", label: "Checkpoint interval (minutes)", kind: "number", phase: "P2", available: false },
-  { key: "fleetTotal", label: "Fleet total", kind: "number", phase: "P3", available: false },
-  { key: "writersPerRepo", label: "Writers per repository", kind: "number", phase: "P3", available: false },
-  { key: "readers", label: "Readers", kind: "number", phase: "P3", available: false },
-  { key: "critics", label: "Critics", kind: "number", phase: "P3", available: false },
-  { key: "retryRounds", label: "Failed rounds", kind: "number", phase: "P3", available: false },
-  { key: "requireWriterWorktree", label: "Require writer worktree", kind: "bool", phase: "P3", available: false },
-  { key: "quotaPausePercent", label: "Pause below quota (%)", kind: "number", phase: "P3", available: false },
-  { key: "frontChatAgent", label: "Front chat agent", kind: "agent", phase: "P5", available: false },
-  { key: "conductorAgent", label: "Conductor agent", kind: "agent", phase: "P4", available: false },
-  { key: "differentReviewProvider", label: "Different review provider", kind: "bool", phase: "P6", available: false },
-  { key: "requireReview", label: "Require review", kind: "bool", phase: "P6", available: false },
-  { key: "portabilityEnabled", label: "Portable context", kind: "bool", phase: "P7", available: false },
-];
-
 function sourceKey(field: Field): string { return field.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`); }
-function effectiveLabel(value: Overlay[Field]): string {
-  if (value == null) return "Unset";
+function valueLabel(value: Overlay[Field]): string {
+  if (value == null) return "Not set";
   if (typeof value === "boolean") return value ? "On" : "Off";
-  return String(value);
+  if (typeof value === "string") return AGENTS.find((a) => a.id === value)?.label ?? value;
+  return value.toLocaleString();
 }
 
 export function OrchestrationPanel({ openRouting }: { openRouting: () => void }) {
@@ -68,6 +113,8 @@ export function OrchestrationPanel({ openRouting }: { openRouting: () => void })
   const [error, setError] = useState("");
   const [json, setJson] = useState("");
   const [preview, setPreview] = useState<ImportPreview | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [plannedOpen, setPlannedOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -90,6 +137,14 @@ export function OrchestrationPanel({ openRouting }: { openRouting: () => void })
     catch (e) { setError(String(e)); }
   }
 
+  async function copyJson() {
+    try {
+      await navigator.clipboard.writeText(json);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    } catch (e) { setError(String(e)); }
+  }
+
   async function inspectImport() {
     try { setPreview(await invoke<ImportPreview>("preview_orchestration_import", { json })); setError(""); }
     catch (e) { setPreview(null); setError(String(e)); }
@@ -103,36 +158,187 @@ export function OrchestrationPanel({ openRouting }: { openRouting: () => void })
     } catch (e) { setError(String(e)); }
   }
 
-  return <div className="routing-panel">
-    <p className="settings-intro">Context display and future orchestration preferences. Limits and role rules are saved for later phases; they do not control sessions yet.</p>
-    <div className="route-scope">
-      <button className={`route-scope-btn${scope === "global" ? " on" : ""}`} onClick={() => setScope("global")}>Global</button>
-      <button className={`route-scope-btn${scope === "project" ? " on" : ""}`} disabled={!project} onClick={() => project && setScope("project")}>{project?.name ?? "This project"}</button>
-    </div>
-    <p className="settings-intro">Agent routes are configured in <button className="route-btn" onClick={openRouting}>Routing settings</button>.</p>
-    {error && <p role="alert">{error}</p>}
-    {!view ? <p>Loading policy…</p> : FIELDS.map(({ key, label, kind, phase, available }) => {
-      const local = scopeId ? view.project : view.global;
-      const inherited = local[key] == null;
-      const source = view.source[sourceKey(key)];
-      const effective = view.effective[key];
-      const reason = available ? "" : `Available in ${phase}; this setting has no effect in P1.`;
-      return <div className="route-task" key={key}>
-        <div className="route-task-head"><span className="route-task-name">{label}</span><span className="route-origin">{source === "default" ? "built-in default" : source === "global" && scopeId ? "inherited from Global" : "set here"}</span>
-          {!inherited && <button className="route-btn route-reset" onClick={() => void write({ ...local, [key]: null })}>Reset</button>}
+  const local = view ? (scopeId ? view.project : view.global) : {};
+  const changes = preview ? importChanges(preview) : [];
+
+  /** Where the value in force came from, phrased for the scope being edited. */
+  function originBadge(key: Field) {
+    const source = view?.source[sourceKey(key)];
+    if (source === "default") return <Badge tone="muted">Default</Badge>;
+    if (source === "global" && scopeId) return <Badge>From Global</Badge>;
+    return <Badge tone="accent">Set here</Badge>;
+  }
+
+  function resetButton(key: Field) {
+    if (local[key] == null) return null;
+    return (
+      <Button variant="ghost" onClick={() => void write({ ...local, [key]: null })}>
+        Reset
+      </Button>
+    );
+  }
+
+  const plannedCount = PLANNED.reduce((n, g) => n + g.fields.length, 0);
+
+  return (
+    <div className="orch-panel">
+      <p className="settings-intro">
+        How Conduit coordinates its agents. Project values override Global; anything left unset
+        inherits.
+      </p>
+
+      <div className="orch-scope">
+        <Segmented
+          label="Policy scope"
+          value={scope}
+          onChange={setScope}
+          options={[
+            { value: "global", label: "Global" },
+            {
+              value: "project",
+              label: project?.name ?? "This project",
+              disabled: !project,
+              title: project ? `Overrides for ${project.name} only` : "Open a project to set overrides",
+            },
+          ]}
+        />
+        <span className="orch-scope-hint">
+          {scope === "global"
+            ? "Applies to every project unless it overrides a value."
+            : `Overrides Global for ${project?.name ?? "this project"} only.`}
+        </span>
+      </div>
+
+      {error && <Notice tone="error">{error}</Notice>}
+
+      {!view ? (
+        <p className="settings-intro">Loading policy…</p>
+      ) : (
+        <>
+          <SettingsSection title="Context">
+            {LIVE.map(({ key, label }) => (
+              <SettingRow
+                key={key}
+                id={`orch-${key}`}
+                title={label}
+                badge={originBadge(key)}
+                detail="Draw a ring on each session's tab and canvas card showing how full its context window is."
+                checked={Boolean(view.effective[key])}
+                onChange={(on) => void write({ ...local, [key]: on })}
+                trailing={resetButton(key)}
+              />
+            ))}
+          </SettingsSection>
+
+          <section className="ui-section">
+            <button
+              type="button"
+              className={`orch-disclosure${plannedOpen ? " open" : ""}`}
+              aria-expanded={plannedOpen}
+              aria-controls="orch-planned"
+              onClick={() => setPlannedOpen((v) => !v)}
+            >
+              <ChevronRightIcon size={11} className="orch-disclosure-caret" />
+              <span className="ui-section-title">Planned</span>
+              <Badge tone="muted">{plannedCount} settings</Badge>
+            </button>
+            <p className="ui-section-desc">
+              Limits and role rules for upcoming releases. They are kept in your policy and can be
+              imported below, but nothing reads them yet.
+            </p>
+            {plannedOpen && (
+              <div id="orch-planned" className="orch-planned">
+                {PLANNED.map((group) => (
+                  <SettingsSection
+                    key={group.title}
+                    title={group.title}
+                    actions={<Badge tone="muted">{group.phase}</Badge>}
+                  >
+                    {group.fields.map(({ key, label }) => (
+                      <SettingRow
+                        key={key}
+                        title={label}
+                        disabled
+                        trailing={
+                          <span className="orch-value">{valueLabel(view.effective[key])}</span>
+                        }
+                      />
+                    ))}
+                  </SettingsSection>
+                ))}
+              </div>
+            )}
+          </section>
+        </>
+      )}
+
+      <SettingsSection
+        title="Policy file"
+        description="Move a policy between machines. The file holds preferences only — no keys, paths or session data. Paste one in, review the changes, then apply."
+        flush
+      >
+        <textarea
+          aria-label="Policy JSON"
+          className="ui-textarea"
+          rows={7}
+          spellCheck={false}
+          placeholder='{ "version": 1, "global": { … }, "projects": { … } }'
+          value={json}
+          onChange={(e) => { setJson(e.target.value); setPreview(null); }}
+        />
+        <div className="orch-file-actions">
+          <ButtonRow align="start">
+            <Button onClick={() => void exportJson()}>Export current</Button>
+            <Button variant="ghost" disabled={!json} onClick={() => void copyJson()}>
+              {copied ? "Copied" : "Copy"}
+            </Button>
+          </ButtonRow>
+          <Button disabled={!json.trim()} onClick={() => void inspectImport()}>
+            Review import
+          </Button>
         </div>
-        <p className="route-hint">Effective: {effectiveLabel(effective)}. {reason}</p>
-        {kind === "bool" ? <label><input type="checkbox" checked={Boolean(effective)} disabled={!available} onChange={(e) => void write({ ...local, [key]: e.target.checked })} /> Enabled</label>
-          : <input aria-label={label} type={kind === "number" ? "number" : "text"} value={String(effective ?? "")} disabled={!available} onChange={(e) => void write({ ...local, [key]: kind === "number" ? Number(e.target.value) : e.target.value })} />}
-      </div>;
-    })}
-    <div className="route-task">
-      <div className="route-task-head"><span className="route-task-name">Policy JSON</span></div>
-      <p className="route-hint">Export contains policy preferences only. Paste JSON, preview changes, then apply.</p>
-      <button className="route-btn" onClick={() => void exportJson()}>Export to text</button>
-      <textarea aria-label="Policy JSON" rows={8} value={json} onChange={(e) => { setJson(e.target.value); setPreview(null); }} />
-      <button className="route-btn" onClick={() => void inspectImport()}>Preview import</button>
-      {preview && <div><p>Changes</p>{importChanges(preview).length ? <ul>{importChanges(preview).map((line) => <li key={line}>{line}</li>)}</ul> : <p>No changes.</p>}<button className="route-btn" disabled={importChanges(preview).length === 0} onClick={() => void applyImport()}>Apply import</button></div>}
+
+        {preview && (
+          <div className="orch-diff">
+            {changes.length === 0 ? (
+              <p className="orch-diff-empty">This file matches your current policy. Nothing to apply.</p>
+            ) : (
+              <>
+                <div className="orch-diff-head">
+                  {changes.length} {changes.length === 1 ? "change" : "changes"}
+                </div>
+                <ul className="orch-diff-list">
+                  {changes.map((c) => (
+                    <li key={`${c.scope}:${c.label}`} className="orch-diff-row">
+                      <span className="orch-diff-scope">
+                        {c.scope === "global" ? "Global" : projects.find((p) => p.id === c.scope)?.name ?? c.scope}
+                      </span>
+                      <span className="orch-diff-label">{c.label}</span>
+                      <span className="orch-diff-values">
+                        <s>{c.before}</s>
+                        <span aria-hidden="true">→</span>
+                        <strong>{c.after}</strong>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                <ButtonRow>
+                  <Button variant="ghost" onClick={() => setPreview(null)}>Cancel</Button>
+                  <Button variant="primary" onClick={() => void applyImport()}>Apply import</Button>
+                </ButtonRow>
+              </>
+            )}
+          </div>
+        )}
+      </SettingsSection>
+
+      <div className="orch-footnote">
+        <span>Which agent takes which kind of task is set in Routing.</span>
+        <Button variant="ghost" onClick={openRouting}>
+          Open Routing
+          <ChevronRightIcon size={10} />
+        </Button>
+      </div>
     </div>
-  </div>;
+  );
 }

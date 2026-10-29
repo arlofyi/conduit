@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { SettingRow } from "./GeneralSettings";
+import { SettingRow } from "./ui";
 import {
   lastSeenLabel,
   qrSvg,

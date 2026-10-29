@@ -8,7 +8,7 @@ import {
   type LaunchRestore,
 } from "../sessionLifecycle";
 import { Dropdown } from "./Dropdown";
-import { SettingRow } from "./GeneralSettings";
+import { SettingRow } from "./ui";
 
 const isWindows = /win/i.test(navigator.platform || navigator.userAgent);
 
