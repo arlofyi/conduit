@@ -8,19 +8,22 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// File-only record. It carries the token hash, so it must never be returned from a
+/// command or event: the frontend gets `DeviceView` and nothing else.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
-    pub id: String,
-    pub name: String,
-    pub token_hash: String,
-    pub tailscale_login: Option<String>,
-    pub created_at: u64,
-    pub last_seen: Option<u64>,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) token_hash: String,
+    pub(crate) tailscale_login: Option<String>,
+    pub(crate) created_at: u64,
+    pub(crate) last_seen: Option<u64>,
 }
 
 /// What the frontend may see: a `Device` without its hash.
@@ -34,7 +37,8 @@ pub struct DeviceView {
     pub last_seen: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
 struct FileV1 {
     version: u32,
     enabled: bool,
@@ -45,6 +49,9 @@ struct FileV1 {
 pub struct MobileDevices {
     path: PathBuf,
     inner: Mutex<FileV1>,
+    /// The file exists but could not be read or set aside. Defaults are in memory, but
+    /// every write is refused so the original survives.
+    read_failed: bool,
 }
 
 #[derive(Serialize)]
@@ -54,6 +61,9 @@ pub struct MobileSettings {
     pub port: Option<u16>,
     pub devices: Vec<DeviceView>,
 }
+
+/// `last_seen` is only rewritten when older than this.
+const LAST_SEEN_THROTTLE_SECS: u64 = 60;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -79,77 +89,98 @@ pub fn sha256_hex(s: &str) -> String {
 }
 
 impl MobileDevices {
-    /// Missing or unparseable -> defaults. An unparseable file is renamed to `.bak`
-    /// right away so the next write cannot destroy it.
+    /// Only `NotFound` means "defaults". An unparseable file is renamed to a unique
+    /// `.bak.<secs>` (never overwriting an earlier backup). Any other failure keeps
+    /// defaults in memory but refuses all writes.
     pub fn load(path: PathBuf) -> Self {
+        let mut read_failed = false;
         let inner = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<FileV1>(&bytes) {
                 Ok(f) => f,
                 Err(_) => {
-                    let mut bak = path.clone().into_os_string();
-                    bak.push(".bak");
-                    let _ = fs::rename(&path, PathBuf::from(bak));
+                    let bak = PathBuf::from(format!("{}.bak.{}", path.display(), now_secs()));
+                    if fs::rename(&path, &bak).is_err() {
+                        read_failed = true;
+                    }
                     FileV1::default()
                 }
             },
-            Err(_) => FileV1::default(),
+            Err(e) => {
+                if e.kind() != io::ErrorKind::NotFound {
+                    read_failed = true;
+                }
+                FileV1::default()
+            }
         };
         Self {
             path,
             inner: Mutex::new(inner),
+            read_failed,
         }
     }
 
-    /// Atomic replace; the caller holds the lock.
-    fn save(&self, f: &FileV1) {
-        let Ok(json) = serde_json::to_vec_pretty(f) else {
-            return;
-        };
+    fn lock(&self) -> std::sync::MutexGuard<'_, FileV1> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Atomic replace: tmp (0600 on unix), fsync, rename.
+    fn save(&self, f: &FileV1) -> io::Result<()> {
+        if self.read_failed {
+            return Err(io::Error::other(
+                "mobile-devices.json could not be read; refusing to overwrite it",
+            ));
+        }
+        let json = serde_json::to_vec_pretty(f).map_err(io::Error::other)?;
         let mut tmp = self.path.clone().into_os_string();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-        if fs::write(&tmp, &json).is_err() {
-            eprintln!("conduit: could not write mobile-devices.json");
-            return;
-        }
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+        drop(file);
         #[cfg(windows)]
         {
             let _ = fs::remove_file(&self.path);
         }
-        if fs::rename(&tmp, &self.path).is_err() {
-            eprintln!("conduit: could not commit mobile-devices.json");
-        }
+        fs::rename(&tmp, &self.path)
+    }
+
+    /// Apply to a clone, persist, and only then commit to memory.
+    fn update<R>(&self, apply: impl FnOnce(&mut FileV1) -> R) -> io::Result<R> {
+        let mut g = self.lock();
+        let mut next = g.clone();
+        next.version = 1;
+        let out = apply(&mut next);
+        self.save(&next)?;
+        *g = next;
+        Ok(out)
     }
 
     pub fn enabled(&self) -> bool {
-        self.inner.lock().unwrap().enabled
+        self.lock().enabled
     }
 
-    pub fn set_enabled(&self, on: bool) {
-        let mut g = self.inner.lock().unwrap();
-        g.version = 1;
-        g.enabled = on;
-        self.save(&g);
+    pub fn set_enabled(&self, on: bool) -> io::Result<()> {
+        self.update(|f| f.enabled = on)
     }
 
     pub fn port(&self) -> Option<u16> {
-        self.inner.lock().unwrap().port
+        self.lock().port
     }
 
-    pub fn set_port(&self, p: u16) {
-        let mut g = self.inner.lock().unwrap();
-        g.version = 1;
-        g.port = Some(p);
-        self.save(&g);
+    pub fn set_port(&self, p: u16) -> io::Result<()> {
+        self.update(|f| f.port = Some(p))
     }
 
     /// Returns the record and the plaintext token (shown once, never stored).
-    pub fn add_device(&self, name: &str, login: Option<String>) -> (Device, String) {
+    pub fn add_device(&self, name: &str, login: Option<String>) -> io::Result<(Device, String)> {
         let token = mint_secret();
         let d = Device {
             id: uuid::Uuid::new_v4().to_string(),
@@ -159,18 +190,16 @@ impl MobileDevices {
             created_at: now_secs(),
             last_seen: None,
         };
-        let mut g = self.inner.lock().unwrap();
-        g.version = 1;
-        g.devices.push(d.clone());
-        self.save(&g);
-        (d, token)
+        let rec = d.clone();
+        self.update(|f| f.devices.push(rec))?;
+        Ok((d, token))
     }
 
     /// Hash the presented token and compare hash-to-hash against every device
-    /// (no early exit), then stamp `last_seen`.
+    /// (no early exit). The `last_seen` stamp is best-effort and throttled.
     pub fn verify(&self, token: &str) -> Option<String> {
         let presented = sha256_hex(token);
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock();
         let mut found = None;
         for (i, d) in g.devices.iter().enumerate() {
             if crate::cli_open::secret_eq(&presented, &d.token_hash) {
@@ -178,27 +207,31 @@ impl MobileDevices {
             }
         }
         let i = found?;
-        g.devices[i].last_seen = Some(now_secs());
         let id = g.devices[i].id.clone();
-        self.save(&g);
+        let now = now_secs();
+        let stale = g.devices[i]
+            .last_seen
+            .is_none_or(|t| now.saturating_sub(t) >= LAST_SEEN_THROTTLE_SECS);
+        if stale {
+            let mut next = g.clone();
+            next.devices[i].last_seen = Some(now);
+            if self.save(&next).is_ok() {
+                *g = next;
+            }
+        }
         Some(id)
     }
 
-    pub fn revoke(&self, id: &str) -> bool {
-        let mut g = self.inner.lock().unwrap();
-        let before = g.devices.len();
-        g.devices.retain(|d| d.id != id);
-        let removed = g.devices.len() != before;
-        if removed {
-            self.save(&g);
-        }
-        removed
+    pub fn revoke(&self, id: &str) -> io::Result<bool> {
+        self.update(|f| {
+            let before = f.devices.len();
+            f.devices.retain(|d| d.id != id);
+            f.devices.len() != before
+        })
     }
 
     pub fn list(&self) -> Vec<DeviceView> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock()
             .devices
             .iter()
             .map(|d| DeviceView {
@@ -222,14 +255,20 @@ pub fn mobile_settings(state: tauri::State<'_, Arc<MobileDevices>>) -> MobileSet
 }
 
 /// Persists the switch only; the bridge controller reconcile is wired in a later task.
-#[tauri::command]
-pub fn mobile_set_enabled(state: tauri::State<'_, Arc<MobileDevices>>, on: bool) {
-    state.set_enabled(on);
+#[tauri::command(async)]
+pub fn mobile_set_enabled(
+    state: tauri::State<'_, Arc<MobileDevices>>,
+    on: bool,
+) -> Result<(), String> {
+    state.set_enabled(on).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn mobile_revoke_device(state: tauri::State<'_, Arc<MobileDevices>>, id: String) -> bool {
-    state.revoke(&id)
+#[tauri::command(async)]
+pub fn mobile_revoke_device(
+    state: tauri::State<'_, Arc<MobileDevices>>,
+    id: String,
+) -> Result<bool, String> {
+    state.revoke(&id).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -238,6 +277,21 @@ mod tests {
 
     fn tmp() -> PathBuf {
         std::env::temp_dir().join(format!("conduit-mobile-{}.json", uuid::Uuid::new_v4()))
+    }
+
+    fn baks(p: &std::path::Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.bak.", p.file_name().unwrap().to_string_lossy());
+        fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|q| {
+                q.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            })
+            .collect()
     }
 
     #[test]
@@ -254,11 +308,40 @@ mod tests {
         fs::write(&p, "{not json").unwrap();
         let m = MobileDevices::load(p.clone());
         assert!(!m.enabled());
-        let bak = PathBuf::from(format!("{}.bak", p.display()));
-        assert_eq!(fs::read_to_string(&bak).unwrap(), "{not json");
-        m.set_enabled(true);
-        assert_eq!(fs::read_to_string(&bak).unwrap(), "{not json");
-        let _ = fs::remove_file(&bak);
+        let b = baks(&p);
+        assert_eq!(b.len(), 1);
+        assert_eq!(fs::read_to_string(&b[0]).unwrap(), "{not json");
+        m.set_enabled(true).unwrap();
+        assert_eq!(fs::read_to_string(&b[0]).unwrap(), "{not json");
+        let _ = fs::remove_file(&b[0]);
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn unreadable_path_refuses_writes_and_changes_nothing() {
+        let p = tmp();
+        fs::create_dir(&p).unwrap();
+        let m = MobileDevices::load(p.clone());
+        assert!(!m.enabled());
+        assert!(m.set_enabled(true).is_err());
+        assert!(!m.enabled(), "memory must not change on a failed write");
+        assert!(m.add_device("x", None).is_err());
+        assert!(m.list().is_empty());
+        assert!(p.is_dir());
+        let _ = fs::remove_dir(&p);
+    }
+
+    #[test]
+    fn last_seen_is_throttled() {
+        let p = tmp();
+        let m = MobileDevices::load(p.clone());
+        let (_, token) = m.add_device("a", None).unwrap();
+        m.verify(&token).unwrap();
+        assert!(m.list()[0].last_seen.is_some());
+        let recent = now_secs() - 10;
+        m.lock().devices[0].last_seen = Some(recent);
+        m.verify(&token).unwrap();
+        assert_eq!(m.list()[0].last_seen, Some(recent));
         let _ = fs::remove_file(&p);
     }
 
@@ -266,9 +349,9 @@ mod tests {
     fn round_trip_persists_enabled_port_devices() {
         let p = tmp();
         let m = MobileDevices::load(p.clone());
-        m.set_enabled(true);
-        m.set_port(8460);
-        let (d, _) = m.add_device("Pixel", Some("a@b.c".into()));
+        m.set_enabled(true).unwrap();
+        m.set_port(8460).unwrap();
+        let (d, _) = m.add_device("Pixel", Some("a@b.c".into())).unwrap();
         let m2 = MobileDevices::load(p.clone());
         assert!(m2.enabled());
         assert_eq!(m2.port(), Some(8460));
@@ -283,7 +366,7 @@ mod tests {
     fn token_verifies_and_hash_is_stored_not_token() {
         let p = tmp();
         let m = MobileDevices::load(p.clone());
-        let (d, token) = m.add_device("iPhone", None);
+        let (d, token) = m.add_device("iPhone", None).unwrap();
         assert_eq!(token.len(), 64);
         assert_eq!(m.verify(&token), Some(d.id));
         let raw = fs::read_to_string(&p).unwrap();
@@ -297,7 +380,7 @@ mod tests {
     fn wrong_token_rejected() {
         let p = tmp();
         let m = MobileDevices::load(p.clone());
-        m.add_device("iPhone", None);
+        m.add_device("iPhone", None).unwrap();
         assert_eq!(m.verify("nope"), None);
         assert_eq!(m.verify(""), None);
         let _ = fs::remove_file(&p);
@@ -307,9 +390,9 @@ mod tests {
     fn revoked_device_cannot_verify() {
         let p = tmp();
         let m = MobileDevices::load(p.clone());
-        let (d, token) = m.add_device("iPhone", None);
-        assert!(m.revoke(&d.id));
-        assert!(!m.revoke(&d.id));
+        let (d, token) = m.add_device("iPhone", None).unwrap();
+        assert!(m.revoke(&d.id).unwrap());
+        assert!(!m.revoke(&d.id).unwrap());
         assert_eq!(m.verify(&token), None);
         let _ = fs::remove_file(&p);
     }
@@ -318,7 +401,7 @@ mod tests {
     fn list_omits_token_hash() {
         let p = tmp();
         let m = MobileDevices::load(p.clone());
-        let (d, _) = m.add_device("iPhone", None);
+        let (d, _) = m.add_device("iPhone", None).unwrap();
         let json = serde_json::to_string(&m.list()).unwrap();
         assert!(!json.contains(&d.token_hash));
         assert!(!json.to_lowercase().contains("tokenhash"));
@@ -330,7 +413,7 @@ mod tests {
     fn atomic_write_leaves_no_tmp() {
         let p = tmp();
         let m = MobileDevices::load(p.clone());
-        m.set_enabled(true);
+        m.set_enabled(true).unwrap();
         assert!(p.exists());
         assert!(!PathBuf::from(format!("{}.tmp", p.display())).exists());
         let _ = fs::remove_file(&p);
