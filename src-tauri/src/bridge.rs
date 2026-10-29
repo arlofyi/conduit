@@ -320,6 +320,11 @@ fn hello_payload(mac_name: &str, version: &str) -> serde_json::Value {
     })
 }
 
+/// Sent once, immediately after a successful `auth`, before any other frame.
+fn auth_ok_payload(device_id: &str) -> serde_json::Value {
+    json!({ "type": "authOk", "deviceId": device_id })
+}
+
 /// Does the upgrade request carry an `Origin` header? Browsers always send one on a
 /// WebSocket upgrade; the phone app and the sidecar never do.
 fn has_origin(req: &Request) -> bool {
@@ -344,7 +349,16 @@ pub fn plan_listeners(
     bound_tailnet: Option<Ipv4Addr>,
 ) -> ListenerPlan {
     let want = match ts {
-        TailscaleState::Running { ipv4, .. } if enabled => *ipv4,
+        _ if !enabled => None,
+        // Hysteresis: "could not tell" (e.g. one CLI timeout) is not "stopped". Keep
+        // whatever is bound now; the next tick decides with a real answer.
+        TailscaleState::Unknown { .. } => bound_tailnet,
+        // Only ever an address in Tailscale's own range -- never 0.0.0.0, never a LAN IP.
+        TailscaleState::Running { ipv4: Some(ip), .. }
+            if tailscale::is_tailnet_addr(IpAddr::V4(*ip)) =>
+        {
+            Some(*ip)
+        }
         _ => None,
     };
     if want == bound_tailnet {
@@ -449,9 +463,15 @@ struct PairingOutcome {
 }
 
 /// SEAM for Task 4 (`pairing.rs`): `pair` and `discover` frames, pre- or post-auth, are
-/// routed to this one function. Until pairing exists every such frame gets the generic
-/// error, so nothing about the device list leaks.
-fn pairing_reply(_ctrl: &BridgeController, _peer: IpAddr, _msg: ClientMsg) -> PairingOutcome {
+/// routed to this one function; `authed` says which (so e.g. `discover` can be refused
+/// pre-auth). Until pairing exists every such frame gets the generic error, so nothing
+/// about the device list leaks.
+fn pairing_reply(
+    _ctrl: &BridgeController,
+    _peer: IpAddr,
+    _authed: bool,
+    _msg: ClientMsg,
+) -> PairingOutcome {
     PairingOutcome {
         reply: unauthorized(),
         authed_device: None,
@@ -552,8 +572,11 @@ impl BridgeController {
         if port == 0 {
             return;
         }
-        let enabled = self.devices.enabled();
         let mut slot = lock(&self.tailnet);
+        // Read the switch only once we hold the lock: a value read before it could be
+        // stale by the time a concurrent reconcile (the "off" one) has released it, and
+        // would re-bind after access was turned off.
+        let enabled = self.devices.enabled();
         // Off and nothing bound: skip the CLI call entirely.
         if !enabled && slot.is_none() {
             return;
@@ -658,6 +681,13 @@ impl BridgeController {
         );
     }
 
+    /// Re-check after registering a live connection: the device is still paired and
+    /// mobile access is still on. Anything that changed between `verify` and
+    /// `register_live` would otherwise have found no flag to set.
+    fn still_admitted(&self, device_id: &str) -> bool {
+        self.devices.enabled() && self.devices.contains(device_id)
+    }
+
     /// Verify a device token from `peer`. None for every failure, alike.
     fn authenticate(&self, peer: IpAddr, token: &str) -> Option<String> {
         if !self.auth_allowed(peer) || !self.devices.enabled() {
@@ -744,7 +774,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
 
     let pty = app.state::<Arc<PtyManager>>().inner().clone();
     let bus = app.state::<Arc<HookBus>>().inner().clone();
-    let (bus_id, bus_rx) = bus.subscribe();
+    // Hook events are subscribed only once the peer is trusted (loopback: now), so an
+    // unauthenticated socket holds no bus slot.
+    let mut bus_sub = authed.then(|| bus.subscribe());
 
     // (session_id, subscription id, frame receiver) once attached.
     let mut attached: Option<(String, u64, std::sync::mpsc::Receiver<String>)> = None;
@@ -770,9 +802,10 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                 if text.len() > PREAUTH_MAX_BYTES {
                     break;
                 }
+                // (device id, came from `auth` -- which is acked with `authOk`).
                 let newly_authed = match parse_client_msg(&text) {
                     Some(ClientMsg::Auth { token }) => match ctrl.authenticate(peer, &token) {
-                        Some(id) => Some(id),
+                        Some(id) => Some((id, true)),
                         None => {
                             let _ = ws.send(Message::Text(unauthorized().to_string()));
                             let _ = ws.close(None);
@@ -781,17 +814,33 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         }
                     },
                     Some(msg @ (ClientMsg::Pair { .. } | ClientMsg::Discover)) => {
-                        let out = pairing_reply(&ctrl, peer, msg);
+                        let out = pairing_reply(&ctrl, peer, false, msg);
                         let _ = ws.send(Message::Text(out.reply.to_string()));
-                        out.authed_device
+                        out.authed_device.map(|id| (id, false))
                     }
                     // Anything else before auth ends the connection.
                     _ => break,
                 };
-                if let Some(id) = newly_authed {
-                    device = Some(LiveConn::register(&ctrl, id));
+                if let Some((id, via_auth)) = newly_authed {
+                    let conn = LiveConn::register(&ctrl, id);
+                    // Close the verify->register window: a revoke (or the switch going
+                    // off) that landed in between found no live entry to flag.
+                    if !ctrl.still_admitted(&conn.device_id) {
+                        let _ = ws.send(Message::Text(unauthorized().to_string()));
+                        let _ = ws.close(None);
+                        let _ = ws.flush();
+                        break;
+                    }
+                    if via_auth {
+                        let ok = auth_ok_payload(&conn.device_id);
+                        if ws.send(Message::Text(ok.to_string())).is_err() {
+                            break;
+                        }
+                    }
+                    device = Some(conn);
                     authed = true;
                     lift_preauth_cap(&mut ws);
+                    bus_sub = Some(bus.subscribe());
                 }
             }
             // Binary (or anything but text/ping/pong/close) pre-auth: not a phone.
@@ -892,7 +941,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                     let _ = pty.write(&session_id, "\x1b");
                 }
                 Some(msg @ (ClientMsg::Pair { .. } | ClientMsg::Discover)) => {
-                    let out = pairing_reply(&ctrl, peer, msg);
+                    let out = pairing_reply(&ctrl, peer, true, msg);
                     let _ = ws.send(Message::Text(out.reply.to_string()));
                 }
                 // Already authenticated (or loopback): a repeat `auth` changes nothing.
@@ -919,7 +968,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             ))
                             .is_err()
                         {
-                            bus.unsubscribe(bus_id);
+                            unsubscribe_bus(&bus, &mut bus_sub);
                             detach(&pty, &attached);
                             return;
                         }
@@ -930,6 +979,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
         }
 
         // 3. Forward hook status events (filtered to the attached session).
+        let Some((bus_id, bus_rx)) = bus_sub.as_ref() else {
+            continue; // not trusted yet: no bus subscription, nothing attached
+        };
         if let Some((sid, _, _)) = attached.as_ref() {
             for _ in 0..DRAIN_PER_TICK {
                 match bus_rx.try_recv() {
@@ -940,7 +992,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             ))
                             .is_err()
                         {
-                            bus.unsubscribe(bus_id);
+                            bus.unsubscribe(*bus_id);
                             detach(&pty, &attached);
                             return;
                         }
@@ -970,8 +1022,17 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
         }
     }
 
-    bus.unsubscribe(bus_id);
+    unsubscribe_bus(&bus, &mut bus_sub);
     detach(&pty, &attached);
+}
+
+fn unsubscribe_bus(
+    bus: &Arc<HookBus>,
+    sub: &mut Option<(u64, std::sync::mpsc::Receiver<crate::hookbus::HookEvent>)>,
+) {
+    if let Some((id, _)) = sub.take() {
+        bus.unsubscribe(id);
+    }
 }
 
 /// An authenticated remote connection's entry in the controller's live map. Dropping it
@@ -1199,9 +1260,6 @@ mod tests {
             TailscaleState::Stopped,
             TailscaleState::NeedsLogin,
             TailscaleState::NotInstalled,
-            TailscaleState::Unknown {
-                reason: "timed out".into(),
-            },
             running(None),
         ] {
             assert_eq!(
@@ -1213,6 +1271,75 @@ mod tests {
                 "{ts:?}"
             );
         }
+    }
+
+    #[test]
+    fn unknown_keeps_current_binding() {
+        let unknown = TailscaleState::Unknown {
+            reason: "tailscale timed out".into(),
+        };
+        let noop = ListenerPlan {
+            bind: None,
+            close: false,
+        };
+        // One unreadable status neither drops a bound listener nor opens a new one.
+        assert_eq!(plan_listeners(true, &unknown, Some(A)), noop);
+        assert_eq!(plan_listeners(true, &unknown, None), noop);
+        // ...but the switch going off still closes it.
+        assert_eq!(
+            plan_listeners(false, &unknown, Some(A)),
+            ListenerPlan {
+                bind: None,
+                close: true
+            }
+        );
+    }
+
+    #[test]
+    fn plan_refuses_non_tailnet_ip() {
+        for ip in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(192, 168, 1, 5)] {
+            assert_eq!(
+                plan_listeners(true, &running(Some(ip)), None),
+                ListenerPlan {
+                    bind: None,
+                    close: false
+                },
+                "{ip}"
+            );
+            assert_eq!(
+                plan_listeners(true, &running(Some(ip)), Some(A)),
+                ListenerPlan {
+                    bind: None,
+                    close: true
+                },
+                "{ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_ok_shape() {
+        assert_eq!(
+            auth_ok_payload("dev-1"),
+            serde_json::json!({ "type": "authOk", "deviceId": "dev-1" })
+        );
+    }
+
+    #[test]
+    fn registration_rechecks_device_and_switch() {
+        let path =
+            std::env::temp_dir().join(format!("conduit-bridge-{}.json", uuid::Uuid::new_v4()));
+        let devices = Arc::new(MobileDevices::load(path));
+        let c = BridgeController::new(devices.clone());
+        let (d, _token) = devices.add_device("phone", None).unwrap();
+        assert!(!c.still_admitted(&d.id), "mobile access is off");
+        devices.set_enabled(true).unwrap();
+        assert!(c.still_admitted(&d.id));
+        devices.revoke(&d.id).unwrap();
+        assert!(
+            !c.still_admitted(&d.id),
+            "revoked between verify and register"
+        );
     }
 
     #[test]

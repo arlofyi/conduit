@@ -222,6 +222,11 @@ impl MobileDevices {
         Some(id)
     }
 
+    /// Is a device with this id still paired? (Cheap; no hashing.)
+    pub fn contains(&self, id: &str) -> bool {
+        self.lock().devices.iter().any(|d| d.id == id)
+    }
+
     pub fn revoke(&self, id: &str) -> io::Result<bool> {
         self.update(|f| {
             let before = f.devices.len();
