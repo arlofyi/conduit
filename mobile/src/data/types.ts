@@ -15,7 +15,7 @@ export interface SavedMac {
   pairedAt: number;
 }
 
-export type AgentKind ="claude" | "codex" | "gemini";
+export type AgentKind = "claude" | "codex" | "gemini";
 
 /** Same four states as the desktop `SessionStatus` (src/store.ts). */
 export type SessionStatus = "idle" | "running" | "needsInput" | "done";
