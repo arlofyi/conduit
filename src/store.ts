@@ -461,24 +461,8 @@ export interface LocalUsage {
   sessions: number;
   messages: number;
 }
-/** One parsed transcript item (mirrors `transcript.rs`'s `parse_line` output).
- *
- *  A loose union on purpose: the Rust side emits `kind` plus whatever that kind needs, and
- *  the renderer switches on `kind`. An unknown kind renders as nothing rather than breaking
- *  the pane, so adding an item type on the Rust side stays additive. */
-export interface TranscriptItem {
-  kind: "bubble" | "event" | "usage" | string;
-  role?: "user" | "assistant";
-  text?: string;
-  event?: string;
-  label?: string;
-  mono?: string | null;
-  model?: string | null;
-  inputTokens?: number;
-  outputTokens?: number;
-  cacheReadTokens?: number;
-  cacheCreationTokens?: number;
-}
+import type { TranscriptItem } from "./chatItems";
+export type { TranscriptItem } from "./chatItems";
 
 /** resetsAt is an RFC3339 timestamp string (the endpoint's format). */
 export interface PlanWindow { label: string; pctUsed: number; resetsAt: string | null; }
