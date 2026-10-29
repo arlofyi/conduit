@@ -1,0 +1,188 @@
+import type { WirePendingItem, WireQuestion } from "../bridge/protocol";
+import {
+  answerSummary,
+  buildAnswers,
+  cardView,
+  emptyPending,
+  entryForToolUse,
+  fromWire,
+  openBySession,
+  pendingReducer,
+  PRIVATE_ANSWER_TEXT,
+  SETTLED_SHOW_MS,
+  trailingEntries,
+  type PendingEvent,
+  type PendingState,
+} from "./pending";
+
+const Q: WireQuestion = {
+  question: "Ship it?",
+  header: "Ship",
+  multiSelect: false,
+  options: [
+    { label: "Yes (Recommended)", description: "go" },
+    { label: "No", description: "" },
+  ],
+};
+const MQ: WireQuestion = {
+  question: "Which checks?",
+  header: "Checks",
+  multiSelect: true,
+  options: [
+    { label: "lint", description: "" },
+    { label: "tests", description: "" },
+    { label: "build", description: "" },
+  ],
+};
+
+const ask = (id: string, toolUseId: string, sessionId = "s1"): WirePendingItem => ({
+  kind: "ask",
+  id,
+  sessionId,
+  toolUseId,
+  questions: [Q],
+  createdMs: 1000,
+});
+const perm = (id: string, sessionId = "s1"): WirePendingItem => ({
+  kind: "permission",
+  id,
+  sessionId,
+  toolName: "Bash",
+  summary: "touch a.txt",
+  createdMs: 2000,
+});
+
+function run(events: PendingEvent[], start: PendingState = emptyPending): PendingState {
+  return events.reduce(pendingReducer, start);
+}
+
+describe("pending", () => {
+  it("pending_reducer_add_resolve", () => {
+    let s = run([{ t: "snapshot", items: [ask("ask-1", "tu1")].map(fromWire), now: 0 }]);
+    expect(Object.keys(s.entries)).toEqual(["ask-1"]);
+    s = run([{ t: "added", item: fromWire(perm("perm-1")) }], s);
+    expect(s.order).toEqual(["ask-1", "perm-1"]);
+    // adding the same id twice is a no-op
+    expect(run([{ t: "added", item: fromWire(perm("perm-1")) }], s)).toBe(s);
+    // resolved elsewhere: kept, settled, and says where
+    s = run([{ t: "resolved", id: "ask-1", by: "desktop", now: 5 }], s);
+    expect(cardView(s.entries["ask-1"])).toMatchObject({ mode: "done", text: "Answered on your Mac" });
+    expect(openBySession(s)).toEqual({ s1: expect.objectContaining({ id: "perm-1" }) });
+    // cancelled: dropped silently
+    s = run([{ t: "resolved", id: "perm-1", by: "cancelled", now: 6 }], s);
+    expect(s.entries["perm-1"]).toBeUndefined();
+    expect(s.order).toEqual(["ask-1"]);
+    // a resolved for an id never seen is ignored
+    expect(run([{ t: "resolved", id: "zz", by: "phone", now: 7 }], s)).toBe(s);
+    // a fresh snapshot (reconnect) drops what is no longer pending and was never settled here
+    s = run([{ t: "added", item: fromWire(ask("ask-2", "tu2")) }, { t: "snapshot", items: [], now: 8 }], s);
+    expect(s.entries["ask-2"]).toBeUndefined();
+    expect(s.entries["ask-1"]).toBeDefined();
+  });
+
+  it("absent_kind_reads_as_ask", () => {
+    const { kind: _k, ...bare } = ask("ask-9", "tu9") as Extract<WirePendingItem, { toolUseId: string }>;
+    expect(fromWire(bare as WirePendingItem)).toMatchObject({ kind: "ask", id: "ask-9", private: false });
+  });
+
+  it("question_card_live_by_tool_use_id", () => {
+    const s = run([{ t: "snapshot", items: [ask("ask-1", "tu1"), ask("ask-2", "tu2", "s2")].map(fromWire), now: 0 }]);
+    const e = entryForToolUse(s, "s1", "tu1");
+    expect(e?.item.id).toBe("ask-1");
+    expect(cardView(e!)).toMatchObject({ mode: "live" });
+    // another session's question never joins this chat's card
+    expect(entryForToolUse(s, "s1", "tu2")).toBeNull();
+    // a transcript question nobody is waiting on stays history
+    expect(entryForToolUse(s, "s1", "tu-old")).toBeNull();
+    // sending, then the answer lands
+    let t = run([{ t: "sent", id: "ask-1", mine: { kind: "answer", summary: "Yes" } }], s);
+    expect(cardView(t.entries["ask-1"])).toMatchObject({ mode: "sending" });
+    t = run([{ t: "result", id: "ask-1", ok: true, now: 10 }, { t: "resolved", id: "ask-1", by: "phone", now: 11 }], t);
+    expect(cardView(t.entries["ask-1"])).toMatchObject({ mode: "done", tone: "ok", text: "Answered", detail: "Yes" });
+    // either order: resolved before the result
+    const u = run([{ t: "sent", id: "ask-1", mine: { kind: "answer", summary: "Yes" } }, { t: "resolved", id: "ask-1", by: "phone", now: 11 }], s);
+    expect(cardView(u.entries["ask-1"])).toMatchObject({ mode: "done", text: "Answered" });
+  });
+
+  it("trailing_cards_for_unjoined_asks_and_permissions", () => {
+    const s = run([{ t: "snapshot", items: [ask("ask-1", "tu1"), ask("ask-2", "tu2"), perm("perm-1"), perm("perm-2", "s2")].map(fromWire), now: 0 }]);
+    // tu1 already has a transcript card; tu2 does not yet; permissions are always standalone
+    const ids = trailingEntries(s, "s1", new Set(["tu1"]), 0).map((e) => e.item.id);
+    expect(ids).toEqual(["ask-2", "perm-1"]);
+    // a settled trailing card stays a moment, then goes
+    const r = run([{ t: "resolved", id: "perm-1", by: "terminal", now: 100 }], s);
+    expect(trailingEntries(r, "s1", new Set(["tu1"]), 100 + SETTLED_SHOW_MS - 1).map((e) => e.item.id)).toContain("perm-1");
+    expect(trailingEntries(r, "s1", new Set(["tu1"]), 100 + SETTLED_SHOW_MS).map((e) => e.item.id)).not.toContain("perm-1");
+  });
+
+  it("multiselect_joins_with_comma_space", () => {
+    // option order, not tap order; original labels (marker and all) go back
+    expect(buildAnswers([MQ], { [MQ.question]: ["build", "lint"] }, {})).toEqual({ "Which checks?": "lint, build" });
+    expect(buildAnswers([Q], { [Q.question]: ["Yes (Recommended)"] }, {})).toEqual({ "Ship it?": "Yes (Recommended)" });
+    // free text wins over picks; an unanswered question means nothing to send
+    expect(buildAnswers([Q, MQ], { [Q.question]: ["No"] }, { [MQ.question]: "  just lint  " })).toEqual({
+      "Ship it?": "No",
+      "Which checks?": "just lint",
+    });
+    expect(buildAnswers([Q, MQ], { [Q.question]: ["No"] }, {})).toBeNull();
+    expect(answerSummary({ a: "Yes (Recommended)", b: "lint, build" })).toBe("Yes, lint, build");
+  });
+
+  it("late_tap_shows_already_answered", () => {
+    const s = run([{ t: "snapshot", items: [ask("ask-1", "tu1"), perm("perm-1")].map(fromWire), now: 0 }]);
+    // the Mac answered first: ok:false, then (or before) resolved names it
+    let t = run(
+      [
+        { t: "sent", id: "ask-1", mine: { kind: "answer", summary: "Yes" } },
+        { t: "result", id: "ask-1", ok: false, now: 5 },
+        { t: "resolved", id: "ask-1", by: "desktop", now: 5 },
+      ],
+      s,
+    );
+    expect(cardView(t.entries["ask-1"])).toMatchObject({ mode: "done", tone: "info", text: "Already answered on your Mac" });
+    // ok:false with no resolved frame (it fell out of the ring): still honest
+    t = run([{ t: "sent", id: "perm-1", mine: { kind: "approve", allow: false } }, { t: "result", id: "perm-1", ok: false, now: 5 }], s);
+    expect(cardView(t.entries["perm-1"])).toMatchObject({ mode: "done", text: "Already answered" });
+    // the terminal and the timeout name themselves
+    expect(cardView(run([{ t: "resolved", id: "ask-1", by: "terminal", now: 1 }], s).entries["ask-1"])).toMatchObject({ text: "Answered in the terminal" });
+    expect(cardView(run([{ t: "resolved", id: "ask-1", by: "timeout", now: 1 }], s).entries["ask-1"])).toMatchObject({ text: "Moved to the terminal" });
+  });
+
+  it("permission_copy_never_claims_more_than_it_did", () => {
+    const s = run([{ t: "snapshot", items: [perm("perm-1"), perm("perm-2")].map(fromWire), now: 0 }]);
+    const t = run(
+      [
+        { t: "sent", id: "perm-1", mine: { kind: "approve", allow: true } },
+        { t: "result", id: "perm-1", ok: true, now: 1 },
+        { t: "sent", id: "perm-2", mine: { kind: "approve", allow: false } },
+        { t: "result", id: "perm-2", ok: true, now: 1 },
+      ],
+      s,
+    );
+    expect(cardView(t.entries["perm-1"])).toMatchObject({ mode: "done", text: "Allowed" });
+    expect(cardView(t.entries["perm-2"])).toMatchObject({
+      mode: "done",
+      text: "Denied — if you'd already allowed it in the terminal, it keeps running.",
+    });
+  });
+
+  it("private_item_not_interactive", () => {
+    const s = run([
+      {
+        t: "snapshot",
+        items: [
+          { kind: "ask", id: "ask-1", sessionId: "s1", private: true },
+          { kind: "permission", id: "perm-1", sessionId: "s1", private: true },
+        ].map((w) => fromWire(w as WirePendingItem)),
+        now: 0,
+      },
+    ]);
+    for (const id of ["ask-1", "perm-1"]) {
+      expect(cardView(s.entries[id])).toEqual({ mode: "private", item: s.entries[id].item, text: PRIVATE_ANSWER_TEXT });
+    }
+    expect(PRIVATE_ANSWER_TEXT).toBe("Private session — answer it on your Mac");
+    // a send for a private item is refused locally: it stays private, never "sending"
+    const t = run([{ t: "sent", id: "ask-1", mine: { kind: "answer", summary: "x" } }], s);
+    expect(cardView(t.entries["ask-1"]).mode).toBe("private");
+  });
+});

@@ -17,6 +17,7 @@ import {
   type Row,
 } from "../logic/chatList";
 import { connStatus } from "../logic/connCopy";
+import { openBySession } from "../logic/pending";
 import type { ChatsProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
 import { TYPE } from "../theme/type";
@@ -36,7 +37,9 @@ const TEXT_INSET = GUTTER + AVATAR_OUTER + 12;
 export function ChatsScreen({ navigation }: ChatsProps) {
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
-  const { view, viewAt, refreshProjects, unread, lastSeen, conn, currentMac } = useLive();
+  const { view, viewAt, refreshProjects, unread, lastSeen, conn, currentMac, pending } = useLive();
+  // Pushed questions/permissions lead their rows at once, ahead of the 10 s poll.
+  const openPending = useMemo(() => openBySession(pending), [pending]);
   const { profileSel, filter, setFilter } = useListSelection();
   const macName = currentMac?.macName ?? "your Mac";
 
@@ -53,8 +56,8 @@ export function ChatsScreen({ navigation }: ChatsProps) {
   // A filter whose chip is gone (nothing left to count, project removed) shows All.
   const activeFilter = view ? resolveFilter(chips, filter) : filter;
   const rows = useMemo(
-    () => (view ? buildRows(view, { profileId, filter: activeFilter, unread, now }) : []),
-    [view, profileId, activeFilter, unread, now],
+    () => (view ? buildRows(view, { profileId, filter: activeFilter, unread, now, pending: openPending }) : []),
+    [view, profileId, activeFilter, unread, now, openPending],
   );
 
   // Pull to refresh: spin until the next view lands (or give up quietly).

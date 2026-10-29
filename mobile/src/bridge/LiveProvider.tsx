@@ -12,7 +12,7 @@ import { AppState, Platform } from "react-native";
 import { usePrefs } from "../data/PrefsProvider";
 import { macStore } from "../data/secureBackend";
 import type { ChatItem, ProjectsView, SavedMac, SessionStatus, TodoProgress } from "../data/types";
-import { bannerFromStatus, bannersFromView, type Banner, type Signals } from "../logic/banner";
+import { bannerFromPending, bannerFromStatus, bannersFromView, type Banner, type Signals } from "../logic/banner";
 import type { ContextInfo } from "../logic/chatHeader";
 import { chatUnread, nextUnread } from "../logic/chatList";
 import { connErrorText } from "../logic/connCopy";
@@ -20,11 +20,12 @@ import { capFeed } from "../logic/feed";
 import { acceptsFrame, frameSession, isSpawnError, PRIVATE_SESSION, refusesOpenChat, spawnErrorText } from "../logic/frames";
 import { loopbackMac, type PairEndpoint } from "../logic/macs";
 import { addressesFor, confirmCode, makeNonce, type QrPayload } from "../logic/pairing";
+import { emptyPending, fromWire, pendingReducer, type Mine, type PendingEvent, type PendingState } from "../logic/pending";
 import { BridgeClient } from "./BridgeClient";
 import { initialConn, lifecycleAction, type ConnError, type ConnState } from "./connection";
 import { appendWire, mapHistory, mapProjectsView, sameView, statusPatch, type LivePatch } from "./live";
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
-import { discoverMsg, pairMsg, spawnMsg, type ClientMsg, type WireMac } from "./protocol";
+import { answerMsg, approveMsg, discoverMsg, pairMsg, spawnMsg, type ClientMsg, type WireMac } from "./protocol";
 
 /** Simulator/dev build: also try loopback, and offer "This Mac (simulator)". */
 export const IS_SIMULATOR_OR_DEV = __DEV__;
@@ -153,6 +154,12 @@ export interface LiveValue {
   spawn: (projectId: string, text: string, agent: string) => void;
   spawnState: SpawnState;
   resetSpawn: () => void;
+  /** questions/permissions the current Mac holds for a human, and how each one ended */
+  pending: PendingState;
+  /** answer a held question; `summary` is what the card confirms */
+  answer: (askId: string, answers: Record<string, string>, summary: string) => void;
+  /** allow or deny a held permission */
+  approve: (id: string, allow: boolean) => void;
   /** the in-app banner on screen, if any */
   banner: Banner | null;
   dismissBanner: () => void;
@@ -196,6 +203,15 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [context, setContext] = useState<ContextInfo | null>(null);
   const [banner, setBanner] = useState<Banner | null>(null);
   const [spawnState, setSpawnState] = useState<SpawnState>({ phase: "idle" });
+  const [pending, setPending] = useState<PendingState>(emptyPending);
+  /** the reducer's latest value, read synchronously by answer/approve (a double tap must not send twice) */
+  const pendingRef = useRef<PendingState>(emptyPending);
+  const dispatchPending = useCallback((ev: PendingEvent) => {
+    const next = pendingReducer(pendingRef.current, ev);
+    if (next === pendingRef.current) return;
+    pendingRef.current = next;
+    setPending(next);
+  }, []);
   const spawnPending = useRef(false);
   /** the last spawn timed out on the phone; the Mac may still answer it */
   const spawnLate = useRef(false);
@@ -268,6 +284,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     streamingRef.current = null;
     lastFrameAt.current = null;
     setDiscovered(null);
+    pendingRef.current = emptyPending;
+    setPending(emptyPending);
     let wasReady = false;
     const client = new BridgeClient(
       { addresses: addressesFor(mac, { simulator: IS_SIMULATOR_OR_DEV }), mac },
@@ -332,6 +350,31 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               break;
             case "macs":
               setDiscovered(m.macs);
+              break;
+            case "pending":
+              dispatchPending({
+                t: "snapshot",
+                items: [...(m.asks ?? []), ...(m.permissions ?? [])].map(fromWire),
+                now: Date.now(),
+              });
+              break;
+            case "pendingAdded": {
+              const item = fromWire(m.item);
+              dispatchPending({ t: "added", item });
+              // Banner now, not at the next 10 s poll (same toggles / open-chat / silo rules).
+              const b = bannerFromPending(signalsRef.current, viewRef.current, item, attachedRef.current, prefsRef.current);
+              signalsRef.current = b.signals;
+              if (b.banner) setBanner(b.banner);
+              break;
+            }
+            case "resolved":
+              dispatchPending({ t: "resolved", id: m.id, by: m.by, now: Date.now() });
+              break;
+            case "answerResult":
+              dispatchPending({ t: "result", id: m.askId, ok: m.ok, now: Date.now() });
+              break;
+            case "approveResult":
+              dispatchPending({ t: "result", id: m.id, ok: m.ok, now: Date.now() });
               break;
             case "projects": {
               const prev = viewRef.current;
@@ -634,6 +677,29 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
 
   const dismissBanner = useCallback(() => setBanner(null), []);
 
+  /** Send once per item: a card that is already sending, settled or private sends nothing. */
+  const sendFor = useCallback(
+    (id: string, mine: Mine, frame: ClientMsg) => {
+      const e = pendingRef.current.entries[id];
+      const client = clientRef.current;
+      if (!e || e.sent || e.item.private || e.ok !== undefined || e.by !== undefined || !client) return;
+      dispatchPending({ t: "sent", id, mine });
+      client.send(frame);
+    },
+    [dispatchPending],
+  );
+
+  const answer = useCallback(
+    (askId: string, answers: Record<string, string>, summary: string) =>
+      sendFor(askId, { kind: "answer", summary }, answerMsg(askId, answers)),
+    [sendFor],
+  );
+
+  const approve = useCallback(
+    (id: string, allow: boolean) => sendFor(id, { kind: "approve", allow }, approveMsg(id, allow)),
+    [sendFor],
+  );
+
   const prompt = useCallback((sessionId: string, text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -722,10 +788,16 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       spawn,
       spawnState,
       resetSpawn,
+      pending,
+      answer,
+      approve,
       banner,
       dismissBanner,
     }),
     [
+      pending,
+      answer,
+      approve,
       sendFrames,
       spawn,
       spawnState,

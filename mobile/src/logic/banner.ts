@@ -11,6 +11,7 @@ import type { WireProjectsView, WireViewProject, WireViewSession } from "../brid
 import type { Prefs } from "../data/prefs";
 import type { SessionStatus } from "../data/types";
 import { isNeeds } from "./chatList";
+import { permissionLine, type PendingItem } from "./pending";
 
 export type BannerKind = "question" | "permission" | "finished";
 
@@ -126,6 +127,45 @@ export function bannerFromStatus(
   for (const p of view.projects) {
     const s = p.sessions.find((x) => x.id === sessionId);
     if (s) return { signals: updated, banner: bannerFor(p, s, kind) };
+  }
+  return { signals: updated, banner: null };
+}
+
+/**
+ * The Mac pushed a NEW question or permission (`pendingAdded`, within ~250 ms of the hook):
+ * banner now rather than at the next 10 s poll. Same toggles, same open-chat and silo rules;
+ * the signal is updated so the poll that later shows the session asking raises nothing more,
+ * and a session already known to need you is not announced twice.
+ */
+export function bannerFromPending(
+  signals: Signals,
+  view: WireProjectsView | null,
+  item: PendingItem,
+  openId: string | null,
+  prefs: NotifyPrefs,
+): { signals: Signals; banner: Banner | null } {
+  const prev = signals[item.sessionId];
+  if (!prev || !view) return { signals, banner: null };
+  const kind: "question" | "permission" = item.kind === "ask" ? "question" : "permission";
+  const updated = { ...signals, [item.sessionId]: { needs: prev.needs ?? kind, status: "needsInput" as const } };
+  if (prev.needs || item.sessionId === openId || !allowed(kind, prefs)) return { signals: updated, banner: null };
+  for (const p of view.projects) {
+    const s = p.sessions.find((x) => x.id === item.sessionId);
+    if (!s) continue;
+    const b = bannerFor(p, s, kind);
+    if (!s.silo && !item.private) {
+      if (item.kind === "ask") {
+        const q = item.questions[0]?.question?.trim();
+        b.text = q ? `Asks: ${q}` : "Asks you a question";
+      } else {
+        const l = permissionLine(item);
+        b.text = l.prefix ? `${l.prefix} ${l.text}` : l.text;
+      }
+    } else {
+      b.openable = false;
+      b.text = PRIVATE_NEEDS_TEXT;
+    }
+    return { signals: updated, banner: b };
   }
   return { signals: updated, banner: null };
 }

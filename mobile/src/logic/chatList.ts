@@ -9,6 +9,7 @@
 import type { WireProjectsView, WireViewProject, WireViewSession } from "../bridge/protocol";
 import { accentFor } from "./accent";
 import { glyphStateFor, type GlyphState } from "./agents";
+import { permissionLine, type PendingItem } from "./pending";
 import { listTime, toMs } from "./time";
 
 /** Profile selection meaning "every profile". Desktop profile ids are uuids; this cannot collide. */
@@ -105,11 +106,21 @@ function inProfile(p: WireViewProject, profileId: ProfileSel): boolean {
  * The row's second line, WhatsApp's precedence: what needs you, then what it is doing right
  * now (WhatsApp's "typing…"), then the last message ("You: …" for yours), then a state word.
  */
-export function previewFor(s: WireViewSession): Preview {
-  if (s.silo) {
+export function previewFor(s: WireViewSession, pending?: PendingItem): Preview {
+  if (s.silo || pending?.private) {
     // Listed (and counted in Needs you) but never opened here: say where to answer it.
-    return { tone: "private", prefix: null, text: isNeeds(s) ? "Private session — open it on your Mac" : "Private session" };
+    return {
+      tone: "private",
+      prefix: null,
+      text: isNeeds(s) || pending ? "Private session — open it on your Mac" : "Private session",
+    };
   }
+  // A pushed question/permission is fresher than the last poll: it leads the row at once.
+  if (pending?.kind === "ask") {
+    const q = pending.questions[0]?.question?.trim();
+    return q ? { tone: "needs", prefix: "Asks:", text: q } : { tone: "needs", prefix: null, text: "Asks you a question" };
+  }
+  if (pending?.kind === "permission") return { tone: "needs", ...permissionLine(pending) };
   if (s.needs?.kind === "ask") {
     return s.needs.text
       ? { tone: "needs", prefix: "Asks:", text: s.needs.text }
@@ -157,7 +168,14 @@ export function offlineText(macName: string, lastSeen: number | null, now: numbe
   return `${macName} offline · last seen ${when}`;
 }
 
-function rowFor(p: WireViewProject, s: WireViewSession, unread: Record<string, number>, now: number): Row {
+function rowFor(
+  p: WireViewProject,
+  s: WireViewSession,
+  unread: Record<string, number>,
+  now: number,
+  pending: PendingItem | undefined,
+): Row {
+  const needs = isNeeds(s) || pending !== undefined;
   return {
     id: s.id,
     projectId: p.id,
@@ -167,34 +185,43 @@ function rowFor(p: WireViewProject, s: WireViewSession, unread: Record<string, n
     agent: s.agent,
     initials: agentInitials(s.agent),
     color: accentFor(p),
-    dot: dotFor(s),
-    glyph: glyphFor(s),
-    needs: isNeeds(s),
+    dot: needs ? "needs" : dotFor(s),
+    glyph: needs ? glyphStateFor("needsInput", s.running) : glyphFor(s),
+    needs,
     time: listTime(lastActivity(s), now),
-    preview: previewFor(s),
+    preview: previewFor(s, pending),
     unread: unread[s.id] ?? 0,
     openable: !s.silo,
   };
 }
 
-function matches(filter: ChatFilter, p: WireViewProject, s: WireViewSession): boolean {
+function matches(filter: ChatFilter, p: WireViewProject, s: WireViewSession, pending: boolean): boolean {
   if (filter === "all") return true;
-  if (filter === "needs") return isNeeds(s);
-  if (filter === "running") return !isNeeds(s) && s.status === "running";
+  if (filter === "needs") return pending || isNeeds(s);
+  if (filter === "running") return !pending && !isNeeds(s) && s.status === "running";
   return p.id === filter;
 }
 
 export function buildRows(
   view: WireProjectsView,
-  opts: { profileId: ProfileSel; filter: ChatFilter; unread: Record<string, number>; now: number },
+  opts: {
+    profileId: ProfileSel;
+    filter: ChatFilter;
+    unread: Record<string, number>;
+    now: number;
+    /** pushed, still-open questions/permissions by session (logic/pending.ts `openBySession`) */
+    pending?: Record<string, PendingItem>;
+  },
 ): Row[] {
   const { profileId, filter, unread, now } = opts;
+  const pending = opts.pending ?? {};
   const items: { row: Row; at: number | null }[] = [];
   for (const p of view.projects) {
     if (!inProfile(p, profileId)) continue;
     for (const s of p.sessions) {
-      if (!matches(filter, p, s)) continue;
-      items.push({ row: rowFor(p, s, unread, now), at: lastActivity(s) });
+      const pend = pending[s.id];
+      if (!matches(filter, p, s, pend !== undefined)) continue;
+      items.push({ row: rowFor(p, s, unread, now, pend), at: lastActivity(s) });
     }
   }
   // Needs you first, then most recent. Stable sort: ties keep the desktop's order.

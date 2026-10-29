@@ -371,3 +371,40 @@ describe("render stability", () => {
     expect(resolveFilter([], "needs")).toBe("all");
   });
 });
+
+describe("needs preview from pending", () => {
+  const ask = {
+    kind: "ask" as const,
+    id: "ask-1",
+    sessionId: "run-new",
+    private: false as const,
+    toolUseId: "tu1",
+    questions: [{ question: "Ship it?", header: "", multiSelect: false, options: [] }],
+    createdMs: 1,
+  };
+  const perm = {
+    kind: "permission" as const,
+    id: "perm-1",
+    sessionId: "run-new",
+    private: false as const,
+    toolName: "Bash",
+    summary: "touch a.txt",
+    createdMs: 1,
+  };
+
+  it("a pushed question or permission leads the row before the next poll", () => {
+    const s = sess({ id: "run-new", status: "running", activity: "Thinking" });
+    expect(previewFor(s, ask)).toEqual({ tone: "needs", prefix: "Asks:", text: "Ship it?" });
+    expect(previewFor(s, perm)).toEqual({ tone: "needs", prefix: "Allow Bash:", text: "touch a.txt" });
+    // a summary that is just the tool name is not repeated
+    expect(previewFor(s, { ...perm, toolName: "WebFetch", summary: "WebFetch" })).toEqual({ tone: "needs", prefix: null, text: "Allow WebFetch?" });
+    // private: never its text
+    expect(previewFor(sess({ id: "x", silo: true }), { kind: "ask", id: "a", sessionId: "x", private: true }).text).toBe(
+      "Private session — open it on your Mac",
+    );
+    // and the row sorts and filters as needing you
+    const rows = buildRows(VIEW, { profileId: null, filter: "needs", unread: {}, now: NOW, pending: { "run-new": perm } });
+    expect(ids(rows)).toContain("run-new");
+    expect(rows.find((r) => r.id === "run-new")).toMatchObject({ needs: true, dot: "needs" });
+  });
+});

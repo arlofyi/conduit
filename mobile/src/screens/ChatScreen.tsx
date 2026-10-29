@@ -23,6 +23,7 @@ import { AssistantMarkdown } from "../components/AssistantMarkdown";
 import { ChatBubble } from "../components/ChatBubble";
 import { Composer } from "../components/Composer";
 import { GlassCircle, GlassSurface, Icon, MaterialBar } from "../components/Glass";
+import { cardStyle, QuestionCard, Tag, TrailingCard, type OnAnswer, type OnApprove } from "../components/PendingCards";
 import type {
   ApprovalItem,
   CommandItem,
@@ -30,17 +31,17 @@ import type {
   ImageItem,
   NoticeItem,
   PlanItem,
-  QuestionItem,
   TodosItem,
 } from "../data/types";
 import { chatOnPhone, glyphStateFor, NO_PHONE_CHAT_TEXT } from "../logic/agents";
 import { PRIVATE_SESSION_TEXT } from "../logic/frames";
 import { chatHeader } from "../logic/chatHeader";
-import { outputPreview, splitRecommended } from "../logic/chatView";
+import { outputPreview } from "../logic/chatView";
 import { mix, readableInk } from "../logic/color";
 import { groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
 import { holdPosition, isPinned, newItemCount, shouldFollow } from "../logic/follow";
 import { imageDataUri } from "../logic/image";
+import { cardView, entryForToolUse, nextExpiry, sameCard, trailingEntries, type CardView } from "../logic/pending";
 import { layoutThread, sameFeedRow, type ThreadRow } from "../logic/thread";
 import type { ChatProps } from "../navigation";
 import { hq } from "../theme/hq";
@@ -57,7 +58,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   const { palette: p } = useTheme();
   const h = hq(p);
   const insets = useSafeAreaInsets();
-  const { sessionLive, context, view, attach, detach, prompt } = useLive();
+  const { sessionLive, context, view, attach, detach, prompt, pending, answer, approve } = useLive();
   const list = useRef<FlatList<DisplayRow>>(null);
 
   // Attach to this session's live stream (transcript history + tail + status) while the screen
@@ -111,12 +112,35 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   // Inverted list: newest first, so offset 0 is the bottom of the conversation. Each row carries
   // its own animateIn, so renderItem never changes and a memoised row re-renders only when ITS
   // content does.
+  // A question the Mac is holding joins its transcript card by tool_use id and makes it live;
+  // permissions (and questions whose transcript card has not landed yet) sit at the end.
+  // `pendingNow` moves only when a settled standalone card's linger ends.
+  const [pendingNow, setPendingNow] = useState(() => Date.now());
+  useEffect(() => {
+    const at = nextExpiry(pending, Date.now());
+    if (at === null) return;
+    const t = setTimeout(() => setPendingNow(Date.now()), Math.max(0, at - Date.now()) + 50);
+    return () => clearTimeout(t);
+  }, [pending, pendingNow]);
   const data = useMemo(() => {
     const index = new Map(rows.map((r, i) => [r, i]));
-    return thread
-      .map((t): DisplayRow => (t.type === "date" ? t : { ...t, animateIn: (index.get(t.row) ?? 0) >= animateFrom }))
-      .reverse();
-  }, [thread, rows, animateFrom]);
+    const asked = new Set<string>();
+    const out = thread.map((t): DisplayRow => {
+      if (t.type === "date") return t;
+      const it = t.row.type === "item" ? t.row.item : null;
+      let card: CardView | undefined;
+      if (it?.kind === "question") {
+        asked.add(it.toolUseId);
+        const e = entryForToolUse(pending, sessionId, it.toolUseId);
+        if (e) card = cardView(e);
+      }
+      return { ...t, animateIn: (index.get(t.row) ?? 0) >= animateFrom, card };
+    });
+    const trailing = trailingEntries(pending, sessionId, asked, pendingNow).map(
+      (e): DisplayRow => ({ type: "pending", key: `pending-${e.item.id}`, card: cardView(e) }),
+    );
+    return [...out, ...trailing].reverse();
+  }, [thread, rows, animateFrom, pending, sessionId, pendingNow]);
 
   // Follow rule (logic/follow.ts): only a reader at the bottom follows new rows.
   const pinnedRef = useRef(true);
@@ -162,15 +186,25 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   const onCopied = useCallback(() => setCopiedAt(Date.now()), []);
 
   const decide = useCallback((_id: string, _decision: "allow" | "deny") => {
-    // approvals arrive via the broker (a later phase); no-op in the read channel
+    // legacy transcript approval items carry no broker id; live permissions use PermissionCard
   }, []);
 
   const renderItem = useCallback(
     ({ item }: { item: DisplayRow }) => {
       if (item.type === "date") return <DatePill label={item.label} />;
-      return <ThreadRowView t={item} animateIn={item.animateIn} onDecide={decide} onCopied={onCopied} />;
+      if (item.type === "pending") return <PendingRowView card={item.card} onAnswer={answer} onApprove={approve} />;
+      return (
+        <ThreadRowView
+          t={item}
+          animateIn={item.animateIn}
+          card={item.card}
+          onDecide={decide}
+          onAnswer={answer}
+          onCopied={onCopied}
+        />
+      );
     },
-    [decide, onCopied],
+    [decide, onCopied, answer, approve],
   );
   const refused = sessionLive.refused === "private";
   // Only Claude's conversation reaches the phone (its transcript); say so rather than show nothing.
@@ -321,7 +355,10 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   );
 }
 
-type DisplayRow = Extract<ThreadRow, { type: "date" }> | (Extract<ThreadRow, { type: "row" }> & { animateIn: boolean });
+type DisplayRow =
+  | Extract<ThreadRow, { type: "date" }>
+  | (Extract<ThreadRow, { type: "row" }> & { animateIn: boolean; card?: CardView })
+  | { type: "pending"; key: string; card: CardView };
 
 function threadKey(t: DisplayRow): string {
   return t.key;
@@ -330,9 +367,26 @@ function threadKey(t: DisplayRow): string {
 type RowProps = {
   t: Extract<ThreadRow, { type: "row" }>;
   animateIn: boolean;
+  /** the live state of a question card the Mac is holding; undefined = history */
+  card?: CardView;
   onDecide: (id: string, d: "allow" | "deny") => void;
+  onAnswer: OnAnswer;
   onCopied: () => void;
 };
+
+type PendingRowProps = { card: CardView; onAnswer: OnAnswer; onApprove: OnApprove };
+
+/** A standalone card at the end of the feed (a permission, or a question ahead of its transcript card). */
+const PendingRowView = React.memo(
+  function PendingRowBody({ card, onAnswer, onApprove }: PendingRowProps) {
+    return (
+      <View style={{ marginTop: 8 }}>
+        <TrailingCard card={card} onAnswer={onAnswer} onApprove={onApprove} />
+      </View>
+    );
+  },
+  (a: PendingRowProps, b: PendingRowProps) => sameCard(a.card, b.card) && a.onAnswer === b.onAnswer && a.onApprove === b.onApprove,
+);
 
 /** A row re-renders only when what it draws changed (see `sameFeedRow`), not on every new message. */
 const ThreadRowView = React.memo(
@@ -342,14 +396,18 @@ const ThreadRowView = React.memo(
     a.t.first === b.t.first &&
     a.t.time === b.t.time &&
     a.animateIn === b.animateIn &&
+    sameCard(a.card, b.card) &&
     a.onDecide === b.onDecide &&
+    a.onAnswer === b.onAnswer &&
     a.onCopied === b.onCopied,
 );
 
 function ThreadRowBody({
   t,
   animateIn,
+  card,
   onDecide,
+  onAnswer,
   onCopied,
 }: RowProps) {
   const row: FeedRow = t.row;
@@ -373,7 +431,7 @@ function ThreadRowBody({
     case "image":
       return <View style={pad}><ImageRow item={item} /></View>;
     case "question":
-      return <View style={pad}><QuestionCard item={item} /></View>;
+      return <View style={pad}><QuestionCard questions={item.questions} card={card} onAnswer={onAnswer} /></View>;
     case "plan":
       return <View style={pad}><PlanCard item={item} /></View>;
   }
@@ -598,41 +656,6 @@ function ImageRow({ item }: { item: ImageItem }) {
   );
 }
 
-/** `.hq-question`: a question Claude asked earlier — history, so neutral, not amber. */
-function QuestionCard({ item }: { item: QuestionItem }) {
-  const { palette: p } = useTheme();
-  const h = hq(p);
-  return (
-    <View style={[cardStyle(p), { gap: 12 }]}>
-      {item.questions.map((q, i) => (
-        <View key={i} style={{ gap: 7 }}>
-          {q.header ? <Tag text={q.header} /> : null}
-          <Text style={{ color: p.textBright, fontSize: TYPE.callout, fontWeight: "600", lineHeight: 21 }}>{q.question}</Text>
-          {q.options.map((o, j) => {
-            const { label, recommended } = splitRecommended(o.label);
-            return (
-              <View key={j} style={{ flexDirection: "row", gap: 10 }}>
-                <Text style={{ color: p.textDim, fontSize: 12, fontFamily: MONO, width: 14, marginTop: 2 }}>{j + 1}</Text>
-                <View style={{ flex: 1, gap: 2 }}>
-                  <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
-                    <Text style={{ color: p.textBright, fontSize: TYPE.subhead }}>{label}</Text>
-                    {recommended ? (
-                      <View style={{ borderWidth: 1, borderColor: h.roseLine, borderRadius: 999, paddingHorizontal: 6 }}>
-                        <Text style={{ color: p.accent, fontSize: 11 }}>Recommended</Text>
-                      </View>
-                    ) : null}
-                  </View>
-                  {o.description ? <Text style={{ color: p.textMid, fontSize: TYPE.footnote, lineHeight: 18 }}>{o.description}</Text> : null}
-                </View>
-              </View>
-            );
-          })}
-        </View>
-      ))}
-    </View>
-  );
-}
-
 function PlanCard({ item }: { item: PlanItem }) {
   const { palette: p } = useTheme();
   return (
@@ -641,29 +664,6 @@ function PlanCard({ item }: { item: PlanItem }) {
       <AssistantMarkdown text={item.markdown} />
     </View>
   );
-}
-
-/** `.hq-question-header` / `.hq-plan-title`: small uppercase accent tag. */
-function Tag({ text }: { text: string }) {
-  const { palette: p } = useTheme();
-  const h = hq(p);
-  return (
-    <View style={{ alignSelf: "flex-start", backgroundColor: h.roseSoft, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 2 }}>
-      <Text style={{ color: p.accent, fontSize: 11, letterSpacing: 0.66, fontWeight: "600" }}>{text.toUpperCase()}</Text>
-    </View>
-  );
-}
-
-function cardStyle(p: ReturnType<typeof useTheme>["palette"]) {
-  return {
-    marginHorizontal: 8,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: p.border,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    backgroundColor: mix(p.selectionBg, p.panelBg, 0.35),
-  } as const;
 }
 
 /** `.hq-call-glyph`: a dot that says how the call went (shape + label, never hue alone). */

@@ -135,6 +135,44 @@ export interface WireMac {
   conduitVersion: string;
 }
 
+// ---- questions + permissions waiting on a human (bridge_view.rs ask_push / permission_push) ----
+
+/** Who settled a pending item (asks.rs `By`). `cancelled` = the turn moved on: drop it silently. */
+export type WireBy = "phone" | "desktop" | "terminal" | "timeout" | "cancelled";
+
+/** A held AskUserQuestion. `kind` is absent from no shipped desktop, but an absent kind reads as "ask". */
+export interface WirePendingAsk {
+  kind?: "ask";
+  id: string;
+  sessionId: string;
+  /** joins the transcript's `question` item */
+  toolUseId: string;
+  /** Claude's `tool_input.questions`, verbatim */
+  questions: WireQuestion[];
+  createdMs: number;
+}
+
+/** A held PermissionRequest. No `toolUseId`: it is never joined to a transcript card. */
+export interface WirePendingPermission {
+  kind: "permission";
+  id: string;
+  sessionId: string;
+  toolName: string;
+  /** one line: the command, the file, or the tool name */
+  summary: string;
+  createdMs: number;
+}
+
+/** A silo'd / local-only session's item: exactly these keys, nothing about what it asks. */
+export interface WirePendingPrivate {
+  kind?: "ask" | "permission";
+  id: string;
+  sessionId: string;
+  private: true;
+}
+
+export type WirePendingItem = WirePendingAsk | WirePendingPermission | WirePendingPrivate;
+
 export type PairFailReason = "declined" | "expired" | "replaced" | "off" | "error";
 
 /** The only protocol version this build speaks. */
@@ -158,7 +196,14 @@ export type ServerMsg =
   | { type: "output"; data: string } // base64 PTY bytes — chat UI ignores
   | { type: "killed"; sessionId: string }
   | { type: "gitresult"; action: string; [k: string]: unknown }
-  | { type: "spawned"; sessionId: string; name: string; projectId: string };
+  | { type: "spawned"; sessionId: string; name: string; projectId: string }
+  // Sent once after trust, then diffs every <= 250 ms (bridge_view.rs push_frames).
+  | { type: "pending"; asks: WirePendingItem[]; permissions: WirePendingItem[] }
+  | { type: "pendingAdded"; item: WirePendingItem }
+  | { type: "resolved"; id: string; by: WireBy }
+  // ok:false = already resolved elsewhere, a private session, or answers the Mac would not accept
+  | { type: "answerResult"; askId: string; ok: boolean }
+  | { type: "approveResult"; id: string; ok: boolean };
 
 // ---- client → server ----
 // Spellings are mixed ON PURPOSE (pinned by Rust tests): attach/input/resize/git/kill/spawn use
@@ -175,7 +220,9 @@ export type ClientMsg =
   | { type: "git"; session_id: string; action: "changes" | "diff"; path?: string }
   | { type: "kill"; session_id: string }
   | { type: "spawn"; project_id: string; prompt: string; agent?: string; worktree?: boolean }
-  | { type: "interrupt"; sessionId: string };
+  | { type: "interrupt"; sessionId: string }
+  | { type: "answer"; askId: string; answers: Record<string, string> }
+  | { type: "approve"; id: string; allow: boolean };
 
 export const authMsg = (token: string): ClientMsg => ({ type: "auth", token });
 
@@ -192,6 +239,10 @@ export const listMsg = (): ClientMsg => ({ type: "list" });
 export const attachMsg = (id: string): ClientMsg => ({ type: "attach", session_id: id });
 export const inputMsg = (id: string, data: string): ClientMsg => ({ type: "input", session_id: id, data });
 export const interruptMsg = (id: string): ClientMsg => ({ type: "interrupt", sessionId: id });
+/** Answer a held question: exact question text -> answer (multi-select already joined ", "). */
+export const answerMsg = (askId: string, answers: Record<string, string>): ClientMsg => ({ type: "answer", askId, answers });
+/** Allow or deny a held permission. */
+export const approveMsg = (id: string, allow: boolean): ClientMsg => ({ type: "approve", id, allow });
 /** Start a new session in a project with its first message; the Mac answers `spawned` or `error`. */
 export const spawnMsg = (projectId: string, prompt: string, agent: string): ClientMsg => ({
   type: "spawn",

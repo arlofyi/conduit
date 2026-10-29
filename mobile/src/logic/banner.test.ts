@@ -1,6 +1,6 @@
 import type { WireProjectsView, WireViewSession } from "../bridge/protocol";
 import { DEFAULT_PREFS } from "../data/prefs";
-import { bannerFromStatus, bannersFromView, type Signals } from "./banner";
+import { bannerFromPending, bannerFromStatus, bannersFromView, type Signals } from "./banner";
 
 function sess(over: Partial<WireViewSession> & { id: string }): WireViewSession {
   return {
@@ -112,5 +112,46 @@ describe("banners", () => {
     const r2 = sess({ id: "r", name: "r", status: "done" });
     const b = run([view(r1, idle), view(r2, asks)], null);
     expect(b.map((x) => x.kind)).toEqual(["question", "finished"]);
+  });
+});
+
+describe("banner from a pushed question or permission", () => {
+  const askItem = {
+    kind: "ask" as const,
+    id: "ask-1",
+    sessionId: "a",
+    private: false as const,
+    toolUseId: "tu1",
+    questions: [{ question: "Ship it?", header: "", multiSelect: false, options: [] }],
+    createdMs: 1,
+  };
+  const permItem = { kind: "permission" as const, id: "perm-1", sessionId: "a", private: false as const, toolName: "Bash", summary: "touch a.txt", createdMs: 1 };
+
+  it("banner_fires_on_pending_added_and_the_next_poll_does_not_repeat_it", () => {
+    const signals = bannersFromView({}, view(idle), null, ALL_ON).signals;
+    const r = bannerFromPending(signals, view(idle), askItem, null, ALL_ON);
+    expect(r.banner).toMatchObject({ sessionId: "a", kind: "question", text: "Asks: Ship it?", openable: true });
+    // the poll that later shows it asking raises nothing more
+    expect(bannersFromView(r.signals, view(asks), null, ALL_ON).banners).toEqual([]);
+    // a permission says what it wants to run
+    expect(bannerFromPending(signals, view(idle), permItem, null, ALL_ON).banner).toMatchObject({
+      kind: "permission",
+      text: "Allow Bash: touch a.txt",
+    });
+  });
+
+  it("pending_banner_respects_toggles_open_chat_and_silo", () => {
+    const signals = bannersFromView({}, view(idle), null, ALL_ON).signals;
+    expect(bannerFromPending(signals, view(idle), askItem, null, { ...ALL_ON, notifyQuestion: false }).banner).toBeNull();
+    expect(bannerFromPending(signals, view(idle), permItem, null, { ...ALL_ON, notifyPermission: false }).banner).toBeNull();
+    expect(bannerFromPending(signals, view(idle), askItem, "a", ALL_ON).banner).toBeNull();
+    // already needing you (seen by a poll or status first): no second banner
+    const needing = bannersFromView({}, view(asks), null, ALL_ON).signals;
+    expect(bannerFromPending(needing, view(asks), askItem, null, ALL_ON).banner).toBeNull();
+    // silo: announced, never its text, cannot be opened
+    const siloIdle = sess({ id: "s", name: "secret", silo: true });
+    const sig = bannersFromView({}, view(siloIdle), null, ALL_ON).signals;
+    const b = bannerFromPending(sig, view(siloIdle), { kind: "ask", id: "ask-2", sessionId: "s", private: true }, null, ALL_ON).banner;
+    expect(b).toMatchObject({ openable: false, text: "Private session — open it on your Mac" });
   });
 });
