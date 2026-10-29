@@ -38,6 +38,8 @@ fn first_question(ask: &AskView) -> Option<String> {
 
 /// Longest `lastMessage.text` the phone is sent.
 const LAST_TEXT_MAX: usize = 160;
+/// Characters of a bubble considered when building its preview.
+const PLAIN_INPUT_MAX: usize = 2048;
 /// How much of a transcript's end is read to find its last bubble.
 const TAIL_BYTES: u64 = 256 * 1024;
 
@@ -49,18 +51,22 @@ pub fn plain_text(md: &str) -> String {
         let t = l.trim();
         !t.is_empty() && t.chars().all(|c| c == '─' || c == '`' || c == '-')
     };
-    let mut lines: Vec<&str> = md.lines().collect();
-    while lines.first().is_some_and(|l| l.trim().is_empty()) {
-        lines.remove(0);
+    // The preview shows 160 chars; anything past a couple of KB can never reach it, and
+    // bounding the input bounds every pass below.
+    let md: String = md.chars().take(PLAIN_INPUT_MAX).collect();
+    let lines: Vec<&str> = md.lines().collect();
+    let mut at = 0;
+    while lines.get(at).is_some_and(|l| l.trim().is_empty()) {
+        at += 1;
     }
-    if lines.first().is_some_and(|l| l.contains("★ Insight")) {
-        lines.remove(0);
-        while lines.first().is_some_and(|l| is_rule(l)) {
-            lines.remove(0);
+    if lines.get(at).is_some_and(|l| l.contains("★ Insight")) {
+        at += 1;
+        while lines.get(at).is_some_and(|l| is_rule(l)) {
+            at += 1;
         }
     }
     let mut out = String::new();
-    for line in lines {
+    for line in &lines[at..] {
         if is_rule(line) {
             continue;
         }
@@ -117,7 +123,9 @@ pub fn last_message_from_text(body: &str) -> Value {
 }
 
 /// Read the last [`TAIL_BYTES`] of a transcript and extract its last message. Any I/O
-/// problem is null: a preview must never fail a `list`.
+/// problem is null: a preview must never fail a `list`. A transcript whose last line is
+/// longer than the window has no complete line in it (the cut-off first line is dropped),
+/// so it also yields null: a missing preview beats a half-parsed one.
 pub fn read_last_message(path: &Path) -> Value {
     let read = || -> std::io::Result<String> {
         let mut f = std::fs::File::open(path)?;
@@ -146,6 +154,8 @@ pub fn read_last_message(path: &Path) -> Value {
 #[derive(Default)]
 pub struct LastMessageCache {
     inner: Mutex<HashMap<PathBuf, CacheEntry>>,
+    /// Paths asked for since the last [`sweep`](Self::sweep).
+    seen: Mutex<HashSet<PathBuf>>,
 }
 
 /// `(len, mtime, preview)` of a transcript when it was last read.
@@ -176,8 +186,23 @@ impl LastMessageCache {
         v
     }
 
+    /// End of a `list` pass: forget entries whose path was not asked for during it (a
+    /// deleted session, a conversation that moved on), then start a fresh pass.
+    pub fn sweep(&self) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|p, _| seen.contains(p));
+        seen.clear();
+    }
+
     /// Cached preview for a transcript file; null when it cannot be statted.
     pub fn for_path(&self, path: &Path) -> Value {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf());
         let Ok(md) = std::fs::metadata(path) else {
             return Value::Null;
         };
@@ -399,6 +424,83 @@ mod tests {
         assert_eq!(cache.get_or_read(p, 6, Some(t0), read)["n"], 2);
         assert_eq!(cache.get_or_read(p, 6, Some(t1), read)["n"], 3);
         assert_eq!(cache.get_or_read(p, 6, Some(t1), read)["n"], 3);
+    }
+
+    fn tmp_file(tag: &str, bytes: &[u8]) -> PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("conduit-tail-{tag}-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn assistant(text: &str) -> String {
+        json!({"type":"assistant","timestamp":"2026-10-29T20:01:00Z",
+            "message":{"content":[{"type":"text","text":text}]}})
+        .to_string()
+    }
+
+    #[test]
+    fn tail_reader_survives_a_line_straddling_the_cut() {
+        // A big first line crosses the 256 KiB boundary; the small last line is intact.
+        let mut body = assistant(&"x".repeat(300 * 1024));
+        body.push('\n');
+        body.push_str(&assistant("the end"));
+        body.push('\n');
+        let p = tmp_file("straddle", body.as_bytes());
+        assert_eq!(read_last_message(&p)["text"], "the end");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn tail_reader_handles_a_multibyte_char_at_the_cut() {
+        // "é" is 2 bytes; make the cut land between them.
+        let last = format!("{}\n", assistant("fin"));
+        let filler_len = TAIL_BYTES as usize - last.len() + 1;
+        let mut body = String::from("é");
+        body.push_str(&"a".repeat(filler_len - 2));
+        body.push('\n');
+        body.push_str(&last);
+        let p = tmp_file("utf8", body.as_bytes());
+        assert_eq!(read_last_message(&p)["text"], "fin");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn tail_reader_handles_crlf() {
+        let body = format!("{}\r\n{}\r\n", assistant("one"), assistant("two"));
+        let p = tmp_file("crlf", body.as_bytes());
+        assert_eq!(read_last_message(&p)["text"], "two");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn tail_reader_gives_null_for_a_single_line_longer_than_the_window() {
+        let p = tmp_file("huge", assistant(&"y".repeat(300 * 1024)).as_bytes());
+        assert!(read_last_message(&p).is_null());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn cache_sweep_drops_unseen_paths() {
+        let c = LastMessageCache::default();
+        let a = tmp_file("sa", assistant("a").as_bytes());
+        let b = tmp_file("sb", assistant("b").as_bytes());
+        c.for_path(&a);
+        c.for_path(&b);
+        c.sweep();
+        assert_eq!(c.inner.lock().unwrap().len(), 2);
+        c.for_path(&a);
+        c.sweep();
+        let g = c.inner.lock().unwrap();
+        assert!(g.contains_key(&a) && !g.contains_key(&b));
+        std::fs::remove_file(a).ok();
+        std::fs::remove_file(b).ok();
+    }
+
+    #[test]
+    fn plain_text_bounds_a_huge_input() {
+        let t = plain_text(&"[a](b) ".repeat(500_000));
+        assert_eq!(t.chars().count(), 160);
     }
 
     #[test]

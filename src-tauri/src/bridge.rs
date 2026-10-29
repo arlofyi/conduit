@@ -1241,6 +1241,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                                 })
                         },
                     );
+                    ctrl.last_messages.sweep();
                     let _ = ws.send(Message::Text(view.to_string()));
                 }
                 Some(ClientMsg::Attach { session_id }) => {
