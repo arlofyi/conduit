@@ -1,4 +1,4 @@
-import type { Agent, EventKind } from "../data/types";
+import type { EventKind } from "../data/types";
 
 /** basename of a path, e.g. "src/auth/login.ts" -> "login.ts" */
 export function basename(p: string): string {
@@ -61,38 +61,4 @@ export function eventKindFor(tool: string): EventKind {
     default:
       return "generic";
   }
-}
-
-export type DotKind = "running" | "done" | "idle" | "needs";
-
-export function statusDot(a: Agent): DotKind {
-  switch (a.status) {
-    case "needsInput":
-      return "needs";
-    case "running":
-      return "running";
-    case "done":
-      return "done";
-    default:
-      return "idle";
-  }
-}
-
-/** Secondary line under an agent's name in the Projects list. */
-export function agentSubline(a: Agent): string {
-  if (a.status === "needsInput") return a.attention ?? "needs your input";
-  if (a.compacting) return "compacting…";
-  if (a.status === "running") return a.activity ?? "working…";
-  if (a.status === "done") return a.doneAgo ? `done · finished ${a.doneAgo}` : "done";
-  return "idle";
-}
-
-/** How many agents are waiting on the human (drives the header chip). */
-export function needsCount(agents: Agent[]): number {
-  return agents.filter((a) => a.status === "needsInput").length;
-}
-
-/** Single-letter avatar for an agent kind: Claude / codeX / Gemini. */
-export function agentBadge(kind: Agent["kind"]): string {
-  return kind === "codex" ? "X" : kind === "gemini" ? "G" : "C";
 }

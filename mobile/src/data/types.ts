@@ -2,7 +2,7 @@
  * vocabulary (src/store.ts LiveState + src/themes.ts) so the two stay legible
  * to each other. Filled from the desktop bridge. */
 
-import type { WireDiff, WireQuestion } from "../bridge/protocol";
+import type { WireDiff, WireProjectsView, WireQuestion, WireViewProject, WireViewSession } from "../bridge/protocol";
 
 /** A paired Mac as stored in the Keychain (one slot per Mac). */
 export interface SavedMac {
@@ -15,8 +15,6 @@ export interface SavedMac {
   pairedAt: number;
 }
 
-export type AgentKind = "claude" | "codex" | "gemini";
-
 /** Same four states as the desktop `SessionStatus` (src/store.ts). */
 export type SessionStatus = "idle" | "running" | "needsInput" | "done";
 
@@ -25,38 +23,10 @@ export interface TodoProgress {
   total: number;
 }
 
-export interface ApprovalRequest {
-  id: string;
-  /** tool name, e.g. "Bash" */
-  tool: string;
-  /** the thing being approved, e.g. "rm -rf node_modules && npm i" */
-  input: string;
-}
-
-export interface Agent {
-  id: string;
-  name: string;
-  branch: string;
-  kind: AgentKind;
-  status: SessionStatus;
-  /** running: "Editing src/store.ts" (mirror of desktop `activity`) */
-  activity?: string;
-  todos?: TodoProgress;
-  compacting?: boolean;
-  /** needsInput sub-line: "approval · Bash: rm -rf…" | "waiting · your reply" */
-  attention?: string;
-  /** done: "3m ago" */
-  doneAgo?: string;
-  /** present when this agent is blocked on an approval */
-  pendingApproval?: ApprovalRequest;
-}
-
-export interface Project {
-  id: string;
-  name: string;
-  path: string;
-  agents: Agent[];
-}
+/** The Mac's typed projects view, as the Chats list reads it (src-tauri/src/bridge_view.rs). */
+export type ProjectsView = WireProjectsView;
+export type ViewProject = WireViewProject;
+export type ViewSession = WireViewSession;
 
 // ---- chat feed items ----
 

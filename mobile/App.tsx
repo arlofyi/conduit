@@ -17,7 +17,7 @@ import type { RootStackParamList, TabParamList } from "./src/navigation";
 import { ChatScreen } from "./src/screens/ChatScreen";
 import { ConnectScreen } from "./src/screens/ConnectScreen";
 import { PairScreen } from "./src/screens/PairScreen";
-import { ProjectsScreen } from "./src/screens/ProjectsScreen";
+import { ChatsScreen } from "./src/screens/ChatsScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
 import { ThemeProvider, useTheme } from "./src/theme/ThemeContext";
 import { TYPE } from "./src/theme/type";
@@ -41,8 +41,7 @@ function Tabs() {
         tabBarLabelPosition: "beside-icon",
       }}
     >
-      {/* Task 5 replaces ProjectsScreen with the Chats list. */}
-      <Tab.Screen name="Chats" component={ProjectsScreen} />
+      <Tab.Screen name="Chats" component={ChatsScreen} />
       <Tab.Screen name="Settings" component={SettingsScreen} />
     </Tab.Navigator>
   );

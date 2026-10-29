@@ -179,6 +179,15 @@ describe("projectAccent", () => {
     const gap = Math.min(Math.abs(a - b), 360 - Math.abs(a - b));
     expect(gap).toBeGreaterThan(20);
   });
+  it("accent_matches_desktop: pins the fixture the phone ports (mobile/src/logic/accent.test.ts)", () => {
+    // The phone re-implements projectAccent so an uncoloured project wears the same colour on
+    // both. Change these values only together with the phone's copy of the same table.
+    expect(projectAccent("p1")).toBe("#c47f88");
+    expect(projectAccent("A")).toBe("#75a898");
+    expect(projectAccent("ooozzy")).toBe("#93ad7c");
+    expect(projectAccent("Samle")).toBe("#c9a86b");
+    expect(projectAccent("9f3c1e")).toBe("#b8b072");
+  });
 });
 
 describe("resolveProjectColor", () => {

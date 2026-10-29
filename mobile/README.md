@@ -71,14 +71,16 @@ src/theme/
   ThemeContext.tsx           ThemeProvider + useTheme + cycle()
   layout.ts                  lightweight safe-area insets
 src/data/
-  types.ts                   Agent / Project / ChatItem model (mirrors desktop status vocab)
+  types.ts                   projects view + ChatItem model (mirrors desktop status vocab)
   mock.ts                    mock projects + per-agent chat feeds  ← swap for BridgeClient (P2)
 src/logic/
-  status.ts (+ .test.ts)     tool→activity mapping, status dots, badges
+  status.ts (+ .test.ts)     tool→activity mapping
+  chatList.ts (+ .test.ts)   Chats list: rows, chips, profiles, unread, relative time
+  accent.ts (+ .test.ts)     project colour (port of the desktop's projectAccent)
   feed.ts   (+ .test.ts)     prompt/approval reducer, event grouping
-src/components/atoms.tsx     Avatar / NeedsPill / StatusDot / ThemeButton
+src/components/atoms.tsx     NeedsPill / ThemeButton
 src/screens/
-  ProjectsScreen.tsx         triage home
+  ChatsScreen.tsx            WhatsApp-style chat list (home)
   ChatScreen.tsx             timeline + bubbles + approval card + composer
 ```
 

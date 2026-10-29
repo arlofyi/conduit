@@ -1,5 +1,5 @@
-import { PHONE_KINDS, appendWire, mapChatItem, mapHistory, mapProjects, statusPatch } from "./live";
-import type { WireChatItem, WireProject } from "./protocol";
+import { PHONE_KINDS, appendWire, mapChatItem, mapHistory, mapProjectsView, statusPatch } from "./live";
+import type { WireChatItem } from "./protocol";
 
 describe("mapChatItem", () => {
   it("maps a user bubble", () => {
@@ -93,23 +93,66 @@ describe("task status table", () => {
   });
 });
 
-describe("mapProjects", () => {
-  it("maps wire projects to UI projects with running→status", () => {
-    const wire: WireProject[] = [
+describe("mapProjectsView", () => {
+  const session = {
+    id: "s1",
+    name: "auth",
+    agent: "claude",
+    branch: "feat/x",
+    model: "opus",
+    stopped: false,
+    running: true,
+    silo: false,
+    status: "running",
+    activity: "Editing x.ts",
+    updatedAt: 1700000000000,
+    needs: { kind: "ask", text: "Ship it?" },
+  };
+  const frame = {
+    type: "projects",
+    profiles: [{ id: null, name: "Default" }, { id: "w", name: "Work" }],
+    activeProfileId: "w",
+    projects: [{ id: "p1", name: "Conduit", profileId: "w", color: "#123456", sessions: [session] }],
+  };
+
+  it("carries the typed view through without the frame tag", () => {
+    const v = mapProjectsView(frame);
+    expect(v).not.toHaveProperty("type");
+    expect(v.activeProfileId).toBe("w");
+    expect(v.profiles).toEqual(frame.profiles);
+    expect(v.projects[0]).toEqual({ ...frame.projects[0], sessions: [session] });
+  });
+
+  it("never lets a silo session carry activity or question text", () => {
+    const v = mapProjectsView({
+      ...frame,
+      projects: [{ ...frame.projects[0], sessions: [{ ...session, silo: true }] }],
+    });
+    expect(v.projects[0].sessions[0]).toMatchObject({ silo: true, activity: null, needs: { kind: "input", text: null } });
+  });
+
+  it("degrades a malformed frame instead of throwing", () => {
+    const v = mapProjectsView({
+      projects: [{ id: "p", sessions: [{ id: "s", status: "weird", updatedAt: 0 }, { name: "no id" }] }, { name: "x" }],
+    });
+    expect(v.profiles).toEqual([{ id: null, name: "Default" }]);
+    expect(v.projects).toHaveLength(1);
+    expect(v.projects[0].sessions).toEqual([
       {
-        id: "p1",
-        name: "Conduit",
-        path: "/repo",
-        sessions: [
-          { id: "s1", name: "auth", branch: "feat/x", agent: "claude", running: true },
-          { id: "s2", name: "idle-one", branch: null, agent: "codex", running: false },
-        ],
+        id: "s",
+        name: "s",
+        agent: "",
+        branch: null,
+        model: null,
+        stopped: false,
+        running: false,
+        silo: false,
+        status: "idle",
+        activity: null,
+        updatedAt: null,
+        needs: null,
       },
-    ];
-    const out = mapProjects(wire);
-    expect(out[0]).toMatchObject({ id: "p1", name: "Conduit", path: "/repo" });
-    expect(out[0].agents[0]).toMatchObject({ id: "s1", name: "auth", branch: "feat/x", kind: "claude", status: "running" });
-    expect(out[0].agents[1]).toMatchObject({ id: "s2", branch: "", kind: "codex", status: "idle" });
+    ]);
   });
 });
 

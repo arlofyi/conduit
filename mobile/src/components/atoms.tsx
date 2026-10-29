@@ -1,6 +1,5 @@
 import React from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import type { DotKind } from "../logic/status";
 import { PALETTES, THEME_ORDER } from "../theme/palettes";
 import { useTheme } from "../theme/ThemeContext";
 import { TYPE } from "../theme/type";
@@ -35,25 +34,6 @@ export function ThemeButton() {
   );
 }
 
-/** Square letter avatar for an agent kind (C / X / G). */
-export function Avatar({ letter }: { letter: string }) {
-  const { palette: p } = useTheme();
-  return (
-    <View
-      style={{
-        width: 36,
-        height: 36,
-        borderRadius: 10,
-        backgroundColor: p.selectionBg,
-        alignItems: "center",
-        justifyContent: "center",
-      }}
-    >
-      <Text style={{ color: p.accent, fontWeight: "700", fontSize: TYPE.callout }}>{letter}</Text>
-    </View>
-  );
-}
-
 /** Amber "needs you" pill. */
 export function NeedsPill({ label = "needs you" }: { label?: string }) {
   const { palette: p } = useTheme();
@@ -68,23 +48,5 @@ export function NeedsPill({ label = "needs you" }: { label?: string }) {
     >
       <Text style={{ color: p.pillNeedsText, fontSize: TYPE.caption, fontWeight: "700" }}>{label}</Text>
     </View>
-  );
-}
-
-/** Status dot mirroring the desktop sidebar accessory. */
-export function StatusDot({ kind }: { kind: DotKind }) {
-  const { palette: p } = useTheme();
-  if (kind === "idle") {
-    return (
-      <View
-        style={{ width: 9, height: 9, borderRadius: 5, borderWidth: 1.5, borderColor: p.textDim }}
-      />
-    );
-  }
-  const bg = kind === "running" || kind === "done" ? p.green : p.amber;
-  return (
-    <View
-      style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: bg, opacity: kind === "done" ? 0.85 : 1 }}
-    />
   );
 }

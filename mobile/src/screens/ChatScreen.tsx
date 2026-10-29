@@ -38,7 +38,7 @@ const STATUS_GLYPH: Record<Call["status"], string> = { running: "◐", ok: "●"
 const DIFF_CAP = 16;
 
 export function ChatScreen({ route, navigation }: ChatProps) {
-  const { agent } = route.params;
+  const { sessionId, name, branch } = route.params;
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
   const { sessionLive, attach, detach, prompt } = useLive();
@@ -48,9 +48,9 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   // Attach to this session's live stream (transcript history + tail + status)
   // while the screen is mounted; detach on leave.
   useEffect(() => {
-    attach(agent.id);
+    attach(sessionId);
     return () => detach();
-  }, [agent.id, attach, detach]);
+  }, [sessionId, attach, detach]);
 
   const feed = sessionLive.feed;
   const rows = useMemo(() => groupFeed(feed), [feed]);
@@ -60,7 +60,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
 
   const send = () => {
     if (!draft.trim()) return;
-    prompt(agent.id, draft); // optimistic echo + write to the live PTY
+    prompt(sessionId, draft); // optimistic echo + write to the live PTY
     setDraft("");
     scrollToEnd();
   };
@@ -95,8 +95,8 @@ export function ChatScreen({ route, navigation }: ChatProps) {
         >
           <Text style={{ color: p.accent, fontSize: 30, lineHeight: 30 }}>‹</Text>
         </Pressable>
-        <Text style={{ fontWeight: "600", fontSize: TYPE.headline, color: p.textBright }}>{agent.name}</Text>
-        <Text style={{ fontSize: TYPE.footnote, color: p.textMid, fontFamily: MONO }}>{agent.branch}</Text>
+        <Text style={{ fontWeight: "600", fontSize: TYPE.headline, color: p.textBright }}>{name}</Text>
+        <Text style={{ fontSize: TYPE.footnote, color: p.textMid, fontFamily: MONO }}>{branch ?? ""}</Text>
         <View style={{ flex: 1 }} />
         {showNeeds ? (
           <NeedsPill />
@@ -138,7 +138,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
         <TextInput
           value={draft}
           onChangeText={setDraft}
-          placeholder={`Reply to ${agent.name}…`}
+          placeholder={`Reply to ${name}…`}
           placeholderTextColor={p.textDim}
           onSubmitEditing={send}
           returnKeyType="send"

@@ -10,34 +10,26 @@ import React, {
 } from "react";
 import { Platform } from "react-native";
 import { macStore } from "../data/secureBackend";
-import type { ChatItem, Project, SavedMac, SessionStatus, TodoProgress } from "../data/types";
+import type { ChatItem, ProjectsView, SavedMac, SessionStatus, TodoProgress } from "../data/types";
+import { chatUnread, nextUnread } from "../logic/chatList";
 import { connErrorText } from "../logic/connCopy";
 import { loopbackMac, type PairEndpoint } from "../logic/macs";
 import { addressesFor, confirmCode, makeNonce, type QrPayload } from "../logic/pairing";
 import { BridgeClient } from "./BridgeClient";
 import { initialConn, type ConnError, type ConnState } from "./connection";
-import { appendWire, mapHistory, mapProjects, statusPatch, type LivePatch } from "./live";
+import { appendWire, mapHistory, mapProjectsView, statusPatch, type LivePatch } from "./live";
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
-import { discoverMsg, pairMsg, type WireMac, type WireProject, type WireProjectsView } from "./protocol";
+import { discoverMsg, pairMsg, type WireMac } from "./protocol";
 
 /** Simulator/dev build: also try loopback, and offer "This Mac (simulator)". */
 export const IS_SIMULATOR_OR_DEV = __DEV__;
 
-/** Adapt the typed projects view to the legacy shape live.ts maps (Task 5 removes this). */
-function legacyProjects(v: WireProjectsView): WireProject[] {
-  return v.projects.map((p) => ({
-    id: p.id,
-    name: p.name,
-    path: "",
-    sessions: p.sessions.map((s) => ({
-      id: s.id,
-      name: s.name,
-      branch: s.branch,
-      agent: s.agent as WireProject["sessions"][number]["agent"],
-      running: s.running,
-    })),
-  }));
-}
+/**
+ * The Mac answers `list` with its whole projects view and pushes nothing in between, so the
+ * Chats list asks again on this cadence while connected. The view is built from in-memory
+ * state on the Mac (no git, no disk), so this is cheap on both ends.
+ */
+export const LIST_POLL_MS = 10_000;
 
 const sha256Hex = (s: string) =>
   Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, s, { encoding: Crypto.CryptoEncoding.HEX });
@@ -113,7 +105,16 @@ export interface LiveValue {
   /** Simulator/dev: every Conduit answering on 127.0.0.1:8455..=8474 (never auto-picked) */
   probeLoopback: () => Promise<LoopbackFound[]>;
   addLoopback: (found: LoopbackFound) => Promise<void>;
-  projects: Project[];
+  /** the current Mac's projects view; kept while offline, null until the first one arrives */
+  view: ProjectsView | null;
+  /** when `view` last arrived (ms); a pull-to-refresh waits for this to move */
+  viewAt: number;
+  /** ask the Mac for a fresh view now */
+  refreshProjects: () => void;
+  /** unread counts per session for the current Mac, in memory only */
+  unread: Record<string, number>;
+  /** when the current Mac last sent anything before the link dropped (ms), for "last seen" */
+  lastSeen: number | null;
   /** live data for the currently-attached session */
   sessionLive: SessionLive;
   attach: (sessionId: string) => void;
@@ -143,7 +144,17 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [notice, setNotice] = useState<ConnError | null>(null);
   const [discovered, setDiscovered] = useState<WireMac[] | null>(null);
   const [pairing, setPairing] = useState<PairingState | null>(null);
-  const [projects, setProjects] = useState<Project[]>([]);
+  const [view, setView] = useState<ProjectsView | null>(null);
+  const [viewAt, setViewAt] = useState(0);
+  const [unread, setUnread] = useState<Record<string, number>>({});
+  const [lastSeen, setLastSeen] = useState<number | null>(null);
+  /** the last view, for diffing the next one into unread counts */
+  const viewRef = useRef<ProjectsView | null>(null);
+  /** the session the Mac is streaming to this socket; outlives `attachedRef` after the chat closes */
+  const streamingRef = useRef<string | null>(null);
+  /** last frame from the Mac; copied into `lastSeen` only when the link drops (a state per frame
+   * would re-render every consumer on each streamed chunk) */
+  const lastFrameAt = useRef<number | null>(null);
   const [sessionLive, setSessionLive] = useState<SessionLive>(EMPTY_LIVE);
   const clientRef = useRef<BridgeClient | null>(null);
   const attachedRef = useRef<string | null>(null);
@@ -195,7 +206,13 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     }
     const mac = currentMac;
     setHello(null);
-    setProjects([]);
+    setView(null);
+    setViewAt(0);
+    setUnread({});
+    setLastSeen(null);
+    viewRef.current = null;
+    streamingRef.current = null;
+    lastFrameAt.current = null;
     setDiscovered(null);
     let wasReady = false;
     const client = new BridgeClient(
@@ -205,10 +222,13 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           setConn(c);
           const ready = c.phase === "ready";
           const justReady = ready && !wasReady;
+          if (wasReady && !ready) setLastSeen(lastFrameAt.current ?? Date.now());
           wasReady = ready;
           if (justReady) {
             client.list();
-            // re-attach across reconnects (desktop is source of truth)
+            // A new socket streams nothing until attached. Re-attach the open chat (desktop is
+            // the source of truth); a chat closed earlier is no longer streamed.
+            streamingRef.current = attachedRef.current;
             if (attachedRef.current) {
               setSessionLive(EMPTY_LIVE);
               client.attach(attachedRef.current);
@@ -226,6 +246,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           setCurrentMac((cur) => (cur?.deviceId === e.deviceId ? null : cur));
         },
         onMessage: (m) => {
+          lastFrameAt.current = Date.now();
           switch (m.type) {
             case "hello":
               setHello({ macName: m.macName, conduitVersion: m.conduitVersion });
@@ -233,15 +254,25 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
             case "macs":
               setDiscovered(m.macs);
               break;
-            case "projects":
-              setProjects(mapProjects(legacyProjects(m)));
+            case "projects": {
+              const next = mapProjectsView(m);
+              const prev = viewRef.current;
+              viewRef.current = next;
+              setUnread((u) => nextUnread(u, prev, next, attachedRef.current));
+              setView(next);
+              setViewAt(Date.now());
               break;
+            }
             case "history":
               setSessionLive((prev) => ({ ...prev, feed: mapHistory(m.items) }));
               break;
-            case "chat":
-              setSessionLive((prev) => ({ ...prev, feed: appendWire(prev.feed, m.item) }));
+            case "chat": {
+              // chat frames carry no session id: they belong to whatever this socket streams
+              const streaming = streamingRef.current;
+              setUnread((u) => chatUnread(u, streaming, attachedRef.current));
+              if (attachedRef.current) setSessionLive((prev) => ({ ...prev, feed: appendWire(prev.feed, m.item) }));
               break;
+            }
             case "status":
               setSessionLive((prev) => applyPatch(prev, statusPatch(m.event, m.body as never)));
               break;
@@ -413,9 +444,28 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     [refreshMacs],
   );
 
+  // Keep the list fresh while connected: the Mac only sends a view when asked.
+  const ready = conn.phase === "ready";
+  useEffect(() => {
+    if (!ready) return;
+    const t = setInterval(() => clientRef.current?.list(), LIST_POLL_MS);
+    return () => clearInterval(t);
+  }, [ready, macKey]);
+
+  const refreshProjects = useCallback(() => {
+    clientRef.current?.list();
+  }, []);
+
   const attach = useCallback((sessionId: string) => {
     attachedRef.current = sessionId;
+    streamingRef.current = sessionId;
     setSessionLive(EMPTY_LIVE);
+    // opening a chat reads it
+    setUnread((u) => {
+      if (!(sessionId in u)) return u;
+      const { [sessionId]: _read, ...rest } = u;
+      return rest;
+    });
     clientRef.current?.attach(sessionId);
   }, []);
 
@@ -453,7 +503,11 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       cancelPairing,
       probeLoopback,
       addLoopback,
-      projects,
+      view,
+      viewAt,
+      refreshProjects,
+      unread,
+      lastSeen,
       sessionLive,
       attach,
       detach,
@@ -477,7 +531,11 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       cancelPairing,
       probeLoopback,
       addLoopback,
-      projects,
+      view,
+      viewAt,
+      refreshProjects,
+      unread,
+      lastSeen,
       sessionLive,
       attach,
       detach,

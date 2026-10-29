@@ -6,23 +6,6 @@
 
 // ---- server → client ----
 
-export interface WireSession {
-  id: string;
-  name: string;
-  branch?: string | null;
-  agent: "claude" | "codex" | "gemini";
-  running: boolean;
-  useWorktree?: boolean;
-  worktreePath?: string | null;
-}
-
-export interface WireProject {
-  id: string;
-  name: string;
-  path: string;
-  sessions: WireSession[];
-}
-
 export interface WireQuestionOption {
   label: string;
   description: string;
@@ -88,7 +71,6 @@ export type WireChatItem =
   | { kind: "note"; tag: string; text: string };
 
 // ---- typed `projects` view (desktop bridge_view.rs) ----
-// WireProject / WireSession above are the legacy shapes live.ts still maps; Task 5 migrates it.
 
 export type WireStatus = "idle" | "running" | "needsInput" | "done";
 

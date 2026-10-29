@@ -1,7 +1,6 @@
 import type { BottomTabScreenProps } from "@react-navigation/bottom-tabs";
 import type { CompositeScreenProps, NavigatorScreenParams } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
-import type { Agent } from "./data/types";
 
 export type TabParamList = {
   Chats: undefined;
@@ -12,7 +11,8 @@ export type TabParamList = {
  * Chat/Connect/Pair push over it. */
 export type RootStackParamList = {
   Tabs: NavigatorScreenParams<TabParamList> | undefined;
-  Chat: { agent: Agent };
+  /** what the list knows about the session; the chat fills in the rest once attached */
+  Chat: { sessionId: string; projectId: string; name: string; branch: string | null };
   Connect: undefined;
   Pair: undefined;
 };
@@ -25,8 +25,6 @@ export type SettingsProps = CompositeScreenProps<
   BottomTabScreenProps<TabParamList, "Settings">,
   NativeStackScreenProps<RootStackParamList>
 >;
-/** the Chats tab renders ProjectsScreen until Task 5 replaces it */
-export type ProjectsProps = ChatsProps;
 export type ChatProps = NativeStackScreenProps<RootStackParamList, "Chat">;
 export type ConnectProps = NativeStackScreenProps<RootStackParamList, "Connect">;
 export type PairProps = NativeStackScreenProps<RootStackParamList, "Pair">;
