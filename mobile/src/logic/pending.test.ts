@@ -143,9 +143,67 @@ describe("pending", () => {
     // ok:false with no resolved frame (it fell out of the ring): still honest
     t = run([{ t: "sent", id: "perm-1", mine: { kind: "approve", allow: false } }, { t: "result", id: "perm-1", ok: false, now: 5 }], s);
     expect(cardView(t.entries["perm-1"])).toMatchObject({ mode: "done", text: "Already answered" });
-    // the terminal and the timeout name themselves
-    expect(cardView(run([{ t: "resolved", id: "ask-1", by: "terminal", now: 1 }], s).entries["ask-1"])).toMatchObject({ text: "Answered in the terminal" });
+    // an ask resolved by the terminal is always a hand-off (Esc, last phone left, another
+    // window): never "Answered in the terminal"; the timeout says the same
+    expect(cardView(run([{ t: "resolved", id: "ask-1", by: "terminal", now: 1 }], s).entries["ask-1"])).toMatchObject({ text: "Moved to the terminal" });
     expect(cardView(run([{ t: "resolved", id: "ask-1", by: "timeout", now: 1 }], s).entries["ask-1"])).toMatchObject({ text: "Moved to the terminal" });
+    const lateAsk = run([{ t: "sent", id: "ask-1", mine: { kind: "answer", summary: "Yes" } }, { t: "resolved", id: "ask-1", by: "terminal", now: 1 }], s);
+    expect(cardView(lateAsk.entries["ask-1"])).toMatchObject({ text: "Moved to the terminal" });
+    // a permission the terminal handled says so
+    expect(cardView(run([{ t: "resolved", id: "perm-1", by: "terminal", now: 1 }], s).entries["perm-1"])).toMatchObject({ text: "Handled in the terminal" });
+    const latePerm = run([{ t: "sent", id: "perm-1", mine: { kind: "approve", allow: true } }, { t: "resolved", id: "perm-1", by: "terminal", now: 1 }], s);
+    expect(cardView(latePerm.entries["perm-1"])).toMatchObject({ text: "Already handled in the terminal" });
+    for (const v of [s, lateAsk, latePerm].flatMap((x) => Object.values(x.entries)).map(cardView)) {
+      expect("text" in v ? v.text : "").not.toContain("Answered in the terminal");
+    }
+  });
+
+  it("a_restarted_mac_reusing_an_id_is_a_new_item", () => {
+    // ask-N / perm-N restart at 1 when Conduit relaunches; the Mac is the truth
+    let s = run([
+      { t: "snapshot", items: [ask("ask-1", "tu1"), perm("perm-1")].map(fromWire), now: 0 },
+      { t: "sent", id: "ask-1", mine: { kind: "answer", summary: "Yes" } },
+      { t: "result", id: "ask-1", ok: true, now: 1 },
+      { t: "resolved", id: "perm-1", by: "desktop", now: 1 },
+    ]);
+    expect(cardView(s.entries["ask-1"]).mode).toBe("done");
+    // the relaunched Mac's snapshot carries a NEW ask-1
+    const snap = run([{ t: "snapshot", items: [ask("ask-1", "tu-new")].map(fromWire), now: 5 }], s);
+    expect(cardView(snap.entries["ask-1"])).toMatchObject({ mode: "live", item: { toolUseId: "tu-new" } });
+    expect(entryForToolUse(snap, "s1", "tu-new")?.item.id).toBe("ask-1");
+    expect(openBySession(snap)).toEqual({ s1: expect.objectContaining({ id: "ask-1" }) });
+    // the settled perm-1 the snapshot does not name keeps its outcome
+    expect(cardView(snap.entries["perm-1"]).mode).toBe("done");
+    // a pendingAdded reusing a settled id is new too
+    s = run([{ t: "added", item: fromWire(perm("perm-1")) }], s);
+    expect(cardView(s.entries["perm-1"]).mode).toBe("live");
+    expect(s.order.filter((id) => id === "perm-1")).toHaveLength(1);
+    // but a pendingAdded for an item already open here changes nothing
+    expect(run([{ t: "added", item: fromWire(perm("perm-1")) }], s)).toBe(s);
+  });
+
+  it("an_unsent_tap_stays_live_and_a_reconnect_clears_sending", () => {
+    const s = run([{ t: "snapshot", items: [perm("perm-1"), ask("ask-1", "tu1")].map(fromWire), now: 0 }]);
+    // the socket was not open: nothing went out, so the card stays live and says why
+    const u = run([{ t: "unsent", id: "perm-1" }], s);
+    expect(cardView(u.entries["perm-1"])).toMatchObject({ mode: "live", notice: "Not connected — try again" });
+    // a later tap that does go out clears the notice
+    const v = run([{ t: "sent", id: "perm-1", mine: { kind: "approve", allow: true } }], u);
+    expect(cardView(v.entries["perm-1"])).toMatchObject({ mode: "sending" });
+    expect(v.entries["perm-1"].unsent).toBeUndefined();
+    // a frame lost with a dropped socket: the reconnect snapshot still lists it, so it is live
+    // again (resending is safe: first answer wins)
+    const w = run(
+      [
+        { t: "sent", id: "ask-1", mine: { kind: "answer", summary: "Yes" } },
+        { t: "snapshot", items: [ask("ask-1", "tu1")].map(fromWire), now: 3 },
+      ],
+      s,
+    );
+    expect(cardView(w.entries["ask-1"])).toEqual({ mode: "live", item: w.entries["ask-1"].item });
+    // unsent never touches a settled or private item
+    const done = run([{ t: "resolved", id: "perm-1", by: "desktop", now: 1 }], s);
+    expect(run([{ t: "unsent", id: "perm-1" }], done)).toBe(done);
   });
 
   it("permission_copy_never_claims_more_than_it_did", () => {

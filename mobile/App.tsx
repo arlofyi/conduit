@@ -9,7 +9,7 @@ import {
 } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { StatusBar } from "expo-status-bar";
-import React from "react";
+import React, { useMemo } from "react";
 import { LogBox, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
@@ -28,6 +28,7 @@ import { NewChatScreen } from "./src/screens/NewChatScreen";
 import { ChatsMenuScreen, QuickActionsScreen, SessionInfoScreen } from "./src/screens/Sheets";
 import { ListSelectionProvider, useListSelection } from "./src/data/ListSelection";
 import { needsCount, resolveProfile } from "./src/logic/chatList";
+import { openBySession } from "./src/logic/pending";
 import { ThemeProvider, useTheme } from "./src/theme/ThemeContext";
 
 // React Native's own dev-only noise: a native-driven animation (the glyph pulse, a bubble's
@@ -55,10 +56,12 @@ function openFromBanner(b: BannerData) {
  */
 function Tabs() {
   const { palette } = useTheme();
-  const { view } = useLive();
+  const { view, pending } = useLive();
   const { profileSel } = useListSelection();
   const profile = view ? resolveProfile(view, profileSel === undefined ? view.activeProfileId : profileSel) : null;
-  const needs = needsCount(view, profile);
+  // Pushed items count too: the poll never marks a held permission as needing you.
+  const openPending = useMemo(() => openBySession(pending), [pending]);
+  const needs = needsCount(view, profile, openPending);
   return (
     <Tab.Navigator
       screenOptions={{

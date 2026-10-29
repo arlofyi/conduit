@@ -139,10 +139,13 @@ export class BridgeClient {
     }, delayMs);
   }
 
-  send(msg: ClientMsg) {
+  /** Whether the frame went out: false while the socket is not OPEN (dialling, redialling). */
+  send(msg: ClientMsg): boolean {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
+      return true;
     }
+    return false;
   }
 
   list() {

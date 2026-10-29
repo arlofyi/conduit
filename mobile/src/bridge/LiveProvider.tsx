@@ -360,7 +360,10 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               break;
             case "pendingAdded": {
               const item = fromWire(m.item);
+              const before = pendingRef.current;
               dispatchPending({ t: "added", item });
+              // An item already open here is not new: no second banner.
+              if (pendingRef.current === before) break;
               // Banner now, not at the next 10 s poll (same toggles / open-chat / silo rules).
               const b = bannerFromPending(signalsRef.current, viewRef.current, item, attachedRef.current, prefsRef.current);
               signalsRef.current = b.signals;
@@ -682,9 +685,12 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     (id: string, mine: Mine, frame: ClientMsg) => {
       const e = pendingRef.current.entries[id];
       const client = clientRef.current;
-      if (!e || e.sent || e.item.private || e.ok !== undefined || e.by !== undefined || !client) return;
-      dispatchPending({ t: "sent", id, mine });
-      client.send(frame);
+      if (!e || e.sent || e.item.private || e.ok !== undefined || e.by !== undefined) return;
+      // Marked sent only once the frame actually went out: a tap while the socket redials
+      // (e.g. just back from the background) stays live and says so, instead of "Sending…"
+      // forever.
+      if (client?.send(frame)) dispatchPending({ t: "sent", id, mine });
+      else dispatchPending({ t: "unsent", id });
     },
     [dispatchPending],
   );

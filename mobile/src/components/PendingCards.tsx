@@ -5,8 +5,8 @@
  * (`.hq-question` + the desktop AskCard's answer model: numbered options, a Recommended tag,
  * checkboxes and "Send N" for multi-select, "Something else…" free text).
  */
-import React, { useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import React, { useEffect, useRef, useState } from "react";
+import { AccessibilityInfo, ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import type { WireQuestion } from "../bridge/protocol";
 import { splitRecommended } from "../logic/chatView";
 import { mix } from "../logic/color";
@@ -82,6 +82,31 @@ function OutcomeLine({ card }: { card: Extract<CardView, { mode: "done" | "priva
   );
 }
 
+/**
+ * VoiceOver hears how a card ended at the moment it ends (a sighted reader sees the outcome line
+ * replace the buttons). Only on the transition: a card that mounts already settled is history.
+ */
+function useAnnounceSettle(card: CardView | undefined) {
+  const prevMode = useRef(card?.mode);
+  const text = card?.mode === "done" ? (card.detail ? `${card.text}, ${card.detail}` : card.text) : null;
+  useEffect(() => {
+    const was = prevMode.current;
+    prevMode.current = card?.mode;
+    if (text && was !== undefined && was !== "done") AccessibilityInfo.announceForAccessibility(text);
+  }, [card?.mode, text]);
+}
+
+/** Why a tap did nothing (no open socket): the card stays live so the reader can try again. */
+function Notice({ text }: { text: string }) {
+  const { palette: p } = useTheme();
+  return (
+    <View accessible accessibilityRole="alert" accessibilityLabel={text} style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+      <Icon name="wifi.slash" size={14} color={p.amber} />
+      <Text style={{ flex: 1, color: p.textMid, fontSize: TYPE.footnote }}>{text}</Text>
+    </View>
+  );
+}
+
 function Sending() {
   const { palette: p } = useTheme();
   return (
@@ -129,8 +154,16 @@ function StaticQuestion({ q }: { q: WireQuestion }) {
  */
 export function QuestionCard({ questions, card, onAnswer }: { questions: WireQuestion[]; card?: CardView; onAnswer: OnAnswer }) {
   const { palette: p } = useTheme();
+  useAnnounceSettle(card);
   if (card && (card.mode === "live" || card.mode === "sending") && card.item.kind === "ask") {
-    return <LiveQuestion ask={card.item} sending={card.mode === "sending"} onAnswer={onAnswer} />;
+    return (
+      <LiveQuestion
+        ask={card.item}
+        sending={card.mode === "sending"}
+        notice={card.mode === "live" ? card.notice : undefined}
+        onAnswer={onAnswer}
+      />
+    );
   }
   const qs = card && card.item.kind === "ask" && !card.item.private ? card.item.questions : questions;
   return (
@@ -148,7 +181,7 @@ export function QuestionCard({ questions, card, onAnswer }: { questions: WireQue
 }
 
 /** The interactive card: the desktop AskCard's model, sized for a thumb. */
-function LiveQuestion({ ask, sending, onAnswer }: { ask: PendingAsk; sending: boolean; onAnswer: OnAnswer }) {
+function LiveQuestion({ ask, sending, notice, onAnswer }: { ask: PendingAsk; sending: boolean; notice?: string; onAnswer: OnAnswer }) {
   const { palette: p } = useTheme();
   const h = hq(p);
   const [page, setPage] = useState(0);
@@ -202,11 +235,9 @@ function LiveQuestion({ ask, sending, onAnswer }: { ask: PendingAsk; sending: bo
   };
 
   return (
-    <View
-      accessibilityRole="none"
-      accessibilityLabel={`Question: ${q.question}`}
-      style={[liveCardStyle(p), { gap: 10 }]}
-    >
+    // The container is not an accessibility element (its rows must stay individually
+    // reachable), so it carries no label; the question itself is the header VoiceOver reads.
+    <View style={[liveCardStyle(p), { gap: 10 }]}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
         <Tag text={q.header?.trim() ? q.header : "Question"} color={p.amber} />
         {total > 1 ? (
@@ -215,7 +246,13 @@ function LiveQuestion({ ask, sending, onAnswer }: { ask: PendingAsk; sending: bo
           </Text>
         ) : null}
       </View>
-      <Text style={{ color: p.textBright, fontSize: TYPE.callout, fontWeight: "600", lineHeight: 21 }}>{q.question}</Text>
+      <Text
+        accessibilityRole="header"
+        accessibilityLabel={`Question${total > 1 ? ` ${page + 1} of ${total}` : ""}: ${q.question}`}
+        style={{ color: p.textBright, fontSize: TYPE.callout, fontWeight: "600", lineHeight: 21 }}
+      >
+        {q.question}
+      </Text>
 
       <View style={{ gap: 4 }}>
         {q.options.map((o, i) => {
@@ -290,6 +327,9 @@ function LiveQuestion({ ask, sending, onAnswer }: { ask: PendingAsk; sending: bo
                 selectionColor={p.accent}
                 keyboardAppearance={p.appearance}
                 accessibilityLabel="Your own answer"
+                // The Mac refuses an answer over 4096 bytes (MAX_ANSWER_BYTES) and keeps the
+                // question; 1000 characters is under that at UTF-8's worst case of 4 bytes each.
+                maxLength={1000}
                 multiline
                 style={{
                   flex: 1,
@@ -346,6 +386,7 @@ function LiveQuestion({ ask, sending, onAnswer }: { ask: PendingAsk; sending: bo
         )}
       </View>
 
+      {notice && !sending ? <Notice text={notice} /> : null}
       {sending ? (
         <Sending />
       ) : multi && !otherOpen ? (
@@ -362,7 +403,19 @@ function LiveQuestion({ ask, sending, onAnswer }: { ask: PendingAsk; sending: bo
 }
 
 /** The accent capsule (the composer's send treatment). */
-function PillButton({ label, onPress, disabled, tone = "accent" }: { label: string; onPress: () => void; disabled?: boolean; tone?: "accent" | "green" | "quiet" }) {
+function PillButton({
+  label,
+  onPress,
+  disabled,
+  tone = "accent",
+  hint,
+}: {
+  label: string;
+  onPress: () => void;
+  disabled?: boolean;
+  tone?: "accent" | "green" | "quiet";
+  hint?: string;
+}) {
   const { palette: p } = useTheme();
   const bg = tone === "green" ? p.green : tone === "quiet" ? p.selectionBg : p.accent;
   const ink = tone === "green" ? p.onGreen : tone === "quiet" ? p.red : p.meText;
@@ -372,6 +425,7 @@ function PillButton({ label, onPress, disabled, tone = "accent" }: { label: stri
       disabled={disabled}
       accessibilityRole="button"
       accessibilityState={{ disabled: !!disabled }}
+      accessibilityHint={hint}
       hitSlop={6}
       style={({ pressed }) => ({
         minHeight: 38,
@@ -393,6 +447,7 @@ function PillButton({ label, onPress, disabled, tone = "accent" }: { label: stri
 /** A tool permission: what it wants to run, then Deny / Allow. Standalone, never joined to the transcript. */
 export function PermissionCard({ card, onApprove }: { card: CardView; onApprove: OnApprove }) {
   const { palette: p } = useTheme();
+  useAnnounceSettle(card);
   if (card.mode === "private") {
     return (
       <View style={[cardStyle(p), { gap: 8 }]}>
@@ -404,6 +459,8 @@ export function PermissionCard({ card, onApprove }: { card: CardView; onApprove:
   const item = card.item as PendingPermission;
   const summary = item.summary && item.summary !== item.toolName ? item.summary : null;
   const live = card.mode === "live";
+  // Deny/Allow alone say nothing about WHAT: VoiceOver hears the tool and its command.
+  const hint = summary ? `${item.toolName}: ${summary}` : item.toolName;
   return (
     <View style={[card.mode === "done" ? cardStyle(p) : liveCardStyle(p), { gap: 10 }]}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
@@ -422,14 +479,17 @@ export function PermissionCard({ card, onApprove }: { card: CardView; onApprove:
         <Text style={{ color: p.textBright, fontSize: TYPE.callout, fontWeight: "600" }}>Allow {item.toolName}?</Text>
       )}
       {live ? (
-        <View style={{ flexDirection: "row", gap: 10 }}>
-          <View style={{ flex: 1 }}>
-            <PillButton label="Deny" tone="quiet" onPress={() => onApprove(item.id, false)} />
+        <>
+          {card.notice ? <Notice text={card.notice} /> : null}
+          <View style={{ flexDirection: "row", gap: 10 }}>
+            <View style={{ flex: 1 }}>
+              <PillButton label="Deny" tone="quiet" hint={hint} onPress={() => onApprove(item.id, false)} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <PillButton label="Allow" tone="green" hint={hint} onPress={() => onApprove(item.id, true)} />
+            </View>
           </View>
-          <View style={{ flex: 1 }}>
-            <PillButton label="Allow" tone="green" onPress={() => onApprove(item.id, true)} />
-          </View>
-        </View>
+        </>
       ) : card.mode === "sending" ? (
         <Sending />
       ) : card.mode === "done" ? (

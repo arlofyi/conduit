@@ -26,6 +26,16 @@ export function newItemCount(prevLength: number, nextLength: number): number {
 }
 
 /**
+ * Keys in `next` not in `seen`: cards that arrived (a trailing permission or question has no
+ * transcript row, so `newItemCount` cannot see it). A card going away is not new.
+ */
+export function newKeys(seen: ReadonlySet<string>, next: readonly string[]): number {
+  let n = 0;
+  for (const k of next) if (!seen.has(k)) n++;
+  return n;
+}
+
+/**
  * FlatList `maintainVisibleContentPosition` for the current pin state: while scrolled up, the
  * first visible row is held still as rows arrive at index 0 (the bottom); while pinned, the
  * list is left alone so offset 0 keeps showing the newest row.

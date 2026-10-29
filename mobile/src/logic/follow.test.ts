@@ -1,4 +1,4 @@
-import { PIN_SLOP, holdPosition, isPinned, newItemCount, shouldFollow } from "./follow";
+import { PIN_SLOP, holdPosition, isPinned, newItemCount, newKeys, shouldFollow } from "./follow";
 
 describe("follow rule (inverted feed: offset 0 is the newest message)", () => {
   it("follow_only_when_pinned", () => {
@@ -32,5 +32,13 @@ describe("follow rule (inverted feed: offset 0 is the newest message)", () => {
     expect(newItemCount(5, 5)).toBe(0);
     // a history replace that shrinks the feed is not "new"
     expect(newItemCount(9, 4)).toBe(0);
+  });
+
+  it("a_card_arriving_while_scrolled_up_counts_as_new", () => {
+    // trailing permission/question cards are keyed by item id; only keys not seen before count
+    expect(newKeys(new Set(), ["pending-perm-1"])).toBe(1);
+    expect(newKeys(new Set(["pending-perm-1"]), ["pending-perm-1", "pending-ask-2"])).toBe(1);
+    // a card going away (settled, lingered) is not new
+    expect(newKeys(new Set(["pending-perm-1", "pending-ask-2"]), ["pending-ask-2"])).toBe(0);
   });
 });

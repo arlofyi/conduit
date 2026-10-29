@@ -134,8 +134,8 @@ export function bannerFromStatus(
 /**
  * The Mac pushed a NEW question or permission (`pendingAdded`, within ~250 ms of the hook):
  * banner now rather than at the next 10 s poll. Same toggles, same open-chat and silo rules;
- * the signal is updated so the poll that later shows the session asking raises nothing more,
- * and a session already known to need you is not announced twice.
+ * the signal is updated so the poll that later shows the session asking raises nothing more.
+ * The caller calls it once per NEW item id, so each question or permission is announced once.
  */
 export function bannerFromPending(
   signals: Signals,
@@ -148,7 +148,10 @@ export function bannerFromPending(
   if (!prev || !view) return { signals, banner: null };
   const kind: "question" | "permission" = item.kind === "ask" ? "question" : "permission";
   const updated = { ...signals, [item.sessionId]: { needs: prev.needs ?? kind, status: "needsInput" as const } };
-  if (prev.needs || item.sessionId === openId || !allowed(kind, prefs)) return { signals: updated, banner: null };
+  // Keyed by the ITEM, not the session's needs flag: `pendingAdded` fires once per new id, so a
+  // second question in a session that already needed you (the first answered on the Mac before
+  // any poll cleared the flag) is still announced.
+  if (item.sessionId === openId || !allowed(kind, prefs)) return { signals: updated, banner: null };
   for (const p of view.projects) {
     const s = p.sessions.find((x) => x.id === item.sessionId);
     if (!s) continue;

@@ -39,7 +39,7 @@ import { chatHeader } from "../logic/chatHeader";
 import { outputPreview } from "../logic/chatView";
 import { mix, readableInk } from "../logic/color";
 import { groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
-import { holdPosition, isPinned, newItemCount, shouldFollow } from "../logic/follow";
+import { holdPosition, isPinned, newItemCount, newKeys, shouldFollow } from "../logic/follow";
 import { imageDataUri } from "../logic/image";
 import { cardView, entryForToolUse, nextExpiry, sameCard, trailingEntries, type CardView } from "../logic/pending";
 import { layoutThread, sameFeedRow, type ThreadRow } from "../logic/thread";
@@ -166,6 +166,15 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     }
     if (added > 0) sentRef.current = false;
   }, [rows.length]);
+  // A permission or question card arriving at the end of the feed has no transcript row, so
+  // the count above never sees it: a reader scrolled up hears of it through the "new" pill.
+  const trailingKeys = useMemo(() => data.filter((d) => d.type === "pending").map((d) => d.key), [data]);
+  const seenTrailing = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const added = newKeys(seenTrailing.current, trailingKeys);
+    seenTrailing.current = new Set(trailingKeys);
+    if (added > 0 && !pinnedRef.current) setUnseen((n) => n + added);
+  }, [trailingKeys]);
 
   const jumpToLatest = () => {
     list.current?.scrollToOffset({ offset: 0, animated: true });

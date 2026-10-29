@@ -229,11 +229,20 @@ export function buildRows(
   return items.map((i) => i.row);
 }
 
-export function chipsFor(view: WireProjectsView, profileId: ProfileSel): Chip[] {
+/**
+ * Needs you: the poll's verdict OR an item the Mac pushed. The poll never marks a held
+ * permission (only asks and a `needsInput` status), so without the pushed items a session
+ * waiting on Allow/Deny would never be counted.
+ */
+function needsYou(s: WireViewSession, pending: Record<string, PendingItem> | undefined): boolean {
+  return isNeeds(s) || pending?.[s.id] !== undefined;
+}
+
+export function chipsFor(view: WireProjectsView, profileId: ProfileSel, pending?: Record<string, PendingItem>): Chip[] {
   const projects = view.projects.filter((p) => inProfile(p, profileId) && p.sessions.length > 0);
   const sessions = projects.flatMap((p) => p.sessions);
-  const needs = sessions.filter(isNeeds).length;
-  const running = sessions.filter((s) => !isNeeds(s) && s.status === "running").length;
+  const needs = sessions.filter((s) => needsYou(s, pending)).length;
+  const running = sessions.filter((s) => !needsYou(s, pending) && s.status === "running").length;
   const chips: Chip[] = [{ key: "all", label: "All", color: null }];
   // A count chip appears only when there is something to count: "Needs you 0" is noise.
   if (needs > 0) chips.push({ key: "needs", label: `Needs you ${needs}`, color: null, needs: true });
@@ -243,9 +252,11 @@ export function chipsFor(view: WireProjectsView, profileId: ProfileSel): Chip[] 
 }
 
 /** How many sessions in the profile need you (the Chats tab badge). */
-export function needsCount(view: WireProjectsView | null, profileId: ProfileSel): number {
+export function needsCount(view: WireProjectsView | null, profileId: ProfileSel, pending?: Record<string, PendingItem>): number {
   if (!view) return 0;
-  return view.projects.filter((p) => inProfile(p, profileId)).reduce((n, p) => n + p.sessions.filter(isNeeds).length, 0);
+  return view.projects
+    .filter((p) => inProfile(p, profileId))
+    .reduce((n, p) => n + p.sessions.filter((s) => needsYou(s, pending)).length, 0);
 }
 
 function counts(view: WireProjectsView, profileId: ProfileSel): { projects: number; needs: number } {

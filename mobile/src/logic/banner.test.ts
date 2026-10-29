@@ -145,9 +145,13 @@ describe("banner from a pushed question or permission", () => {
     expect(bannerFromPending(signals, view(idle), askItem, null, { ...ALL_ON, notifyQuestion: false }).banner).toBeNull();
     expect(bannerFromPending(signals, view(idle), permItem, null, { ...ALL_ON, notifyPermission: false }).banner).toBeNull();
     expect(bannerFromPending(signals, view(idle), askItem, "a", ALL_ON).banner).toBeNull();
-    // already needing you (seen by a poll or status first): no second banner
+    // a NEW question in a session already needing you still banners: it is keyed by the item,
+    // not by the session's needs flag (the first was answered on the Mac before any poll)
     const needing = bannersFromView({}, view(asks), null, ALL_ON).signals;
-    expect(bannerFromPending(needing, view(asks), askItem, null, ALL_ON).banner).toBeNull();
+    const second = bannerFromPending(needing, view(asks), { ...askItem, id: "ask-2" }, null, ALL_ON);
+    expect(second.banner).toMatchObject({ sessionId: "a", kind: "question", text: "Asks: Ship it?" });
+    const third = bannerFromPending(second.signals, view(asks), { ...permItem, id: "perm-9" }, null, ALL_ON);
+    expect(third.banner).toMatchObject({ kind: "permission" });
     // silo: announced, never its text, cannot be opened
     const siloIdle = sess({ id: "s", name: "secret", silo: true });
     const sig = bannersFromView({}, view(siloIdle), null, ALL_ON).signals;

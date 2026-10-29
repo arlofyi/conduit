@@ -407,4 +407,20 @@ describe("needs preview from pending", () => {
     expect(ids(rows)).toContain("run-new");
     expect(rows.find((r) => r.id === "run-new")).toMatchObject({ needs: true, dot: "needs" });
   });
+
+  it("a_held_permission_counts_as_needing_you_in_the_chip_and_the_badge", () => {
+    // the poll never marks a held permission as needing you; the pushed item does
+    const pending = { "run-new": perm, c1: { ...perm, id: "perm-2", sessionId: "c1" } };
+    const chips = chipsFor(VIEW, null, pending);
+    expect(chips.find((c) => c.key === "needs")?.label).toBe("Needs you 3");
+    expect(chips.find((c) => c.key === "running")?.label).toBe("Running 1");
+    expect(needsCount(VIEW, null, pending)).toBe(3);
+    expect(needsCount(VIEW, "work", pending)).toBe(1);
+    // a session needing you on both counts is counted once
+    expect(needsCount(VIEW, null, { need: { ...perm, sessionId: "need" } })).toBe(2);
+    // the Needs-you filter survives when only a pushed item needs you
+    const quiet: WireProjectsView = { ...VIEW, projects: [proj("p", null, [sess({ id: "run-new", status: "running" })])] };
+    expect(resolveFilter(chipsFor(quiet, null, { "run-new": perm }), "needs")).toBe("needs");
+    expect(resolveFilter(chipsFor(quiet, null), "needs")).toBe("all");
+  });
 });

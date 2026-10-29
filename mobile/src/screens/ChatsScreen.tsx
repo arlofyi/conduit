@@ -52,7 +52,7 @@ export function ChatsScreen({ navigation }: ChatsProps) {
   useEffect(() => setNow(Date.now()), [viewAt]);
 
   const profileId = view ? resolveProfile(view, profileSel === undefined ? view.activeProfileId : profileSel) : null;
-  const chips = useMemo(() => (view ? chipsFor(view, profileId) : []), [view, profileId]);
+  const chips = useMemo(() => (view ? chipsFor(view, profileId, openPending) : []), [view, profileId, openPending]);
   // A filter whose chip is gone (nothing left to count, project removed) shows All.
   const activeFilter = view ? resolveFilter(chips, filter) : filter;
   const rows = useMemo(

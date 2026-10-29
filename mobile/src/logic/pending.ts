@@ -42,6 +42,8 @@ export type Mine = { kind: "answer"; summary: string } | { kind: "approve"; allo
 export interface Entry {
   item: PendingItem;
   sent?: Mine;
+  /** the last tap found no open socket: nothing went out, the card stays live and says so */
+  unsent?: true;
   /** the Mac's answerResult / approveResult */
   ok?: boolean;
   /** who resolved it, from `resolved` */
@@ -98,6 +100,7 @@ export type PendingEvent =
   | { t: "added"; item: PendingItem }
   | { t: "resolved"; id: string; by: By; now: number }
   | { t: "sent"; id: string; mine: Mine }
+  | { t: "unsent"; id: string }
   | { t: "result"; id: string; ok: boolean; now: number };
 
 export const isSettled = (e: Entry): boolean => e.ok !== undefined || e.by !== undefined;
@@ -116,34 +119,43 @@ function prune(order: string[], entries: Record<string, Entry>): PendingState {
 function patch(s: PendingState, id: string, f: (e: Entry) => Entry): PendingState {
   const e = s.entries[id];
   if (!e) return s;
-  return { order: s.order, entries: { ...s.entries, [id]: f(e) } };
+  const next = f(e);
+  if (next === e) return s;
+  return { order: s.order, entries: { ...s.entries, [id]: next } };
 }
 
 export function pendingReducer(s: PendingState, ev: PendingEvent): PendingState {
   switch (ev.t) {
     case "snapshot": {
-      // A fresh socket's view of what is waiting. Anything this phone already saw settle keeps
-      // its outcome; anything still open here but absent there settled while we were away and
-      // nobody can say how, so it simply goes.
+      // A fresh socket's view of what is waiting, and the Mac is the truth. Anything this phone
+      // saw settle keeps its outcome UNLESS the snapshot names its id: ask-N / perm-N restart at
+      // 1 when Conduit relaunches, so a listed id is a new item, never the settled one. Anything
+      // still open here but absent there settled while we were away and nobody can say how, so
+      // it simply goes. An open item keeps nothing of a send: a frame lost with the old socket
+      // would otherwise sit at "Sending…" for good, and resending is safe (first answer wins).
+      const listed = new Set(ev.items.map((i) => i.id));
       const order: string[] = [];
       const entries: Record<string, Entry> = {};
       for (const id of s.order) {
-        if (isSettled(s.entries[id])) {
+        if (isSettled(s.entries[id]) && !listed.has(id)) {
           order.push(id);
           entries[id] = s.entries[id];
         }
       }
       for (const item of ev.items) {
         if (entries[item.id]) continue;
-        const prev = s.entries[item.id];
         order.push(item.id);
-        entries[item.id] = prev ? { ...prev, item } : { item };
+        entries[item.id] = { item };
       }
       return prune(order, entries);
     }
-    case "added":
-      if (s.entries[ev.item.id]) return s;
-      return { order: [...s.order, ev.item.id], entries: { ...s.entries, [ev.item.id]: { item: ev.item } } };
+    case "added": {
+      const prev = s.entries[ev.item.id];
+      if (prev && !isSettled(prev)) return s;
+      // A settled id pushed again is a relaunched Mac's new item: replace it, at the end.
+      const order = prev ? s.order.filter((id) => id !== ev.item.id) : s.order;
+      return { order: [...order, ev.item.id], entries: { ...s.entries, [ev.item.id]: { item: ev.item } } };
+    }
     case "resolved": {
       const e = s.entries[ev.id];
       if (!e) return s;
@@ -155,7 +167,9 @@ export function pendingReducer(s: PendingState, ev: PendingEvent): PendingState 
       return prune(s.order, { ...s.entries, [ev.id]: { ...e, by: ev.by, settledAt: e.settledAt ?? ev.now } });
     }
     case "sent":
-      return patch(s, ev.id, (e) => (e.item.private || isSettled(e) ? e : { ...e, sent: ev.mine }));
+      return patch(s, ev.id, (e) => (e.item.private || isSettled(e) ? e : { item: e.item, sent: ev.mine }));
+    case "unsent":
+      return patch(s, ev.id, (e) => (e.item.private || isSettled(e) || e.sent || e.unsent ? e : { ...e, unsent: true }));
     case "result":
       return patch(s, ev.id, (e) => ({ ...e, ok: ev.ok, settledAt: e.settledAt ?? ev.now }));
   }
@@ -164,17 +178,22 @@ export function pendingReducer(s: PendingState, ev: PendingEvent): PendingState 
 // ---- what a card shows ----
 
 export type CardView =
-  | { mode: "live"; item: PendingAsk | PendingPermission }
+  | { mode: "live"; item: PendingAsk | PendingPermission; notice?: string }
   | { mode: "sending"; item: PendingAsk | PendingPermission; mine: Mine }
   | { mode: "private"; item: PendingItem; text: string }
   | { mode: "done"; item: PendingItem; tone: "ok" | "bad" | "info"; text: string; detail?: string };
 
-function elsewhere(by: By | undefined, late: boolean): string {
+export const UNSENT_TEXT = "Not connected — try again";
+
+function elsewhere(kind: PendingItem["kind"], by: By | undefined, late: boolean): string {
   switch (by) {
     case "desktop":
       return late ? "Already answered on your Mac" : "Answered on your Mac";
     case "terminal":
-      return late ? "Already answered in the terminal" : "Answered in the terminal";
+      // An ask resolved by the terminal is always a hand-off (Esc in the pane, the last phone
+      // left, another window) -- nobody answered it anywhere yet.
+      if (kind === "ask") return "Moved to the terminal";
+      return late ? "Already handled in the terminal" : "Handled in the terminal";
     case "timeout":
       return "Moved to the terminal";
     case "phone":
@@ -196,11 +215,11 @@ export function cardView(e: Entry): CardView {
       // ok:true means the answer reached Claude's hook, not that the tool was stopped.
       return mine.allow ? { mode: "done", item, tone: "ok", text: "Allowed" } : { mode: "done", item, tone: "bad", text: DENIED_TEXT };
     }
-    if (e.ok === false || e.by !== undefined) return { mode: "done", item, tone: "info", text: elsewhere(e.by, true) };
+    if (e.ok === false || e.by !== undefined) return { mode: "done", item, tone: "info", text: elsewhere(item.kind, e.by, true) };
     return { mode: "sending", item, mine };
   }
-  if (e.by !== undefined || e.ok !== undefined) return { mode: "done", item, tone: "info", text: elsewhere(e.by, false) };
-  return { mode: "live", item };
+  if (e.by !== undefined || e.ok !== undefined) return { mode: "done", item, tone: "info", text: elsewhere(item.kind, e.by, false) };
+  return e.unsent ? { mode: "live", item, notice: UNSENT_TEXT } : { mode: "live", item };
 }
 
 /** Value equality for memoised rows. */
@@ -208,6 +227,7 @@ export function sameCard(a: CardView | undefined, b: CardView | undefined): bool
   if (a === b) return true;
   if (!a || !b || a.mode !== b.mode || a.item !== b.item) return false;
   if (a.mode === "done" && b.mode === "done") return a.text === b.text && a.detail === b.detail && a.tone === b.tone;
+  if (a.mode === "live" && b.mode === "live") return a.notice === b.notice;
   return true;
 }
 
