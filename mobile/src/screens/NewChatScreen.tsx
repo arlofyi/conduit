@@ -59,7 +59,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
 
   const pending = spawnState.phase === "pending";
   const ready = conn.phase === "ready";
-  const canStart = ready && !pending && projectId !== null && text.trim().length > 0;
+  const canStart = ready && !pending && projectId !== null && chatOnPhone(agent) && text.trim().length > 0;
   const project = projects.find((x) => x.id === projectId) ?? null;
 
   return (
@@ -103,7 +103,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
           return (
             <Pressable
               key={a.id}
-              onPress={() => setAgent(a.id)}
+              onPress={() => usable && setAgent(a.id)}
               disabled={!usable}
               accessibilityRole="button"
               accessibilityLabel={usable ? a.label : `${a.label}, opens on your Mac only`}
