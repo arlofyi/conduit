@@ -175,6 +175,22 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     seenTrailing.current = new Set(trailingKeys);
     if (added > 0 && !pinnedRef.current) setUnseen((n) => n + added);
   }, [trailingKeys]);
+  // A question or permission turning live (on open, or as it arrives) is the one thing the
+  // reader must see whole. Its card is taller than the static one it replaces, and it grows
+  // after the list has settled, so a reader at the bottom is put back at offset 0 once it has
+  // laid out -- never a reader scrolled up into history.
+  const liveCards = useMemo(
+    () => data.flatMap((d) => (d.type !== "date" && d.card && (d.card.mode === "live" || d.card.mode === "sending") ? [d.card.item.id] : [])),
+    [data],
+  );
+  const seenLive = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const added = newKeys(seenLive.current, liveCards);
+    seenLive.current = new Set(liveCards);
+    if (!shouldFollow(pinnedRef.current, added)) return;
+    const t = setTimeout(() => list.current?.scrollToOffset({ offset: 0, animated: true }), 60);
+    return () => clearTimeout(t);
+  }, [liveCards]);
 
   const jumpToLatest = () => {
     list.current?.scrollToOffset({ offset: 0, animated: true });
@@ -233,6 +249,11 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   const [headerH, setHeaderH] = useState(insets.top + 56);
   const [composerH, setComposerH] = useState(insets.bottom + 54);
   const running = header.state === "running";
+  // A private chat shows only its notice: no typing bubble and no rows under it. The Mac sends
+  // nothing of that session, so the bubble would only be guessing, and any card for it is a
+  // private one that repeats the notice -- either would be drawn beneath the centred notice.
+  const typing = running && !refused;
+  const rowsShown = refused ? NO_ROWS : data;
   const stateColor = header.state === "needs" ? p.amber : running ? p.green : p.textMid;
   const ringState = glyphStateFor(
     header.state === "needs" ? "needsInput" : header.state === "running" ? "running" : sessionLive.status === "done" ? "done" : "idle",
@@ -249,14 +270,14 @@ export function ChatScreen({ route, navigation }: ChatProps) {
         <FlatList
           ref={list}
           inverted
-          data={data}
+          data={rowsShown}
           keyExtractor={threadKey}
           renderItem={renderItem}
           style={{ flex: 1 }}
           // inverted: paddingTop is the visual BOTTOM (above the composer), paddingBottom the top
           contentContainerStyle={{ paddingHorizontal: 10, paddingTop: composerH + 6, paddingBottom: headerH + 10 }}
           scrollIndicatorInsets={{ top: composerH, bottom: headerH }}
-          ListHeaderComponent={running ? <WorkingBubble activity={sessionLive.activity} /> : null}
+          ListHeaderComponent={typing ? <WorkingBubble activity={sessionLive.activity} /> : null}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="interactive"
           onScroll={onScroll}
@@ -368,6 +389,8 @@ type DisplayRow =
   | Extract<ThreadRow, { type: "date" }>
   | (Extract<ThreadRow, { type: "row" }> & { animateIn: boolean; card?: CardView })
   | { type: "pending"; key: string; card: CardView };
+
+const NO_ROWS: DisplayRow[] = [];
 
 function threadKey(t: DisplayRow): string {
   return t.key;
