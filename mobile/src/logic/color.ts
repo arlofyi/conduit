@@ -44,6 +44,21 @@ export function glyphInk(tint: string, textBright: string, ground?: string): str
   return ink;
 }
 
+/**
+ * A colour used AS TEXT (a project's name in its own colour): kept as is when it already reads
+ * at `min`:1 on `ground`, else bent toward the theme's ink just far enough. The project palette
+ * is pastel, which is fine as a dot and too faint as words on Warm Light's cream.
+ */
+export function readableInk(color: string, textBright: string, ground: string, min = 4.5): string {
+  let w = 1;
+  let ink = color;
+  while (w > 0.2 && (contrast(ink, ground) ?? min) < min) {
+    w -= 0.05;
+    ink = mix(color, textBright, w);
+  }
+  return ink;
+}
+
 /** WCAG relative luminance of a `#rrggbb` colour; null for anything else. */
 export function luminance(hex: string): number | null {
   const c = parse(hex);

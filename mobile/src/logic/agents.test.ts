@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { AGENT_MARKS, AGENTS, agentInfo, glyphStateFor, pulsePeriod } from "./agents";
-import { contrast, glyphInk, mix } from "./color";
+import { contrast, glyphInk, mix, readableInk } from "./color";
 import { PALETTES } from "../theme/palettes";
 
 const DESKTOP = path.resolve(__dirname, "../../../src");
@@ -47,6 +47,17 @@ describe("glyphStateFor", () => {
     expect(pulsePeriod("needsInput")).toBe(1600);
     expect(pulsePeriod("idle")).toBeNull();
     expect(pulsePeriod(undefined)).toBeNull();
+  });
+});
+
+describe("readableInk", () => {
+  it("keeps a colour that already reads as text, bends one that does not to 4.5:1", () => {
+    const d = PALETTES["warm-near-black"];
+    expect(readableInk("#c47f88", d.textBright, d.panelBg)).toBe("#c47f88");
+    const l = PALETTES["warm-light"];
+    const ink = readableInk("#c47f88", l.textBright, l.panelBg);
+    expect(ink).not.toBe("#c47f88");
+    expect(contrast(ink, l.panelBg)!).toBeGreaterThanOrEqual(4.5);
   });
 });
 

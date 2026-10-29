@@ -35,7 +35,7 @@ import type {
 import { glyphStateFor } from "../logic/agents";
 import { chatHeader } from "../logic/chatHeader";
 import { outputPreview, splitRecommended } from "../logic/chatView";
-import { mix } from "../logic/color";
+import { mix, readableInk } from "../logic/color";
 import { groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
 import { holdPosition, isPinned, newItemCount, shouldFollow } from "../logic/follow";
 import { imageDataUri } from "../logic/image";
@@ -187,7 +187,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     header.state === "needs" ? "needsInput" : header.state === "running" ? "running" : sessionLive.status === "done" ? "done" : "idle",
     session?.session.running ?? false,
   );
-  const accent = session ? (header.color ?? p.accent) : p.accent;
+  const accent = readableInk(session ? (header.color ?? p.accent) : p.accent, p.textBright, p.panelBg);
 
   return (
     <View style={{ flex: 1, backgroundColor: p.panelBg }}>

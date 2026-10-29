@@ -5,7 +5,7 @@ import { useLive } from "../bridge/LiveProvider";
 import { AgentAvatar } from "../components/AgentAvatar";
 import { GlassCircle } from "../components/Glass";
 import { useListSelection } from "../data/ListSelection";
-import { mix } from "../logic/color";
+import { mix, readableInk } from "../logic/color";
 import {
   buildRows,
   chipsFor,
@@ -271,7 +271,7 @@ function ChatRowView({ row, onOpen }: { row: Row; onOpen: (row: Row) => void }) 
             style={{ flex: 1, fontSize: TYPE.subhead, lineHeight: 20, color: previewColor, fontStyle: pv.tone === "private" ? "italic" : "normal" }}
             numberOfLines={2}
           >
-            <Text style={{ color: row.color, fontWeight: "600" }}>{row.projectName}</Text>
+            <Text style={{ color: readableInk(row.color, p.textBright, p.panelBg), fontWeight: "600" }}>{row.projectName}</Text>
             <Text style={{ color: p.textDim }}>{"  ·  "}</Text>
             {pv.prefix && (
               <Text style={{ color: pv.tone === "needs" ? p.pillNeedsText : p.textBright, fontWeight: "600" }}>{pv.prefix} </Text>

@@ -10,7 +10,7 @@ import {
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { StatusBar } from "expo-status-bar";
 import React from "react";
-import { View } from "react-native";
+import { LogBox, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { LiveProvider, useLive } from "./src/bridge/LiveProvider";
@@ -28,6 +28,11 @@ import { ChatsMenuScreen, QuickActionsScreen, SessionInfoScreen } from "./src/sc
 import { ListSelectionProvider, useListSelection } from "./src/data/ListSelection";
 import { needsCount, resolveProfile } from "./src/logic/chatList";
 import { ThemeProvider, useTheme } from "./src/theme/ThemeContext";
+
+// React Native's own dev-only noise: a native-driven animation (the glyph pulse, a bubble's
+// arrival) reports its final value back with no JS listener attached. Nothing is wrong, and in
+// dev the toast it raises covers the composer. Only this exact message is filtered.
+LogBox.ignoreLogs(["Sending `onAnimatedValueUpdate` with no listeners registered."]);
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 const Tab = createNativeBottomTabNavigator<TabParamList>();
