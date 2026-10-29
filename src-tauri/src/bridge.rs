@@ -134,6 +134,21 @@ const PREAUTH_MAX_BYTES: usize = 4 * 1024;
 /// Failed `auth` attempts allowed per peer IP in [`AUTH_FAILURE_WINDOW`].
 const AUTH_FAILURES_MAX: usize = 5;
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// Pair prompts raised on the Mac per peer IP in [`PAIR_PROMPT_WINDOW`], whatever their
+/// outcome -- a hang-up or a self-replacement still put a prompt in front of the human, so
+/// counting only failures would let a peer wear down the confirm-on-the-Mac safeguard.
+const PAIR_PROMPTS_MAX: usize = 5;
+const PAIR_PROMPT_WINDOW: Duration = Duration::from_secs(600);
+
+/// Take one prompt slot for `ip` (records it). `false` = budget spent; raise no prompt.
+fn take_prompt_slot(prompts: &Mutex<HashMap<String, VecDeque<Instant>>>, ip: IpAddr) -> bool {
+    crate::fleet::rate_limited(
+        prompts,
+        &ip.to_string(),
+        PAIR_PROMPTS_MAX,
+        PAIR_PROMPT_WINDOW,
+    )
+}
 /// How often a listener's accept loop checks its stop flag.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 /// How often the tailnet listener is re-planned against Tailscale's state.
@@ -552,6 +567,10 @@ fn pair_flow(
     } else {
         tailscale::whois(peer).map(|w| w.login_name)
     };
+    // Every prompt costs a slot, however it ends; spent = no prompt at all.
+    if !take_prompt_slot(&ctrl.pair_prompts, peer) {
+        return refuse(ws);
+    }
     let (id, rx) = pairing.register(PairRequest {
         peer,
         device_name: device_name.clone(),
@@ -637,6 +656,8 @@ pub struct BridgeController {
     live: Mutex<HashMap<String, Vec<Arc<AtomicBool>>>>,
     /// Failed auth attempts per peer IP (`fleet::rate_limited`'s map shape).
     auth_failures: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// Pair prompts raised per peer IP (a budget separate from failures).
+    pair_prompts: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
 impl BridgeController {
@@ -649,6 +670,7 @@ impl BridgeController {
             tailnet: Mutex::new(None),
             live: Mutex::new(HashMap::new()),
             auth_failures: Mutex::new(HashMap::new()),
+            pair_prompts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1310,6 +1332,23 @@ mod tests {
         let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
         k.sort();
         k
+    }
+
+    #[test]
+    fn pair_prompts_capped_per_peer() {
+        let prompts = Mutex::new(HashMap::new());
+        let a: IpAddr = "100.64.0.2".parse().unwrap();
+        let b: IpAddr = "100.64.0.3".parse().unwrap();
+        for i in 0..PAIR_PROMPTS_MAX {
+            assert!(take_prompt_slot(&prompts, a), "prompt {} allowed", i + 1);
+        }
+        assert!(
+            !take_prompt_slot(&prompts, a),
+            "6th prompt in the window refused"
+        );
+        assert!(take_prompt_slot(&prompts, b), "another IP is unaffected");
+        assert_eq!(PAIR_PROMPTS_MAX, 5);
+        assert_eq!(PAIR_PROMPT_WINDOW, Duration::from_secs(600));
     }
 
     #[test]
