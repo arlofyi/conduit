@@ -10,7 +10,7 @@ design in
 The app talks to a running Conduit desktop through `BridgeClient` (`src/bridge/`), mounted
 by `LiveProvider`: it lists the desktop's projects and sessions, attaches to a session for
 its transcript history and live tail, and sends prompts into the real PTY. The chat feed
-renders the full transcript item set: bubbles, tool-event rails, to-dos, approvals,
+renders the full transcript item set: bubbles, tool calls (status, errors, edit diffs; quiet runs fold), to-dos, approvals,
 notices, dividers (compaction/interrupts), slash-command chips, images, AskUserQuestion
 cards (read-only) and plans (Markdown, as on desktop). The mock data in `src/data/mock.ts` remains for
 tests and offline UI work only.

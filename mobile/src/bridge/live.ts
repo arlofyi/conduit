@@ -33,12 +33,13 @@ function eventKind(e: string): EventKind {
 }
 
 /**
- * Every wire kind `mapChatItem` handles: the Rust manifest minus `usage` (not shown on the phone).
+ * Every wire kind `mapChatItem` handles: the Rust manifest minus `usage` (not shown on the phone); `result` stays in the feed and is paired with its call by `groupFeed`.
  * A literal on purpose: Metro cannot bundle files outside mobile/. live.test.ts checks it against the manifest.
  */
 export const PHONE_KINDS: readonly string[] = [
   "bubble",
   "event",
+  "result",
   "task",
   "peer",
   "auto",
@@ -81,6 +82,16 @@ export function mapChatItem(w: WireChatItem): ChatItem | null {
         label: w.label,
         mono: w.mono ?? undefined,
         ok: w.ok ?? undefined,
+        toolUseId: w.toolUseId ?? undefined,
+      };
+    case "result":
+      return {
+        kind: "result",
+        id: nextId("r"),
+        toolUseId: w.toolUseId,
+        isError: w.isError,
+        errorText: w.errorText,
+        diff: w.diff,
       };
     case "task": {
       const { tone, text } = taskLine(w.status);

@@ -2,7 +2,7 @@
  * vocabulary (src/store.ts LiveState + src/themes.ts) so the two stay legible
  * to each other. Backed by mock data in this shell; by the bridge later. */
 
-import type { WireQuestion } from "../bridge/protocol";
+import type { WireDiff, WireQuestion } from "../bridge/protocol";
 
 export type AgentKind = "claude" | "codex" | "gemini";
 
@@ -70,6 +70,18 @@ export interface EventItem {
   mono?: string;
   /** trailing ok marker, e.g. "✓ 12" */
   ok?: string;
+  /** pairs this call with its `ResultItem` */
+  toolUseId?: string;
+}
+
+/** A tool call's outcome. Never rendered on its own; `groupFeed` folds it into its call. */
+export interface ResultItem {
+  kind: "result";
+  id: string;
+  toolUseId: string;
+  isError: boolean;
+  errorText: string | null;
+  diff: WireDiff | null;
 }
 
 export interface TodosItem {
@@ -135,6 +147,7 @@ export interface PlanItem {
 export type ChatItem =
   | BubbleItem
   | EventItem
+  | ResultItem
   | TodosItem
   | ApprovalItem
   | NoticeItem

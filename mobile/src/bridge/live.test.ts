@@ -15,6 +15,24 @@ describe("mapChatItem", () => {
     });
     expect(mapChatItem({ kind: "event", event: "weird", label: "did" })).toMatchObject({ event: "generic" });
   });
+  it("keeps toolUseId on events and maps a result item", () => {
+    expect(mapChatItem({ kind: "event", event: "read", label: "read", toolUseId: "T1" })).toMatchObject({
+      toolUseId: "T1",
+    });
+    expect(
+      mapChatItem({ kind: "result", toolUseId: "T1", isError: true, errorText: "boom", diff: null }),
+    ).toMatchObject({ kind: "result", toolUseId: "T1", isError: true, errorText: "boom", diff: null });
+  });
+  it("appendWire keeps a late result in the feed", () => {
+    const feed = appendWire(appendWire([], { kind: "event", event: "bash", label: "ran", toolUseId: "T" }), {
+      kind: "result",
+      toolUseId: "T",
+      isError: false,
+      errorText: null,
+      diff: null,
+    });
+    expect(feed.map((i) => i.kind)).toEqual(["event", "result"]);
+  });
   it("assigns an id", () => {
     expect(mapChatItem({ kind: "bubble", role: "assistant", text: "yo" })?.id).toBeTruthy();
   });

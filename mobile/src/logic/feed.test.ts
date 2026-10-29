@@ -1,8 +1,11 @@
-import type { ChatItem } from "../data/types";
+import type { ChatItem, EventItem, ResultItem } from "../data/types";
 import {
   appendAssistantReply,
   appendPrompt,
   groupFeed,
+  groupLabel,
+  type Call,
+  type FeedRow,
   pendingApproval,
   resolveApproval,
 } from "./feed";
@@ -62,17 +65,113 @@ describe("pendingApproval", () => {
 });
 
 describe("groupFeed", () => {
-  it("collapses consecutive events onto one rail and keeps others standalone", () => {
-    const feed: ChatItem[] = [
-      { kind: "bubble", id: "u", role: "user", text: "go" },
-      { kind: "event", id: "e1", event: "read", label: "read", mono: "a.ts" },
-      { kind: "event", id: "e2", event: "bash", label: "ran", mono: "npm test" },
-      { kind: "approval", id: "ap", tool: "Bash", input: "rm" },
-    ];
-    const rows = groupFeed(feed);
-    expect(rows.map((r) => r.type)).toEqual(["item", "events", "item"]);
-    const eventsRow = rows[1];
-    if (eventsRow.type !== "events") throw new Error("expected events row");
-    expect(eventsRow.events).toHaveLength(2);
+  const ev = (kind: EventItem["event"], mono: string, toolUseId?: string, id?: string): EventItem => ({
+    kind: "event",
+    id: id ?? `e-${mono}`,
+    event: kind,
+    label: kind,
+    mono,
+    toolUseId,
+  });
+  const res = (toolUseId: string, over: Partial<ResultItem> = {}): ResultItem => ({
+    kind: "result",
+    id: `r-${toolUseId}`,
+    toolUseId,
+    isError: false,
+    errorText: null,
+    diff: null,
+    ...over,
+  });
+  const asst = (text: string): ChatItem => ({ kind: "bubble", id: `b-${text}`, role: "assistant", text });
+  const diff = { filePath: "a", added: 1, removed: 0, created: false, lines: [], more: 0 };
+  const types = (rows: { type: string }[]) => rows.map((r) => r.type);
+  const status = (r: FeedRow) => (r.type === "call" ? r.call.status : null);
+
+  it("pairs_result_across_interleaved_items", () => {
+    const rows = groupFeed([ev("read", "a", "A"), ev("read", "b", "B"), res("A"), res("B")]);
+    expect(types(rows)).toEqual(["tools"]);
+    const r = rows[0];
+    expect(r.type === "tools" && r.calls.map((c) => c.status)).toEqual(["ok", "ok"]);
+    const rows2 = groupFeed([ev("read", "a", "A"), asst("hi"), res("A")]);
+    expect(types(rows2)).toEqual(["call", "item"]);
+    expect(status(rows2[0])).toBe("ok");
+  });
+
+  it("last call without result is running", () => {
+    const rows = groupFeed([ev("read", "a", "A"), res("A"), ev("read", "b", "B")]);
+    expect(types(rows)).toEqual(["call", "call"]);
+    expect(status(rows[1])).toBe("running");
+  });
+
+  it("earlier call without result is unknown", () => {
+    const rows = groupFeed([ev("read", "a", "A"), res("A"), ev("read", "b", "B"), ev("bash", "ls", "C")]);
+    expect(types(rows)).toEqual(["call", "call", "call"]);
+    expect(status(rows[1])).toBe("unknown");
+    expect(status(rows[2])).toBe("running");
+    const after = groupFeed([ev("read", "b", "B"), asst("moved on")]);
+    expect(status(after[0])).toBe("unknown");
+  });
+
+  it("two quiet calls fold, a failed call between them splits the run", () => {
+    const rows = groupFeed([
+      ev("read", "a", "A"),
+      ev("bash", "x", "B"),
+      ev("read", "c", "C"),
+      res("A"),
+      res("B", { isError: true, errorText: "boom" }),
+      res("C"),
+    ]);
+    expect(types(rows)).toEqual(["call", "call", "call"]);
+    const r = rows[1];
+    expect(r.type === "call" && r.call.errorText).toBe("boom");
+    expect(types(groupFeed([ev("read", "a", "A"), ev("read", "b", "B"), res("A"), res("B")]))).toEqual(["tools"]);
+  });
+
+  it("three quiet calls fold into tools", () => {
+    const rows = groupFeed([
+      ev("read", "a", "A"),
+      ev("read", "b", "B"),
+      ev("bash", "c", "C"),
+      res("A"),
+      res("B"),
+      res("C"),
+    ]);
+    expect(types(rows)).toEqual(["tools"]);
+    expect(rows[0].type === "tools" && rows[0].calls.length).toBe(3);
+  });
+
+  it("edit with diff stays standalone", () => {
+    const rows = groupFeed([ev("edit", "a", "A"), ev("edit", "b", "B"), res("A", { diff }), res("B", { diff })]);
+    expect(types(rows)).toEqual(["call", "call"]);
+    expect(rows[0].type === "call" && rows[0].call.diff).toEqual(diff);
+  });
+
+  it("orphan result is dropped", () => {
+    expect(types(groupFeed([res("ZZ"), asst("x")]))).toEqual(["item"]);
+  });
+
+  it("a result arriving later updates its call on the next grouping", () => {
+    const before = [ev("bash", "ls", "A")];
+    expect(status(groupFeed(before)[0])).toBe("running");
+    expect(status(groupFeed([...before, res("A", { isError: true, errorText: "no" })])[0])).toBe("error");
+  });
+
+  it("keys: tools row by its first call's event id", () => {
+    const rows = groupFeed([ev("read", "a", "A", "e1"), ev("read", "b", "B", "e2"), res("A"), res("B")]);
+    expect(rows[0].type === "tools" && rows[0].id).toBe("tools-e1");
+  });
+});
+
+describe("groupLabel", () => {
+  const c = (kind: EventItem["event"]): Call => ({
+    event: { kind: "event", id: kind, event: kind, label: kind },
+    status: "ok",
+    errorText: null,
+    diff: null,
+  });
+  it("buckets", () => {
+    expect(groupLabel([c("bash"), c("bash"), c("read")])).toBe("Ran 2 shell commands, read 1 file");
+    expect(groupLabel([c("search")])).toBe("Searched 1 time");
+    expect(groupLabel([c("generic"), c("subagent"), c("web")])).toBe("Called 2 tools, browsed 1 page");
   });
 });

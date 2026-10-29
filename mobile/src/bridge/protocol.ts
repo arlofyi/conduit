@@ -34,10 +34,39 @@ export interface WireQuestion {
   options: WireQuestionOption[];
 }
 
+export interface WireDiffLine {
+  kind: "add" | "del" | "ctx" | "gap";
+  text: string;
+  oldNo: number | null;
+  newNo: number | null;
+}
+export interface WireDiff {
+  filePath: string;
+  added: number;
+  removed: number;
+  created: boolean;
+  lines: WireDiffLine[];
+  more: number;
+}
+
 /** A transcript-derived chat item (no id on the wire). Kinds mirror src-tauri/src/transcript_item_kinds.json. */
 export type WireChatItem =
   | { kind: "bubble"; role: "user" | "assistant"; text: string }
-  | { kind: "event"; event: string; label: string; mono?: string | null; ok?: string | null }
+  | {
+      kind: "event";
+      event: string;
+      label: string;
+      mono?: string | null;
+      ok?: string | null;
+      toolUseId?: string | null;
+    }
+  | {
+      kind: "result";
+      toolUseId: string;
+      isError: boolean;
+      errorText: string | null;
+      diff: WireDiff | null;
+    }
   | {
       kind: "usage";
       model: string;
