@@ -59,16 +59,19 @@ const isQuiet = (c: Call) => c.status === "ok" && c.diff === null;
 /**
  * Pair each event with its result by `toolUseId` across the whole feed, drop `result`
  * items, and fold runs of >= 2 quiet calls. Same rule as the desktop (`groupTools`).
- * A call with no result is `running` only when nothing but `usage`/`result` follows it;
+ * A call with no result is `running` only when nothing but events/`usage`/`result` follows it;
  * otherwise the turn moved on without a result and its status is `unknown` (never folds).
  */
 export function groupFeed(items: ChatItem[]): FeedRow[] {
   const results = new Map<string, ResultItem>();
   for (const it of items) if (it.kind === "result") results.set(it.toolUseId, it);
-  let lastVisible = -1;
-  items.forEach((it, i) => {
-    if (it.kind !== "result") lastVisible = i;
-  });
+  // `tailOpen[i]`: everything after item i is an event or result (turn has not moved on).
+  const tailOpen: boolean[] = new Array(items.length);
+  let open = true;
+  for (let i = items.length - 1; i >= 0; i--) {
+    tailOpen[i] = open;
+    if (items[i].kind !== "event" && items[i].kind !== "result") open = false;
+  }
 
   const rows: FeedRow[] = [];
   let run: Call[] = [];
@@ -83,7 +86,7 @@ export function groupFeed(items: ChatItem[]): FeedRow[] {
       const r = item.toolUseId ? results.get(item.toolUseId) : undefined;
       const call: Call = r
         ? { event: item, status: r.isError ? "error" : "ok", errorText: r.errorText, diff: r.diff }
-        : { event: item, status: i === lastVisible ? "running" : "unknown", errorText: null, diff: null };
+        : { event: item, status: tailOpen[i] ? "running" : "unknown", errorText: null, diff: null };
       if (isQuiet(call)) {
         run.push(call);
       } else {

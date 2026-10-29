@@ -94,7 +94,7 @@ export const RENDERED_KINDS: readonly string[] = [
 /** A tool call with its outcome folded in. */
 export type Call = {
   event: EventItem;
-  status: "running" | "ok" | "error";
+  status: "running" | "ok" | "error" | "unknown";
   errorText: string | null;
   diff: Diff | null;
 };
@@ -115,6 +115,16 @@ export function groupTools(items: TranscriptItem[]): ChatRow[] {
   const results = new Map<string, Extract<TranscriptItem, { kind: "result" }>>();
   for (const it of items) if (it.kind === "result") results.set(it.toolUseId, it);
 
+  // A call with no result is `running` only while the turn has not moved on: everything after
+  // it is an event, result or usage. Otherwise its result is lost to us (`unknown`, never folds).
+  const tailOpen: boolean[] = new Array(items.length);
+  let open = true;
+  for (let i = items.length - 1; i >= 0; i--) {
+    tailOpen[i] = open;
+    const k = items[i].kind;
+    if (k !== "event" && k !== "result" && k !== "usage") open = false;
+  }
+
   const rows: ChatRow[] = [];
   let run: Call[] = [];
   const flush = () => {
@@ -122,24 +132,24 @@ export function groupTools(items: TranscriptItem[]): ChatRow[] {
     else for (const call of run) rows.push({ type: "call", call });
     run = [];
   };
-  for (const item of items) {
-    if (item.kind === "usage" || item.kind === "result") continue;
+  items.forEach((item, i) => {
+    if (item.kind === "usage" || item.kind === "result") return;
     if (item.kind === "event") {
       const r = item.toolUseId ? results.get(item.toolUseId) : undefined;
       const call: Call = r
         ? { event: item, status: r.isError ? "error" : "ok", errorText: r.errorText, diff: r.diff }
-        : { event: item, status: "running", errorText: null, diff: null };
+        : { event: item, status: tailOpen[i] ? "running" : "unknown", errorText: null, diff: null };
       if (isQuiet(call)) {
         run.push(call);
       } else {
         flush();
         rows.push({ type: "call", call });
       }
-      continue;
+      return;
     }
     flush();
     rows.push({ type: "item", item });
-  }
+  });
   flush();
   return rows;
 }

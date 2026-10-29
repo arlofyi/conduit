@@ -51,11 +51,29 @@ describe("chatItems", () => {
     expect(rows2[0].type === "call" && rows2[0].call.status).toBe("ok");
   });
 
-  it("call_without_result_is_running_and_standalone", () => {
-    const rows = groupTools([ev("read", "a", "A"), res("A"), ev("read", "b", "B"), ev("bash", "ls", "C")]);
+  const st = (r: { type: string }) => (r.type === "call" ? (r as unknown as { call: Call }).call.status : null);
+
+  it("last call without result is running", () => {
+    const rows = groupTools([ev("read", "a", "A"), res("A"), ev("read", "b", "B")]);
+    expect(types(rows)).toEqual(["call", "call"]);
+    expect(st(rows[1])).toBe("running");
+  });
+
+  it("earlier call without result is unknown", () => {
+    const rows = groupTools([ev("read", "b", "B"), asst("x"), ev("bash", "ls", "C")]);
+    expect(st(rows[0])).toBe("unknown");
+    expect(st(rows[2])).toBe("running");
+  });
+
+  it("parallel calls without results are all running", () => {
+    const rows = groupTools([ev("read", "a", "A"), ev("read", "b", "B"), ev("bash", "c", "C")]);
     expect(types(rows)).toEqual(["call", "call", "call"]);
-    expect(rows[1].type === "call" && rows[1].call.status).toBe("running");
-    expect(rows[2].type === "call" && rows[2].call.status).toBe("running");
+    expect(rows.map(st)).toEqual(["running", "running", "running"]);
+  });
+
+  it("call without result followed by a bubble is unknown", () => {
+    const rows = groupTools([ev("read", "a", "A"), asst("x")]);
+    expect(st(rows[0])).toBe("unknown");
   });
 
   it("two quiet calls fold, a failed call between them splits the run", () => {

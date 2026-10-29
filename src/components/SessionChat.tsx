@@ -47,7 +47,7 @@ const EVENT_MARK: Record<string, string> = {
  *  permission-mode cycle to (auto-accept → plan → normal). */
 const SHIFT_TAB = "\x1b[Z";
 
-const STATUS_GLYPH = { running: "◐", ok: "●", error: "✕" } as const;
+const STATUS_GLYPH = { running: "◐", ok: "●", error: "✕", unknown: "○" } as const;
 
 function DiffBlock({ diff }: { diff: Diff }) {
   return (
@@ -85,7 +85,7 @@ function CallLine({ call }: { call: Call }) {
   return (
     <div className="hq-call">
       <div className="hq-tool-line" title={item.mono ?? undefined}>
-        <span className={`hq-call-glyph hq-call-${call.status}`} aria-label={call.status}>
+        <span className={`hq-call-glyph hq-call-${call.status}`} role="img" aria-label={call.status}>
           {STATUS_GLYPH[call.status]}
         </span>
         <span className="hq-tool-verb">{mark}</span>
@@ -254,7 +254,6 @@ function Item({ item }: { item: TranscriptItem }) {
       </>
     );
   }
-  if (item.kind === "event") return null; // events render as paired calls via groupTools
   switch (item.kind) {
     case "task": {
       const t = taskLine(item.status);

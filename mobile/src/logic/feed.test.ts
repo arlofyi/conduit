@@ -104,12 +104,19 @@ describe("groupFeed", () => {
   });
 
   it("earlier call without result is unknown", () => {
-    const rows = groupFeed([ev("read", "a", "A"), res("A"), ev("read", "b", "B"), ev("bash", "ls", "C")]);
-    expect(types(rows)).toEqual(["call", "call", "call"]);
-    expect(status(rows[1])).toBe("unknown");
+    const rows = groupFeed([ev("read", "b", "B"), asst("moved on"), ev("bash", "ls", "C")]);
+    expect(status(rows[0])).toBe("unknown");
     expect(status(rows[2])).toBe("running");
-    const after = groupFeed([ev("read", "b", "B"), asst("moved on")]);
-    expect(status(after[0])).toBe("unknown");
+  });
+
+  it("parallel calls without results are all running", () => {
+    const rows = groupFeed([ev("read", "a", "A"), ev("read", "b", "B"), ev("bash", "c", "C")]);
+    expect(types(rows)).toEqual(["call", "call", "call"]);
+    expect(rows.map(status)).toEqual(["running", "running", "running"]);
+  });
+
+  it("call without result followed by a bubble is unknown", () => {
+    expect(status(groupFeed([ev("read", "a", "A"), asst("hi")])[0])).toBe("unknown");
   });
 
   it("two quiet calls fold, a failed call between them splits the run", () => {
