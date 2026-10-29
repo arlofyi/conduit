@@ -70,6 +70,9 @@ mod transcript;
 mod transcript_index;
 mod transcript_user;
 mod updates;
+// Consumed by the mobile bridge in later tasks; only the two commands are wired yet.
+#[allow(dead_code)]
+mod tailscale;
 mod usage_tally;
 mod window_registry;
 mod worktree;
@@ -3658,6 +3661,8 @@ pub fn run() {
             open_external,
             reveal_path,
             claude_status::fetch_claude_status,
+            tailscale::tailscale_status,
+            tailscale::tailscale_open_app,
             claude_usage::fetch_claude_usage,
             transcript::session_transcript,
             routing::agent_routes,
