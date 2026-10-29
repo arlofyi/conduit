@@ -34,14 +34,20 @@ export type ChatRole = "user" | "assistant";
 export type EventKind = "read" | "bash" | "edit" | "search" | "web" | "subagent" | "generic";
 export type TodoStatus = "pending" | "in_progress" | "completed";
 
-export interface BubbleItem {
+/** Every feed item: `at` is the transcript line's ISO time when it had one (none for items the
+ * phone made itself, e.g. its own "Interrupted" divider). */
+export interface ItemBase {
+  at?: string;
+}
+
+export interface BubbleItem extends ItemBase {
   kind: "bubble";
   id: string;
   role: ChatRole;
   text: string;
 }
 
-export interface EventItem {
+export interface EventItem extends ItemBase {
   kind: "event";
   id: string;
   event: EventKind;
@@ -56,7 +62,7 @@ export interface EventItem {
 }
 
 /** A tool call's outcome. Never rendered on its own; `groupFeed` folds it into its call. */
-export interface ResultItem {
+export interface ResultItem extends ItemBase {
   kind: "result";
   id: string;
   toolUseId: string;
@@ -65,7 +71,7 @@ export interface ResultItem {
   diff: WireDiff | null;
 }
 
-export interface TodosItem {
+export interface TodosItem extends ItemBase {
   kind: "todos";
   id: string;
   done: number;
@@ -73,7 +79,7 @@ export interface TodosItem {
   items: { text: string; status: TodoStatus }[];
 }
 
-export interface ApprovalItem {
+export interface ApprovalItem extends ItemBase {
   kind: "approval";
   id: string;
   tool: string;
@@ -82,7 +88,7 @@ export interface ApprovalItem {
   resolved?: "allow" | "deny";
 }
 
-export interface NoticeItem {
+export interface NoticeItem extends ItemBase {
   kind: "notice";
   id: string;
   tone: "ok" | "bad" | "info";
@@ -90,14 +96,14 @@ export interface NoticeItem {
   detail?: string;
 }
 
-export interface DividerItem {
+export interface DividerItem extends ItemBase {
   kind: "divider";
   id: string;
   label: string;
   tone: "info" | "warning";
 }
 
-export interface CommandItem {
+export interface CommandItem extends ItemBase {
   kind: "command";
   id: string;
   name: string;
@@ -105,21 +111,21 @@ export interface CommandItem {
   output?: string;
 }
 
-export interface ImageItem {
+export interface ImageItem extends ItemBase {
   kind: "image";
   id: string;
   mediaType: string;
   data: string | null;
 }
 
-export interface QuestionItem {
+export interface QuestionItem extends ItemBase {
   kind: "question";
   id: string;
   toolUseId: string;
   questions: WireQuestion[];
 }
 
-export interface PlanItem {
+export interface PlanItem extends ItemBase {
   kind: "plan";
   id: string;
   markdown: string;
