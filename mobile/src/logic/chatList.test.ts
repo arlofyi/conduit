@@ -9,6 +9,8 @@ import {
   offlineText,
   previewFor,
   profileName,
+  resolveFilter,
+  sameRow,
   profileSheet,
   profileSummary,
   resolveProfile,
@@ -167,6 +169,19 @@ describe("previewFor", () => {
     expect(previewFor(sess({ id: "a", branch: "feat/x" })).text).toBe("feat/x");
     expect(previewFor(sess({ id: "a" })).text).toBe("");
   });
+
+  it("silo_needs_preview_points_to_the_mac", () => {
+    const s = sess({ id: "a", silo: true, status: "needsInput", needs: { kind: "input", text: null } });
+    expect(previewFor(s)).toEqual({ tone: "private", prefix: null, text: "Private session — open it on your Mac" });
+    // still a needs row (counted in Needs you), dimmed and not openable
+    const v: WireProjectsView = { ...VIEW, projects: [proj("p", null, [s])] };
+    const row = buildRows(v, { profileId: null, filter: "needs", unread: {}, now: NOW })[0].rows[0];
+    expect(row.needs).toBe(true);
+    expect(row.openable).toBe(false);
+    expect(chipsFor(v, null)[0].label).toBe("Needs you 1");
+    // a silo session that needs nothing keeps the plain copy
+    expect(previewFor(sess({ id: "b", silo: true })).text).toBe("Private session");
+  });
 });
 
 describe("relativeTime", () => {
@@ -217,6 +232,14 @@ describe("nextUnread", () => {
     expect(nextUnread({}, r, d, null)).toEqual({});
   });
 
+  it("returns the same object when no count changed (no re-render)", () => {
+    const v = one(sess({ id: "s", status: "running" }));
+    const u = { s: 2 };
+    expect(nextUnread(u, v, v, null)).toBe(u);
+    const empty = {};
+    expect(nextUnread(empty, null, v, null)).toBe(empty);
+  });
+
   it("drops counts for sessions that no longer exist", () => {
     const v = one(sess({ id: "s" }));
     expect(nextUnread({ gone: 3, s: 1 }, v, v, null)).toEqual({ s: 1 });
@@ -263,5 +286,26 @@ describe("profile labels", () => {
       needs: null,
     });
     expect(profileSummary({ id: null, name: "D", projects: 0, needs: 3 }).needs).toBe("3 need you");
+  });
+});
+
+describe("render stability", () => {
+  it("sameRow compares rows by value, including the preview", () => {
+    const rows = () => buildRows(VIEW, { profileId: null, filter: "conduit", unread: {}, now: NOW })[0].rows;
+    const a = rows();
+    const b = rows();
+    expect(a[0]).not.toBe(b[0]);
+    expect(sameRow(a[0], b[0])).toBe(true);
+    expect(sameRow(a[0], { ...b[0], unread: 1 })).toBe(false);
+    expect(sameRow(a[0], { ...b[0], preview: { ...b[0].preview, text: "x" } })).toBe(false);
+  });
+
+  it("resolveFilter falls back to all when the filter matches no chip", () => {
+    const chips = chipsFor(VIEW, null);
+    expect(resolveFilter(chips, "conduit")).toBe("conduit");
+    expect(resolveFilter(chips, "needs")).toBe("needs");
+    expect(resolveFilter(chips, "client")).toBe("all"); // another profile's project
+    expect(resolveFilter(chips, "deleted")).toBe("all");
+    expect(resolveFilter([], "needs")).toBe("all");
   });
 });

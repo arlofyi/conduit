@@ -1,4 +1,4 @@
-import { PHONE_KINDS, appendWire, mapChatItem, mapHistory, mapProjectsView, statusPatch } from "./live";
+import { PHONE_KINDS, appendWire, mapChatItem, mapHistory, mapProjectsView, sameView, statusPatch } from "./live";
 import type { WireChatItem } from "./protocol";
 
 describe("mapChatItem", () => {
@@ -177,5 +177,23 @@ describe("statusPatch", () => {
   });
   it("unknown verb → empty patch", () => {
     expect(statusPatch("mystery", {})).toEqual({});
+  });
+});
+
+describe("sameView", () => {
+  const frame = () => ({
+    type: "projects",
+    profiles: [{ id: null, name: "Default" }],
+    activeProfileId: null,
+    projects: [{ id: "p", name: "P", profileId: null, color: null, sessions: [{ id: "s", name: "S", status: "running" }] }],
+  });
+
+  it("is true for a deep-equal frame and false for any change", () => {
+    const a = mapProjectsView(frame());
+    expect(sameView(a, mapProjectsView(frame()))).toBe(true);
+    const f = frame();
+    f.projects[0].sessions[0].status = "done";
+    expect(sameView(a, mapProjectsView(f))).toBe(false);
+    expect(sameView(null, a)).toBe(false);
   });
 });

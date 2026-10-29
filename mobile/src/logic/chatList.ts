@@ -96,7 +96,10 @@ function inProfile(p: WireViewProject, profileId: ProfileSel): boolean {
 }
 
 export function previewFor(s: WireViewSession): Preview {
-  if (s.silo) return { tone: "private", prefix: null, text: "Private session" };
+  if (s.silo) {
+    // Listed (and counted in Needs you) but never opened here: say where to answer it.
+    return { tone: "private", prefix: null, text: isNeeds(s) ? "Private session — open it on your Mac" : "Private session" };
+  }
   if (s.needs?.kind === "ask") {
     return s.needs.text
       ? { tone: "needs", prefix: "Asks:", text: s.needs.text }
@@ -251,17 +254,42 @@ export function nextUnread(
 ): Record<string, number> {
   const before = prev ? sessionsById(prev) : null;
   const out: Record<string, number> = {};
+  let changed = false;
+  let kept = 0;
   for (const s of sessionsById(next).values()) {
     let n = unread[s.id] ?? 0;
     const old = before?.get(s.id);
     if (old && s.id !== openId && !s.silo) {
       const newlyNeeds = isNeeds(s) && !isNeeds(old);
       const finished = old.status === "running" && (s.status === "done" || s.status === "idle") && !isNeeds(s);
-      if (newlyNeeds || finished) n++;
+      if (newlyNeeds || finished) {
+        n++;
+        changed = true;
+      }
     }
-    if (n > 0) out[s.id] = n;
+    if (n > 0) {
+      out[s.id] = n;
+      kept++;
+    }
   }
+  // Same counts → same object, so a poll that changed nothing re-renders nothing.
+  if (!changed && kept === Object.keys(unread).length) return unread;
   return out;
+}
+
+/** Shallow value equality for list rows (the preview is the one nested object). */
+export function sameRow(a: Row, b: Row): boolean {
+  if (a === b) return true;
+  for (const k of Object.keys(a) as (keyof Row)[]) {
+    if (k === "preview") continue;
+    if (a[k] !== b[k]) return false;
+  }
+  return a.preview.tone === b.preview.tone && a.preview.prefix === b.preview.prefix && a.preview.text === b.preview.text;
+}
+
+/** The filter to apply: one whose chip is gone (other profile, project removed) reads as All. */
+export function resolveFilter(chips: Chip[], filter: ChatFilter): ChatFilter {
+  return chips.some((c) => c.key === filter) ? filter : "all";
 }
 
 /** A `chat` frame arrived for the attached session: count it unless that chat is open. */

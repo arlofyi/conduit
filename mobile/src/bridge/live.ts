@@ -200,6 +200,17 @@ export function mapProjectsView(m: unknown): WireProjectsView {
   };
 }
 
+/**
+ * Deep equality of two mapped views. `mapProjectsView` builds every object with a fixed key
+ * order, so comparing serializations is exact; the provider keeps the previous reference when
+ * a poll brings nothing new, so the list re-renders nothing.
+ */
+export function sameView(a: WireProjectsView | null, b: WireProjectsView | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 // ---- live status reducer (subset of desktop src/App.tsx hook switch) ----
 
 export interface LivePatch {

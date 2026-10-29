@@ -19,7 +19,9 @@ import {
   profileName,
   profileSheet,
   profileSummary,
+  resolveFilter,
   resolveProfile,
+  sameRow,
   type ChatFilter,
   type ProfileSel,
   type Row,
@@ -48,6 +50,14 @@ export function ChatsScreen({ navigation }: ChatsProps) {
   const [filter, setFilter] = useState<ChatFilter>("all");
   const [sheetOpen, setSheetOpen] = useState(false);
 
+  // Another Mac has other profiles and projects: start it from its own active profile and All.
+  const macId = currentMac?.deviceId ?? null;
+  useEffect(() => {
+    setProfileSel(undefined);
+    setFilter("all");
+    setSheetOpen(false);
+  }, [macId]);
+
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), CLOCK_MS);
@@ -57,12 +67,15 @@ export function ChatsScreen({ navigation }: ChatsProps) {
   useEffect(() => setNow(Date.now()), [viewAt]);
 
   const profileId = view ? resolveProfile(view, profileSel === undefined ? view.activeProfileId : profileSel) : null;
+  const chips = useMemo(() => (view ? chipsFor(view, profileId) : []), [view, profileId]);
+  // A filter whose chip is gone (project removed, or now empty) shows All rather than nothing.
+  const activeFilter = view ? resolveFilter(chips, filter) : filter;
   const sections = useMemo(
     // SectionList reads each section's rows from `data`
-    () => (view ? buildRows(view, { profileId, filter, unread, now }) : []).map((s) => ({ ...s, data: s.rows })),
-    [view, profileId, filter, unread, now],
+    () =>
+      (view ? buildRows(view, { profileId, filter: activeFilter, unread, now }) : []).map((s) => ({ ...s, data: s.rows })),
+    [view, profileId, activeFilter, unread, now],
   );
-  const chips = useMemo(() => (view ? chipsFor(view, profileId) : []), [view, profileId]);
   const sheet = useMemo(() => (view ? profileSheet(view) : []), [view]);
 
   // Pull to refresh: spin until the next view lands (or give up quietly).
@@ -94,16 +107,19 @@ export function ChatsScreen({ navigation }: ChatsProps) {
     setSheetOpen(false);
   };
 
-  const open = (row: Row) => {
-    if (!row.openable) return;
-    navigation.navigate("Chat", { sessionId: row.id, projectId: row.projectId, name: row.title, branch: row.branch });
-  };
+  const open = useCallback(
+    (row: Row) => {
+      if (!row.openable) return;
+      navigation.navigate("Chat", { sessionId: row.id, projectId: row.projectId, name: row.title, branch: row.branch });
+    },
+    [navigation],
+  );
 
   const empty = !view
     ? ready
       ? "Loading sessions…"
       : status.text
-    : filter === "needs"
+    : activeFilter === "needs"
       ? "Nothing needs you right now."
       : "No sessions here.";
 
@@ -178,7 +194,7 @@ export function ChatsScreen({ navigation }: ChatsProps) {
             contentContainerStyle={{ gap: 6, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 6 }}
           >
             {chips.map((c) => (
-              <ChipView key={c.key} chip={c} on={filter === c.key} needs={c.key === "needs"} onPress={() => setFilter(c.key)} />
+              <ChipView key={c.key} chip={c} on={activeFilter === c.key} needs={c.key === "needs"} onPress={() => setFilter(c.key)} />
             ))}
           </ScrollView>
         </View>
@@ -222,7 +238,7 @@ export function ChatsScreen({ navigation }: ChatsProps) {
             </View>
           )
         }
-        renderItem={({ item }) => <ChatRow row={item} onPress={() => open(item)} />}
+        renderItem={({ item }) => <ChatRow row={item} onOpen={open} />}
         ListEmptyComponent={
           <View style={{ paddingVertical: 40, paddingHorizontal: 24, alignItems: "center" }}>
             <Text style={{ color: p.textMid, fontSize: TYPE.subhead, textAlign: "center" }}>{empty}</Text>
@@ -285,7 +301,10 @@ function ChipView({
   );
 }
 
-function ChatRow({ row, onPress }: { row: Row; onPress: () => void }) {
+/** Memoized by row VALUE: rows are rebuilt on every poll/clock tick, and most do not change. */
+const ChatRow = React.memo(ChatRowView, (a, b) => a.onOpen === b.onOpen && sameRow(a.row, b.row));
+
+function ChatRowView({ row, onOpen }: { row: Row; onOpen: (row: Row) => void }) {
   const { palette: p } = useTheme();
   const dot = row.dot === "needs" ? p.amber : row.dot === "running" ? p.green : p.textDim;
   const pv = row.preview;
@@ -293,7 +312,7 @@ function ChatRow({ row, onPress }: { row: Row; onPress: () => void }) {
   const state = row.dot === "needs" ? "needs you" : row.dot === "running" ? "working" : "idle";
   return (
     <Pressable
-      onPress={onPress}
+      onPress={() => onOpen(row)}
       disabled={!row.openable}
       accessibilityRole="button"
       accessibilityState={{ disabled: !row.openable }}
