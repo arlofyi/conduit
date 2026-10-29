@@ -619,7 +619,7 @@ protocol is UNDOCUMENTED and was pinned empirically against claude 2.1.267 — t
 
 Root chat (HQ) reaches Conduit through a SECOND in-app MCP server, `root_mcp.rs`, on
 `/mcp?rootchat=<chat-id>` (`start` binds the first free port in 8496..=8516, clear of the
-hook server's 8423..=8443, the mobile bridge's 8455..=8475, and fleet's own 8475..=8495).
+hook server's 8423..=8443, the mobile bridge's 8455..=8474, and fleet's own 8475..=8495).
 It is deliberately not part of `fleet_mcp.rs`: every fleet tool is project-scoped by
 construction, root chat is global, and teaching one authorizer both shapes is what
 produced the earlier cross-project leak. The two surfaces share no `authorize()` — only

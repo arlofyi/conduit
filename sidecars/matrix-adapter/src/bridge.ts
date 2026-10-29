@@ -18,7 +18,7 @@ import {
 } from "./protocol.js";
 
 const PORT_RANGE_START = 8455;
-const PORT_RANGE_END = 8475;
+const PORT_RANGE_END = 8474; // 8475 is fleet MCP's
 const PROBE_TIMEOUT_MS = 1200;
 const RECONNECT_MS = 15_000;
 
