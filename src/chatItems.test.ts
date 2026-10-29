@@ -6,6 +6,7 @@ import {
   imageSrc,
   taskLine,
   groupLabel,
+  callVerb,
   type Call,
   type TranscriptItem,
 } from "./chatItems";
@@ -142,5 +143,29 @@ describe("imageSrc", () => {
   });
   it("rejects null data", () => {
     expect(imageSrc({ mediaType: "image/png", data: null })).toBeNull();
+  });
+});
+
+describe("callVerb (keep identical to mobile/src/logic/feed.ts)", () => {
+  const call = (kind: string, status: Call["status"], errorText: string | null = null): Call => ({
+    event: ev(kind, "touch a.txt", "T"),
+    status,
+    errorText,
+    diff: null,
+  });
+  it("keeps the normal verb unless the result is an error", () => {
+    for (const s of ["ok", "running", "unknown"] as const) expect(callVerb(call("bash", s), "ran")).toBe("ran");
+  });
+  it("says Denied for a refused tool, whoever refused it", () => {
+    expect(callVerb(call("bash", "error", "Denied from Conduit"), "ran")).toBe("Denied: Bash");
+    expect(
+      callVerb(call("edit", "error", "The user doesn't want to proceed with this tool use."), "edited"),
+    ).toBe("Denied: Edit");
+    expect(callVerb(call("bash", "error", "Permission to use Bash has been denied."), "ran")).toBe("Denied: Bash");
+  });
+  it("says Failed for any other error", () => {
+    expect(callVerb(call("bash", "error", "Exit code 1"), "ran")).toBe("Failed: Bash");
+    expect(callVerb(call("read", "error", null), "read")).toBe("Failed: Read");
+    expect(callVerb(call("generic", "error", "boom"), "tool")).toBe("Failed: tool");
   });
 });

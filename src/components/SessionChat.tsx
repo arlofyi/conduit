@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { findSession, useStore, type TranscriptItem } from "../store";
-import { groupLabel, groupTools, imageSrc, taskLine, type Call, type ChatRow, type Diff } from "../chatItems";
+import { callVerb, groupLabel, groupTools, imageSrc, taskLine, type Call, type ChatRow, type Diff } from "../chatItems";
 import { AGENTS } from "../agents";
 import { modeLabel, nextMode } from "../permissionMode";
 import { renderMarkdown, splitInsights } from "../markdown";
@@ -81,7 +81,7 @@ function DiffBlock({ diff }: { diff: Diff }) {
 
 function CallLine({ call }: { call: Call }) {
   const item = call.event;
-  const mark = EVENT_MARK[item.event ?? "generic"] ?? "tool";
+  const mark = callVerb(call, EVENT_MARK[item.event ?? "generic"] ?? "tool");
   return (
     <div className="hq-call">
       <div className="hq-tool-line" title={item.mono ?? undefined}>

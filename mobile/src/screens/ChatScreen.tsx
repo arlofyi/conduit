@@ -38,7 +38,7 @@ import { PRIVATE_SESSION_TEXT } from "../logic/frames";
 import { chatHeader } from "../logic/chatHeader";
 import { outputPreview } from "../logic/chatView";
 import { mix, readableInk } from "../logic/color";
-import { groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
+import { callVerb, groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
 import { holdPosition, isPinned, newItemCount, newKeys, shouldFollow } from "../logic/follow";
 import { imageDataUri } from "../logic/image";
 import { cardView, entryForToolUse, nextExpiry, sameCard, trailingEntries, type CardView } from "../logic/pending";
@@ -706,7 +706,7 @@ function CallLine({ call }: { call: Call }) {
         <View style={{ width: 10, alignItems: "center" }}>
           <CallMark status={call.status} />
         </View>
-        <Text style={{ fontSize: TYPE.footnote, color: p.textMid }}>{e.label}</Text>
+        <Text style={{ fontSize: TYPE.footnote, color: p.textMid }}>{callVerb(call, e.label)}</Text>
         {e.mono ? (
           <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: 12.5, color: p.textMid, fontFamily: MONO }}>
             {e.mono}

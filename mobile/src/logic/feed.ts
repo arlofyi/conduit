@@ -121,6 +121,30 @@ export function groupFeed(items: ChatItem[]): FeedRow[] {
   return rows;
 }
 
+/** The tool a call kind names, for a line that no longer has a verb of its own. */
+const CALL_NOUN: Record<string, string> = {
+  read: "Read",
+  bash: "Bash",
+  edit: "Edit",
+  search: "Search",
+  web: "Web",
+  subagent: "Agent",
+};
+
+/** A refusal, whoever refused: Conduit's own deny (`broker::DENY_MESSAGE`), a terminal "No",
+ *  or a permission rule. */
+const DENIED = /\b(denied|rejected)\b|doesn't want to proceed/i;
+
+/** The verb a call line shows. The transcript fixes it when the tool is CALLED ("ran"), so a
+ *  call whose result is an error would still read "ran touch a.txt" beside its ✕ -- which
+ *  contradicts an honest "Denied". Once the result is an error the line says what happened.
+ *  Keep identical to `callVerb` in src/chatItems.ts (desktop). */
+export function callVerb(call: Call, verb: string): string {
+  if (call.status !== "error") return verb;
+  const noun = CALL_NOUN[call.event.event] ?? "tool";
+  return `${call.errorText && DENIED.test(call.errorText) ? "Denied" : "Failed"}: ${noun}`;
+}
+
 /** One-line digest of a folded run: buckets in descending count (stable on first seen). Matches desktop `groupLabel`. */
 export function groupLabel(calls: Call[]): string {
   const buckets: [string, string][] = [];
