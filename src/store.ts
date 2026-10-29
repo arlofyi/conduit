@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { PendingAsk } from "./asks";
+import type { PairRequest } from "./mobilePairing";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir as getHomeDir } from "@tauri-apps/api/path";
 import {
@@ -1910,6 +1911,10 @@ interface AppState {
   answeredAsks: Record<string, true>;
   addAsk: (a: PendingAsk) => void;
   removeAsk: (id: string) => void;
+  /** Pending phone-pairing prompts held by Rust (pairing.rs), keyed by request id. */
+  pairRequests: Record<string, PairRequest>;
+  addPairRequest: (r: PairRequest) => void;
+  removePairRequest: (id: string) => void;
   markAskAnswered: (id: string) => void;
   /** Conduit session ids the open Continuity view draws as nodes (a raw map, replaced
    *  only when the set changes). An ask whose session is NOT in here has no card in the
@@ -4321,6 +4326,15 @@ export const useStore = create<AppState>((set, get) => {
     windowFocused: typeof document !== "undefined" ? document.hasFocus() : true,
     answeredAsks: {},
     addAsk: (a) => set((s) => ({ asks: { ...s.asks, [a.id]: a } })),
+    pairRequests: {},
+    addPairRequest: (r) => set((s) => ({ pairRequests: { ...s.pairRequests, [r.id]: r } })),
+    removePairRequest: (id) =>
+      set((s) => {
+        if (!(id in s.pairRequests)) return s; // idempotent: pair-resolved can arrive twice
+        const next = { ...s.pairRequests };
+        delete next[id];
+        return { pairRequests: next };
+      }),
     removeAsk: (id) =>
       set((s) => {
         if (!(id in s.asks) && !(id in s.answeredAsks)) return s;
