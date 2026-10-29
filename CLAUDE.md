@@ -582,8 +582,12 @@ plus install/remove/status), and one listener in `App.tsx`.
 - **`tailscale.rs` only reads** (`status`/`whois --json`). Never add `up`/`down`/`set`/
   `serve`/`funnel`/`login`; the CLI call has a 3 s deadline.
 - **Peers and handshake.** A peer outside loopback and the tailnet ranges is dropped before
-  the handshake; any upgrade carrying `Origin` gets 403 (a web page on the Mac must never
-  reach the bridge). Every peer gets `hello`; a non-loopback peer must `auth` with its device
+  the handshake; an upgrade whose `Origin` is not the bridge itself gets 403 (a web page on
+  the Mac must never reach the bridge). `origin_allowed` admits only the listener's own
+  origin (arrival IP, `localhost` on loopback, this Mac's MagicDNS name on the tailnet
+  address, with the bridge port), because iOS's WebSocket ALWAYS sends `Origin:
+  http://<dialled host>:<port>` and JS cannot remove it -- a blanket "no Origin" rule
+  refused every phone. Never compare it to `Host` (DNS rebinding). Every peer gets `hello`; a non-loopback peer must `auth` with its device
   token (or `pair`/`discover`) within 5 s; the WebSocket upgrade itself has ONE 5 s overall deadline (a watchdog shuts the socket down, so a byte-dribbling peer cannot hold the thread). Pre-auth frames are capped at 4 KiB and the cap is
   lifted on auth. Success is acked with an `authOk` frame; a pair request waiting on the Mac
   sends `pairPending`. Failures answer one generic `unauthorized` (no oracle) and are
@@ -609,6 +613,16 @@ plus install/remove/status), and one listener in `App.tsx`.
   8475 (see the root-chat section for the full carve-up of 8423..=8516).
 - Secrets rule applies: no token, nonce or QR secret is logged; types holding a plaintext secret or
   token (`ClientMsg`) hand-write `Debug` and print them as `<redacted>`; the rest never derive it.
+- **The phone app is `mobile/`** (Expo SDK 56 dev build; run/pairing steps in
+  `mobile/README.md`). Pure logic lives in `mobile/src/logic` + `src/bridge` with jest tests;
+  `LiveProvider` owns the one socket. Chat messages go into the PTY as a bracketed paste +
+  `\r` (`promptInput`, the twin of `pty::paste_and_submit`) -- a bare `text + "\r"` leaves a
+  long message unsent in Claude's composer. To drive it end to end, run the desktop as
+  `CONDUIT_DATA_DIR_NAME=ConduitTauri-dev pnpm tauri dev` and pick ITS port in the
+  Simulator's loopback scan (the installed Conduit answers on loopback too, usually 8455).
+  A dev build launched from a terminal inside the installed Conduit inherits that app's
+  `CONDUIT_HOOK_*` env; `build_script` now exports `CONDUIT_HOOK_ENDPOINT` so its sessions'
+  hooks still reach the dev build, not the installed one.
 
 ## Where the IDE integration lives
 
