@@ -33,7 +33,12 @@ function PairCard({ req, onDone }: { req: PairRequest; onDone: () => void }) {
       <div className="pair-title">
         Pair <strong>{req.deviceName}</strong>?
       </div>
-      {req.login && <div className="pair-login">Tailscale account: {req.login}</div>}
+      <div className="pair-login">
+        {req.login ? `Tailscale account: ${req.login}` : "Tailscale account unknown"}
+      </div>
+      <div className="pair-via">
+        {req.via === "secret" ? "Scanned the QR code" : "Asked to pair"} · {req.peer}
+      </div>
       <div className="pair-code" aria-label={`Code ${req.code.split("").join(" ")}`}>
         {req.code}
       </div>

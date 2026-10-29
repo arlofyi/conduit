@@ -22,7 +22,7 @@ const PORT_RANGE_END = 8474; // 8475 is fleet MCP's
 const PROBE_TIMEOUT_MS = 1200;
 const RECONNECT_MS = 15_000;
 
-/** Find the bridge: CONDUIT_BRIDGE_URL wins (LAN/token mode), else probe loopback
+/** Find the bridge: CONDUIT_BRIDGE_URL overrides the URL; by default probe loopback
  *  ports until one actually ANSWERS `list` with a `projects` frame. A completed
  *  handshake alone is not proof — a stale/foreign Conduit instance (or any other
  *  websocket server squatting in the range) would otherwise win the probe and then

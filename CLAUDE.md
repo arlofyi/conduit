@@ -584,20 +584,21 @@ plus install/remove/status), and one listener in `App.tsx`.
 - **Peers and handshake.** A peer outside loopback and the tailnet ranges is dropped before
   the handshake; any upgrade carrying `Origin` gets 403 (a web page on the Mac must never
   reach the bridge). Every peer gets `hello`; a non-loopback peer must `auth` with its device
-  token (or `pair`/`discover`) within 5 s. Pre-auth frames are capped at 4 KiB and the cap is
+  token (or `pair`/`discover`) within 5 s; the WebSocket upgrade itself has ONE 5 s overall deadline (a watchdog shuts the socket down, so a byte-dribbling peer cannot hold the thread). Pre-auth frames are capped at 4 KiB and the cap is
   lifted on auth. Success is acked with an `authOk` frame; a pair request waiting on the Mac
   sends `pairPending`. Failures answer one generic `unauthorized` (no oracle) and are
   rate-limited 5 per 60 s per IP.
 - **`mobile-devices.json`, never `state.json`** (the orphan-sweep rule). It holds the switch,
   the port and SHA-256 token hashes; plaintext is returned once. An unparseable file is moved
-  to `.bak.<secs>` (never overwriting an earlier one) and defaults load; if it cannot be
+  to `.bak.<secs>-<8 hex>` (a uuid fragment, so names never collide) and defaults load; if it cannot be
   read or set aside, defaults stay in memory and EVERY write is refused so the original
   survives. `Device` carries the hash and never leaves Rust; the UI gets `DeviceView`.
 - **Pairing** (`pairing.rs`): a QR secret is >= 128-bit, single-use, 5 min, and a new QR
   replaces it; the desktop card calls `pair_cancel(secret)` (clears only a matching, current secret, so another window's newer QR survives) on Cancel, expiry and unmount. A phone
   that found this Mac via another can instead send a `request`. Either way the Mac shows a
   4-digit-code prompt (`pair-request`, mirroring `ask-request`) and the human approves; a
-  request waits 120 s, one per peer IP (newer replaces older). Turning access off calls
+  request waits 120 s, one per peer IP (newer replaces older). Turning access off first drops every authenticated phone
+  (`disconnect_all_devices`, `live` lock only, so a slow Tailscale CLI cannot delay it), then calls
   `Pairing::clear`: drops the secret and resolves every waiter `off`, and the waiter
   re-checks the switch before persisting a device. Pair PROMPTS are budgeted 5 per 10 min per
   peer, separate from the auth-failure limit: a hang-up still put a prompt in front of the
@@ -605,7 +606,7 @@ plus install/remove/status), and one listener in `App.tsx`.
 - **Port range 8455..=8474**, persisted if free. It ends at 8474 because fleet MCP starts at
   8475 (see the root-chat section for the full carve-up of 8423..=8516).
 - Secrets rule applies: no token, nonce or QR secret is logged; types holding a plaintext secret or
-  token do not derive `Debug`.
+  token (`ClientMsg`) hand-write `Debug` and print them as `<redacted>`; the rest never derive it.
 
 ## Where the IDE integration lives
 
