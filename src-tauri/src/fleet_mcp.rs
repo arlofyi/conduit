@@ -837,7 +837,7 @@ fn json_response(body: String) -> Response<std::io::Cursor<Vec<u8>>> {
 }
 
 /// Boot the fleet MCP server on the first free port in 8475..=8495 (clear of the
-/// hook server's 8423..=8443 and Conduit's other in-use port 8455).
+/// hook server's 8423..=8443 and the mobile bridge's 8455..=8474).
 pub fn start(
     app: AppHandle,
     store: Arc<Store>,

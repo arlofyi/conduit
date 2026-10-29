@@ -2,6 +2,8 @@
  * vocabulary (src/store.ts LiveState + src/themes.ts) so the two stay legible
  * to each other. Backed by mock data in this shell; by the bridge later. */
 
+import type { WireDiff, WireQuestion } from "../bridge/protocol";
+
 export type AgentKind = "claude" | "codex" | "gemini";
 
 /** Same four states as the desktop `SessionStatus` (src/store.ts). */
@@ -68,6 +70,18 @@ export interface EventItem {
   mono?: string;
   /** trailing ok marker, e.g. "✓ 12" */
   ok?: string;
+  /** pairs this call with its `ResultItem` */
+  toolUseId?: string;
+}
+
+/** A tool call's outcome. Never rendered on its own; `groupFeed` folds it into its call. */
+export interface ResultItem {
+  kind: "result";
+  id: string;
+  toolUseId: string;
+  isError: boolean;
+  errorText: string | null;
+  diff: WireDiff | null;
 }
 
 export interface TodosItem {
@@ -87,4 +101,58 @@ export interface ApprovalItem {
   resolved?: "allow" | "deny";
 }
 
-export type ChatItem = BubbleItem | EventItem | TodosItem | ApprovalItem;
+export interface NoticeItem {
+  kind: "notice";
+  id: string;
+  tone: "ok" | "bad" | "info";
+  text: string;
+  detail?: string;
+}
+
+export interface DividerItem {
+  kind: "divider";
+  id: string;
+  label: string;
+  tone: "info" | "warning";
+}
+
+export interface CommandItem {
+  kind: "command";
+  id: string;
+  name: string;
+  args: string;
+  output?: string;
+}
+
+export interface ImageItem {
+  kind: "image";
+  id: string;
+  mediaType: string;
+  data: string | null;
+}
+
+export interface QuestionItem {
+  kind: "question";
+  id: string;
+  toolUseId: string;
+  questions: WireQuestion[];
+}
+
+export interface PlanItem {
+  kind: "plan";
+  id: string;
+  markdown: string;
+}
+
+export type ChatItem =
+  | BubbleItem
+  | EventItem
+  | ResultItem
+  | TodosItem
+  | ApprovalItem
+  | NoticeItem
+  | DividerItem
+  | CommandItem
+  | ImageItem
+  | QuestionItem
+  | PlanItem;

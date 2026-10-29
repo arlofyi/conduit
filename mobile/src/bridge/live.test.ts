@@ -1,4 +1,4 @@
-import { mapChatItem, mapProjects, statusPatch } from "./live";
+import { PHONE_KINDS, appendWire, mapChatItem, mapHistory, mapProjects, statusPatch } from "./live";
 import type { WireChatItem, WireProject } from "./protocol";
 
 describe("mapChatItem", () => {
@@ -15,8 +15,81 @@ describe("mapChatItem", () => {
     });
     expect(mapChatItem({ kind: "event", event: "weird", label: "did" })).toMatchObject({ event: "generic" });
   });
+  it("keeps toolUseId on events and maps a result item", () => {
+    expect(mapChatItem({ kind: "event", event: "read", label: "read", toolUseId: "T1" })).toMatchObject({
+      toolUseId: "T1",
+    });
+    expect(
+      mapChatItem({ kind: "result", toolUseId: "T1", isError: true, errorText: "boom", diff: null }),
+    ).toMatchObject({ kind: "result", toolUseId: "T1", isError: true, errorText: "boom", diff: null });
+  });
+  it("appendWire keeps a late result in the feed", () => {
+    const feed = appendWire(appendWire([], { kind: "event", event: "bash", label: "ran", toolUseId: "T" }), {
+      kind: "result",
+      toolUseId: "T",
+      isError: false,
+      errorText: null,
+      diff: null,
+    });
+    expect(feed.map((i) => i.kind)).toEqual(["event", "result"]);
+  });
   it("assigns an id", () => {
-    expect(mapChatItem({ kind: "bubble", role: "assistant", text: "yo" }).id).toBeTruthy();
+    expect(mapChatItem({ kind: "bubble", role: "assistant", text: "yo" })?.id).toBeTruthy();
+  });
+});
+
+const kinds: string[] = require("../../../src-tauri/src/transcript_item_kinds.json");
+describe("phone item mapping", () => {
+  it("handles every kind Rust can emit except usage", () => {
+    expect([...PHONE_KINDS].sort()).toEqual(kinds.filter((k) => k !== "usage").sort());
+  });
+  it("mapChatItem drops usage and unknown kinds", () => {
+    expect(mapChatItem({ kind: "usage" } as never)).toBeNull();
+    expect(mapChatItem({ kind: "from-the-future" } as never)).toBeNull();
+  });
+  it("task becomes an ok notice with the summary as detail", () => {
+    const n = mapChatItem({ kind: "task", taskId: "b1", status: "completed", summary: "exit 0" });
+    expect(n).toMatchObject({ kind: "notice", tone: "ok", text: "Background task finished", detail: "exit 0" });
+  });
+  it("mapHistory folds command output into its command", () => {
+    const out = mapHistory([
+      { kind: "command", name: "/compact", args: "" },
+      { kind: "command_output", text: "Compacted", stream: "stdout" },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ kind: "command", name: "/compact", output: "Compacted" });
+  });
+});
+
+describe("appendWire", () => {
+  const cmd = { kind: "command", name: "/x", args: "" } as const;
+  const out = (text: string) => ({ kind: "command_output", text, stream: "stdout" }) as const;
+  it("folds command_output into the previous command", () => {
+    const feed = appendWire(appendWire([], cmd), out("done"));
+    expect(feed).toHaveLength(1);
+    expect(feed[0]).toMatchObject({ kind: "command", name: "/x", output: "done" });
+  });
+  it("a lone command_output becomes a nameless command", () => {
+    expect(appendWire([], out("hi"))[0]).toMatchObject({ kind: "command", name: "", output: "hi" });
+  });
+  it("leaves the feed unchanged for a null-mapped item", () => {
+    const feed = appendWire([], cmd);
+    expect(appendWire(feed, { kind: "usage" } as never)).toBe(feed);
+  });
+  it("does not overwrite an already-folded output", () => {
+    const feed = appendWire(appendWire(appendWire([], cmd), out("one")), out("two"));
+    expect(feed).toHaveLength(2);
+    expect(feed[0]).toMatchObject({ output: "one" });
+    expect(feed[1]).toMatchObject({ name: "", output: "two" });
+  });
+});
+
+describe("task status table", () => {
+  const t = (status: string) => mapChatItem({ kind: "task", taskId: null, status, summary: "s" });
+  it("maps failed, stopped and unknown", () => {
+    expect(t("failed")).toMatchObject({ tone: "bad", text: "Background task failed" });
+    expect(t("stopped")).toMatchObject({ tone: "info", text: "Background task stopped" });
+    expect(t("wat")).toMatchObject({ tone: "info", text: "Background task update" });
   });
 });
 

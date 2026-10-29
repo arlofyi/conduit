@@ -567,6 +567,47 @@ plus install/remove/status), and one listener in `App.tsx`.
   `cli_shim.rs` pin all of it, including that `release.yml` passes no `--features`.
 - Design: `docs/superpowers/specs/2026-09-04-conduit-cli-launcher-design.md`.
 
+## Where the mobile bridge lives
+
+`bridge.rs` (WebSocket server + `BridgeController`), `tailscale.rs`, `mobile_devices.rs`,
+`pairing.rs`; UI in `MobilePanel.tsx` (Settings -> Mobile) and the `pair-request` prompt.
+
+- **Where it listens is the whole security story.** Loopback always (unauthenticated: the
+  matrix sidecar and simulator rely on it) plus the Tailscale IPv4 ONLY while mobile access
+  is on and Tailscale is `Running`. Never `0.0.0.0`/`::`. `plan_listeners` (pure) decides it
+  and is re-run every 30 s and on the toggle, so a restart or new address re-binds within a
+  tick. Only an address inside the tailnet range (`tailscale::is_tailnet_addr`) is ever
+  bound. A Tailscale `Unknown` read keeps the current binding (one CLI timeout is not
+  "stopped"); `Stopped`/`NeedsLogin` closes it even if stale addresses are reported.
+- **`tailscale.rs` only reads** (`status`/`whois --json`). Never add `up`/`down`/`set`/
+  `serve`/`funnel`/`login`; the CLI call has a 3 s deadline.
+- **Peers and handshake.** A peer outside loopback and the tailnet ranges is dropped before
+  the handshake; any upgrade carrying `Origin` gets 403 (a web page on the Mac must never
+  reach the bridge). Every peer gets `hello`; a non-loopback peer must `auth` with its device
+  token (or `pair`/`discover`) within 5 s; the WebSocket upgrade itself has ONE 5 s overall deadline (a watchdog shuts the socket down, so a byte-dribbling peer cannot hold the thread). Pre-auth frames are capped at 4 KiB and the cap is
+  lifted on auth. Success is acked with an `authOk` frame; a pair request waiting on the Mac
+  sends `pairPending`. Failures answer one generic `unauthorized` (no oracle) and are
+  rate-limited 5 per 60 s per IP.
+- **`mobile-devices.json`, never `state.json`** (the orphan-sweep rule). It holds the switch,
+  the port and SHA-256 token hashes; plaintext is returned once. An unparseable file is moved
+  to `.bak.<secs>-<8 hex>` (a uuid fragment, so names never collide) and defaults load; if it cannot be
+  read or set aside, defaults stay in memory and EVERY write is refused so the original
+  survives. `Device` carries the hash and never leaves Rust; the UI gets `DeviceView`.
+- **Pairing** (`pairing.rs`): a QR secret is >= 128-bit, single-use, 5 min, and a new QR
+  replaces it; the desktop card calls `pair_cancel(secret)` (clears only a matching, current secret, so another window's newer QR survives) on Cancel, expiry and unmount. A phone
+  that found this Mac via another can instead send a `request`. Either way the Mac shows a
+  4-digit-code prompt (`pair-request`, mirroring `ask-request`) and the human approves; a
+  request waits 120 s, one per peer IP (newer replaces older). Turning access off first drops every authenticated phone
+  (`disconnect_all_devices`, `live` lock only, so a slow Tailscale CLI cannot delay it), then calls
+  `Pairing::clear`: drops the secret and resolves every waiter `off`, and the waiter
+  re-checks the switch before persisting a device. Pair PROMPTS are budgeted 5 per 10 min per
+  peer, separate from the auth-failure limit: a hang-up still put a prompt in front of the
+  human. `discover` answers only a phone on the same Tailscale user as this Mac.
+- **Port range 8455..=8474**, persisted if free. It ends at 8474 because fleet MCP starts at
+  8475 (see the root-chat section for the full carve-up of 8423..=8516).
+- Secrets rule applies: no token, nonce or QR secret is logged; types holding a plaintext secret or
+  token (`ClientMsg`) hand-write `Debug` and print them as `<redacted>`; the rest never derive it.
+
 ## Where the IDE integration lives
 
 Conduit announces itself to the `claude` CLI as an IDE (the VS Code/JetBrains protocol):
@@ -619,7 +660,7 @@ protocol is UNDOCUMENTED and was pinned empirically against claude 2.1.267 — t
 
 Root chat (HQ) reaches Conduit through a SECOND in-app MCP server, `root_mcp.rs`, on
 `/mcp?rootchat=<chat-id>` (`start` binds the first free port in 8496..=8516, clear of the
-hook server's 8423..=8443, the mobile bridge's 8455..=8475, and fleet's own 8475..=8495).
+hook server's 8423..=8443, the mobile bridge's 8455..=8474, and fleet's own 8475..=8495).
 It is deliberately not part of `fleet_mcp.rs`: every fleet tool is project-scoped by
 construction, root chat is global, and teaching one authorizer both shapes is what
 produced the earlier cross-project leak. The two surfaces share no `authorize()` — only
@@ -1298,7 +1339,13 @@ own id names a conversation it has left (see "Where conversation continuity live
 BACKWARDS with a substring pre-filter and reads only the trailing 1 MB; the window is resolved
 by model FAMILY because Claude Code runs opus/sonnet at 1M while the id stays bare), `subagents.rs` (the right panel's
 Agents tab), and `transcript_index.rs` (palette search over past conversations). All are
-read-only and degrade to "show less" rather than erroring.
+read-only and degrade to "show less" rather than erroring. Tool results arrive as separate `result` items paired to their call by `toolUseId` in each renderer's grouping function, and the quiet-fold rule (and the running/unknown rule for a call with no result) must stay identical in `src/chatItems.ts` and `mobile/src/logic/feed.ts`.
+
+**User/system lines are classified in one place:** `transcript_user.rs` decides whether a
+`user` record is a real prompt or a notice/command/skill/etc. Its item kinds are pinned by
+`src-tauri/src/transcript_item_kinds.json`, checked by Rust, desktop (vitest) and mobile
+(jest) tests -- the phone keeps a literal list because Metro cannot bundle files outside
+`mobile/`. `origin.kind == "human"` is always a user bubble, whatever the text looks like.
 
 ## Where conversation continuity lives
 

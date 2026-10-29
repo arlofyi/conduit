@@ -5,21 +5,24 @@ with inline status actions**, instead of mirroring the desktop terminal. See the
 design in
 [`docs/superpowers/specs/2026-06-30-conduit-mobile-chat-companion-design.md`](../docs/superpowers/specs/2026-06-30-conduit-mobile-chat-companion-design.md).
 
-## Status: testable shell, mock-backed
+## Status: wired to the desktop's live bridge
 
-This is the **P0 front-end shell**. It runs on a real device and demonstrates the full
-UX, but it is driven by **mock data** (`src/data/mock.ts`) with **simulated
-interactions** — it does **not** yet talk to a live Conduit bridge. Wiring it to the
-structured bridge + approval broker is **P1/P2** (a reviewed phase, because it touches
-the desktop's load-bearing PTY and `hooks.rs`).
+The app talks to a running Conduit desktop through `BridgeClient` (`src/bridge/`), mounted
+by `LiveProvider`: it lists the desktop's projects and sessions, attaches to a session for
+its transcript history and live tail, and sends prompts into the real PTY. The chat feed
+renders the full transcript item set: bubbles, tool calls (status, errors, edit diffs; quiet runs fold), to-dos, approvals,
+notices, dividers (compaction/interrupts), slash-command chips, images, AskUserQuestion
+cards (read-only) and plans (Markdown, as on desktop). The mock data in `src/data/mock.ts` remains for
+tests and offline UI work only.
 
-What works to test right now:
+Not done yet: connecting from a phone off the desktop's loopback. Reaching the bridge over
+Tailscale, with pairing, is the next plan; approvals from the phone arrive with the broker.
+
+What works:
 
 - **Projects screen** — projects → agents triage list, live status vocabulary
   (needs-you / running + activity + `n/m` todos / done / idle), "n need you" summary.
-- **Chat screen** — compact timeline (file reads, commands, edits), chat bubbles,
-  to-do cards, and the **approval card** with working **Approve / Deny**.
-- **Composer** — type a prompt, send it (appends to the feed; a simulated reply follows).
+- **Chat screen** — the live transcript described above, plus the composer.
 - **Theme switcher** — the three-swatch control (top-right) cycles all **three Warm
   schemes** (Near-Black / Dim / Light), ported 1:1 from the desktop `src/themes.ts`.
 
@@ -55,7 +58,7 @@ Don't run two Metro instances at once — they fight over port 8081.
 ## Checks
 
 ```bash
-npm test          # jest — pure logic (status mapping + feed reducer), 21 tests
+npm test          # jest — pure logic (status mapping + feed reducer, bridge mapping, image allowlist)
 npm run typecheck # tsc --noEmit (strict)
 ```
 

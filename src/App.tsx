@@ -46,6 +46,8 @@ import { TmuxNotice } from "./components/TmuxNotice";
 import { ConversationRepairNotice } from "./components/ConversationRepairNotice";
 import { Toasts } from "./components/Toasts";
 import { AskDock } from "./components/AskDock";
+import { PairPrompt } from "./components/PairPrompt";
+import type { PairRequest } from "./mobilePairing";
 import { NewProjectDialog } from "./components/NewProjectDialog";
 import { PendingDecisions } from "./components/PendingDecisions";
 import { Settings } from "./components/Settings";
@@ -944,6 +946,34 @@ export default function App() {
     };
   }, []);
 
+  // Phone pairing prompts (pairing.rs). Same shape as the ask cards: listeners first, then
+  // the catch-up. `pair-resolved` can arrive twice for one id; removal is idempotent.
+  useEffect(() => {
+    let disposed = false;
+    const uns: (() => void)[] = [];
+    void (async () => {
+      const ready = await Promise.all([
+        listen<PairRequest>("pair-request", ({ payload }) =>
+          useStore.getState().addPairRequest(payload),
+        ),
+        listen<{ id: string; how: string }>("pair-resolved", ({ payload }) =>
+          useStore.getState().removePairRequest(payload.id),
+        ),
+      ]).catch(() => [] as (() => void)[]);
+      if (disposed) {
+        ready.forEach((f) => f());
+        return;
+      }
+      uns.push(...ready);
+      const list = await invoke<PairRequest[]>("pair_pending").catch(() => [] as PairRequest[]);
+      if (!disposed) list.forEach((r) => useStore.getState().addPairRequest(r));
+    })();
+    return () => {
+      disposed = true;
+      uns.forEach((f) => f());
+    };
+  }, []);
+
   // Keep Rust's gate in step: capture questions only when a card could be seen. With
   // profile windows every window writes the gate; the last writer wins, which is the
   // focused window -- the one whose card could actually be seen.
@@ -1104,6 +1134,7 @@ export default function App() {
       <ConversationRepairNotice />
       <Toasts />
       <AskDock />
+      <PairPrompt />
       <PendingDecisions />
       {showSettings && (
         <Settings onClose={() => setShowSettings(false)} initialTab={settingsTab} />

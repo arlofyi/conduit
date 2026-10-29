@@ -60,8 +60,8 @@ conduit: mobile bridge on ws://127.0.0.1:8456
 ```
 
 That loopback WebSocket is what the adapter connects to. Because the adapter runs on
-the **same Mac**, loopback is all you need — no `CONDUIT_BRIDGE_TOKEN`, no open ports,
-nothing exposed to the network.
+the **same Mac**, loopback is all you need — loopback connections need no pairing or
+token, no ports are opened, and nothing is exposed to the network.
 
 ---
 
@@ -232,7 +232,7 @@ is fine; a logged-out one is not.)
   running the `feat/matrix-adapter` build (§1) and that its log shows
   `mobile bridge on ws://127.0.0.1:8456`.
 - **Adapter prints "Conduit bridge not found."** Same cause. Check with
-  `lsof -nP -iTCP:8455-8475 -sTCP:LISTEN` — you want the *patched* Conduit process
+  `lsof -nP -iTCP:8455-8474 -sTCP:LISTEN` — you want the *patched* Conduit process
   listening. If a stale old Conduit is squatting the port, quit it.
 - **The bot doesn't respond to your messages.** Your Matrix id isn't on the owner
   allowlist. Re-run `pair … --owner @you:badger.signout.io`. Also note the bot only

@@ -20,9 +20,12 @@ export function appendItem(items: ChatItem[] | undefined, item: ChatItem): ChatI
   return [...(items ?? []), item];
 }
 
-/** Usage records ride the same stream for future meters; they never render as rows. */
+/** Only bubbles and events render as rows: RootChatView draws nothing else. Usage records
+ *  ride the same stream for future meters, and `parse_line` emits the full transcript kind
+ *  set (tasks, commands, notes, …) -- counting those as shown would hide the home state
+ *  behind rows that never paint. */
 export function isRenderable(item: ChatItem): boolean {
-  return item.kind !== "usage";
+  return item.kind === "bubble" || item.kind === "event";
 }
 
 export function canSend(text: string, running: boolean): boolean {

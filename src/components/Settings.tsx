@@ -16,6 +16,7 @@ import { CommandCodePanel } from "./CommandCodePanel";
 import { RoutingPanel } from "./RoutingPanel";
 import { OrchestrationPanel } from "./OrchestrationPanel";
 import { PluginsPanel } from "./PluginsPanel";
+import { MobilePanel } from "./MobilePanel";
 
 // Exported for the native menu integration (menu → open Settings at a specific tab).
 export type SettingsTab =
@@ -35,6 +36,7 @@ export type SettingsTab =
   | "security"
   | "privacy"
   | "plugins"
+  | "mobile"
   | "about";
 
 /** Grouped sidebar navigation — scales past the point where flat tabs got unwieldy. */
@@ -75,6 +77,7 @@ const NAV: Array<{ group: string; items: Array<{ id: SettingsTab; label: string 
     ],
   },
   { group: "Extensions", items: [{ id: "plugins", label: "Plugins" }] },
+  { group: "Devices", items: [{ id: "mobile", label: "Mobile" }] },
   { group: "", items: [{ id: "about", label: "About" }] },
 ];
 
@@ -216,6 +219,14 @@ export function Settings({
                 <>
                   <p className="settings-intro">Community extensions.</p>
                   <PluginsPanel />
+                </>
+              )}
+              {tab === "mobile" && (
+                <>
+                  <p className="settings-intro">
+                    Read and drive your sessions from your phone over your private Tailscale network.
+                  </p>
+                  <MobilePanel />
                 </>
               )}
               {tab === "about" && <AboutPanel />}

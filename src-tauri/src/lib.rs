@@ -44,9 +44,11 @@ mod hotexit;
 pub mod ide_host;
 mod local_llm;
 mod menu;
+mod mobile_devices;
 mod notify;
 mod openrouter_usage;
 mod orchestration_policy;
+mod pairing;
 mod plugins;
 mod project_new;
 mod proposals;
@@ -62,12 +64,14 @@ mod session_files;
 mod status_rules;
 mod store;
 mod subagents;
+mod tailscale;
 mod tasks;
 mod telemetry;
 #[cfg_attr(windows, allow(dead_code))]
 mod tmux;
 mod transcript;
 mod transcript_index;
+mod transcript_user;
 mod updates;
 mod usage_tally;
 mod window_registry;
@@ -3204,10 +3208,20 @@ pub fn run() {
     #[cfg(feature = "wdio")]
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
 
+    // One device registry, shared by the settings commands and the bridge's auth.
+    let mobile_devices = Arc::new(mobile_devices::MobileDevices::load(
+        store::data_dir().join("mobile-devices.json"),
+    ));
+
     builder
         .manage(Arc::new(PtyManager::new()))
         .manage(crate::ide_host::IdeHost::new())
         .manage(Arc::new(Store::new()))
+        .manage(Arc::new(bridge::BridgeController::new(
+            mobile_devices.clone(),
+        )))
+        .manage(mobile_devices)
+        .manage(Arc::new(pairing::Pairing::default()))
         .manage(Arc::new(HookState::default()))
         .manage(Arc::new(crate::fleet::FleetState::default()))
         .manage(Arc::new(crate::board::BoardState::default()))
@@ -3357,7 +3371,9 @@ pub fn run() {
                 asks_state,
                 ask_gate,
             );
-            bridge::start(app.handle().clone());
+            app.state::<Arc<bridge::BridgeController>>()
+                .inner()
+                .start(app.handle().clone());
             continuity_watch::start(app.handle().clone());
 
             // IDE announce: hand the host to the PTY manager (teardown needs it) and
@@ -3657,6 +3673,15 @@ pub fn run() {
             open_external,
             reveal_path,
             claude_status::fetch_claude_status,
+            tailscale::tailscale_status,
+            mobile_devices::mobile_settings,
+            mobile_devices::mobile_set_enabled,
+            mobile_devices::mobile_revoke_device,
+            pairing::pair_start,
+            pairing::pair_cancel,
+            pairing::pair_pending,
+            pairing::pair_respond,
+            tailscale::tailscale_open_app,
             claude_usage::fetch_claude_usage,
             transcript::session_transcript,
             routing::agent_routes,

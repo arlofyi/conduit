@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { findSession, useStore, type TranscriptItem } from "../store";
+import { groupLabel, groupTools, imageSrc, taskLine, type Call, type ChatRow, type Diff } from "../chatItems";
 import { AGENTS } from "../agents";
 import { modeLabel, nextMode } from "../permissionMode";
 import { renderMarkdown, splitInsights } from "../markdown";
@@ -46,6 +47,181 @@ const EVENT_MARK: Record<string, string> = {
  *  permission-mode cycle to (auto-accept → plan → normal). */
 const SHIFT_TAB = "\x1b[Z";
 
+const STATUS_GLYPH = { running: "◐", ok: "●", error: "✕", unknown: "○" } as const;
+
+function DiffBlock({ diff }: { diff: Diff }) {
+  return (
+    <div className="hq-diff">
+      <div className="hq-diff-head">
+        {diff.created ? (
+          <span className="hq-diff-add">created · +{diff.added} lines</span>
+        ) : (
+          <>
+            <span className="hq-diff-add">+{diff.added}</span>{" "}
+            <span className="hq-diff-del">−{diff.removed}</span>
+          </>
+        )}
+      </div>
+      {diff.lines.map((l, i) =>
+        l.kind === "gap" ? (
+          <div key={i} className="hq-diff-row hq-diff-gap">⋮</div>
+        ) : (
+          <div key={i} className={`hq-diff-row hq-diff-${l.kind}`}>
+            <span className="hq-diff-no">{l.oldNo ?? ""}</span>
+            <span className="hq-diff-no">{l.newNo ?? ""}</span>
+            <span className="hq-diff-mark">{l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}</span>
+            <span className="hq-diff-text">{l.text}</span>
+          </div>
+        ),
+      )}
+      {diff.more > 0 && <div className="hq-diff-row hq-diff-gap">… {diff.more} more lines</div>}
+    </div>
+  );
+}
+
+function CallLine({ call }: { call: Call }) {
+  const item = call.event;
+  const mark = EVENT_MARK[item.event ?? "generic"] ?? "tool";
+  return (
+    <div className="hq-call">
+      <div className="hq-tool-line" title={item.mono ?? undefined}>
+        <span className={`hq-call-glyph hq-call-${call.status}`} role="img" aria-label={call.status}>
+          {STATUS_GLYPH[call.status]}
+        </span>
+        <span className="hq-tool-verb">{mark}</span>
+        {item.mono && <code>{item.mono}</code>}
+      </div>
+      {call.status === "error" && call.errorText && (
+        <div className="hq-call-err">{call.errorText}</div>
+      )}
+      {call.diff && <DiffBlock diff={call.diff} />}
+    </div>
+  );
+}
+
+/** A run of quiet calls folded to one digest line; click lists the individual lines. */
+function ToolsRow({ calls }: { calls: Call[] }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="hq-tools">
+      <button
+        type="button"
+        className="hq-tool-line hq-tool-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="hq-tool-verb">{open ? "▾" : "▸"}</span>
+        <span className="hq-tool-summary">{groupLabel(calls)}</span>
+      </button>
+      {open && (
+        <div className="hq-tool-list">
+          {calls.map((c, i) => (
+            <CallLine key={c.event.seq ?? i} call={c} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A centred pill; with `body` it toggles that text open beneath. */
+function Note({
+  label,
+  mark,
+  body,
+}: {
+  label: string;
+  mark?: "ok" | "bad" | "info";
+  body?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const glyph = mark === "ok" ? "✓" : mark === "bad" ? "✕" : mark === "info" ? "•" : null;
+  const inner = (
+    <>
+      {glyph && <span className={`hq-note-mark ${mark}`}>{glyph}</span>}
+      <span>{label}</span>
+    </>
+  );
+  return (
+    <div className="hq-note-wrap">
+      {body ? (
+        <button
+          type="button"
+          className="hq-note"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+        >
+          {inner}
+        </button>
+      ) : (
+        <div className="hq-note">{inner}</div>
+      )}
+      {body && open && <div className="hq-note-body">{body}</div>}
+    </div>
+  );
+}
+
+function CommandOutput({ text, stream }: { text: string; stream: "stdout" | "stderr" }) {
+  const [open, setOpen] = useState(false);
+  const lines = text.split("\n");
+  const long = lines.length > 3;
+  const shown = open || !long ? text : lines.slice(0, 3).join("\n");
+  return (
+    <div className={`hq-command-output ${stream}`}>
+      <pre>{shown}</pre>
+      {long && (
+        <button
+          type="button"
+          className="hq-command-more"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? "Show less" : `… ${lines.length - 3} more lines`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function Question({ item }: { item: Extract<TranscriptItem, { kind: "question" }> }) {
+  return (
+    <>
+      {item.questions.map((q, qi) => (
+        <div key={qi} className="hq-question">
+          {q.header && <span className="hq-question-header">{q.header}</span>}
+          <div className="hq-question-text">{q.question}</div>
+          <ol className="hq-question-options">
+            {q.options.map((o, oi) => {
+              const rec = / \(Recommended\)$/.test(o.label);
+              const label = rec ? o.label.replace(/ \(Recommended\)$/, "") : o.label;
+              return (
+                <li key={oi}>
+                  <span className="hq-option-num">{oi + 1}</span>
+                  <div>
+                    <span className="hq-option-label">{label}</span>
+                    {rec && <span className="hq-option-tag">Recommended</span>}
+                    {o.description && <div className="hq-option-desc">{o.description}</div>}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function PlanCard({ markdown }: { markdown: string }) {
+  const html = useMemo(() => renderMarkdown(markdown), [markdown]);
+  return (
+    <div className="hq-plan">
+      <span className="hq-plan-title">Plan</span>
+      <div className="hq-assistant" dangerouslySetInnerHTML={{ __html: html }} />
+    </div>
+  );
+}
+
 function Item({ item }: { item: TranscriptItem }) {
   // Assistant prose is split around `★ Insight` blocks so each renders as a styled
   // callout instead of showing the output style's raw dash-rule chrome.
@@ -78,14 +254,44 @@ function Item({ item }: { item: TranscriptItem }) {
       </>
     );
   }
-  if (item.kind === "event") {
-    const mark = EVENT_MARK[item.event ?? "generic"] ?? "tool";
-    return (
-      <div className="hq-tool-line" title={item.mono ?? undefined}>
-        <span className="hq-tool-verb">{mark}</span>
-        {item.mono && <code>{item.mono}</code>}
-      </div>
-    );
+  switch (item.kind) {
+    case "task": {
+      const t = taskLine(item.status);
+      return <Note label={t.text} mark={t.mark} body={item.summary || undefined} />;
+    }
+    case "peer":
+      return <Note label={`Message from ${item.from}`} body={item.text} />;
+    case "auto":
+      return <Note label={item.label} body={item.text} />;
+    case "skill":
+      return <Note label={`Loaded skill ${item.name}`} />;
+    case "note":
+      return <Note label={item.tag} body={item.text} />;
+    case "command":
+      return (
+        <div className="hq-command-row">
+          <span className="hq-command">
+            {item.name}
+            {item.args ? ` ${item.args}` : ""}
+          </span>
+        </div>
+      );
+    case "command_output":
+      return <CommandOutput text={item.text} stream={item.stream} />;
+    case "image": {
+      const src = imageSrc(item);
+      return src ? <img className="hq-image" alt="" src={src} /> : <Note label="Image" />;
+    }
+    case "divider":
+      return (
+        <div className={`hq-divider ${item.tone}`} role="separator">
+          <span>{item.label}</span>
+        </div>
+      );
+    case "question":
+      return <Question item={item} />;
+    case "plan":
+      return <PlanCard markdown={item.markdown} />;
   }
   // `usage` and anything a later Rust version adds render as nothing, not a broken row.
   return null;
@@ -106,6 +312,7 @@ export function SessionChat({
   const loadTranscript = useStore((s) => s.loadTranscript);
   const agentId = useStore((s) => findSession(s.projects, sessionId)?.session.agent ?? "claude");
   const live = useStore((s) => s.live[sessionId]);
+  const rows: ChatRow[] = useMemo(() => groupTools(items ?? []), [items]);
   const [draft, setDraft] = useState("");
   const endRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -204,7 +411,17 @@ export function SessionChat({
               way.
             </p>
           ) : (
-            items.map((item, i) => <Item key={i} item={item} />)
+            // Keyed by `seq` (stable across polls), not the index: the list is a sliding
+            // tail, so an index key moves every row's state once the session passes it.
+            rows.map((row, i) =>
+              row.type === "tools" ? (
+                <ToolsRow key={row.calls[0].event.seq ?? i} calls={row.calls} />
+              ) : row.type === "call" ? (
+                <CallLine key={row.call.event.seq ?? i} call={row.call} />
+              ) : (
+                <Item key={row.item.seq ?? i} item={row.item} />
+              ),
+            )
           )}
           {working && (
             <div className="hq-working">

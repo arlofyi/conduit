@@ -1,4 +1,5 @@
-import type { ApprovalItem, ChatItem } from "../data/types";
+import type { WireDiff } from "../bridge/protocol";
+import type { ApprovalItem, ChatItem, EventItem, ResultItem } from "../data/types";
 
 let seq = 0;
 /** Monotonic id generator (deterministic; avoids Math.random for testability). */
@@ -37,31 +38,95 @@ export function pendingApproval(items: ChatItem[]): ApprovalItem | null {
   );
 }
 
-/**
- * Group a flat feed for rendering: consecutive `event` items collapse onto one
- * timeline rail; everything else stays standalone. Returns render rows.
- */
-export type FeedRow =
-  | { type: "item"; item: Exclude<ChatItem, { kind: "event" }> }
-  | { type: "events"; id: string; events: Extract<ChatItem, { kind: "event" }>[] };
+export type CallStatus = "running" | "ok" | "error" | "unknown";
 
+/** A tool call with its outcome folded in. */
+export type Call = {
+  event: EventItem;
+  status: CallStatus;
+  errorText: string | null;
+  diff: WireDiff | null;
+};
+
+export type FeedRow =
+  | { type: "item"; item: Exclude<ChatItem, EventItem | ResultItem> }
+  | { type: "call"; call: Call }
+  | { type: "tools"; id: string; calls: Call[] };
+
+/** Quiet = has a result, not an error, no diff. Only quiet calls fold. */
+const isQuiet = (c: Call) => c.status === "ok" && c.diff === null;
+
+/**
+ * Pair each event with its result by `toolUseId` across the whole feed, drop `result`
+ * items, and fold runs of >= 2 quiet calls. Same rule as the desktop (`groupTools`).
+ * A call with no result is `running` only when nothing but events/`usage`/`result` follows it;
+ * otherwise the turn moved on without a result and its status is `unknown` (never folds).
+ */
 export function groupFeed(items: ChatItem[]): FeedRow[] {
-  const rows: FeedRow[] = [];
-  let run: Extract<ChatItem, { kind: "event" }>[] = [];
-  const flush = () => {
-    if (run.length) {
-      rows.push({ type: "events", id: `evs-${run[0].id}`, events: run });
-      run = [];
-    }
-  };
-  for (const it of items) {
-    if (it.kind === "event") {
-      run.push(it);
-    } else {
-      flush();
-      rows.push({ type: "item", item: it });
-    }
+  const results = new Map<string, ResultItem>();
+  for (const it of items) if (it.kind === "result") results.set(it.toolUseId, it);
+  // `tailOpen[i]`: everything after item i is an event or result (turn has not moved on).
+  const tailOpen: boolean[] = new Array(items.length);
+  let open = true;
+  for (let i = items.length - 1; i >= 0; i--) {
+    tailOpen[i] = open;
+    if (items[i].kind !== "event" && items[i].kind !== "result") open = false;
   }
+
+  const rows: FeedRow[] = [];
+  let run: Call[] = [];
+  const flush = () => {
+    if (run.length >= 2) rows.push({ type: "tools", id: `tools-${run[0].event.id}`, calls: run });
+    else for (const call of run) rows.push({ type: "call", call });
+    run = [];
+  };
+  items.forEach((item, i) => {
+    if (item.kind === "result") return;
+    if (item.kind === "event") {
+      const r = item.toolUseId ? results.get(item.toolUseId) : undefined;
+      const call: Call = r
+        ? { event: item, status: r.isError ? "error" : "ok", errorText: r.errorText, diff: r.diff }
+        : { event: item, status: tailOpen[i] ? "running" : "unknown", errorText: null, diff: null };
+      if (isQuiet(call)) {
+        run.push(call);
+      } else {
+        flush();
+        rows.push({ type: "call", call });
+      }
+      return;
+    }
+    flush();
+    rows.push({ type: "item", item });
+  });
   flush();
   return rows;
+}
+
+/** One-line digest of a folded run: buckets in descending count (stable on first seen). Matches desktop `groupLabel`. */
+export function groupLabel(calls: Call[]): string {
+  const buckets: [string, string][] = [];
+  const counts = new Map<string, number>();
+  const spec = (k: string): [string, string] =>
+    k === "bash"
+      ? ["bash", "ran %d shell command"]
+      : k === "read"
+        ? ["read", "read %d file"]
+        : k === "search"
+          ? ["search", "searched %d time"]
+          : k === "web"
+            ? ["web", "browsed %d page"]
+            : k === "subagent"
+              ? ["subagent", "ran %d subagent"]
+              : ["other", "called %d tool"];
+  for (const c of calls) {
+    const sp = spec(c.event.event);
+    if (!counts.has(sp[0])) buckets.push(sp);
+    counts.set(sp[0], (counts.get(sp[0]) ?? 0) + 1);
+  }
+  const text = buckets
+    .map((b, i) => ({ b, i, n: counts.get(b[0])! }))
+    .sort((x, y) => y.n - x.n || x.i - y.i)
+    .map(({ b, n }) => b[1].replace("%d", String(n)) + (n === 1 ? "" : "s"))
+    .join(", ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }

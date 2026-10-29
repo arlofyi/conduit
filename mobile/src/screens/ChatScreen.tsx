@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Image,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -13,22 +14,28 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Markdown from "react-native-markdown-display";
 import { useLive } from "../bridge/LiveProvider";
 import { NeedsPill, ThemeButton } from "../components/atoms";
-import type { ApprovalItem, BubbleItem, EventItem, TodosItem } from "../data/types";
-import { groupFeed, type FeedRow } from "../logic/feed";
+import type {
+  ApprovalItem,
+  BubbleItem,
+  CommandItem,
+  DividerItem,
+  ImageItem,
+  NoticeItem,
+  PlanItem,
+  QuestionItem,
+  TodosItem,
+} from "../data/types";
+import { outputPreview, splitRecommended } from "../logic/chatView";
+import { imageDataUri } from "../logic/image";
+import type { WireDiff } from "../bridge/protocol";
+import { groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
 import type { ChatProps } from "../navigation";
 import type { Palette } from "../theme/palettes";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, MONO, TYPE } from "../theme/type";
 
-const EVENT_GLYPH: Record<EventItem["event"], string> = {
-  read: "📄",
-  bash: "▶",
-  edit: "✏️",
-  search: "🔎",
-  web: "🌐",
-  subagent: "🧩",
-  generic: "•",
-};
+const STATUS_GLYPH: Record<Call["status"], string> = { running: "◐", ok: "●", error: "✕", unknown: "○" };
+const DIFF_CAP = 16;
 
 export function ChatScreen({ route, navigation }: ChatProps) {
   const { agent } = route.params;
@@ -169,7 +176,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
 }
 
 function rowKey(row: FeedRow): string {
-  return row.type === "events" ? row.id : row.item.id;
+  return row.type === "tools" ? row.id : row.type === "call" ? row.call.event.id : row.item.id;
 }
 
 function FeedRowView({
@@ -179,7 +186,8 @@ function FeedRowView({
   row: FeedRow;
   onDecide: (id: string, d: "allow" | "deny") => void;
 }) {
-  if (row.type === "events") return <EventRail events={row.events} />;
+  if (row.type === "tools") return <ToolsRow calls={row.calls} />;
+  if (row.type === "call") return <CallLine call={row.call} />;
   const item = row.item;
   switch (item.kind) {
     case "bubble":
@@ -188,7 +196,222 @@ function FeedRowView({
       return <TodosCard item={item} />;
     case "approval":
       return <ApprovalCard item={item} onDecide={onDecide} />;
+    case "notice":
+      return <NoticePill item={item} />;
+    case "divider":
+      return <DividerRow item={item} />;
+    case "command":
+      return <CommandChip item={item} />;
+    case "image":
+      return <ImageRow item={item} />;
+    case "question":
+      return <QuestionCard item={item} />;
+    case "plan":
+      return <PlanCard item={item} />;
   }
+}
+
+function NoticePill({ item }: { item: NoticeItem }) {
+  const { palette: p } = useTheme();
+  const [open, setOpen] = useState(false);
+  const color = item.tone === "ok" ? p.green : item.tone === "bad" ? p.red : p.textMid;
+  return (
+    <View style={{ alignSelf: "center", maxWidth: "92%", alignItems: "center", gap: 4 }}>
+      <Pressable
+        disabled={!item.detail}
+        onPress={() => setOpen((o) => !o)}
+        style={{
+          backgroundColor: p.chipBg,
+          borderRadius: 12,
+          paddingHorizontal: 12,
+          paddingVertical: 5,
+        }}
+      >
+        <Text style={{ color, fontSize: TYPE.footnote }}>
+          {item.text}
+          {item.detail ? (open ? " ▾" : " ▸") : ""}
+        </Text>
+      </Pressable>
+      {open && item.detail ? (
+        <Text style={{ color: p.textMid, fontSize: TYPE.footnote, fontFamily: MONO }}>{item.detail}</Text>
+      ) : null}
+    </View>
+  );
+}
+
+function DividerRow({ item }: { item: DividerItem }) {
+  const { palette: p } = useTheme();
+  const color = item.tone === "warning" ? p.amber : p.textMid;
+  const line = { flex: 1, height: StyleSheet.hairlineWidth, backgroundColor: color, opacity: 0.6 };
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginVertical: 4 }}>
+      <View style={line} />
+      <Text style={{ color, fontSize: TYPE.caption }}>{item.label}</Text>
+      <View style={line} />
+    </View>
+  );
+}
+
+/** A slash/`!` command chip with its output beneath. A nameless command is output that
+ * arrived without one (e.g. a `!` command's stderr), so it draws only the output block. */
+function CommandChip({ item }: { item: CommandItem }) {
+  const { palette: p } = useTheme();
+  return (
+    <View style={{ alignSelf: "flex-end", maxWidth: "84%", alignItems: "flex-end", gap: 4 }}>
+      {item.name ? (
+        <View style={{ backgroundColor: p.chipBg, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 6 }}>
+          <Text style={{ color: p.chipText, fontFamily: MONO, fontSize: TYPE.footnote }}>
+            {item.name}
+            {item.args ? ` ${item.args}` : ""}
+          </Text>
+        </View>
+      ) : null}
+      {item.output ? <CommandOutput text={item.output} /> : null}
+    </View>
+  );
+}
+
+/** Output collapsed to its first lines with a tap to expand, as desktop shows it. */
+function CommandOutput({ text }: { text: string }) {
+  const { palette: p } = useTheme();
+  const [open, setOpen] = useState(false);
+  const view = outputPreview(text, open);
+  const long = open || view.hidden > 0;
+  return (
+    <Pressable
+      disabled={!long}
+      onPress={() => setOpen((o) => !o)}
+      accessibilityRole={long ? "button" : undefined}
+      accessibilityState={long ? { expanded: open } : undefined}
+      style={{
+        alignSelf: "stretch",
+        backgroundColor: p.panelBg,
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: p.border,
+        borderRadius: 8,
+        paddingHorizontal: 10,
+        paddingVertical: 8,
+        gap: 4,
+      }}
+    >
+      <Text style={{ color: p.textMid, fontFamily: MONO, fontSize: TYPE.footnote }}>{view.text}</Text>
+      {long ? (
+        <Text style={{ color: p.accent, fontSize: TYPE.caption }}>
+          {open ? "Show less" : `… ${view.hidden} more lines`}
+        </Text>
+      ) : null}
+    </Pressable>
+  );
+}
+
+function ImageRow({ item }: { item: ImageItem }) {
+  const { palette: p } = useTheme();
+  const uri = imageDataUri(item.mediaType, item.data);
+  if (uri) {
+    return (
+      <Image
+        source={{ uri }}
+        resizeMode="contain"
+        accessibilityLabel="Image"
+        style={{ alignSelf: "flex-end", width: 220, height: 220, borderRadius: 10 }}
+      />
+    );
+  }
+  return (
+    <View
+      style={{
+        alignSelf: "flex-end",
+        backgroundColor: p.chipBg,
+        borderRadius: 10,
+        paddingHorizontal: 11,
+        paddingVertical: 6,
+      }}
+    >
+      <Text style={{ color: p.chipText, fontSize: TYPE.footnote }}>Image</Text>
+    </View>
+  );
+}
+
+/** A question Claude asked earlier in the transcript. Neutral, not amber: this is history,
+ * not a pending prompt (answering from the phone arrives with the broker). */
+function QuestionCard({ item }: { item: QuestionItem }) {
+  const { palette: p } = useTheme();
+  const chip = {
+    alignSelf: "flex-start" as const,
+    backgroundColor: p.chipBg,
+    borderRadius: 6,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+  };
+  return (
+    <View
+      style={{
+        backgroundColor: p.sidebarBg,
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: p.border,
+        borderRadius: 11,
+        padding: 13,
+        gap: 12,
+      }}
+    >
+      {item.questions.map((q, i) => (
+        <View key={i} style={{ gap: 6 }}>
+          {q.header ? (
+            <View style={chip}>
+              <Text style={{ color: p.chipText, fontSize: TYPE.caption, fontWeight: "600" }}>{q.header}</Text>
+            </View>
+          ) : null}
+          <Text style={{ color: p.textBright, fontWeight: "700", fontSize: TYPE.callout }}>{q.question}</Text>
+          {q.options.map((o, j) => {
+            const { label, recommended } = splitRecommended(o.label);
+            return (
+              <View key={j} style={{ flexDirection: "row", gap: 8 }}>
+                <Text style={{ color: p.textDim, fontSize: TYPE.subhead, fontFamily: MONO, width: 16 }}>
+                  {j + 1}
+                </Text>
+                <View style={{ flex: 1, gap: 2 }}>
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+                    <Text style={{ color: p.textBright, fontSize: TYPE.subhead }}>{label}</Text>
+                    {recommended ? (
+                      <View style={chip}>
+                        <Text style={{ color: p.chipText, fontSize: TYPE.caption }}>Recommended</Text>
+                      </View>
+                    ) : null}
+                  </View>
+                  {o.description ? (
+                    <Text style={{ color: p.textMid, fontSize: TYPE.footnote }}>{o.description}</Text>
+                  ) : null}
+                </View>
+              </View>
+            );
+          })}
+        </View>
+      ))}
+    </View>
+  );
+}
+
+/** An ExitPlanMode plan, rendered as Markdown in an assistant-style bubble (desktop's
+ * PlanCard renders the same markdown). */
+function PlanCard({ item }: { item: PlanItem }) {
+  const { palette: p } = useTheme();
+  return (
+    <View
+      style={{
+        maxWidth: "94%",
+        alignSelf: "flex-start",
+        backgroundColor: p.selectionBg,
+        borderRadius: 16,
+        borderBottomLeftRadius: 5,
+        paddingHorizontal: 14,
+        paddingTop: 10,
+        paddingBottom: 4,
+      }}
+    >
+      <Text style={{ fontSize: TYPE.subhead, fontWeight: "700", color: p.textBright }}>Plan</Text>
+      <Markdown style={mdStyles(p)}>{item.markdown}</Markdown>
+    </View>
+  );
 }
 
 function Bubble({ item }: { item: BubbleItem }) {
@@ -272,20 +495,113 @@ function mdStyles(p: Palette) {
   };
 }
 
-function EventRail({ events }: { events: EventItem[] }) {
+function CallLine({ call }: { call: Call }) {
   const { palette: p } = useTheme();
+  const e = call.event;
+  const glyphColor =
+    call.status === "ok" ? p.green : call.status === "error" ? p.red : p.textDim;
   return (
-    <View style={{ borderLeftWidth: 2, borderLeftColor: p.border, marginLeft: 6, paddingLeft: 12, gap: 8 }}>
-      {events.map((e) => (
-        <View key={e.id} style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-          <Text style={{ fontSize: 14 }}>{EVENT_GLYPH[e.event]}</Text>
-          <Text style={{ fontSize: TYPE.footnote, color: p.textMid }}>{e.label}</Text>
-          {e.mono && <Text style={{ fontSize: TYPE.footnote, color: p.textBright, fontFamily: MONO }}>{e.mono}</Text>}
-          {e.ok && <Text style={{ fontSize: TYPE.footnote, color: p.green, fontWeight: "600" }}>{e.ok}</Text>}
-          <View style={{ flex: 1 }} />
-          <Text style={{ color: p.textDim, fontSize: 15 }}>›</Text>
+    <View style={{ gap: 4 }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        <Text
+          accessibilityLabel={call.status}
+          style={{ width: 16, fontSize: TYPE.footnote, color: glyphColor }}
+        >
+          {STATUS_GLYPH[call.status]}
+        </Text>
+        <Text style={{ fontSize: TYPE.footnote, color: p.textMid }}>{e.label}</Text>
+        {e.mono && (
+          <Text
+            numberOfLines={1}
+            style={{ flexShrink: 1, fontSize: TYPE.footnote, color: p.textBright, fontFamily: MONO }}
+          >
+            {e.mono}
+          </Text>
+        )}
+      </View>
+      {call.status === "error" && call.errorText && (
+        <Text style={{ marginLeft: 24, fontSize: TYPE.footnote, color: p.red, fontFamily: MONO }}>
+          {call.errorText}
+        </Text>
+      )}
+      {call.diff && <DiffBlock diff={call.diff} />}
+    </View>
+  );
+}
+
+/** A run of quiet calls folded to one dim digest line; tap lists the individual calls. */
+function ToolsRow({ calls }: { calls: Call[] }) {
+  const { palette: p } = useTheme();
+  const [open, setOpen] = useState(false);
+  return (
+    <View style={{ gap: 8 }}>
+      <Pressable
+        onPress={() => setOpen((v) => !v)}
+        accessibilityRole="button"
+        accessibilityState={{ expanded: open }}
+        style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: MIN_TOUCH }}
+      >
+        <Text style={{ width: 16, fontSize: TYPE.footnote, color: p.textDim }}>{open ? "▾" : "▸"}</Text>
+        <Text style={{ fontSize: TYPE.footnote, color: p.textDim }}>{groupLabel(calls)}</Text>
+      </Pressable>
+      {open && (
+        <View style={{ borderLeftWidth: 2, borderLeftColor: p.border, marginLeft: 6, paddingLeft: 12, gap: 8 }}>
+          {calls.map((c) => (
+            <CallLine key={c.event.id} call={c} />
+          ))}
         </View>
-      ))}
+      )}
+    </View>
+  );
+}
+
+function DiffBlock({ diff }: { diff: WireDiff }) {
+  const { palette: p } = useTheme();
+  const rows = diff.lines.slice(0, DIFF_CAP);
+  const hidden = diff.more + (diff.lines.length - rows.length);
+  const tint = (k: string) => (k === "add" ? p.green : k === "del" ? p.red : p.textMid);
+  const mark = (k: string) => (k === "add" ? "+" : k === "del" ? "-" : " ");
+  return (
+    <View
+      style={{
+        marginLeft: 24,
+        backgroundColor: p.panelBg,
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: p.border,
+        borderRadius: 8,
+        padding: 8,
+        gap: 2,
+      }}
+    >
+      {diff.created ? (
+        <Text style={{ fontSize: TYPE.footnote, color: p.green, fontFamily: MONO }}>
+          created · +{diff.added} lines
+        </Text>
+      ) : (
+        <Text style={{ fontSize: TYPE.footnote, fontFamily: MONO }}>
+          <Text style={{ color: p.green }}>+{diff.added}</Text>
+          <Text style={{ color: p.textDim }}> </Text>
+          <Text style={{ color: p.red }}>−{diff.removed}</Text>
+        </Text>
+      )}
+      {rows.map((l, i) =>
+        l.kind === "gap" ? (
+          <Text key={i} style={{ fontSize: TYPE.footnote, color: p.textDim, fontFamily: MONO }}>
+            ⋮
+          </Text>
+        ) : (
+          <Text
+            key={i}
+            numberOfLines={1}
+            style={{ fontSize: TYPE.footnote, color: tint(l.kind), fontFamily: MONO }}
+          >
+            {mark(l.kind)} {l.text}
+          </Text>
+        ),
+      )}
+      {hidden > 0 && (
+        <Text style={{ fontSize: TYPE.footnote, color: p.textDim, fontFamily: MONO }}>… {hidden} more lines</Text>
+      )}
     </View>
   );
 }

@@ -9,7 +9,7 @@ import React, {
 } from "react";
 import type { ChatItem, Project, SessionStatus, TodoProgress } from "../data/types";
 import { BridgeClient, type ConnState } from "./BridgeClient";
-import { mapChatItem, mapProjects, statusPatch, type LivePatch } from "./live";
+import { appendWire, mapHistory, mapProjects, statusPatch, type LivePatch } from "./live";
 import { DEFAULT_BRIDGE_URL } from "./protocol";
 
 export interface SessionLive {
@@ -78,10 +78,10 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
             setProjects(mapProjects(m.projects));
             break;
           case "history":
-            setSessionLive((prev) => ({ ...prev, feed: m.items.map(mapChatItem) }));
+            setSessionLive((prev) => ({ ...prev, feed: mapHistory(m.items) }));
             break;
           case "chat":
-            setSessionLive((prev) => ({ ...prev, feed: [...prev.feed, mapChatItem(m.item)] }));
+            setSessionLive((prev) => ({ ...prev, feed: appendWire(prev.feed, m.item) }));
             break;
           case "status":
             setSessionLive((prev) => applyPatch(prev, statusPatch(m.event, m.body as never)));

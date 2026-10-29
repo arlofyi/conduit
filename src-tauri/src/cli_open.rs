@@ -193,7 +193,7 @@ pub fn write_token_file() -> String {
 }
 
 /// Constant-time-ish equality: no early return on the first differing byte.
-fn secret_eq(a: &str, b: &str) -> bool {
+pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }

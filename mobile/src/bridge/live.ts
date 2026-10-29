@@ -32,19 +32,108 @@ function eventKind(e: string): EventKind {
   }
 }
 
-/** Transcript-derived wire item → UI ChatItem (assigns a render id). */
-export function mapChatItem(w: WireChatItem): ChatItem {
-  if (w.kind === "bubble") {
-    return { kind: "bubble", id: nextId("b"), role: w.role, text: w.text };
+/**
+ * Every wire kind `mapChatItem` handles: the Rust manifest minus `usage` (not shown on the phone); `result` stays in the feed and is paired with its call by `groupFeed`.
+ * A literal on purpose: Metro cannot bundle files outside mobile/. live.test.ts checks it against the manifest.
+ */
+export const PHONE_KINDS: readonly string[] = [
+  "bubble",
+  "event",
+  "result",
+  "task",
+  "peer",
+  "auto",
+  "command",
+  "command_output",
+  "skill",
+  "image",
+  "divider",
+  "question",
+  "plan",
+  "note",
+];
+
+/** Same table as the desktop's `taskLine` (src/chatItems.ts); keep in step. */
+function taskLine(status: string): { tone: "ok" | "bad" | "info"; text: string } {
+  switch (status) {
+    case "completed":
+      return { tone: "ok", text: "Background task finished" };
+    case "failed":
+    case "error":
+      return { tone: "bad", text: "Background task failed" };
+    case "stopped":
+    case "killed":
+      return { tone: "info", text: "Background task stopped" };
+    default:
+      return { tone: "info", text: "Background task update" };
   }
-  return {
-    kind: "event",
-    id: nextId("e"),
-    event: eventKind(w.event),
-    label: w.label,
-    mono: w.mono ?? undefined,
-    ok: w.ok ?? undefined,
-  };
+}
+
+/** Transcript-derived wire item to UI ChatItem (assigns a render id). Null = not shown on the phone. */
+export function mapChatItem(w: WireChatItem): ChatItem | null {
+  switch (w.kind) {
+    case "bubble":
+      return { kind: "bubble", id: nextId("b"), role: w.role, text: w.text };
+    case "event":
+      return {
+        kind: "event",
+        id: nextId("e"),
+        event: eventKind(w.event),
+        label: w.label,
+        mono: w.mono ?? undefined,
+        ok: w.ok ?? undefined,
+        toolUseId: w.toolUseId ?? undefined,
+      };
+    case "result":
+      return {
+        kind: "result",
+        id: nextId("r"),
+        toolUseId: w.toolUseId,
+        isError: w.isError,
+        errorText: w.errorText,
+        diff: w.diff,
+      };
+    case "task": {
+      const { tone, text } = taskLine(w.status);
+      return { kind: "notice", id: nextId("n"), tone, text, detail: w.summary };
+    }
+    case "peer":
+      return { kind: "notice", id: nextId("n"), tone: "info", text: `Message from ${w.from}`, detail: w.text };
+    case "auto":
+      return { kind: "notice", id: nextId("n"), tone: "info", text: w.label, detail: w.text };
+    case "skill":
+      return { kind: "notice", id: nextId("n"), tone: "info", text: `Loaded skill ${w.name}` };
+    case "note":
+      return { kind: "notice", id: nextId("n"), tone: "info", text: w.tag, detail: w.text };
+    case "divider":
+      return { kind: "divider", id: nextId("d"), label: w.label, tone: w.tone };
+    case "command":
+      return { kind: "command", id: nextId("c"), name: w.name, args: w.args };
+    case "command_output":
+      return { kind: "command", id: nextId("c"), name: "", args: "", output: w.text };
+    case "image":
+      return { kind: "image", id: nextId("i"), mediaType: w.mediaType, data: w.data };
+    case "question":
+      return { kind: "question", id: nextId("q"), toolUseId: w.toolUseId, questions: w.questions };
+    case "plan":
+      return { kind: "plan", id: nextId("p"), markdown: w.markdown };
+    default:
+      return null; // usage, and kinds from a newer desktop
+  }
+}
+
+/** Append one wire item to a feed, folding a command's output into the command before it. */
+export function appendWire(feed: ChatItem[], w: WireChatItem): ChatItem[] {
+  const last = feed[feed.length - 1];
+  if (w.kind === "command_output" && last && last.kind === "command" && last.output === undefined) {
+    return [...feed.slice(0, -1), { ...last, output: w.text }];
+  }
+  const item = mapChatItem(w);
+  return item ? [...feed, item] : feed;
+}
+
+export function mapHistory(ws: WireChatItem[]): ChatItem[] {
+  return ws.reduce<ChatItem[]>(appendWire, []);
 }
 
 export function mapSession(s: WireSession): Agent {
