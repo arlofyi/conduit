@@ -1,5 +1,5 @@
 import type { SavedMac } from "../data/types";
-import { initialConn, step, type ConnEvent, type ConnState } from "./connection";
+import { awaitingHello, initialConn, isLoopbackAddress, step, type ConnEvent, type ConnState } from "./connection";
 import type { ServerMsg } from "./protocol";
 
 const mac: SavedMac = {
@@ -115,6 +115,73 @@ describe("connection reducer", () => {
     ]);
     expect(r.state.phase).toBe("ready");
     expect(r.effects).toEqual([{ k: "saveToken", deviceId: "D", token: "T" }]);
+  });
+
+  it("post_ready_non_auth_error_keeps_ready_and_forgets_nothing", () => {
+    const r = run(initialConn, [
+      start(),
+      { t: "open" },
+      { t: "frame", msg: hello() },
+      { t: "frame", msg: { type: "authOk", deviceId: "dev1" } },
+      { t: "frame", msg: { type: "error", message: "no such session" } },
+      { t: "frame", msg: { type: "error", message: "unauthorized" } },
+    ]);
+    expect(r.state.phase).toBe("ready");
+    expect(r.state.error).toBeUndefined();
+    expect(r.effects).toEqual([]);
+  });
+
+  it("no_token_mac_is_ready_only_on_loopback", () => {
+    const loop: SavedMac = { ...mac, deviceId: "loopback-8455", token: "", dnsName: "localhost", ip: "127.0.0.1" };
+    const ok = run(initialConn, [
+      start(loop, ["ws://localhost:8455", "ws://127.0.0.1:8455"]),
+      { t: "open" },
+      { t: "frame", msg: hello() },
+    ]);
+    expect(ok.state.phase).toBe("ready");
+    expect(ok.send).toEqual([]);
+
+    const remote = run(initialConn, [start({ ...mac, token: "" }), { t: "open" }, { t: "frame", msg: hello() }]);
+    expect(remote.state.phase).toBe("failed");
+    expect(remote.state.error).toEqual({ kind: "notPaired", macName: "Studio" });
+    expect(remote.send).toEqual([]);
+
+    const noMac = run(initialConn, [start(null, ["ws://studio.ts.net:8455"]), { t: "open" }, { t: "frame", msg: hello() }]);
+    expect(noMac.state.phase).toBe("failed");
+  });
+
+  it("is_loopback_address", () => {
+    expect(isLoopbackAddress("ws://127.0.0.1:8455")).toBe(true);
+    expect(isLoopbackAddress("ws://localhost:8460")).toBe(true);
+    expect(isLoopbackAddress("ws://[::1]:8460")).toBe(true);
+    expect(isLoopbackAddress("ws://studio.ts.net:8455")).toBe(false);
+    expect(isLoopbackAddress("ws://127.0.0.1.evil.ts.net:8455")).toBe(false);
+    expect(isLoopbackAddress("ws://100.1.2.3:8455")).toBe(false);
+    expect(isLoopbackAddress(undefined)).toBe(false);
+  });
+
+  it("awaiting_hello_only_before_hello", () => {
+    const s0 = run(initialConn, [start()]).state;
+    expect(awaitingHello(s0)).toBe(true);
+    const s1 = run(s0, [{ t: "open" }]).state;
+    expect(awaitingHello(s1)).toBe(true);
+    const s2 = run(s1, [{ t: "frame", msg: hello() }]).state;
+    expect(awaitingHello(s2)).toBe(false);
+  });
+
+  it("pairing_falls_through_addresses_before_hello_then_fails", () => {
+    const pairStart: ConnEvent = { t: "start", mac: null, addresses: ADDRS, pairing: true };
+    const a = run(initialConn, [pairStart, { t: "close" }]);
+    expect(a.state.phase).toBe("connecting");
+    expect(a.state.addressIndex).toBe(1);
+    expect(a.effects).toEqual([{ k: "reconnect", addressIndex: 1, delayMs: 0 }]);
+    const b = run(a.state, [{ t: "close" }, { t: "close" }]);
+    expect(b.state.phase).toBe("failed");
+    expect(b.state.error).toEqual({ kind: "closed" });
+    // once the socket reached pairing, a close is final
+    const c = run(initialConn, [pairStart, { t: "open" }, { t: "frame", msg: hello() }, { t: "close" }]);
+    expect(c.state.phase).toBe("failed");
+    expect(c.effects).toEqual([]);
   });
 
   it("pairing_failure_and_close_do_not_reconnect", () => {

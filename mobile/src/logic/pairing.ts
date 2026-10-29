@@ -91,5 +91,6 @@ export async function confirmCode(
 export function addressesFor(mac: SavedMac, opts: { simulator: boolean }): string[] {
   const hosts = [mac.dnsName, mac.ip];
   if (opts.simulator) hosts.push("127.0.0.1");
-  return hosts.filter((h) => h.length > 0).map((h) => `ws://${h}:${mac.port}`);
+  const urls = hosts.filter((h) => h.length > 0).map((h) => `ws://${h}:${mac.port}`);
+  return [...new Set(urls)];
 }

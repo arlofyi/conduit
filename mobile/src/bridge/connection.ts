@@ -14,6 +14,8 @@ export type ConnError =
   /** protocol mismatch; `direction` says which side must be updated */
   | { kind: "protocol"; direction: "updateApp" | "updateMac"; macName: string }
   | { kind: "pairFailed"; reason: string }
+  /** a Mac with no device token reached a non-loopback address (only loopback is trusted) */
+  | { kind: "notPaired"; macName?: string }
   | { kind: "closed" };
 
 export interface ConnState {
@@ -57,6 +59,23 @@ export const initialConn: ConnState = {
   pairing: false,
 };
 
+/** How long a socket may take to open AND say hello before it is dropped and the next
+ * address is tried (BridgeClient enforces it; `awaitingHello` says when it applies). */
+export const HELLO_TIMEOUT_MS = 6000;
+
+/** True while the connection has not yet heard `hello` on the current socket. */
+export const awaitingHello = (s: ConnState): boolean => s.phase === "connecting" || s.phase === "hello";
+
+/** `ws://127.0.0.1:…` / `ws://localhost:…` / `ws://[::1]:…` — the only hosts the desktop
+ * serves without a device token. */
+export function isLoopbackAddress(url: string | undefined): boolean {
+  if (!url) return false;
+  const m = /^wss?:\/\/(\[[^\]]+\]|[^:/]+)/i.exec(url);
+  if (!m) return false;
+  const host = m[1].toLowerCase();
+  return host === "127.0.0.1" || host === "localhost" || host === "[::1]";
+}
+
 const out = (state: ConnState, send: ClientMsg[] = [], effects: Effect[] = []): StepResult => ({
   state,
   send,
@@ -81,11 +100,18 @@ export function step(state: ConnState, ev: ConnEvent): StepResult {
     case "close": {
       // Terminal states and an unstarted client never reconnect.
       if (state.phase === "idle" || state.phase === "failed") return out(state);
-      if (state.pairing) {
-        // A pairing socket is single-shot: the secret / request is spent.
-        return out({ ...state, phase: "failed", error: { kind: "closed" } });
-      }
       const n = Math.max(state.addresses.length, 1);
+      if (state.pairing) {
+        // A pairing socket is single-shot once `pair` could have been sent (the secret /
+        // request is spent). Before hello it falls through the remaining addresses once.
+        const nextIdx = state.addressIndex + 1;
+        if (state.phase === "pairing" || state.phase === "ready" || nextIdx >= n) {
+          return out({ ...state, phase: "failed", error: { kind: "closed" } });
+        }
+        return out({ ...state, phase: "connecting", addressIndex: nextIdx }, [], [
+          { k: "reconnect", addressIndex: nextIdx, delayMs: 0 },
+        ]);
+      }
       const next = (state.addressIndex + 1) % n;
       const delayMs = state.backoffMs;
       return out(
@@ -122,9 +148,14 @@ function onFrame(state: ConnState, msg: ServerMsg): StepResult {
         });
       }
       if (state.pairing) return out({ ...state, phase: "pairing" });
-      if (state.mac) return out({ ...state, phase: "authing" }, [authMsg(state.mac.token)]);
-      // Loopback with no saved Mac: the desktop trusts loopback, no auth.
-      return out({ ...state, phase: "ready", backoffMs: BACKOFF_START_MS });
+      if (state.mac && state.mac.token) {
+        return out({ ...state, phase: "authing" }, [authMsg(state.mac.token)]);
+      }
+      // No token (no Mac, or a saved loopback "Mac"): the desktop trusts loopback only.
+      if (isLoopbackAddress(state.addresses[state.addressIndex])) {
+        return out({ ...state, phase: "ready", backoffMs: BACKOFF_START_MS });
+      }
+      return out({ ...state, phase: "failed", error: { kind: "notPaired", macName: msg.macName } });
     }
 
     case "authOk":

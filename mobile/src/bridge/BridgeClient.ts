@@ -1,5 +1,13 @@
 import type { SavedMac } from "../data/types";
-import { initialConn, step, type ConnEvent, type ConnState, type Effect } from "./connection";
+import {
+  awaitingHello,
+  HELLO_TIMEOUT_MS,
+  initialConn,
+  step,
+  type ConnEvent,
+  type ConnState,
+  type Effect,
+} from "./connection";
 import { attachMsg, inputMsg, interruptMsg, listMsg, type ClientMsg, type ServerMsg } from "./protocol";
 
 export interface BridgeOptions {
@@ -27,6 +35,8 @@ export class BridgeClient {
   private ws: WebSocket | null = null;
   private state: ConnState = initialConn;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  /** connect + hello deadline for the current socket */
+  private helloTimer: ReturnType<typeof setTimeout> | null = null;
   private closedByUser = false;
 
   constructor(
@@ -50,7 +60,27 @@ export class BridgeClient {
       if (e.k === "reconnect") this.scheduleReconnect(e.delayMs);
       else this.handlers.onEffect?.(e);
     }
+    if (!awaitingHello(this.state)) this.clearHelloTimer();
+    // A failed connection is terminal: drop the socket so the desktop sees it go.
+    if (changed && this.state.phase === "failed") this.dropSocket();
     if (changed) this.handlers.onState?.(this.state);
+  }
+
+  private clearHelloTimer() {
+    if (this.helloTimer) clearTimeout(this.helloTimer);
+    this.helloTimer = null;
+  }
+
+  /** Detach and close the current socket; its own onclose is ignored afterwards. */
+  private dropSocket() {
+    this.clearHelloTimer();
+    const ws = this.ws;
+    this.ws = null;
+    try {
+      ws?.close();
+    } catch {
+      // already closing
+    }
   }
 
   private connect() {
@@ -65,6 +95,14 @@ export class BridgeClient {
       return;
     }
     this.ws = ws;
+    this.clearHelloTimer();
+    // A host that never answers (a dead tailnet route) must not hold the address list.
+    this.helloTimer = setTimeout(() => {
+      this.helloTimer = null;
+      if (this.ws !== ws || !awaitingHello(this.state)) return;
+      this.dropSocket();
+      this.apply({ t: "close" });
+    }, HELLO_TIMEOUT_MS);
     ws.onopen = () => {
       if (this.ws === ws) this.apply({ t: "open" });
     };
@@ -82,6 +120,7 @@ export class BridgeClient {
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
+      this.clearHelloTimer();
       this.apply({ t: "close" });
     };
     ws.onerror = () => {
@@ -124,8 +163,7 @@ export class BridgeClient {
   close() {
     this.closedByUser = true;
     if (this.timer) clearTimeout(this.timer);
-    const ws = this.ws;
-    this.ws = null;
-    ws?.close();
+    this.timer = null;
+    this.dropSocket();
   }
 }
