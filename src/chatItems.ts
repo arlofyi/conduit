@@ -12,7 +12,12 @@ export type QuestionSpec = {
   options: QuestionOption[];
 };
 
-export type TranscriptItem =
+/** Fields every item may carry. `seq` is the item's absolute index in the whole parsed
+ *  conversation, stamped by `session_transcript` BEFORE it tails to the view limit -- a
+ *  stable row key as the window slides. Absent on the bridge and root-chat paths. */
+type ItemBase = { seq?: number };
+
+type ItemBody =
   | { kind: "bubble"; role: "user" | "assistant"; text: string }
   | { kind: "event"; event: string; label: string; mono: string | null }
   | {
@@ -34,6 +39,8 @@ export type TranscriptItem =
   | { kind: "question"; toolUseId: string; questions: QuestionSpec[] }
   | { kind: "plan"; markdown: string }
   | { kind: "note"; tag: string; text: string };
+
+export type TranscriptItem = ItemBase & ItemBody;
 
 type EventItem = Extract<TranscriptItem, { kind: "event" }>;
 

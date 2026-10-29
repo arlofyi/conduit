@@ -186,7 +186,21 @@ pub fn session_transcript(
         .filter(|l| !l.trim().is_empty())
         .flat_map(parse_line)
         .collect();
-    tail(items, limit.unwrap_or(VIEW_LIMIT))
+    tail(stamp_seq(items), limit.unwrap_or(VIEW_LIMIT))
+}
+
+/// Stamp each item with `seq`, its absolute index in the whole parsed conversation.
+///
+/// Done BEFORE `tail`, so an item keeps its number as the 400-item window slides forward on
+/// each poll. An index into the tail shifts every row once a session passes the limit, and
+/// the view's per-row state (an expanded tool run) then lands on the wrong row.
+fn stamp_seq(mut items: Vec<Value>) -> Vec<Value> {
+    for (i, item) in items.iter_mut().enumerate() {
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("seq".into(), json!(i));
+        }
+    }
+    items
 }
 
 /// The last `limit` items. Split out so the boundary is testable without a Store.
@@ -348,6 +362,15 @@ mod tests {
             "content":"Running scheduled task (Sep 13 3:00am)"})
         .to_string();
         assert!(parse_line(&l).is_empty());
+    }
+
+    #[test]
+    fn stamp_seq_survives_tailing() {
+        let items: Vec<Value> = (0..10).map(|i| json!({ "n": i })).collect();
+        let last3 = tail(stamp_seq(items), 3);
+        let seqs: Vec<u64> = last3.iter().map(|i| i["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, vec![7, 8, 9]);
+        assert_eq!(last3[0]["n"], 7);
     }
 
     #[test]

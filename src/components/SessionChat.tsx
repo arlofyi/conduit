@@ -78,7 +78,7 @@ function ToolsRow({ events }: { events: EventItem[] }) {
       {open && (
         <div className="hq-tool-list">
           {events.map((e, i) => (
-            <EventLine key={i} item={e} />
+            <EventLine key={e.seq ?? i} item={e} />
           ))}
         </div>
       )}
@@ -374,11 +374,13 @@ export function SessionChat({
               way.
             </p>
           ) : (
+            // Keyed by `seq` (stable across polls), not the index: the list is a sliding
+            // tail, so an index key moves every row's state once the session passes it.
             rows.map((row, i) =>
               row.type === "tools" ? (
-                <ToolsRow key={i} events={row.events} />
+                <ToolsRow key={row.events[0].seq ?? i} events={row.events} />
               ) : (
-                <Item key={i} item={row.item} />
+                <Item key={row.item.seq ?? i} item={row.item} />
               ),
             )
           )}

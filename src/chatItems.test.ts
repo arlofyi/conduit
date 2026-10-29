@@ -40,6 +40,16 @@ describe("chatItems", () => {
     expect(rows[1].type === "tools" && rows[1].events.length).toBe(2);
   });
 
+  it("groupTools keeps each item's seq, which SessionChat keys rows by", () => {
+    const rows = groupTools([
+      { kind: "bubble", role: "user", text: "go", seq: 401 },
+      { ...ev("read", "a.rs"), seq: 402 },
+      { ...ev("edit", "b.rs"), seq: 404 },
+    ]);
+    expect(rows[0].type === "item" && rows[0].item.seq).toBe(401);
+    expect(rows[1].type === "tools" && rows[1].events.map((e) => e.seq)).toEqual([402, 404]);
+  });
+
   it("toolsSummary counts repeated kinds", () => {
     expect(toolsSummary([ev("search", "busy_sessions"), ev("read", "a"), ev("read", "b"), ev("edit", "c")])).toBe(
       "searched busy_sessions · read 2 files · edited c",
