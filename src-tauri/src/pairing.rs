@@ -255,6 +255,13 @@ impl Pairing {
         ok
     }
 
+    /// Drop the current QR secret without touching waiting requests. The desktop card
+    /// calls it when it closes, so a leftover screenshot of the QR is dead.
+    pub fn cancel_secret(&self) {
+        let (mut g, _) = self.swept();
+        g.secret = None;
+    }
+
     /// Park a request for the human. A request already waiting from the same peer IP is
     /// resolved as [`Resolution::Replaced`] (its waiter reports it), so a phone whose old
     /// socket went half-open can simply ask again.
@@ -525,6 +532,12 @@ pub fn pair_start(
     Ok(pairing.start_qr(&mac, port))
 }
 
+/// Cancel the QR on screen (Cancel, expiry, or the card unmounting).
+#[tauri::command]
+pub fn pair_cancel(pairing: tauri::State<'_, Arc<Pairing>>) {
+    pairing.cancel_secret();
+}
+
 #[tauri::command]
 pub fn pair_pending(pairing: tauri::State<'_, Arc<Pairing>>) -> Vec<PairRequestView> {
     pairing.pending()
@@ -698,6 +711,14 @@ mod tests {
             Decision::Refuse("replaced")
         );
         assert!(p.get(&new).is_some());
+    }
+
+    #[test]
+    fn cancel_kills_the_old_secret() {
+        let (p, _) = clocked(0);
+        let qr = p.start_qr(&mac(), 8455);
+        p.cancel_secret();
+        assert!(!p.consume_secret(&qr.secret));
     }
 
     #[test]

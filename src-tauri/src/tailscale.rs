@@ -313,7 +313,10 @@ pub fn tailscale_status() -> TailscaleState {
 pub fn tailscale_open_app() {
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open").args(["-a", "Tailscale"]).status();
+        let _ = Command::new("open")
+            .args(["-a", "Tailscale"])
+            .no_window()
+            .status();
     }
     #[cfg(windows)]
     {

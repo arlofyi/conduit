@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SettingRow } from "./GeneralSettings";
 import {
@@ -143,9 +143,27 @@ function PairCard({ now, running }: { now: number; running: boolean }) {
       .catch((e) => setErr(String(e)));
   };
 
+  // Kill the QR secret on the Mac whenever the card stops showing it.
+  const cancel = () => {
+    setPayload(null);
+    invoke("pair_cancel").catch(() => {});
+  };
+  const shownRef = useRef(false);
+
   const left = payload ? secondsLeft(startedAt + PAIR_TTL_SECS, now) : 0;
   // The secret is single-use with a 5-minute TTL; once it lapses the QR is dead, so drop it.
   const live = payload && left > 0;
+  shownRef.current = !!payload;
+  const expired = !!payload && left <= 0;
+  useEffect(() => {
+    if (expired) invoke("pair_cancel").catch(() => {});
+  }, [expired]);
+  useEffect(
+    () => () => {
+      if (shownRef.current) invoke("pair_cancel").catch(() => {});
+    },
+    [],
+  );
 
   return (
     <div className="mobile-pair">
@@ -167,7 +185,7 @@ function PairCard({ now, running }: { now: number; running: boolean }) {
             <div className="mobile-device-meta">
               Expires in {Math.floor(left / 60)}:{String(left % 60).padStart(2, "0")}
             </div>
-            <button type="button" onClick={() => setPayload(null)}>
+            <button type="button" onClick={cancel}>
               Cancel
             </button>
           </div>

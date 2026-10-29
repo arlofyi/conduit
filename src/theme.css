@@ -6915,7 +6915,7 @@ button.hq-note:hover { color: var(--hq-ink-2); border-color: var(--hq-line-2); }
 .pair-title { font-size: 13px; color: var(--text-bright); }
 .pair-login { font-size: 11.5px; color: var(--text-mid); margin-top: 2px; }
 .pair-code {
-  font-family: var(--mono, ui-monospace, monospace); font-size: 34px; letter-spacing: 0.18em;
+  font-family: var(--mono-font); font-size: 34px; letter-spacing: 0.18em;
   text-align: center; color: var(--text-bright); margin: 12px 0 4px;
 }
 .pair-hint { font-size: 11.5px; color: var(--text-mid); text-align: center; }
@@ -6930,7 +6930,7 @@ button.hq-note:hover { color: var(--hq-ink-2); border-color: var(--hq-line-2); }
 .mobile-device-name { font-size: 13px; color: var(--text-bright); }
 .mobile-device-meta, .mobile-empty, .mobile-port { font-size: 11.5px; color: var(--text-mid); }
 .mobile-port { margin-top: 12px; }
-.mobile-error { font-size: 12px; color: var(--danger, #e5484d); margin-top: 6px; }
+.mobile-error { font-size: 12px; color: var(--red); margin-top: 6px; }
 .header-badge {
   min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; margin-left: 2px;
   background: var(--amber); color: var(--panel-bg); font-size: 10.5px; font-weight: 700; line-height: 16px; text-align: center;

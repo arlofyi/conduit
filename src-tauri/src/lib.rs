@@ -3678,6 +3678,7 @@ pub fn run() {
             mobile_devices::mobile_set_enabled,
             mobile_devices::mobile_revoke_device,
             pairing::pair_start,
+            pairing::pair_cancel,
             pairing::pair_pending,
             pairing::pair_respond,
             tailscale::tailscale_open_app,
