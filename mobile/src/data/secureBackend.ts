@@ -3,6 +3,7 @@
 import * as SecureStore from "expo-secure-store";
 import type { KeyValueBackend } from "./macStore";
 import { createMacStore } from "./macStore";
+import { createPrefsStore } from "./prefs";
 
 const OPTS: SecureStore.SecureStoreOptions = {
   keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
@@ -15,3 +16,5 @@ export const secureBackend: KeyValueBackend = {
 };
 
 export const macStore = createMacStore(secureBackend);
+
+export const prefsStore = createPrefsStore(secureBackend);

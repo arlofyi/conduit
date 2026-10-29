@@ -1,6 +1,6 @@
 /** Data model for the mobile companion. Mirrors the desktop's session/status
  * vocabulary (src/store.ts LiveState + src/themes.ts) so the two stay legible
- * to each other. Backed by mock data in this shell; by the bridge later. */
+ * to each other. Filled from the desktop bridge. */
 
 import type { WireDiff, WireQuestion } from "../bridge/protocol";
 

@@ -36,7 +36,19 @@ export function connErrorText(e: ConnError, macName = "your Mac"): string {
   }
 }
 
-export type ConnTone = "ok" | "busy" | "bad";
+/** Why a scanned code was refused (`parseQr` reasons). */
+export function qrErrorText(reason: "notConduit" | "version" | "invalid"): string {
+  switch (reason) {
+    case "notConduit":
+      return "That isn't a Conduit pairing code.";
+    case "version":
+      return "That code is from a newer Conduit. Update the app.";
+    case "invalid":
+      return "That pairing code can't be used. Show a new one on your Mac.";
+  }
+}
+
+export type ConnTone ="ok" | "busy" | "bad";
 
 /** Status line for the current Mac's connection. */
 export function connStatus(c: ConnState, macName: string): { tone: ConnTone; text: string } {

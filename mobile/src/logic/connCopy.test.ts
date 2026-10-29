@@ -1,5 +1,13 @@
 import { initialConn, type ConnState } from "../bridge/connection";
-import { connErrorText, connStatus, pairFailText } from "./connCopy";
+import { connErrorText, connStatus, pairFailText, qrErrorText } from "./connCopy";
+
+describe("qrErrorText", () => {
+  it("every_reason_has_copy", () => {
+    expect(qrErrorText("notConduit")).toMatch(/isn't a Conduit/);
+    expect(qrErrorText("version")).toMatch(/Update the app/);
+    expect(qrErrorText("invalid")).toMatch(/new one/);
+  });
+});
 
 describe("pairFailText", () => {
   it("maps_every_desktop_reason", () => {
