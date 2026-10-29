@@ -5,8 +5,9 @@
  * `★ Insight` block lifted into the desktop's callout card (`.hq-insight`).
  */
 import React, { useMemo } from "react";
-import { ScrollView, StyleSheet, Text, View } from "react-native";
-import Markdown, { type RenderRules } from "react-native-markdown-display";
+import { Alert, Linking, ScrollView, StyleSheet, Text, View } from "react-native";
+import Markdown, { MarkdownIt, type RenderRules } from "react-native-markdown-display";
+import { safeLink } from "../logic/links";
 import { splitInsights } from "../logic/markdown";
 import { hq } from "../theme/hq";
 import type { Palette } from "../theme/palettes";
@@ -21,8 +22,44 @@ function trimFence(content: string): string {
   return content.endsWith("\n") ? content.slice(0, -1) : content;
 }
 
+// Module-level so every render passes the SAME parser and handler list: the library's own
+// defaults are rebuilt per render, which throws away its memoised parser each time.
+const MARKDOWN = MarkdownIt({ typographer: true });
+/** No image is ever fetched: a reply's image URL is attacker-choosable (a read web page can
+ * plant one) and loading it would tell that server the phone opened the chat. */
+const NO_IMAGE_HANDLERS: string[] = [];
+
+/** Open a reply's link only for http(s)/mailto, and only after the reader has seen its host. */
+function confirmOpen(href: string | undefined): void {
+  const v = safeLink(href);
+  if (!v.ok) return;
+  Alert.alert("Open this link?", v.host, [
+    { text: "Cancel", style: "cancel" },
+    { text: "Open", onPress: () => Linking.openURL(v.url).catch(() => undefined) },
+  ]);
+}
+
+/** The library's own handler opens any URL it is handed; this one never lets it (returns false). */
+function onLinkPress(url: string): boolean {
+  confirmOpen(url);
+  return false;
+}
+
+/** Props that never change, as one object (the typings omit `allowedImageHandlers`, which the
+ * runtime takes; the `image` rule below would ignore it anyway). */
+const STABLE_PROPS = { markdownit: MARKDOWN, onLinkPress, allowedImageHandlers: NO_IMAGE_HANDLERS };
+
 function makeRules(p: Palette): RenderRules {
   const h = hq(p);
+  // A link the phone will not open reads as the plain words it wraps, never as a link.
+  const link: NonNullable<RenderRules["link"]> = (node, children, _parent, styles) =>
+    safeLink(node.attributes.href).ok ? (
+      <Text key={node.key} style={styles.link} accessibilityRole="link" onPress={() => confirmOpen(node.attributes.href)}>
+        {children}
+      </Text>
+    ) : (
+      <Text key={node.key}>{children}</Text>
+    );
   const block = (key: string, content: string) => (
     <ScrollView
       key={key}
@@ -47,6 +84,17 @@ function makeRules(p: Palette): RenderRules {
   return {
     fence: (node) => block(node.key, node.content),
     code_block: (node) => block(node.key, node.content),
+    link,
+    blocklink: link,
+    // Never load an image: say what it was, quietly.
+    image: (node) => {
+      const alt = typeof node.attributes.alt === "string" ? node.attributes.alt.trim() : "";
+      return (
+        <Text key={node.key} style={{ color: p.textDim, fontStyle: "italic" }}>
+          {alt ? `[${alt}]` : "[image]"}
+        </Text>
+      );
+    },
   };
 }
 
@@ -105,18 +153,28 @@ function themed(p: Palette) {
   return v;
 }
 
-export function AssistantMarkdown({ text }: { text: string }) {
+/** Memoised on `text`: an older reply never re-parses because a new one arrived. */
+export const AssistantMarkdown = React.memo(function AssistantMarkdown({ text }: { text: string }) {
   const { palette: p } = useTheme();
   const { rules, styles } = themed(p);
   const h = hq(p);
   const segments = useMemo(() => splitInsights(text), [text]);
+  const md = (key: React.Key | undefined, body: string) => (
+    <Markdown
+      key={key}
+      style={styles}
+      rules={rules}
+      mergeStyle
+      {...STABLE_PROPS}
+    >
+      {body}
+    </Markdown>
+  );
   return (
     <View>
       {segments.map((seg, i) =>
         seg.kind === "md" ? (
-          <Markdown key={i} style={styles} rules={rules} mergeStyle>
-            {seg.text}
-          </Markdown>
+          md(i, seg.text)
         ) : (
           <View
             key={i}
@@ -133,12 +191,10 @@ export function AssistantMarkdown({ text }: { text: string }) {
             }}
           >
             <Text style={{ fontSize: 11, letterSpacing: 0.66, color: p.accent, fontWeight: "600" }}>★ INSIGHT</Text>
-            <Markdown style={styles} rules={rules} mergeStyle>
-              {seg.text}
-            </Markdown>
+            {md(undefined, seg.text)}
           </View>
         ),
       )}
     </View>
   );
-}
+});
