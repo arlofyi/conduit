@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { useStore } from "../store";
-import { SettingRow } from "./ui";
+import { Button, ButtonRow, SettingRow } from "./ui";
 
 /** Mirrors `cli_shim::ShimStatus` (serde camelCase). */
 type ShimStatus = {
@@ -175,15 +175,16 @@ export function GeneralSettings() {
         title="Workspace root"
         detail="The folder HQ root chats read from — where your projects live. Leave empty for your home directory. Root chats can read anything under it but never modify files."
         control={
-          <div className="workspace-root-input">
+          <div className="setting-field">
             <input
               type="text"
+              className="ui-input mono"
               value={workspaceRoot}
               placeholder="~ (home directory)"
               spellCheck={false}
               onChange={(e) => setWorkspaceRoot(e.target.value)}
             />
-            <button
+            <Button
               onClick={async () => {
                 const dir = await open({
                   directory: true,
@@ -194,7 +195,7 @@ export function GeneralSettings() {
               }}
             >
               Choose…
-            </button>
+            </Button>
           </div>
         }
       />
@@ -227,22 +228,21 @@ export function GeneralSettings() {
           ) : undefined
         }
         control={
-          <div className="cli-shim-action">
+          <ButtonRow align="start">
             {shim?.outdated && (
-              <>
-                <button onClick={() => void runShim("install_cli_shim")}>
-                  Update command line tool
-                </button>{" "}
-              </>
+              <Button variant="primary" onClick={() => void runShim("install_cli_shim")}>
+                Update command line tool
+              </Button>
             )}
-            <button
+            <Button
+              variant={shim?.installed ? "danger" : "secondary"}
               onClick={() =>
                 void runShim(shim?.installed ? "remove_cli_shim" : "install_cli_shim")
               }
             >
               {shim?.installed ? "Remove" : "Install"}
-            </button>
-          </div>
+            </Button>
+          </ButtonRow>
         }
       />
     </div>

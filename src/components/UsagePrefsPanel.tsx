@@ -1,5 +1,6 @@
 import { useStore, type UsagePrefs } from "../store";
 import { Dropdown } from "./Dropdown";
+import { SettingRow, SettingsSection } from "./ui";
 
 const LAYOUTS: Array<{ id: UsagePrefs["layout"]; label: string; hint: string }> = [
   { id: "selected", label: "Selected session only", hint: "Just the current session's account (default)." },
@@ -45,8 +46,7 @@ export function UsagePrefsPanel() {
         preferences only.
       </p>
 
-      <div className="usage-prefs-section">
-        <div className="usage-prefs-title">Layout</div>
+      <SettingsSection title="Layout" flush>
         <div className="agent-list">
           {LAYOUTS.map((l) => (
             <div key={l.id} className={`agent-list-row ${prefs.layout === l.id ? "def" : ""}`}>
@@ -64,10 +64,13 @@ export function UsagePrefsPanel() {
             </div>
           ))}
         </div>
-      </div>
+      </SettingsSection>
 
-      <div className="usage-prefs-section">
-        <div className="usage-prefs-title">Meters show</div>
+      <SettingsSection
+        title="Meters show"
+        description="Applies to the number and the bar together, everywhere — they always read the same way. Colour still warns on consumption whichever you pick."
+        flush
+      >
         <div className="agent-list">
           {METRICS.map((m) => (
             <div key={m.id} className={`agent-list-row ${prefs.metric === m.id ? "def" : ""}`}>
@@ -85,14 +88,9 @@ export function UsagePrefsPanel() {
             </div>
           ))}
         </div>
-        <div className="agent-list-meta">
-          Applies to the number and the bar together, everywhere — they always read the same
-          way. Colour still warns on consumption whichever you pick.
-        </div>
-      </div>
+      </SettingsSection>
 
-      <div className="usage-prefs-section">
-        <div className="usage-prefs-title">Windows to show</div>
+      <SettingsSection title="Windows to show" flush>
         <div className="usage-prefs-checks">
           {WINDOWS.map((w) => (
             <label key={w.id} className="account-tag-check">
@@ -107,37 +105,42 @@ export function UsagePrefsPanel() {
             </label>
           ))}
         </div>
-      </div>
+      </SettingsSection>
 
-      <div className="usage-prefs-section">
-        <div className="usage-prefs-title">Sort accounts by</div>
-        <Dropdown
-          className="dd-settings"
-          value={prefs.sort}
-          options={[
-            { value: "critical", label: "Most critical first" },
-            { value: "label", label: "Name (A–Z)" },
-          ]}
-          onChange={(v) => setUsagePrefs({ sort: v as UsagePrefs["sort"] })}
+      <SettingsSection title="Accounts">
+        <SettingRow
+          id="usage-sort"
+          title="Sort accounts by"
+          trailing={
+            <Dropdown
+              className="dd-settings"
+              value={prefs.sort}
+              options={[
+                { value: "critical", label: "Most critical first" },
+                { value: "label", label: "Name (A–Z)" },
+              ]}
+              onChange={(v) => setUsagePrefs({ sort: v as UsagePrefs["sort"] })}
+            />
+          }
         />
-      </div>
-
-      <div className="usage-prefs-section">
-        <div className="usage-prefs-title">
-          "Low" threshold: {prefs.lowThresholdPct}% remaining
-        </div>
-        <input
-          type="range"
-          min={5}
-          max={50}
-          step={5}
-          value={prefs.lowThresholdPct}
-          onChange={(e) => setUsagePrefs({ lowThresholdPct: Number(e.target.value) })}
+        <SettingRow
+          id="usage-low"
+          title={<>&ldquo;Low&rdquo; threshold</>}
+          trailing={<span className="usage-prefs-value">{prefs.lowThresholdPct}% remaining</span>}
+          status='Below this, a meter turns red and the account counts as "running low".'
+          control={
+            <input
+              type="range"
+              aria-label="Low threshold, percent remaining"
+              min={5}
+              max={50}
+              step={5}
+              value={prefs.lowThresholdPct}
+              onChange={(e) => setUsagePrefs({ lowThresholdPct: Number(e.target.value) })}
+            />
+          }
         />
-        <div className="agent-list-meta">
-          Below this, a meter turns red and the account counts as "running low".
-        </div>
-      </div>
+      </SettingsSection>
     </div>
   );
 }

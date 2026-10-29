@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Changed — Settings look and behave the same on every page.** Buttons, on/off switches, scope pickers, text fields and status badges now share one design across every Settings page, and on/off settings use switches instead of checkboxes. Inline actions such as "Add key" and "Remove" are real buttons rather than coloured text.
+- **Changed — Orchestration settings are easier to read.** The page shows the one setting that works today at the top, keeps the planned limits and role rules folded away and grouped by the release that will use them, and shows a clear list of changes before you apply an imported policy file.
 - **Added — Mobile access over Tailscale.** Settings → Mobile shows whether Tailscale is running, turns on mobile access, pairs a phone with a one-time QR code, and lists and revokes paired phones. A phone asking to pair shows a code prompt you approve on the Mac, even with Settings closed. The phone reaches this Mac from anywhere on your tailnet — never from the open network — and any paired phone can be revoked at once.
 - **Changed — The mobile bridge no longer opens to the local network.** The old `CONDUIT_BRIDGE_TOKEN` setting is gone; the bridge listens only on this Mac and its Tailscale address.
 - **Changed — Tool calls in session chat show what matters.** A failed call stays on its own line with its error, a file edit shows `+N −M` and a short diff, and only finished, successful calls fold into a one-line summary such as "Ran 2 shell commands, read 3 files" — on desktop and phone alike.

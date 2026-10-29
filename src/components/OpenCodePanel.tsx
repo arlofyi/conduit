@@ -6,6 +6,7 @@ import {
   type OpenCodeSettings,
 } from "../store";
 import { Dropdown } from "./Dropdown";
+import { Button, Switch } from "./ui";
 
 /**
  * Local models — route OpenCode sessions to a local GPU / self-hosted endpoint. Zero-config
@@ -240,12 +241,8 @@ export function OpenCodePanel() {
 
   return (
     <div className="trust-panel">
-      <label className="telemetry-toggle">
-        <input
-          type="checkbox"
-          checked={oc.enabled}
-          onChange={(e) => onMasterToggle(e.target.checked)}
-        />
+      <label className="ui-switch-label">
+        <Switch checked={oc.enabled} onChange={onMasterToggle} />
         <span>Route OpenCode sessions at a chosen endpoint</span>
       </label>
 
@@ -258,9 +255,9 @@ export function OpenCodePanel() {
       <div className="oc-section">
         <div className="section-label">
           Server
-          <button className="oc-detect" onClick={() => void autoConfigure()} disabled={!!busy}>
+          <Button onClick={() => void autoConfigure()} disabled={!!busy}>
             {busy ? "Working…" : "Re-scan & auto-set"}
-          </button>
+          </Button>
         </div>
         <div className="oc-presets">
           {presetRows.map((p) => {
@@ -303,21 +300,19 @@ export function OpenCodePanel() {
         <div className="section-label">
           Model
           <span className="oc-actions">
-            <button
-              className="oc-detect"
+            <Button
               onClick={() => void runProbe()}
               disabled={!!busy || probing || !oc.model.trim() || !oc.baseUrl.trim()}
               title="Sends one real request to check the model makes NATIVE tool calls — the thing agents live on. May take a minute if the model has to load."
             >
               {probing ? "Testing…" : "Test tool-calling"}
-            </button>
-            <button
-              className="oc-detect"
+            </Button>
+            <Button
               onClick={() => void fetchModels()}
               disabled={!!busy || !oc.baseUrl.trim()}
             >
               Refresh list
-            </button>
+            </Button>
           </span>
         </div>
         {models.length > 0 ? (
@@ -389,6 +384,7 @@ export function OpenCodePanel() {
                 <span>Base URL</span>
                 <input
                   type="text"
+                  className="ui-input mono"
                   value={oc.baseUrl}
                   placeholder="http://127.0.0.1:11434/v1"
                   onChange={(e) => save({ baseUrl: e.target.value })}
@@ -399,6 +395,7 @@ export function OpenCodePanel() {
                 <span>Model id</span>
                 <input
                   type="text"
+                  className="ui-input mono"
                   value={oc.model}
                   placeholder="auto-set by scan"
                   onChange={(e) => save({ model: e.target.value })}
@@ -411,6 +408,7 @@ export function OpenCodePanel() {
                 <span>Context tokens</span>
                 <input
                   type="text"
+                  className="ui-input"
                   inputMode="numeric"
                   value={oc.contextLimit ?? ""}
                   placeholder="auto"
@@ -424,6 +422,7 @@ export function OpenCodePanel() {
                 <span>Max output{oc.contextLimit == null ? " (needs context)" : ""}</span>
                 <input
                   type="text"
+                  className="ui-input"
                   inputMode="numeric"
                   value={oc.outputLimit ?? ""}
                   placeholder="8192"
@@ -437,14 +436,14 @@ export function OpenCodePanel() {
                   <span>API key {needsKey ? "(required by this server)" : "(optional)"}</span>
                   <input
                     type="password"
+                    className="ui-input mono"
                     value={keyInput}
                     placeholder={keySet ? "•••••• held for this run" : "none"}
                     onChange={(e) => setKeyInput(e.target.value)}
                     autoComplete="off"
                   />
                 </label>
-                <button
-                  className="oc-detect"
+                <Button
                   disabled={!keyInput.trim()}
                   onClick={() => {
                     void setOpenCodeKey(keyInput);
@@ -452,20 +451,16 @@ export function OpenCodePanel() {
                   }}
                 >
                   Set
-                </button>
+                </Button>
                 {keySet && (
-                  <button className="oc-detect" onClick={() => void setOpenCodeKey("")}>
+                  <Button variant="ghost" onClick={() => void setOpenCodeKey("")}>
                     Clear
-                  </button>
+                  </Button>
                 )}
               </div>
             )}
-            <label className="telemetry-toggle">
-              <input
-                type="checkbox"
-                checked={oc.pinLocal}
-                onChange={(e) => save({ pinLocal: e.target.checked })}
-              />
+            <label className="ui-switch-label">
+              <Switch checked={oc.pinLocal} onChange={(on) => save({ pinLocal: on })} />
               <span>Local only — block every other provider</span>
             </label>
             <p className="trust-note">
