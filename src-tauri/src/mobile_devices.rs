@@ -254,21 +254,31 @@ pub fn mobile_settings(state: tauri::State<'_, Arc<MobileDevices>>) -> MobileSet
     }
 }
 
-/// Persists the switch only; the bridge controller reconcile is wired in a later task.
+/// Persists the switch, then re-plans the bridge's Tailscale listener at once rather
+/// than at the next 30 s tick. `(async)`: the reconcile runs the Tailscale CLI.
 #[tauri::command(async)]
 pub fn mobile_set_enabled(
     state: tauri::State<'_, Arc<MobileDevices>>,
+    bridge: tauri::State<'_, Arc<crate::bridge::BridgeController>>,
     on: bool,
 ) -> Result<(), String> {
-    state.set_enabled(on).map_err(|e| e.to_string())
+    state.set_enabled(on).map_err(|e| e.to_string())?;
+    bridge.reconcile();
+    Ok(())
 }
 
+/// Forget a device and close any socket it has open right now.
 #[tauri::command(async)]
 pub fn mobile_revoke_device(
     state: tauri::State<'_, Arc<MobileDevices>>,
+    bridge: tauri::State<'_, Arc<crate::bridge::BridgeController>>,
     id: String,
 ) -> Result<bool, String> {
-    state.revoke(&id).map_err(|e| e.to_string())
+    let removed = state.revoke(&id).map_err(|e| e.to_string())?;
+    if removed {
+        bridge.disconnect_device(&id);
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

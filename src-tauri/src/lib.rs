@@ -3211,13 +3211,19 @@ pub fn run() {
     #[cfg(feature = "wdio")]
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
 
+    // One device registry, shared by the settings commands and the bridge's auth.
+    let mobile_devices = Arc::new(mobile_devices::MobileDevices::load(
+        store::data_dir().join("mobile-devices.json"),
+    ));
+
     builder
         .manage(Arc::new(PtyManager::new()))
         .manage(crate::ide_host::IdeHost::new())
         .manage(Arc::new(Store::new()))
-        .manage(Arc::new(mobile_devices::MobileDevices::load(
-            store::data_dir().join("mobile-devices.json"),
+        .manage(Arc::new(bridge::BridgeController::new(
+            mobile_devices.clone(),
         )))
+        .manage(mobile_devices)
         .manage(Arc::new(HookState::default()))
         .manage(Arc::new(crate::fleet::FleetState::default()))
         .manage(Arc::new(crate::board::BoardState::default()))
@@ -3367,7 +3373,9 @@ pub fn run() {
                 asks_state,
                 ask_gate,
             );
-            bridge::start(app.handle().clone());
+            app.state::<Arc<bridge::BridgeController>>()
+                .inner()
+                .start(app.handle().clone());
             continuity_watch::start(app.handle().clone());
 
             // IDE announce: hand the host to the PTY manager (teardown needs it) and
