@@ -40,6 +40,7 @@ use tungstenite::{accept_hdr_with_config, Message, WebSocket};
 
 use crate::asks::{AskGate, AskView, Asks};
 use crate::bridge_view::read_lines;
+use crate::broker::{Broker, PermissionView};
 use crate::hookbus::HookBus;
 use crate::mobile_devices::MobileDevices;
 use crate::pairing::{self, Decision, PairRequest, Pairing, Resolution, Via, WaitEnd};
@@ -122,6 +123,12 @@ pub enum ClientMsg {
         ask_id: String,
         answers: serde_json::Map<String, serde_json::Value>,
     },
+    /// Decide a pending tool permission (a `permission` item from `pending`/`pendingAdded`).
+    /// First decision wins; acked with `approveResult`.
+    Approve {
+        id: String,
+        allow: bool,
+    },
 }
 
 /// Manual `Debug`: `Auth.token`, `Pair.secret` and `Pair.nonce` are plaintext secrets and
@@ -199,6 +206,11 @@ impl std::fmt::Debug for ClientMsg {
                 .debug_struct("Answer")
                 .field("ask_id", ask_id)
                 .field("answers", &answers.len())
+                .finish(),
+            Self::Approve { id, allow } => f
+                .debug_struct("Approve")
+                .field("id", id)
+                .field("allow", allow)
                 .finish(),
         }
     }
@@ -280,6 +292,22 @@ fn phone_may_answer(
     answers: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {
     view.is_some_and(|v| !private && crate::asks::validate_answers(&v.questions, answers).is_ok())
+}
+
+/// May a phone decide this permission? Only a still-pending one (None = already decided
+/// elsewhere), and never a private session's.
+fn phone_may_approve(view: Option<&PermissionView>, private: bool) -> bool {
+    view.is_some() && !private
+}
+
+/// What a phone is sent when it tries to decide a private session's permission: the
+/// session-tagged refusal every private request gets, then the `approveResult` that settles
+/// its button.
+fn approve_refusal(view: &PermissionView) -> Vec<serde_json::Value> {
+    vec![
+        crate::bridge_view::private_session_error(&view.session),
+        crate::bridge_view::approve_result_frame(&view.id, false),
+    ]
 }
 
 /// The attached session, if it has become private since it was attached (a phone must stop
@@ -924,6 +952,8 @@ pub struct BridgeController {
     /// The question registry and the desktop gate, so the last phone leaving can hand
     /// back the asks only it was holding. Wired once at startup (`wire_asks`).
     asks: OnceLock<(Arc<Asks>, Arc<AskGate>)>,
+    /// The permission registry, for the same hand-off (`wire_permissions`).
+    permissions: OnceLock<Arc<Broker>>,
 }
 
 impl BridgeController {
@@ -941,12 +971,19 @@ impl BridgeController {
             spawns: Mutex::new(HashMap::new()),
             last_messages: Default::default(),
             asks: OnceLock::new(),
+            permissions: OnceLock::new(),
         }
     }
 
     /// Hand the controller the question registry and desktop gate. Once; later calls no-op.
     pub fn wire_asks(&self, asks: Arc<Asks>, gate: Arc<AskGate>) {
         let _ = self.asks.set((asks, gate));
+    }
+
+    /// Hand the controller the permission registry. Once; later calls no-op. The desktop
+    /// gate comes from `wire_asks` -- one gate holds both.
+    pub fn wire_permissions(&self, broker: Arc<Broker>) {
+        let _ = self.permissions.set(broker);
     }
 
     /// Is an authenticated REMOTE phone connected AND still heard from? Loopback peers
@@ -964,13 +1001,16 @@ impl BridgeController {
             .any(|slot| !conn_is_stale(slot.last_heard(), now))
     }
 
-    /// The last remote phone just left. Every ask it alone was holding goes back to the
+    /// The last remote phone just left. Every ask or permission it alone was holding goes back to the
     /// terminal now -- unless the desktop is watching, in which case its card still can.
     /// Called with the `live` lock released.
     fn last_phone_left(&self) {
         if let Some((asks, gate)) = self.asks.get() {
             if !gate.is_open() {
                 asks.hand_off_where(|_, held_for_phone| held_for_phone);
+                if let Some(broker) = self.permissions.get() {
+                    broker.hand_off_where(|_, held_for_phone| held_for_phone);
+                }
             }
         }
     }
@@ -1661,6 +1701,35 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         let reply = crate::bridge_view::answer_result_frame(&ask_id, ok);
                         let _ = ws.send(Message::Text(reply.to_string()));
                     }
+                    // Same rule for a permission: `resolve` is the check-and-set. A private
+                    // session's is refused like every private request, tagged with its
+                    // session, and the button still gets its `approveResult`.
+                    Some(ClientMsg::Approve { id, allow }) => {
+                        let broker = app.state::<Arc<Broker>>();
+                        let view = broker.get(&id);
+                        let private = view.as_ref().is_some_and(|v| {
+                            crate::bridge_view::session_is_private(
+                                &app.state::<Arc<Store>>().list(),
+                                &v.session,
+                            )
+                        });
+                        let frames = match view {
+                            Some(v) if private => approve_refusal(&v),
+                            view => {
+                                let decision = if allow {
+                                    crate::broker::Decision::Allow
+                                } else {
+                                    crate::broker::Decision::Deny
+                                };
+                                let ok = phone_may_approve(view.as_ref(), private)
+                                    && broker.resolve(&id, decision, crate::asks::By::Phone);
+                                vec![crate::bridge_view::approve_result_frame(&id, ok)]
+                            }
+                        };
+                        for frame in frames {
+                            let _ = ws.send(Message::Text(frame.to_string()));
+                        }
+                    }
                     // Already authenticated (or loopback): a repeat `auth` changes nothing.
                     Some(ClientMsg::Auth { .. }) | None => {}
                 }
@@ -1713,7 +1782,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             }
         }
 
-        // 1c. Pending questions: the whole list once trusted, then what changed, at most
+        // 1c. Pending questions and permissions: the whole list once trusted, then what changed, at most
         //     every PUSH_EVERY. Every socket diffs on its own, so every phone collapses a
         //     card whoever answered it.
         if authed && (pushed.is_none() || Instant::now() >= next_push) {
@@ -1854,25 +1923,34 @@ fn push_pending(
     pushed: &mut Option<HashSet<String>>,
 ) -> bool {
     let asks = app.state::<Arc<Asks>>();
+    let broker = app.state::<Arc<Broker>>();
     let views = asks.pending();
-    let unchanged = pushed
-        .as_ref()
-        .is_some_and(|p| p.len() == views.len() && views.iter().all(|v| p.contains(&v.id)));
+    let perms = broker.pending();
+    let unchanged = pushed.as_ref().is_some_and(|p| {
+        p.len() == views.len() + perms.len()
+            && views.iter().all(|v| p.contains(&v.id))
+            && perms.iter().all(|v| p.contains(&v.id))
+    });
     if unchanged {
         return true;
     }
     // The store is read only when there is something to classify.
-    let projects = if views.is_empty() {
+    let projects = if views.is_empty() && perms.is_empty() {
         Vec::new()
     } else {
         app.state::<Arc<Store>>().list()
     };
-    let items = crate::bridge_view::ask_push_items(&views, |sid| {
-        crate::bridge_view::session_is_private(&projects, sid)
-    });
-    // The ring is read only when something can have been resolved.
+    let is_private = |sid: &str| crate::bridge_view::session_is_private(&projects, sid);
+    let mut items = crate::bridge_view::ask_push_items(&views, is_private);
+    items.extend(crate::bridge_view::permission_push_items(
+        &perms, is_private,
+    ));
+    // The ring is read only when something can have been resolved. Ask and permission ids
+    // never collide (`ask-N` / `perm-N`), so one combined ring names either.
     let recent = if pushed.is_some() {
-        asks.recent_resolutions()
+        let mut r = asks.recent_resolutions();
+        r.extend(broker.recent_resolutions());
+        r
     } else {
         Vec::new()
     };
@@ -2887,6 +2965,79 @@ mod tests {
         );
         assert!(!phone_may_answer(Some(&view), false, &bad), "validated");
         assert!(!phone_may_answer(None, false, &good), "already resolved");
+    }
+
+    fn perm_view(id: &str) -> crate::broker::PermissionView {
+        crate::broker::PermissionView {
+            id: id.into(),
+            session: "s".into(),
+            tool_name: "Bash".into(),
+            summary: "ls".into(),
+            created_ms: 0,
+        }
+    }
+
+    #[test]
+    fn approve_refused_for_silo() {
+        let view = perm_view("perm-1");
+        assert!(phone_may_approve(Some(&view), false));
+        assert!(
+            !phone_may_approve(Some(&view), true),
+            "a private session's permission is never decided from a phone"
+        );
+        assert!(!phone_may_approve(None, false), "already resolved");
+        // The refusal names the session, so a phone in another chat can ignore it.
+        assert_eq!(
+            approve_refusal(&view),
+            vec![
+                serde_json::json!({ "type": "error", "message": "private session", "sessionId": "s" }),
+                serde_json::json!({ "type": "approveResult", "id": "perm-1", "ok": false }),
+            ]
+        );
+    }
+
+    #[test]
+    fn approve_msg_parses_camel_case() {
+        match parse_client_msg(r#"{"type":"approve","id":"perm-2","allow":true}"#) {
+            Some(ClientMsg::Approve { id, allow }) => {
+                assert_eq!(id, "perm-2");
+                assert!(allow);
+            }
+            other => panic!("expected Approve, got {other:?}"),
+        }
+        assert!(parse_client_msg(r#"{"type":"approve","id":"x"}"#).is_none());
+        assert!(parse_client_msg(r#"{"type":"approve","id":"x","allow":"yes"}"#).is_none());
+        // Not session-scoped by its fields: the handler checks the permission's own session.
+        let m = parse_client_msg(r#"{"type":"approve","id":"x","allow":false}"#).unwrap();
+        assert_eq!(session_scope(&m), None);
+    }
+
+    #[test]
+    fn last_phone_leaving_hands_off_permissions_too() {
+        use crate::asks::By;
+        use crate::broker::Decision;
+        let (c, _asks, gate) = wired_controller();
+        let broker = Arc::new(crate::broker::Broker::default());
+        c.wire_permissions(broker.clone());
+        let a = c.register_live("d1");
+        let (held, rx_held) =
+            broker.register_held("s".into(), "Bash".into(), serde_json::json!({}), 1, true);
+        let (desk, rx_desk) =
+            broker.register_held("s".into(), "Bash".into(), serde_json::json!({}), 2, false);
+        c.unregister_live("d1", &a);
+        assert_eq!(
+            rx_held.try_recv().unwrap(),
+            (Decision::FallThrough, By::Terminal)
+        );
+        assert!(broker.get(&held).is_none());
+        assert!(rx_desk.try_recv().is_err() && broker.get(&desk).is_some());
+        // While the desktop watches, its card can still answer: nothing is handed off.
+        gate.set(true);
+        let b = c.register_live("d2");
+        let (kept, rx_kept) =
+            broker.register_held("s".into(), "Bash".into(), serde_json::json!({}), 3, true);
+        c.unregister_live("d2", &b);
+        assert!(rx_kept.try_recv().is_err() && broker.get(&kept).is_some());
     }
 
     #[test]

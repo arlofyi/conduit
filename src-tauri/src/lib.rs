@@ -1750,6 +1750,24 @@ fn set_ask_gate(gate: State<Arc<asks::AskGate>>, open: bool) {
     gate.set(open);
 }
 
+/// Catch-up for a reload or a newly opened window: the permissions `/permission` is holding.
+#[tauri::command]
+fn permission_pending(broker: State<Arc<broker::Broker>>) -> Vec<broker::PermissionView> {
+    broker.pending()
+}
+
+/// Allow or deny a pending permission from its desktop card. `false` = it already resolved
+/// (decided on a phone, in the terminal, cancelled or timed out) -- nothing was sent.
+#[tauri::command]
+fn permission_respond(broker: State<Arc<broker::Broker>>, id: String, allow: bool) -> bool {
+    let decision = if allow {
+        broker::Decision::Allow
+    } else {
+        broker::Decision::Deny
+    };
+    broker.resolve(&id, decision, asks::By::Desktop)
+}
+
 /// How long a project's resolved git toplevels are reused (see `ToplevelCache`).
 const TOPLEVEL_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -3241,7 +3259,6 @@ pub fn run() {
         .manage(Arc::new(root_chat::RootChatState::default()))
         .manage(Arc::new(hookbus::HookBus::default()))
         .manage(Arc::new(broker::Broker::default()))
-        .manage(Arc::new(broker::Presence::default()))
         .manage(Arc::new(asks::Asks::default()))
         .manage(Arc::new(asks::AskGate::default()))
         .manage(Arc::new(proposals::Proposals::default()))
@@ -3308,7 +3325,6 @@ pub fn run() {
             let hook_state = app.state::<Arc<HookState>>().inner().clone();
             let bus = app.state::<Arc<hookbus::HookBus>>().inner().clone();
             let broker = app.state::<Arc<broker::Broker>>().inner().clone();
-            let presence = app.state::<Arc<broker::Presence>>().inner().clone();
             let pty = app.state::<Arc<PtyManager>>().inner().clone();
             let store = app.state::<Arc<Store>>().inner().clone();
             let tasks = app.state::<Arc<TaskBoard>>().inner().clone();
@@ -3365,7 +3381,6 @@ pub fn run() {
                 hook_state,
                 bus,
                 broker,
-                presence,
                 fleet.clone(),
                 store.clone(),
                 pty.clone(),
@@ -3386,6 +3401,7 @@ pub fn run() {
                     app.state::<Arc<asks::Asks>>().inner().clone(),
                     app.state::<Arc<asks::AskGate>>().inner().clone(),
                 );
+                bridge.wire_permissions(app.state::<Arc<broker::Broker>>().inner().clone());
                 bridge.start(app.handle().clone());
             }
             continuity_watch::start(app.handle().clone());
@@ -3602,6 +3618,8 @@ pub fn run() {
             ask_handoff,
             ask_pending,
             set_ask_gate,
+            permission_pending,
+            permission_respond,
             add_session,
             detect_agents,
             rename_session,

@@ -14,6 +14,7 @@ use std::time::SystemTime;
 use serde_json::{json, Value};
 
 use crate::asks::AskView;
+use crate::broker::PermissionView;
 use crate::context_window::ContextUsage;
 use crate::fleet::FleetStatus;
 use crate::store::{Profile, Project, Session};
@@ -372,7 +373,7 @@ pub fn private_session_error(session_id: &str) -> Value {
 }
 
 /// One pending item pushed to phones: its id (what a connection diffs on) and the wire
-/// object (`AskPush`; Task 3 adds `PermissionPush`, told apart by `kind`).
+/// object (`AskPush` or `PermissionPush`, told apart by `kind`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PushItem {
     pub id: String,
@@ -406,6 +407,36 @@ pub fn ask_push_items(views: &[AskView], is_private: impl Fn(&str) -> bool) -> V
         .collect()
 }
 
+/// A permission as a phone sees it. A private (silo / local-only) session's carries only
+/// that it EXISTS -- never the tool or what it would run.
+pub fn permission_push(view: &PermissionView, private: bool) -> Value {
+    if private {
+        return json!({ "kind": "permission", "id": view.id, "sessionId": view.session, "private": true });
+    }
+    json!({
+        "kind": "permission",
+        "id": view.id,
+        "sessionId": view.session,
+        "toolName": view.tool_name,
+        "summary": view.summary,
+        "createdMs": view.created_ms,
+    })
+}
+
+/// The pending permissions as push items, oldest first, each classified private or not.
+pub fn permission_push_items(
+    views: &[PermissionView],
+    is_private: impl Fn(&str) -> bool,
+) -> Vec<PushItem> {
+    views
+        .iter()
+        .map(|v| PushItem {
+            id: v.id.clone(),
+            item: permission_push(v, is_private(&v.session)),
+        })
+        .collect()
+}
+
 /// The full list, sent once right after auth (and on a loopback connect).
 pub fn pending_frame(items: &[PushItem]) -> Value {
     let of = |kind: &str| -> Vec<Value> {
@@ -431,6 +462,12 @@ pub fn resolved_frame(id: &str, by: &str) -> Value {
 /// (private session) or invalid -- nothing was sent to the agent.
 pub fn answer_result_frame(ask_id: &str, ok: bool) -> Value {
     json!({ "type": "answerResult", "askId": ask_id, "ok": ok })
+}
+
+/// The reply to a phone's `approve`: `ok: false` = already decided elsewhere or refused
+/// (private session) -- nothing was sent to the agent.
+pub fn approve_result_frame(id: &str, ok: bool) -> Value {
+    json!({ "type": "approveResult", "id": id, "ok": ok })
 }
 
 /// The frames one connection sends for the pending list now, and the id set it has then
@@ -984,6 +1021,48 @@ mod tests {
         assert_eq!(
             answer_result_frame("ask-1", false),
             json!({ "type": "answerResult", "askId": "ask-1", "ok": false })
+        );
+    }
+
+    #[test]
+    fn permission_push_shape_and_private_shape() {
+        let view = crate::broker::PermissionView {
+            id: "perm-1".into(),
+            session: "s1".into(),
+            tool_name: "Bash".into(),
+            summary: "touch a.txt".into(),
+            created_ms: 9,
+        };
+        let open = permission_push(&view, false);
+        assert_eq!(
+            open,
+            json!({ "kind": "permission", "id": "perm-1", "sessionId": "s1",
+                "toolName": "Bash", "summary": "touch a.txt", "createdMs": 9 })
+        );
+        // Private: that it exists, nothing of what it would run.
+        let private = permission_push(&view, true);
+        assert_eq!(
+            private,
+            json!({ "kind": "permission", "id": "perm-1", "sessionId": "s1", "private": true })
+        );
+        // `pending` sorts it into `permissions`; asks stay in `asks`.
+        let items = permission_push_items(&[view], |_| false);
+        let ask_item = PushItem {
+            id: "ask-1".into(),
+            item: ask_push(&ask("ask-1", "s1"), false),
+        };
+        let both = [ask_item.clone(), items[0].clone()];
+        assert_eq!(
+            pending_frame(&both),
+            json!({ "type": "pending", "asks": [ask_item.item], "permissions": [open.clone()] })
+        );
+        assert_eq!(
+            pending_added_frame(&items[0]),
+            json!({ "type": "pendingAdded", "item": open })
+        );
+        assert_eq!(
+            approve_result_frame("perm-1", true),
+            json!({ "type": "approveResult", "id": "perm-1", "ok": true })
         );
     }
 
