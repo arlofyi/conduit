@@ -1,4 +1,4 @@
-import { PHONE_KINDS, mapChatItem, mapHistory, mapProjects, statusPatch } from "./live";
+import { PHONE_KINDS, appendWire, mapChatItem, mapHistory, mapProjects, statusPatch } from "./live";
 import type { WireChatItem, WireProject } from "./protocol";
 
 describe("mapChatItem", () => {
@@ -40,6 +40,38 @@ describe("phone item mapping", () => {
     ]);
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({ kind: "command", name: "/compact", output: "Compacted" });
+  });
+});
+
+describe("appendWire", () => {
+  const cmd = { kind: "command", name: "/x", args: "" } as const;
+  const out = (text: string) => ({ kind: "command_output", text, stream: "stdout" }) as const;
+  it("folds command_output into the previous command", () => {
+    const feed = appendWire(appendWire([], cmd), out("done"));
+    expect(feed).toHaveLength(1);
+    expect(feed[0]).toMatchObject({ kind: "command", name: "/x", output: "done" });
+  });
+  it("a lone command_output becomes a nameless command", () => {
+    expect(appendWire([], out("hi"))[0]).toMatchObject({ kind: "command", name: "", output: "hi" });
+  });
+  it("leaves the feed unchanged for a null-mapped item", () => {
+    const feed = appendWire([], cmd);
+    expect(appendWire(feed, { kind: "usage" } as never)).toBe(feed);
+  });
+  it("does not overwrite an already-folded output", () => {
+    const feed = appendWire(appendWire(appendWire([], cmd), out("one")), out("two"));
+    expect(feed).toHaveLength(2);
+    expect(feed[0]).toMatchObject({ output: "one" });
+    expect(feed[1]).toMatchObject({ name: "", output: "two" });
+  });
+});
+
+describe("task status table", () => {
+  const t = (status: string) => mapChatItem({ kind: "task", taskId: null, status, summary: "s" });
+  it("maps failed, stopped and unknown", () => {
+    expect(t("failed")).toMatchObject({ tone: "bad", text: "Background task failed" });
+    expect(t("stopped")).toMatchObject({ tone: "info", text: "Background task stopped" });
+    expect(t("wat")).toMatchObject({ tone: "info", text: "Background task update" });
   });
 });
 

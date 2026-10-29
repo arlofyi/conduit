@@ -32,10 +32,25 @@ function eventKind(e: string): EventKind {
   }
 }
 
-const KINDS: string[] = require("../../../src-tauri/src/transcript_item_kinds.json");
-
-/** Every wire kind `mapChatItem` handles: the Rust manifest minus `usage` (not shown on the phone). */
-export const PHONE_KINDS: readonly string[] = KINDS.filter((k) => k !== "usage");
+/**
+ * Every wire kind `mapChatItem` handles: the Rust manifest minus `usage` (not shown on the phone).
+ * A literal on purpose: Metro cannot bundle files outside mobile/. live.test.ts checks it against the manifest.
+ */
+export const PHONE_KINDS: readonly string[] = [
+  "bubble",
+  "event",
+  "task",
+  "peer",
+  "auto",
+  "command",
+  "command_output",
+  "skill",
+  "image",
+  "divider",
+  "question",
+  "plan",
+  "note",
+];
 
 /** Same table as the desktop's `taskLine` (src/chatItems.ts); keep in step. */
 function taskLine(status: string): { tone: "ok" | "bad" | "info"; text: string } {
