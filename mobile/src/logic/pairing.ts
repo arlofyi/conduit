@@ -20,6 +20,17 @@ const PORT_MIN = 8455;
 const PORT_MAX = 8474;
 const SECRET_RE = /^[0-9a-f]{64}$/;
 
+const HOST_RE = /^[a-z0-9.-]{1,253}$/i;
+
+/** IPv4 in 100.64.0.0/10 (Tailscale CGNAT). */
+function isTailnetIp(ip: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  if (!m) return false;
+  const n = m.slice(1).map(Number);
+  if (n.some((x) => x > 255)) return false;
+  return n[0] === 100 && n[1] >= 64 && n[1] <= 127;
+}
+
 const str = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 
 /** Validate a scanned QR. Anything that is not exactly a Conduit pairing payload is
@@ -38,7 +49,9 @@ export function parseQr(text: string): QrResult {
   if (
     !str(o.macName) ||
     !str(o.dnsName) ||
+    !HOST_RE.test(o.dnsName) ||
     !str(o.ip) ||
+    !isTailnetIp(o.ip) ||
     typeof o.port !== "number" ||
     !Number.isInteger(o.port) ||
     o.port < PORT_MIN ||
@@ -58,7 +71,9 @@ const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "
 
 /** 16 random bytes as 32 lowercase hex. */
 export function makeNonce(randomBytes: (n: number) => Uint8Array): string {
-  return hex(randomBytes(16));
+  const b = randomBytes(16);
+  if (b.length < 16) throw new Error("randomBytes returned too few bytes");
+  return hex(b.subarray(0, 16));
 }
 
 /** `sha256(utf8(input) || utf8(nonce))`, first two bytes big-endian, % 10000, zero padded.

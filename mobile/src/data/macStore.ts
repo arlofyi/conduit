@@ -13,13 +13,14 @@ export interface KeyValueBackend {
 const INDEX = "macs.index";
 const CURRENT = "macs.current";
 const slot = (id: string) => `mac.${id}`;
+const ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+const validId = (id: unknown): id is string => typeof id === "string" && ID_RE.test(id);
 
 function isSavedMac(v: unknown): v is SavedMac {
   if (!v || typeof v !== "object") return false;
   const o = v as Record<string, unknown>;
   return (
-    typeof o.deviceId === "string" &&
-    o.deviceId.length > 0 &&
+    validId(o.deviceId) &&
     typeof o.token === "string" &&
     typeof o.macName === "string" &&
     typeof o.dnsName === "string" &&
@@ -35,21 +36,37 @@ export function createMacStore(be: KeyValueBackend) {
     if (!raw) return [];
     try {
       const v = JSON.parse(raw);
-      return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+      return Array.isArray(v) ? v.filter(validId) : [];
     } catch {
       return [];
     }
   }
   const writeIndex = (ids: string[]) => be.set(INDEX, JSON.stringify(ids));
 
-  async function list(): Promise<SavedMac[]> {
+  // Serializes index read-modify-writes so concurrent saves/forgets cannot lose updates.
+  let chain: Promise<unknown> = Promise.resolve();
+  function locked<T>(fn: () => Promise<T>): Promise<T> {
+    const run = chain.then(fn, fn);
+    chain = run.catch(() => undefined);
+    return run;
+  }
+
+  async function listInner(): Promise<SavedMac[]> {
     const ids = await readIndex();
     const out: SavedMac[] = [];
     const kept: string[] = [];
+    let dropped = false;
     for (const id of ids) {
+      let raw: string | null;
+      try {
+        raw = await be.get(slot(id));
+      } catch {
+        // Transient read failure: skip for this call, touch nothing.
+        kept.push(id);
+        continue;
+      }
       let mac: SavedMac | null = null;
       try {
-        const raw = await be.get(slot(id));
         const parsed = raw ? JSON.parse(raw) : null;
         if (isSavedMac(parsed) && parsed.deviceId === id) mac = parsed;
       } catch {
@@ -59,24 +76,41 @@ export function createMacStore(be: KeyValueBackend) {
         out.push(mac);
         kept.push(id);
       } else {
-        await be.del(slot(id));
+        dropped = true;
+        try {
+          await be.del(slot(id));
+        } catch {
+          // best-effort cleanup
+        }
       }
     }
-    if (kept.length !== ids.length) await writeIndex(kept);
+    if (dropped) {
+      try {
+        await writeIndex(kept);
+      } catch {
+        // best-effort cleanup
+      }
+    }
     return out;
   }
 
-  async function save(mac: SavedMac): Promise<void> {
-    await be.set(slot(mac.deviceId), JSON.stringify(mac));
-    const ids = await readIndex();
-    if (!ids.includes(mac.deviceId)) await writeIndex([...ids, mac.deviceId]);
-  }
+  const list = () => locked(listInner);
 
-  async function forget(deviceId: string): Promise<void> {
-    await be.del(slot(deviceId));
-    await writeIndex((await readIndex()).filter((i) => i !== deviceId));
-    if ((await be.get(CURRENT)) === deviceId) await be.del(CURRENT);
-  }
+  const save = (mac: SavedMac): Promise<void> =>
+    locked(async () => {
+      if (!validId(mac.deviceId)) throw new Error("invalid deviceId");
+      await be.set(slot(mac.deviceId), JSON.stringify(mac));
+      const ids = await readIndex();
+      if (!ids.includes(mac.deviceId)) await writeIndex([...ids, mac.deviceId]);
+    });
+
+  const forget = (deviceId: string): Promise<void> =>
+    locked(async () => {
+      if (!validId(deviceId)) return;
+      await be.del(slot(deviceId));
+      await writeIndex((await readIndex()).filter((i) => i !== deviceId));
+      if ((await be.get(CURRENT)) === deviceId) await be.del(CURRENT);
+    });
 
   async function current(): Promise<SavedMac | null> {
     const id = await be.get(CURRENT);
@@ -84,9 +118,8 @@ export function createMacStore(be: KeyValueBackend) {
     return (await list()).find((m) => m.deviceId === id) ?? null;
   }
 
-  async function setCurrent(deviceId: string): Promise<void> {
-    await be.set(CURRENT, deviceId);
-  }
+  const setCurrent = (deviceId: string): Promise<void> =>
+    locked(() => be.set(CURRENT, deviceId));
 
   return { list, save, forget, current, setCurrent };
 }

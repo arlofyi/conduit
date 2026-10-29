@@ -54,4 +54,39 @@ describe("macStore", () => {
     be.m.set("macs.index", "garbage");
     expect(await createMacStore(be).list()).toEqual([]);
   });
+  it("transient_read_failure_keeps_slot", async () => {
+    const be = memory();
+    const s = createMacStore(be);
+    await s.save(mk("a"));
+    await s.save(mk("b"));
+    const flaky: KeyValueBackend = { ...be, get: async (k) => { if (k === "mac.a") throw new Error("locked"); return be.get(k); } };
+    expect((await createMacStore(flaky).list()).map((x) => x.deviceId)).toEqual(["b"]);
+    expect(be.m.has("mac.a")).toBe(true);
+    expect(JSON.parse(be.m.get("macs.index")!)).toEqual(["a", "b"]);
+    expect((await s.list()).map((x) => x.deviceId)).toEqual(["a", "b"]);
+  });
+  it("cleanup_failure_does_not_throw", async () => {
+    const be = memory();
+    const s = createMacStore({ ...be, del: async () => { throw new Error("x"); } });
+    await s.save(mk("a"));
+    be.m.set("mac.a", "{bad");
+    expect(await s.list()).toEqual([]);
+  });
+  it("rejects_bad_device_ids", async () => {
+    const be = memory();
+    const s = createMacStore(be);
+    await expect(s.save(mk("../evil"))).rejects.toThrow();
+    await expect(s.save(mk(""))).rejects.toThrow();
+    expect(be.m.size).toBe(0);
+    be.m.set("macs.index", JSON.stringify(["bad id", "a"]));
+    be.m.set("mac.a", JSON.stringify(mk("a")));
+    expect((await s.list()).map((x) => x.deviceId)).toEqual(["a"]);
+  });
+  it("concurrent_saves_both_land", async () => {
+    const be = memory();
+    const slow: KeyValueBackend = { ...be, get: async (k) => { await new Promise((r) => setTimeout(r, 5)); return be.get(k); } };
+    const s = createMacStore(slow);
+    await Promise.all([s.save(mk("a")), s.save(mk("b")), s.save(mk("c"))]);
+    expect(JSON.parse(be.m.get("macs.index")!)).toEqual(["a", "b", "c"]);
+  });
 });

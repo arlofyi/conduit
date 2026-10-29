@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { createHash, randomBytes } from "crypto";
 import { addressesFor, confirmCode, makeNonce, parseQr } from "./pairing";
 import type { SavedMac } from "../data/types";
@@ -17,6 +18,12 @@ describe("makeNonce", () => {
   it("nonce_is_32_hex", () => {
     const n = makeNonce((len) => new Uint8Array(randomBytes(len)));
     expect(n).toMatch(/^[0-9a-f]{32}$/);
+  });
+});
+
+describe("makeNonce short", () => {
+  it("throws_on_short_random", () => {
+    expect(() => makeNonce(() => new Uint8Array(8))).toThrow();
   });
 });
 
@@ -41,6 +48,15 @@ describe("parseQr", () => {
     for (const port of [8454, 8475, 0, "8455", 8455.5]) {
       expect(parseQr(JSON.stringify({ ...good, port }))).toEqual({ ok: false, reason: "invalid" });
     }
+  });
+  it("rejects_bad_qr_ip_and_dns", () => {
+    for (const ip of ["192.168.1.5", "100.63.0.1", "100.128.0.1", "100.64.0.256", "evil.com", "100.64.0.1:80"]) {
+      expect(parseQr(JSON.stringify({ ...good, ip }))).toEqual({ ok: false, reason: "invalid" });
+    }
+    for (const dnsName of ["ws://x.ts.net", "x.ts.net:8455", "x.ts.net/path", ""]) {
+      expect(parseQr(JSON.stringify({ ...good, dnsName }))).toEqual({ ok: false, reason: "invalid" });
+    }
+    expect(parseQr(JSON.stringify({ ...good, ip: "100.127.255.254" })).ok).toBe(true);
   });
   it("accepts_real_qr_shape", () => {
     expect(parseQr(JSON.stringify(good))).toEqual({ ok: true, qr: good });
