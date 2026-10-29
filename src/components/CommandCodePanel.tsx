@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useStore } from "../store";
 import { Dropdown } from "./Dropdown";
+import { Switch, SettingsSection, Notice } from "./ui";
 
 /**
  * Settings → Command Code: edit `~/.commandcode/config.json` without opening a session.
@@ -186,17 +187,16 @@ export function CommandCodePanel() {
         </label>
       )}
 
-      {err && <div className="cc-note cc-warn">{err}</div>}
+      {err && <Notice tone="error">{err}</Notice>}
 
       {cfg && !cfg.exists && (
-        <div className="cc-note">
+        <Notice tone="info">
           No config file yet — Command Code writes one on first run. Changing anything here
           creates it at <code>{cfg.path}</code>.
-        </div>
+        </Notice>
       )}
 
-      <div className="cc-section">
-        <span className="section-label">Session defaults</span>
+      <SettingsSection title="Session defaults" flush>
 
         <label className="cc-field">
           <span>Model</span>
@@ -210,10 +210,10 @@ export function CommandCodePanel() {
         </label>
 
         {modelsErr && (
-          <div className="cc-note cc-warn">
+          <Notice tone="warn">
             {modelsErr} The model lists are empty, but everything else here still works —
             this usually means Command Code isn’t installed, or isn’t on this app’s PATH.
-          </div>
+          </Notice>
         )}
 
         <label className="cc-field">
@@ -230,28 +230,26 @@ export function CommandCodePanel() {
           />
         </label>
 
-        <label className="cc-toggle">
-          <input
-            type="checkbox"
+        <label className="ui-switch-label">
+          <Switch
             disabled={busy}
             checked={values.tasteLearning === true}
-            onChange={(e) => patch({ tasteLearning: e.target.checked ? true : null })}
+            onChange={(on) => patch({ tasteLearning: on ? true : null })}
           />
           <span>
             Taste learning — let Command Code learn this codebase’s conventions from your
             sessions and apply them to later work.
           </span>
         </label>
-      </div>
+      </SettingsSection>
 
-      <div className="cc-section">
-        <span className="section-label">Built-in task models</span>
-        <p className="cc-note">
+      <SettingsSection title="Built-in task models" flush>
+        <Notice tone="info">
           Which model runs Command Code’s <em>own</em> housekeeping. These never answer you —
           they name sessions, compact history, and describe tool calls — so a cheap model
           here keeps your quota for the work you actually asked for. This is Command Code
           routing itself, one level below Conduit’s own agent routing.
-        </p>
+        </Notice>
         {FEATURES.map((f) => (
           <label className="cc-field" key={f.key}>
             <span title={f.hint}>{f.label}</span>
@@ -264,7 +262,7 @@ export function CommandCodePanel() {
             />
           </label>
         ))}
-      </div>
+      </SettingsSection>
     </div>
   );
 }

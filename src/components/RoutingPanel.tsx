@@ -4,6 +4,7 @@ import { useStore } from "../store";
 import { AGENTS, agentMeta, type AgentId } from "../agents";
 import { AgentGlyph } from "./AgentGlyph";
 import { Dropdown } from "./Dropdown";
+import { Button, Segmented, Badge } from "./ui";
 import type { Chain, RouteTarget, TaskKind } from "../routing";
 
 /**
@@ -86,27 +87,35 @@ function TargetRow({
         </span>
       )}
 
-      <button
-        className="route-btn"
+      <Button
+        variant="ghost"
+        size="sm"
         disabled={index === 0}
         onClick={() => onMove(-1)}
         aria-label="Move up"
         title="Move up"
       >
         ↑
-      </button>
-      <button
-        className="route-btn"
+      </Button>
+      <Button
+        variant="ghost"
+        size="sm"
         disabled={index === count - 1}
         onClick={() => onMove(1)}
         aria-label="Move down"
         title="Move down"
       >
         ↓
-      </button>
-      <button className="route-btn" onClick={onRemove} aria-label="Remove" title="Remove">
+      </Button>
+      <Button
+        variant="danger"
+        size="sm"
+        onClick={onRemove}
+        aria-label="Remove"
+        title="Remove"
+      >
         ×
-      </button>
+      </Button>
     </div>
   );
 }
@@ -162,22 +171,20 @@ export function RoutingPanel() {
         quota, so the same list covers your preference, a missing CLI, and a spent limit.
       </p>
 
-      <div className="route-scope">
-        <button
-          className={`route-scope-btn${scopeId === null ? " on" : ""}`}
-          onClick={() => setScopeId(null)}
-        >
-          Global
-        </button>
-        <button
-          className={`route-scope-btn${scopeId !== null ? " on" : ""}`}
-          disabled={!openProject}
-          onClick={() => openProject && setScopeId(openProject.id)}
-          title={openProject ? openProject.name : "Open a project first"}
-        >
-          {openProject ? openProject.name : "This project"}
-        </button>
-      </div>
+      <Segmented
+        value={scopeId ?? "global"}
+        onChange={(val) => setScopeId(val === "global" ? null : val)}
+        label="Choose scope"
+        options={[
+          { value: "global", label: "Global" },
+          {
+            value: openProject?.id ?? "project",
+            label: openProject ? openProject.name : "This project",
+            disabled: !openProject,
+            title: openProject ? undefined : "Open a project first",
+          },
+        ]}
+      />
 
       {taskKinds.map((t) => {
         const chain = chainOf(t.id);
@@ -187,7 +194,15 @@ export function RoutingPanel() {
           <div className="route-task" key={t.id}>
             <div className="route-task-head">
               <span className="route-task-name">{t.label}</span>
-              <span className="route-origin">
+              <Badge
+                tone={
+                  origin === "default"
+                    ? "muted"
+                    : origin === (scopeId === null ? "global" : "project")
+                      ? "accent"
+                      : "neutral"
+                }
+              >
                 {origin === "default"
                   ? "built-in default"
                   : origin === "global"
@@ -195,15 +210,16 @@ export function RoutingPanel() {
                       ? "inherited from Global"
                       : "set here"
                     : "set here"}
-              </span>
+              </Badge>
               {overridden && (
-                <button
-                  className="route-btn route-reset"
+                <Button
+                  variant="ghost"
+                  size="sm"
                   onClick={() => write(t.id, null)}
                   title="Go back to inheriting"
                 >
                   Reset
-                </button>
+                </Button>
               )}
             </div>
             <p className="route-hint">{t.hint}</p>
@@ -233,8 +249,9 @@ export function RoutingPanel() {
               </p>
             )}
 
-            <button
-              className="route-add"
+            <Button
+              variant="secondary"
+              size="sm"
               onClick={() => {
                 // Default the new link to an agent not already in the chain, since a
                 // fallback onto the same agent shares the same quota and buys nothing.
@@ -244,7 +261,7 @@ export function RoutingPanel() {
               }}
             >
               + Add fallback
-            </button>
+            </Button>
           </div>
         );
       })}

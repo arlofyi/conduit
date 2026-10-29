@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useStore } from "../store";
 import { PluginConsentDialog } from "./PluginConsentDialog";
 import type { PluginDescriptor, PluginManifest, PluginPermission } from "../plugins/types";
+import { Button, ButtonRow } from "./ui";
 
 function statusOf(d: PluginDescriptor): string {
   if (!d.manifest) return "error";
@@ -47,13 +48,13 @@ export function PluginsPanel() {
         Plugins extend Conduit. They run sandboxed and only get the access you grant.
         Drop a plugin folder into the plugins directory, then enable it here.
       </p>
-      <div className="plugins-actions">
-        <button onClick={() => void invoke<string>("open_plugins_dir").then((p) => console.log("plugins dir:", p))}>
+      <ButtonRow align="start">
+        <Button variant="secondary" onClick={() => void invoke<string>("open_plugins_dir").then((p) => console.log("plugins dir:", p))}>
           Open plugins folder
-        </button>
-        <button onClick={() => void refresh()}>Rescan</button>
-        <button className="danger" onClick={() => void setAll(false)}>Disable all</button>
-      </div>
+        </Button>
+        <Button variant="secondary" onClick={() => void refresh()}>Rescan</Button>
+        <Button variant="danger" onClick={() => void setAll(false)}>Disable all</Button>
+      </ButtonRow>
       <ul className="plugins-list">
         {plugins.map((d) => (
           <li key={d.id} className="plugin-row">
@@ -70,9 +71,9 @@ export function PluginsPanel() {
             </div>
             <div className="plugin-controls">
               {d.manifest && d.problems.length === 0 && (
-                <button onClick={() => onToggle(d)}>{d.record?.enabled ? "Disable" : "Enable"}</button>
+                <Button variant="secondary" onClick={() => onToggle(d)}>{d.record?.enabled ? "Disable" : "Enable"}</Button>
               )}
-              <button className="danger" onClick={() => void removePlugin(d.id)}>Remove</button>
+              <Button variant="danger" onClick={() => void removePlugin(d.id)}>Remove</Button>
             </div>
           </li>
         ))}

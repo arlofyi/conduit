@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { SettingRow } from "./GeneralSettings";
+import { Button, Notice, SettingRow } from "./ui";
 import {
   lastSeenLabel,
   qrSvg,
@@ -71,13 +71,13 @@ export function MobilePanel() {
         control={
           row?.action ? (
             row.action === "install" ? (
-              <button type="button" onClick={() => void invoke("open_external", { url: "https://tailscale.com/download" })}>
+              <Button variant="secondary" onClick={() => void invoke("open_external", { url: "https://tailscale.com/download" })}>
                 Install Tailscale
-              </button>
+              </Button>
             ) : (
-              <button type="button" onClick={() => void invoke("tailscale_open_app")}>
+              <Button variant="secondary" onClick={() => void invoke("tailscale_open_app")}>
                 Open Tailscale
-              </button>
+              </Button>
             )
           ) : undefined
         }
@@ -86,13 +86,12 @@ export function MobilePanel() {
         id="mobile-access"
         title="Mobile access"
         detail="Lets paired phones on your tailnet read and drive your sessions. Off by default; turning it off disconnects every phone and cancels pairing."
-        status={
-          !running && !cfg?.enabled ? "Needs Tailscale connected on this Mac." : (error ?? undefined)
-        }
+        status={!running && !cfg?.enabled ? "Needs Tailscale connected on this Mac." : undefined}
         checked={!!cfg?.enabled}
         disabled={!cfg || (!running && !cfg.enabled)}
         onChange={setEnabled}
       />
+      {error && <Notice tone="error">{error}</Notice>}
       {cfg?.enabled && <PairCard now={now} running={running} />}
       <div className="mobile-devices">
         <div className="section-label">Paired phones</div>
@@ -108,17 +107,17 @@ export function MobilePanel() {
             {revoking === d.id ? (
               <span className="mobile-device-confirm">
                 Revoke {d.name}?{" "}
-                <button type="button" onClick={() => setRevoking(null)}>
+                <Button variant="ghost" size="sm" onClick={() => setRevoking(null)}>
                   Keep
-                </button>{" "}
-                <button type="button" className="primary" onClick={() => revoke(d.id)}>
+                </Button>{" "}
+                <Button variant="danger" size="sm" onClick={() => revoke(d.id)}>
                   Revoke
-                </button>
+                </Button>
               </span>
             ) : (
-              <button type="button" onClick={() => setRevoking(d.id)}>
+              <Button variant="danger" onClick={() => setRevoking(d.id)}>
                 Revoke
-              </button>
+              </Button>
             )}
           </div>
         ))}
@@ -171,11 +170,11 @@ function PairCard({ now, running }: { now: number; running: boolean }) {
   return (
     <div className="mobile-pair">
       {!live && (
-        <button type="button" className="primary" disabled={!running} onClick={start}>
+        <Button variant="primary" disabled={!running} onClick={start}>
           Pair a phone
-        </button>
+        </Button>
       )}
-      {err && <div className="mobile-error">{err}</div>}
+      {err && <Notice tone="error">{err}</Notice>}
       {payload && !live && <div className="mobile-empty">That code expired. Start again.</div>}
       {live && payload && (
         <div className="mobile-qr-card">
@@ -188,9 +187,9 @@ function PairCard({ now, running }: { now: number; running: boolean }) {
             <div className="mobile-device-meta">
               Expires in {Math.floor(left / 60)}:{String(left % 60).padStart(2, "0")}
             </div>
-            <button type="button" onClick={cancel}>
+            <Button variant="ghost" onClick={cancel}>
               Cancel
-            </button>
+            </Button>
           </div>
         </div>
       )}

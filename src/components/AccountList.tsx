@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useStore, type Account } from "../store";
 import { agentMeta, type AgentId } from "../agents";
 import { Dropdown } from "./Dropdown";
+import { Button, ButtonRow, Notice, SettingRow, SettingsSection } from "./ui";
 
 /** Agents that support multi-account today. The rest is deferred, so they are
  *  intentionally not offered here — see the multi-account design doc.
@@ -112,27 +113,25 @@ export function AccountList() {
                 ))}
               </div>
             </div>
-            <button
-              className="account-remove"
+            <Button
+              variant="danger"
               aria-label={`Remove ${a.label}`}
               onClick={() => void removeAccount(a.id)}
             >
               Remove
-            </button>
+            </Button>
           </div>
         ))}
       </div>
 
-      {error && <div className="account-error">{error}</div>}
+      {error && <Notice tone="error">{error}</Notice>}
 
-      <div className="account-actions">
-        <button className="agent-rescan" onClick={() => void detect()}>
-          Detect accounts
-        </button>
-        <button className="agent-rescan" onClick={() => void pickAndAdd()}>
-          Add by path
-        </button>
-      </div>
+      <ButtonRow align="start">
+        <Button onClick={() => void detect()}>Detect accounts</Button>
+        <Button variant="ghost" onClick={() => void pickAndAdd()}>
+          Add by path…
+        </Button>
+      </ButtonRow>
 
       {freshCandidates.length > 0 && (
         <div className="account-candidates">
@@ -144,9 +143,7 @@ export function AccountList() {
                   <div className="agent-list-name">{c.label}</div>
                   <div className="agent-list-meta">{c.configDir}</div>
                 </div>
-                <button className="agent-rescan" onClick={() => void add(c.label, c.configDir)}>
-                  Add
-                </button>
+                <Button onClick={() => void add(c.label, c.configDir)}>Add</Button>
               </div>
             ))}
           </div>
@@ -155,64 +152,69 @@ export function AccountList() {
 
       {/* ---- Global default per agent ---- */}
       {accounts.length > 0 && (
-        <div className="account-defaults">
-          <div className="account-defaults-title">Default account per agent</div>
+        <SettingsSection title="Default account per agent">
           {MANAGED_AGENTS.map((agent) => {
             const opts = eligible(agent);
             if (opts.length === 0) return null;
             return (
-              <label key={agent} className="account-default-row">
-                <span className="account-default-label">{agentMeta(agent).label}</span>
-                <Dropdown
-                  className="dd-account"
-                  value={defaultAccounts[agent] ?? ""}
-                  options={[
-                    { value: "", label: "Default (your normal config)" },
-                    ...opts.map((a) => ({ value: a.id, label: a.label })),
-                  ]}
-                  onChange={(v) => void setDefaultAccount(agent, v || null)}
-                />
-              </label>
+              <SettingRow
+                key={agent}
+                title={agentMeta(agent).label}
+                trailing={
+                  <Dropdown
+                    className="dd-account"
+                    value={defaultAccounts[agent] ?? ""}
+                    options={[
+                      { value: "", label: "Default (your normal config)" },
+                      ...opts.map((a) => ({ value: a.id, label: a.label })),
+                    ]}
+                    onChange={(v) => void setDefaultAccount(agent, v || null)}
+                  />
+                }
+              />
             );
           })}
-        </div>
+        </SettingsSection>
       )}
 
       {/* ---- Per-project defaults (beat the global default) ---- */}
       {accounts.length > 0 && projects.length > 0 && (
-        <div className="account-defaults">
-          <div className="account-defaults-title">Per-project defaults</div>
-          <p className="account-defaults-hint">
-            Override the global default for one project. Blank = use the global default.
-          </p>
+        <SettingsSection
+          title="Per-project defaults"
+          description="Override the global default for one project. Blank = use the global default."
+          flush
+        >
           {projects.map((p) => {
             const rows = MANAGED_AGENTS.map((agent) => {
               const opts = eligible(agent);
               if (opts.length === 0) return null;
               return (
-                <label key={agent} className="account-default-row">
-                  <span className="account-default-label">{agentMeta(agent).label}</span>
-                  <Dropdown
-                    className="dd-account"
-                    value={p.defaultAccounts?.[agent] ?? ""}
-                    options={[
-                      { value: "", label: "Use global default" },
-                      ...opts.map((a) => ({ value: a.id, label: a.label })),
-                    ]}
-                    onChange={(v) => void setProjectDefaultAccount(p.id, agent, v || null)}
-                  />
-                </label>
+                <SettingRow
+                  key={agent}
+                  title={agentMeta(agent).label}
+                  trailing={
+                    <Dropdown
+                      className="dd-account"
+                      value={p.defaultAccounts?.[agent] ?? ""}
+                      options={[
+                        { value: "", label: "Use global default" },
+                        ...opts.map((a) => ({ value: a.id, label: a.label })),
+                      ]}
+                      onChange={(v) => void setProjectDefaultAccount(p.id, agent, v || null)}
+                    />
+                  }
+                />
               );
             }).filter(Boolean);
             if (rows.length === 0) return null;
             return (
               <div key={p.id} className="account-project-block">
                 <div className="account-project-name">{p.name}</div>
-                {rows}
+                <div className="ui-section-body">{rows}</div>
               </div>
             );
           })}
-        </div>
+        </SettingsSection>
       )}
     </div>
   );

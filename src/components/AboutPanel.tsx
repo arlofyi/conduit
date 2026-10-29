@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { useStore } from "../store";
+import { Button } from "./ui";
 
 const REPO_URL = "https://github.com/uziiuzair/conduit";
 const SITE_URL = "https://arlo.fyi";
@@ -63,13 +64,14 @@ export function AboutPanel() {
         <div className="about-row">
           <span className="about-key">Updates</span>
           <span className="about-val about-updates">
-            <button
-              className="about-check-btn"
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={() => void check({ manual: true })}
               disabled={phase === "checking" || phase === "downloading"}
             >
               Check for updates
-            </button>
+            </Button>
             <span className="about-update-status">{status()}</span>
           </span>
         </div>
