@@ -46,6 +46,9 @@ export interface Entry {
   unsent?: true;
   /** the Mac's answerResult / approveResult */
   ok?: boolean;
+  /** the Mac refused OUR answer (answerResult ok:false) and nobody else has answered: the
+   *  question is still waiting, so the card goes back to live and says why */
+  rejected?: true;
   /** who resolved it, from `resolved` */
   by?: By;
   /** when it first settled (ok or by arrived), for how long a standalone card lingers */
@@ -169,9 +172,16 @@ export function pendingReducer(s: PendingState, ev: PendingEvent): PendingState 
     case "sent":
       return patch(s, ev.id, (e) => (e.item.private || isSettled(e) ? e : { item: e.item, sent: ev.mine }));
     case "unsent":
-      return patch(s, ev.id, (e) => (e.item.private || isSettled(e) || e.sent || e.unsent ? e : { ...e, unsent: true }));
+      return patch(s, ev.id, (e) => (e.item.private || isSettled(e) || (e.sent && !e.rejected) || e.unsent ? e : { ...e, unsent: true }));
     case "result":
-      return patch(s, ev.id, (e) => ({ ...e, ok: ev.ok, settledAt: e.settledAt ?? ev.now }));
+      return patch(s, ev.id, (e) => {
+        // An answer refused while no `resolved` names a winner was refused for what it SAID
+        // (`phone_may_answer`: over MAX_ANSWER_BYTES). The ask is still pending, so this is not
+        // a settlement: keep the card live, and a retry may still win. If someone else did
+        // answer, their `resolved` frame follows within one push and settles it.
+        if (!ev.ok && e.sent?.kind === "answer" && e.by === undefined) return { item: e.item, sent: e.sent, rejected: true };
+        return { ...e, ok: ev.ok, settledAt: e.settledAt ?? ev.now };
+      });
   }
 }
 
@@ -184,6 +194,7 @@ export type CardView =
   | { mode: "done"; item: PendingItem; tone: "ok" | "bad" | "info"; text: string; detail?: string };
 
 export const UNSENT_TEXT = "Not connected — try again";
+export const REJECTED_ANSWER_TEXT = "Couldn't send that answer — try a shorter one";
 
 function elsewhere(kind: PendingItem["kind"], by: By | undefined, late: boolean): string {
   switch (by) {
@@ -207,9 +218,10 @@ export function cardView(e: Entry): CardView {
   const item = e.item;
   if (item.private) return { mode: "private", item, text: PRIVATE_ANSWER_TEXT };
   const mine = e.sent;
+  if (mine && e.rejected && e.by === undefined) return { mode: "live", item, notice: e.unsent ? UNSENT_TEXT : REJECTED_ANSWER_TEXT };
   if (mine) {
     // Ours won if the Mac said ok, or (result still in flight) the resolution names a phone.
-    const won = e.ok === true || (e.ok === undefined && e.by === "phone");
+    const won = e.ok === true || (e.ok === undefined && !e.rejected && e.by === "phone");
     if (won) {
       if (mine.kind === "answer") return { mode: "done", item, tone: "ok", text: "Answered", detail: mine.summary || undefined };
       // ok:true means the answer reached Claude's hook, not that the tool was stopped.
@@ -263,7 +275,7 @@ export function openBySession(s: PendingState): Record<string, PendingItem> {
   const out: Record<string, PendingItem> = {};
   for (const id of s.order) {
     const e = s.entries[id];
-    if (isSettled(e) || e.sent) continue;
+    if (isSettled(e) || (e.sent && !e.rejected)) continue;
     if (!out[e.item.sessionId]) out[e.item.sessionId] = e.item;
   }
   return out;

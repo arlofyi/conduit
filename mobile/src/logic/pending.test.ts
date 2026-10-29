@@ -9,6 +9,7 @@ import {
   openBySession,
   pendingReducer,
   PRIVATE_ANSWER_TEXT,
+  REJECTED_ANSWER_TEXT,
   SETTLED_SHOW_MS,
   trailingEntries,
   type PendingEvent,
@@ -126,6 +127,42 @@ describe("pending", () => {
     });
     expect(buildAnswers([Q, MQ], { [Q.question]: ["No"] }, {})).toBeNull();
     expect(answerSummary({ a: "Yes (Recommended)", b: "lint, build" })).toBe("Yes, lint, build");
+  });
+
+  it("a_rejected_answer_returns_the_card_to_live", () => {
+    const s = run([{ t: "snapshot", items: [ask("ask-1", "tu1")].map(fromWire), now: 0 }]);
+    // The Mac refused the answer itself (too long), and nobody else has answered: the question
+    // is still waiting, so the card must not claim it is done.
+    let t = run(
+      [
+        { t: "sent", id: "ask-1", mine: { kind: "answer", summary: "x".repeat(60) } },
+        { t: "result", id: "ask-1", ok: false, now: 5 },
+      ],
+      s,
+    );
+    expect(cardView(t.entries["ask-1"])).toMatchObject({ mode: "live", notice: REJECTED_ANSWER_TEXT });
+    expect(REJECTED_ANSWER_TEXT).toBe("Couldn't send that answer — try a shorter one");
+    expect(openBySession(t)["s1"]?.id).toBe("ask-1");
+    expect(trailingEntries(t, "s1", new Set(), 10_000)).toHaveLength(1);
+    // A retry goes out and can win.
+    t = run(
+      [
+        { t: "sent", id: "ask-1", mine: { kind: "answer", summary: "short" } },
+        { t: "result", id: "ask-1", ok: true, now: 6 },
+      ],
+      t,
+    );
+    expect(cardView(t.entries["ask-1"])).toMatchObject({ mode: "done", tone: "ok", text: "Answered", detail: "short" });
+    // Or someone else answers meanwhile: the resolved frame settles it honestly.
+    const u = run(
+      [
+        { t: "sent", id: "ask-1", mine: { kind: "answer", summary: "long" } },
+        { t: "result", id: "ask-1", ok: false, now: 5 },
+        { t: "resolved", id: "ask-1", by: "phone", now: 6 },
+      ],
+      s,
+    );
+    expect(cardView(u.entries["ask-1"])).toMatchObject({ mode: "done", tone: "info", text: "Already answered on another phone" });
   });
 
   it("late_tap_shows_already_answered", () => {
