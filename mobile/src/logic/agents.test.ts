@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { AGENT_MARKS, AGENTS, agentInfo, glyphStateFor, pulsePeriod } from "./agents";
+import { AGENT_MARKS, AGENTS, agentInfo, chatOnPhone, glyphStateFor, pulsePeriod } from "./agents";
 import { contrast, glyphInk, mix, readableInk } from "./color";
 import { PALETTES } from "../theme/palettes";
 
@@ -84,5 +84,13 @@ describe("colour mixing", () => {
     const l = PALETTES["warm-light"];
     expect(glyphInk("#e0b341", l.textBright)).toBe(mix("#e0b341", l.textBright, 0.72));
     expect(glyphInk("#e0b341", l.textBright, l.panelBg)).not.toBe(mix("#e0b341", l.textBright, 0.72));
+  });
+});
+
+describe("chatOnPhone", () => {
+  it("is Claude only: its transcript is the chat, and its slash commands are the quick actions", () => {
+    expect(chatOnPhone("claude")).toBe(true);
+    for (const a of AGENTS.filter((x) => x.id !== "claude")) expect(chatOnPhone(a.id)).toBe(false);
+    expect(chatOnPhone("")).toBe(false);
   });
 });

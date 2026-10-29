@@ -32,6 +32,21 @@ export function agentInfo(id: string): AgentInfo {
   return AGENTS.find((a) => a.id === id) ?? { ...UNKNOWN, id };
 }
 
+/**
+ * Agents whose conversation the phone can show and steer. Only Claude: the bridge reads the
+ * chat from Claude's transcript, and Compact/Clear are Claude Code slash commands. Other
+ * agents' sessions can still be messaged and stopped, and are started on the Mac.
+ */
+export const PHONE_CHAT_AGENTS: readonly string[] = ["claude"];
+
+export function chatOnPhone(agent: string): boolean {
+  return PHONE_CHAT_AGENTS.includes(agent);
+}
+
+/** What a chat for an agent the phone cannot read says instead of a blank feed. */
+export const NO_PHONE_CHAT_TEXT =
+  "This agent's conversation isn't available on the phone yet — you can still send it messages and stop it.";
+
 export interface AgentMark {
   viewBox: string;
   path: string;

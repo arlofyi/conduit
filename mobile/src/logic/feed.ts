@@ -38,6 +38,25 @@ export function pendingApproval(items: ChatItem[]): ApprovalItem | null {
   );
 }
 
+/** Most items a chat keeps in memory. A long-running session's transcript can hold tens of
+ * thousands of lines; the phone keeps the newest and says where the rest are. */
+export const FEED_CAP = 2000;
+export const FEED_CAP_ID = "feed-cap";
+
+/**
+ * The newest `max` items of a feed (the "earlier messages" divider counts as one of them),
+ * led by that divider whenever anything was dropped. Returns the same array when under the
+ * cap, so a feed that did not overflow keeps its identity.
+ */
+export function capFeed(feed: ChatItem[], max: number = FEED_CAP): ChatItem[] {
+  if (feed.length <= max) return feed;
+  const rest = feed[0]?.id === FEED_CAP_ID ? feed.slice(1) : feed;
+  return [
+    { kind: "divider", id: FEED_CAP_ID, label: "Earlier messages are on your Mac", tone: "info" },
+    ...rest.slice(rest.length - (max - 1)),
+  ];
+}
+
 export type CallStatus = "running" | "ok" | "error" | "unknown";
 
 /** A tool call with its outcome folded in. */

@@ -3,9 +3,12 @@
  * first message. Sends the bridge's existing `spawn`; the Mac creates the session, opens its
  * tab and hands it the message; on `spawned` this sheet becomes that chat.
  *
- * Agents: the bridge does not (yet) report which agent CLIs are installed on the Mac, so the
- * picker offers Conduit's seven adapters, agents already in use on this Mac first. Claude is
- * the default, as on the desktop.
+ * Agents: only Claude can be started here, because only Claude's conversation reaches the
+ * phone (the bridge reads its transcript). The other adapters are listed, disabled, as
+ * "Opens on your Mac only". The Mac budgets spawns per phone (10 an hour).
+ *
+ * Start is disabled while a spawn is pending, and a timed-out spawn is never retried by
+ * itself: the Mac may have started it, and a second press is the reader's call.
  */
 import { StackActions } from "@react-navigation/native";
 import React, { useEffect, useMemo, useState } from "react";
@@ -14,7 +17,7 @@ import { useLive } from "../bridge/LiveProvider";
 import { AgentMarkGlyph } from "../components/AgentAvatar";
 import { useListSelection } from "../data/ListSelection";
 import { accentFor } from "../logic/accent";
-import { AGENTS, agentInfo } from "../logic/agents";
+import { AGENTS, agentInfo, chatOnPhone } from "../logic/agents";
 import { glyphInk, mix } from "../logic/color";
 import type { NewChatProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
@@ -30,9 +33,12 @@ export function NewChatScreen({ navigation }: NewChatProps) {
   const [projectId, setProjectId] = useState<string | null>(() =>
     projects.some((x) => x.id === filter) ? filter : (projects[0]?.id ?? null),
   );
+  // Claude first and the only one selectable: it is the agent whose chat the phone can show.
+  // The others are listed so the reader knows they exist, and start on the Mac.
   const agents = useMemo(() => {
     const used = new Set(projects.flatMap((x) => x.sessions.map((s) => s.agent)));
-    return [...AGENTS].sort((a, b) => Number(used.has(b.id)) - Number(used.has(a.id)));
+    const rank = (id: string) => (chatOnPhone(id) ? 2 : used.has(id) ? 1 : 0);
+    return [...AGENTS].sort((a, b) => rank(b.id) - rank(a.id));
   }, [projects]);
   const [agent, setAgent] = useState("claude");
   const [text, setText] = useState("");
@@ -82,7 +88,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
               }}
             >
               <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: c }} />
-              <Text style={{ fontSize: TYPE.subhead, color: on ? p.textBright : p.textMid, fontWeight: on ? "600" : "400" }}>{x.name}</Text>
+              <Text maxFontSizeMultiplier={1.6} style={{ fontSize: TYPE.subhead, color: on ? p.textBright : p.textMid, fontWeight: on ? "600" : "400" }}>{x.name}</Text>
             </Pressable>
           );
         })}
@@ -92,15 +98,18 @@ export function NewChatScreen({ navigation }: NewChatProps) {
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentInsetAdjustmentBehavior="never" style={{ flexGrow: 0 }} contentContainerStyle={{ gap: 8, paddingHorizontal: 16, paddingBottom: 4 }}>
         {agents.map((a) => {
           const on = a.id === agent;
+          const usable = chatOnPhone(a.id);
           const ink = glyphInk(a.tint, p.textBright, p.panelBg);
           return (
             <Pressable
               key={a.id}
               onPress={() => setAgent(a.id)}
+              disabled={!usable}
               accessibilityRole="button"
-              accessibilityLabel={a.label}
-              accessibilityState={{ selected: on }}
+              accessibilityLabel={usable ? a.label : `${a.label}, opens on your Mac only`}
+              accessibilityState={{ selected: on, disabled: !usable }}
               style={{
+                opacity: usable ? 1 : 0.5,
                 width: 84,
                 paddingVertical: 10,
                 alignItems: "center",
@@ -123,9 +132,14 @@ export function NewChatScreen({ navigation }: NewChatProps) {
               >
                 <AgentMarkGlyph agent={a.id} size={20} color={ink} />
               </View>
-              <Text style={{ fontSize: TYPE.caption, color: on ? p.textBright : p.textMid, fontWeight: on ? "600" : "400" }} numberOfLines={1}>
+              <Text maxFontSizeMultiplier={1.6} style={{ fontSize: TYPE.caption, color: on ? p.textBright : p.textMid, fontWeight: on ? "600" : "400" }} numberOfLines={1}>
                 {a.label.replace(/ (CLI|Code|Agent)$/, "")}
               </Text>
+              {usable ? null : (
+                <Text maxFontSizeMultiplier={1.4} style={{ fontSize: 10, color: p.textDim, textAlign: "center", marginTop: -3 }} numberOfLines={2}>
+                  Opens on your Mac only
+                </Text>
+              )}
             </Pressable>
           );
         })}

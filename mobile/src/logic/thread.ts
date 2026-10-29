@@ -4,7 +4,26 @@
  * groups them (tight spacing, a tail only on the first bubble of a run, the time on each).
  * Pure over `groupFeed`'s rows, so the rules are tested here and the screen only draws.
  */
-import type { FeedRow } from "./feed";
+import type { Call, FeedRow } from "./feed";
+
+function sameCall(a: Call, b: Call): boolean {
+  return a.event === b.event && a.status === b.status && a.errorText === b.errorText && a.diff === b.diff;
+}
+
+/**
+ * Does `b` draw exactly what `a` drew? `groupFeed` rebuilds its row objects on every new item,
+ * but the items inside them keep their identity, so comparing what a row is MADE of lets a
+ * memoised row skip re-rendering when only the end of the conversation changed.
+ */
+export function sameFeedRow(a: FeedRow, b: FeedRow): boolean {
+  if (a === b) return true;
+  if (a.type === "item" && b.type === "item") return a.item === b.item;
+  if (a.type === "call" && b.type === "call") return sameCall(a.call, b.call);
+  if (a.type === "tools" && b.type === "tools") {
+    return a.id === b.id && a.calls.length === b.calls.length && a.calls.every((c, i) => sameCall(c, b.calls[i]));
+  }
+  return false;
+}
 import { dateSeparator, dayKey, formatTime, toMs } from "./time";
 
 export type ThreadRow =

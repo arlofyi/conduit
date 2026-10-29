@@ -4,7 +4,7 @@
  */
 import { type SFSymbol } from "expo-symbols";
 import React from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
 import { AgentAvatar } from "../components/AgentAvatar";
@@ -14,7 +14,7 @@ import { agentInfo } from "../logic/agents";
 import { accentFor } from "../logic/accent";
 import { modelLabel } from "../logic/chatHeader";
 import { ALL_PROFILES, profileSheet, profileSummary, resolveProfile, isNeeds } from "../logic/chatList";
-import { quickActionMsgs, quickActionsFor } from "../logic/quickActions";
+import { quickActionMsgs, quickActionsFor, type QuickAction } from "../logic/quickActions";
 import type { ChatsMenuProps, QuickActionsProps, SessionInfoProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, MONO, TYPE } from "../theme/type";
@@ -185,11 +185,20 @@ export function ChatsMenuScreen({ navigation }: ChatsMenuProps) {
 
 export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
   const { sendFrames, interrupt } = useLive();
-  const { sessionId, running } = route.params;
-  const actions = quickActionsFor(running);
+  const { sessionId, running, agent } = route.params;
+  const actions = quickActionsFor(running, agent);
+  const run = (a: QuickAction) => {
+    // Stop goes through the provider so the open feed marks the interruption.
+    if (a.id === "stop") interrupt(sessionId);
+    else sendFrames(quickActionMsgs(a.id, sessionId));
+    navigation.goBack();
+  };
   return (
     <SheetScaffold title="Steer this session" onClose={() => navigation.goBack()}>
       <Group>
+        {actions.length === 0 ? (
+          <SheetRow first symbol="stop.circle" title="Nothing to steer right now" detail="Stop appears here while the agent is working." disabled />
+        ) : null}
         {actions.map((a, i) => (
           <SheetRow
             key={a.id}
@@ -199,10 +208,12 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
             detail={a.detail}
             tone={a.destructive ? "destructive" : "plain"}
             onPress={() => {
-              // Stop goes through the provider so the open feed marks the interruption.
-              if (a.id === "stop") interrupt(sessionId);
-              else sendFrames(quickActionMsgs(a.id, sessionId));
-              navigation.goBack();
+              const c = a.confirm;
+              if (!c) return run(a);
+              Alert.alert(c.title, c.message, [
+                { text: "Cancel", style: "cancel" },
+                { text: c.action, style: "destructive", onPress: () => run(a) },
+              ]);
             }}
           />
         ))}

@@ -151,9 +151,10 @@ export type ServerMsg =
   | ({ type: "projects" } & WireProjectsView)
   | { type: "context"; sessionId: string; used: number; window: number; fraction: number; model: string | null }
   | { type: "size"; cols: number; rows: number }
-  | { type: "history"; items: WireChatItem[] }
-  | { type: "chat"; item: WireChatItem }
-  | { type: "status"; event: string; body: unknown }
+  // `sessionId` names the session the frame is about; absent from desktops before it was added.
+  | { type: "history"; sessionId?: string; items: WireChatItem[] }
+  | { type: "chat"; sessionId?: string; item: WireChatItem }
+  | { type: "status"; sessionId?: string; event: string; body: unknown }
   | { type: "output"; data: string } // base64 PTY bytes — chat UI ignores
   | { type: "killed"; sessionId: string }
   | { type: "gitresult"; action: string; [k: string]: unknown }

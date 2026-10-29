@@ -20,7 +20,7 @@ export type RootStackParamList = {
   /** "…" on Chats: profile + Switch Mac */
   ChatsMenu: undefined;
   /** "+" in the composer */
-  QuickActions: { sessionId: string; running: boolean };
+  QuickActions: { sessionId: string; running: boolean; agent: string };
   /** tap the chat header */
   SessionInfo: { sessionId: string; projectId: string };
 };

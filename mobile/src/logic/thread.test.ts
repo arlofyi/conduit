@@ -1,6 +1,6 @@
 import type { ChatItem } from "../data/types";
 import { groupFeed } from "./feed";
-import { layoutThread } from "./thread";
+import { layoutThread, sameFeedRow } from "./thread";
 
 const t = (d: number, h: number, m = 0) => new Date(2026, 9, d, h, m).toISOString();
 const NOW = new Date(2026, 9, 30, 9, 0).getTime();
@@ -54,5 +54,36 @@ describe("layoutThread / groupBubbles", () => {
 
   it("draws no pill for a feed with no times at all", () => {
     expect(shape([bubble("a", "user"), bubble("b", "user")])).toEqual(["a^", "b$"]);
+  });
+});
+
+describe("sameFeedRow", () => {
+  const ev = (id: string, toolUseId: string): ChatItem => ({ kind: "event", id, event: "read", label: "Read", toolUseId });
+  const res = (toolUseId: string): ChatItem => ({ kind: "result", id: `r-${toolUseId}`, toolUseId, isError: false, errorText: null, diff: null });
+
+  it("treats rows rebuilt around the same items as unchanged", () => {
+    const a1 = bubble("a1", "assistant");
+    const e1 = ev("e1", "t1");
+    const before = groupFeed([a1, e1]);
+    const after = groupFeed([a1, e1, bubble("a2", "assistant")]);
+    expect(after[0]).not.toBe(before[0]);
+    expect(sameFeedRow(before[0], after[0])).toBe(true);
+    // the call row: still running before the new bubble, unknown after -> it DID change
+    expect(sameFeedRow(before[1], after[1])).toBe(false);
+  });
+
+  it("sees a call's result arrive, and a folded run grow", () => {
+    const e1 = ev("e1", "t1");
+    const e2 = ev("e2", "t2");
+    const e3 = ev("e3", "t3");
+    const r1 = res("t1");
+    const r2 = res("t2");
+    const r3 = res("t3");
+    const two = groupFeed([e1, r1, e2, r2]);
+    const twoAgain = groupFeed([e1, r1, e2, r2]);
+    const three = groupFeed([e1, r1, e2, r2, e3, r3]);
+    expect(sameFeedRow(two[0], twoAgain[0])).toBe(true);
+    expect(sameFeedRow(two[0], three[0])).toBe(false);
+    expect(sameFeedRow(two[0], groupFeed([bubble("x", "user")])[0])).toBe(false);
   });
 });

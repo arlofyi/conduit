@@ -16,6 +16,8 @@ import { bannerFromStatus, bannersFromView, type Banner, type Signals } from "..
 import type { ContextInfo } from "../logic/chatHeader";
 import { chatUnread, nextUnread } from "../logic/chatList";
 import { connErrorText } from "../logic/connCopy";
+import { capFeed } from "../logic/feed";
+import { acceptsFrame, frameSession, isSpawnError, PRIVATE_SESSION, spawnErrorText } from "../logic/frames";
 import { loopbackMac, type PairEndpoint } from "../logic/macs";
 import { addressesFor, confirmCode, makeNonce, type QrPayload } from "../logic/pairing";
 import { BridgeClient } from "./BridgeClient";
@@ -78,6 +80,8 @@ export interface SessionLive {
   activity?: string;
   compacting?: boolean;
   todos?: TodoProgress;
+  /** the Mac refused this chat: a private (silo'd / local-only) session */
+  refused?: "private";
 }
 
 const EMPTY_LIVE: SessionLive = { feed: [], status: "idle", statusAt: 0 };
@@ -158,6 +162,7 @@ const Ctx = createContext<LiveValue | null>(null);
 
 function applyPatch(prev: SessionLive, patch: LivePatch): SessionLive {
   return {
+    ...prev,
     feed: prev.feed,
     status: patch.status ?? prev.status,
     statusAt: patch.status ? Date.now() : prev.statusAt,
@@ -192,6 +197,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [banner, setBanner] = useState<Banner | null>(null);
   const [spawnState, setSpawnState] = useState<SpawnState>({ phase: "idle" });
   const spawnPending = useRef(false);
+  /** the last spawn timed out on the phone; the Mac may still answer it */
+  const spawnLate = useRef(false);
   /** each session's last known needs/status, shared by the view and status-frame banner paths */
   const signalsRef = useRef<Signals>({});
   /** read inside socket callbacks, which are created once per Mac */
@@ -299,17 +306,24 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               setHello({ macName: m.macName, conduitVersion: m.conduitVersion });
               break;
             case "spawned":
-              if (spawnPending.current) {
+              // A late answer (after the sheet's timeout) still opens the chat it started, so
+              // the reader is not tempted into starting a second one.
+              if (spawnPending.current || spawnLate.current) {
                 spawnPending.current = false;
+                spawnLate.current = false;
                 setSpawnState({ phase: "spawned", sessionId: m.sessionId, projectId: m.projectId, name: m.name });
                 clientRef.current?.list(); // the new session belongs in the list now
               }
               break;
             case "error":
-              // the only request that waits on an `error` answer is a spawn
-              if (spawnPending.current) {
+              if (m.message === PRIVATE_SESSION) {
+                // The Mac refused the chat that was opened: say so instead of an empty feed.
+                if (attachedRef.current) setSessionLive({ ...EMPTY_LIVE, refused: "private" });
+              } else if (spawnPending.current && isSpawnError(m.message)) {
+                // Only the spawn's own errors answer a spawn; anything else is about another request.
                 spawnPending.current = false;
-                setSpawnState({ phase: "failed", message: m.message });
+                spawnLate.current = false;
+                setSpawnState({ phase: "failed", message: spawnErrorText(m.message) });
               }
               break;
             case "macs":
@@ -334,20 +348,26 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               if (m.sessionId === attachedRef.current) setContext({ fraction: m.fraction, model: m.model });
               break;
             case "history":
-              setSessionLive((prev) => ({ ...prev, feed: mapHistory(m.items) }));
+              // Also re-sent when the Mac follows the session onto a new transcript (/clear).
+              if (attachedRef.current && acceptsFrame(m.sessionId, attachedRef.current)) {
+                setSessionLive((prev) => ({ ...prev, feed: capFeed(mapHistory(m.items)) }));
+              }
               break;
             case "chat": {
-              // chat frames carry no session id: they belong to whatever this socket streams
-              const streaming = streamingRef.current;
-              setUnread((u) => chatUnread(u, streaming, attachedRef.current));
-              if (attachedRef.current) setSessionLive((prev) => ({ ...prev, feed: appendWire(prev.feed, m.item) }));
+              // A tagged frame names its session; an untagged one (older Mac) is the streamed one's.
+              const about = frameSession(m.sessionId, streamingRef.current);
+              setUnread((u) => chatUnread(u, about, attachedRef.current));
+              if (attachedRef.current && acceptsFrame(m.sessionId, attachedRef.current)) {
+                setSessionLive((prev) => ({ ...prev, feed: capFeed(appendWire(prev.feed, m.item)) }));
+              }
               break;
             }
             case "status": {
-              // status frames carry no session id either: they are the streamed session's
               const patch = statusPatch(m.event, m.body as never);
-              const streaming = streamingRef.current;
-              if (attachedRef.current) setSessionLive((prev) => applyPatch(prev, patch));
+              const streaming = frameSession(m.sessionId, streamingRef.current);
+              if (attachedRef.current && acceptsFrame(m.sessionId, attachedRef.current)) {
+                setSessionLive((prev) => applyPatch(prev, patch));
+              }
               if (patch.status && streaming) {
                 const r = bannerFromStatus(
                   signalsRef.current,
@@ -587,7 +607,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       status: "idle",
       statusAt: Date.now(),
       activity: undefined,
-      feed: [
+      feed: capFeed([
         ...s.feed,
         {
           kind: "divider",
@@ -596,7 +616,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           tone: "warning",
           at: new Date().toISOString(),
         },
-      ],
+      ]),
     }));
   }, []);
 
@@ -624,23 +644,32 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     spawnPending.current = true;
+    spawnLate.current = false;
     setSpawnState({ phase: "pending" });
     client.send(spawnMsg(projectId, trimmed, agent));
   }, []);
 
-  // A spawn the Mac never answers (link dropped mid-request) must not spin forever.
+  // A spawn the Mac never answers (link dropped mid-request) must not spin forever. It is NOT
+  // retried: the Mac may have started the session anyway, and a retry would start a second.
+  // A late `spawned` still opens the chat (spawnLate).
   useEffect(() => {
     if (spawnState.phase !== "pending") return;
     const t = setTimeout(() => {
       if (!spawnPending.current) return;
       spawnPending.current = false;
-      setSpawnState({ phase: "failed", message: "Your Mac did not answer. Try again." });
+      spawnLate.current = true;
+      clientRef.current?.list();
+      setSpawnState({
+        phase: "failed",
+        message: "Your Mac hasn't answered yet. Check Chats before starting another — it may have started.",
+      });
     }, SPAWN_TIMEOUT_MS);
     return () => clearTimeout(t);
   }, [spawnState.phase]);
 
   const resetSpawn = useCallback(() => {
     spawnPending.current = false;
+    spawnLate.current = false;
     setSpawnState({ phase: "idle" });
   }, []);
 

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Animated,
+  AppState,
   Easing,
   FlatList,
   Image,
@@ -32,14 +33,15 @@ import type {
   QuestionItem,
   TodosItem,
 } from "../data/types";
-import { glyphStateFor } from "../logic/agents";
+import { chatOnPhone, glyphStateFor, NO_PHONE_CHAT_TEXT } from "../logic/agents";
+import { PRIVATE_SESSION_TEXT } from "../logic/frames";
 import { chatHeader } from "../logic/chatHeader";
 import { outputPreview, splitRecommended } from "../logic/chatView";
 import { mix, readableInk } from "../logic/color";
 import { groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
 import { holdPosition, isPinned, newItemCount, shouldFollow } from "../logic/follow";
 import { imageDataUri } from "../logic/image";
-import { layoutThread, type ThreadRow } from "../logic/thread";
+import { layoutThread, sameFeedRow, type ThreadRow } from "../logic/thread";
 import type { ChatProps } from "../navigation";
 import { hq } from "../theme/hq";
 import { useTheme } from "../theme/ThemeContext";
@@ -56,7 +58,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   const h = hq(p);
   const insets = useSafeAreaInsets();
   const { sessionLive, context, view, attach, detach, prompt } = useLive();
-  const list = useRef<FlatList<ThreadRow>>(null);
+  const list = useRef<FlatList<DisplayRow>>(null);
 
   // Attach to this session's live stream (transcript history + tail + status) while the screen
   // is mounted. Attaching also clears its unread count. Detach names the session, so a chat
@@ -82,35 +84,39 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     return null;
   }, [view, sessionId]);
   const projectName = session?.project.name ?? null;
-
-  // A chat opened the moment it was spawned attaches before its transcript exists, and the Mac
-  // fixes the transcript it tails at attach — so the conversation would never arrive. While the
-  // feed is still empty, re-attach whenever the list shows the session has moved on.
-  const activityKey = `${session?.session.lastMessage?.at ?? ""}|${session?.session.updatedAt ?? ""}`;
-  const feedEmpty = sessionLive.feed.length === 0;
-  const lastKey = useRef(activityKey);
-  const [listGen, setListGen] = useState(0);
-  useEffect(() => {
-    if (activityKey === lastKey.current) return;
-    lastKey.current = activityKey;
-    if (!feedEmpty) return;
-    attach(sessionId);
-    setListGen((g) => g + 1); // a fresh list: the old one kept a scroll position for content it no longer has
-  }, [activityKey, feedEmpty, attach, sessionId]);
+  const agent = session?.session.agent ?? "";
+  // The Mac follows the session onto a new transcript itself (/clear, a just-spawned chat) and
+  // re-sends `history`, so the chat never has to re-attach to catch up.
 
   const feed = sessionLive.feed;
   const rows = useMemo(() => groupFeed(feed), [feed]);
+  // "Today"/"Yesterday" go stale past midnight: re-read the clock every minute and on return
+  // to the foreground (a timer does not run while the app is suspended).
   const [now, setNow] = useState(() => Date.now());
-  useEffect(() => setNow(Date.now()), [rows.length]);
+  useEffect(() => {
+    const tick = () => setNow(Date.now());
+    const t = setInterval(tick, 60_000);
+    const sub = AppState.addEventListener("change", (s) => s === "active" && tick());
+    return () => {
+      clearInterval(t);
+      sub.remove();
+    };
+  }, []);
   const thread = useMemo(() => layoutThread(rows, now), [rows, now]);
-  // Inverted list: newest first, so offset 0 is the bottom of the conversation.
-  const data = useMemo(() => [...thread].reverse(), [thread]);
 
   // Rows that arrived while the chat was open animate in; the first history load does not.
   const firstLoad = useRef<number | null>(null);
   if (firstLoad.current === null && rows.length > 0) firstLoad.current = rows.length;
   const animateFrom = firstLoad.current === null ? Infinity : Math.max(firstLoad.current, rows.length - ANIMATE_NEWEST);
-  const rowIndex = useMemo(() => new Map(rows.map((r, i) => [r, i])), [rows]);
+  // Inverted list: newest first, so offset 0 is the bottom of the conversation. Each row carries
+  // its own animateIn, so renderItem never changes and a memoised row re-renders only when ITS
+  // content does.
+  const data = useMemo(() => {
+    const index = new Map(rows.map((r, i) => [r, i]));
+    return thread
+      .map((t): DisplayRow => (t.type === "date" ? t : { ...t, animateIn: (index.get(t.row) ?? 0) >= animateFrom }))
+      .reverse();
+  }, [thread, rows, animateFrom]);
 
   // Follow rule (logic/follow.ts): only a reader at the bottom follows new rows.
   const pinnedRef = useRef(true);
@@ -160,13 +166,15 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   }, []);
 
   const renderItem = useCallback(
-    ({ item }: { item: ThreadRow }) => {
+    ({ item }: { item: DisplayRow }) => {
       if (item.type === "date") return <DatePill label={item.label} />;
-      const i = rowIndex.get(item.row) ?? 0;
-      return <ThreadRowView t={item} animateIn={i >= animateFrom} onDecide={decide} onCopied={onCopied} />;
+      return <ThreadRowView t={item} animateIn={item.animateIn} onDecide={decide} onCopied={onCopied} />;
     },
-    [rowIndex, animateFrom, decide, onCopied],
+    [decide, onCopied],
   );
+  const refused = sessionLive.refused === "private";
+  // Only Claude's conversation reaches the phone (its transcript); say so rather than show nothing.
+  const notice = refused ? PRIVATE_SESSION_TEXT : session && !chatOnPhone(agent) && feed.length === 0 ? NO_PHONE_CHAT_TEXT : null;
 
   // With the keyboard up there is no home indicator to clear, so the composer sits on the keys.
   const [keyboardUp, setKeyboardUp] = useState(false);
@@ -196,7 +204,6 @@ export function ChatScreen({ route, navigation }: ChatProps) {
         <View style={{ flex: 1 }}>
         {/* the conversation scrolls under both floating bars */}
         <FlatList
-          key={listGen}
           ref={list}
           inverted
           data={data}
@@ -215,6 +222,19 @@ export function ChatScreen({ route, navigation }: ChatProps) {
           initialNumToRender={20}
           windowSize={11}
         />
+
+        {notice ? (
+          <View pointerEvents="none" style={{ position: "absolute", left: 24, right: 24, top: headerH, bottom: composerH, justifyContent: "center", alignItems: "center" }}>
+            <View
+              accessible
+              accessibilityRole="text"
+              style={{ maxWidth: 320, flexDirection: "row", alignItems: "flex-start", gap: 10, paddingHorizontal: 16, paddingVertical: 14, borderRadius: 14, backgroundColor: p.sidebarBg, borderWidth: StyleSheet.hairlineWidth, borderColor: p.border }}
+            >
+              <Icon name={refused ? "lock.fill" : "laptopcomputer"} size={16} color={p.textMid} />
+              <Text style={{ flex: 1, color: p.textMid, fontSize: TYPE.subhead, lineHeight: 20 }}>{notice}</Text>
+            </View>
+          </View>
+        ) : null}
 
         <View style={{ position: "absolute", left: 0, right: 0, bottom: 0 }}>
           {!pinned && (
@@ -236,18 +256,20 @@ export function ChatScreen({ route, navigation }: ChatProps) {
                     justifyContent: "center",
                   }}
                 >
-                  <Text style={{ color: p.meText, fontSize: TYPE.caption, fontWeight: "700", fontVariant: ["tabular-nums"] }}>{unseen}</Text>
+                  <Text maxFontSizeMultiplier={1.3} style={{ color: p.meText, fontSize: TYPE.caption, fontWeight: "700", fontVariant: ["tabular-nums"] }}>{unseen}</Text>
                 </View>
               )}
             </View>
           )}
-          <Composer
-            name={header.name}
-            bottomInset={keyboardUp ? 0 : insets.bottom}
-            onSend={send}
-            onActions={() => navigation.navigate("QuickActions", { sessionId, running })}
-            onHeight={setComposerH}
-          />
+          {refused ? null : (
+            <Composer
+              name={header.name}
+              bottomInset={keyboardUp ? 0 : insets.bottom}
+              onSend={send}
+              onActions={() => navigation.navigate("QuickActions", { sessionId, running, agent })}
+              onHeight={setComposerH}
+            />
+          )}
         </View>
         </View>
       </KeyboardAvoidingView>
@@ -279,14 +301,14 @@ export function ChatScreen({ route, navigation }: ChatProps) {
           </Pressable>
           {header.canStop && (
             <Pressable
-              onPress={() => navigation.navigate("QuickActions", { sessionId, running: true })}
+              onPress={() => navigation.navigate("QuickActions", { sessionId, running: true, agent })}
               hitSlop={8}
               accessibilityRole="button"
               accessibilityLabel="Stop or steer the current turn"
             >
               <GlassSurface interactive style={{ height: 34, borderRadius: 17, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", gap: 5 }}>
                 <Icon name="stop.fill" size={11} color={p.red} />
-                <Text style={{ color: p.red, fontSize: TYPE.footnote, fontWeight: "600" }}>Stop</Text>
+                <Text maxFontSizeMultiplier={1.6} style={{ color: p.red, fontSize: TYPE.footnote, fontWeight: "600" }}>Stop</Text>
               </GlassSurface>
             </Pressable>
           )}
@@ -299,21 +321,37 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   );
 }
 
-function threadKey(t: ThreadRow): string {
+type DisplayRow = Extract<ThreadRow, { type: "date" }> | (Extract<ThreadRow, { type: "row" }> & { animateIn: boolean });
+
+function threadKey(t: DisplayRow): string {
   return t.key;
 }
 
-function ThreadRowView({
-  t,
-  animateIn,
-  onDecide,
-  onCopied,
-}: {
+type RowProps = {
   t: Extract<ThreadRow, { type: "row" }>;
   animateIn: boolean;
   onDecide: (id: string, d: "allow" | "deny") => void;
   onCopied: () => void;
-}) {
+};
+
+/** A row re-renders only when what it draws changed (see `sameFeedRow`), not on every new message. */
+const ThreadRowView = React.memo(
+  ThreadRowBody,
+  (a: RowProps, b: RowProps) =>
+    sameFeedRow(a.t.row, b.t.row) &&
+    a.t.first === b.t.first &&
+    a.t.time === b.t.time &&
+    a.animateIn === b.animateIn &&
+    a.onDecide === b.onDecide &&
+    a.onCopied === b.onCopied,
+);
+
+function ThreadRowBody({
+  t,
+  animateIn,
+  onDecide,
+  onCopied,
+}: RowProps) {
   const row: FeedRow = t.row;
   const pad = { marginTop: 8 };
   if (row.type === "tools") return <View style={pad}><ToolsRow calls={row.calls} /></View>;
@@ -424,7 +462,7 @@ function CopiedToast({ at, top }: { at: number; top: number }) {
     <Animated.View pointerEvents="none" style={{ position: "absolute", top, alignSelf: "center", opacity: o }}>
       <GlassSurface style={{ borderRadius: 16, paddingHorizontal: 14, height: 32, flexDirection: "row", alignItems: "center", gap: 6 }}>
         <Icon name="doc.on.doc" size={13} color={p.textBright} />
-        <Text style={{ color: p.textBright, fontSize: TYPE.footnote, fontWeight: "600" }}>Copied</Text>
+        <Text maxFontSizeMultiplier={1.6} style={{ color: p.textBright, fontSize: TYPE.footnote, fontWeight: "600" }}>Copied</Text>
       </GlassSurface>
     </Animated.View>
   );

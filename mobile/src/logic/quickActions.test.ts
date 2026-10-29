@@ -2,8 +2,20 @@ import { quickActionMsgs, quickActionsFor } from "./quickActions";
 
 describe("quick actions", () => {
   it("offers Stop only while a turn is running", () => {
-    expect(quickActionsFor(true).map((a) => a.id)).toEqual(["stop", "compact", "clear"]);
-    expect(quickActionsFor(false).map((a) => a.id)).toEqual(["compact", "clear"]);
+    expect(quickActionsFor(true, "claude").map((a) => a.id)).toEqual(["stop", "compact", "clear"]);
+    expect(quickActionsFor(false, "claude").map((a) => a.id)).toEqual(["compact", "clear"]);
+  });
+
+  it("offers Compact and Clear only to Claude; Stop to every agent", () => {
+    expect(quickActionsFor(true, "hermes").map((a) => a.id)).toEqual(["stop"]);
+    expect(quickActionsFor(false, "codex").map((a) => a.id)).toEqual([]);
+    expect(quickActionsFor(true, "").map((a) => a.id)).toEqual(["stop"]);
+  });
+
+  it("asks before Clear, which throws the conversation away", () => {
+    const clear = quickActionsFor(false, "claude").find((a) => a.id === "clear");
+    expect(clear?.confirm).toBeTruthy();
+    expect(quickActionsFor(false, "claude").find((a) => a.id === "compact")?.confirm).toBeUndefined();
   });
 
   it("maps each action to the frames the bridge accepts", () => {
