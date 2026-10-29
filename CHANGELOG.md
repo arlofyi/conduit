@@ -5,10 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
-- **Added — Mobile access over Tailscale.** Settings → Mobile shows whether Tailscale is running, turns on mobile access, and pairs a phone with a one-time QR code you approve on the Mac. The phone reaches this Mac from anywhere on your tailnet — never from the open network — and any paired phone can be revoked at once.
+- **Added — Mobile access over Tailscale.** Settings → Mobile shows whether Tailscale is running, turns on mobile access, pairs a phone with a one-time QR code, and lists and revokes paired phones. A phone asking to pair shows a code prompt you approve on the Mac, even with Settings closed. The phone reaches this Mac from anywhere on your tailnet — never from the open network — and any paired phone can be revoked at once.
 - **Changed — The mobile bridge no longer opens to the local network.** The old `CONDUIT_BRIDGE_TOKEN` setting is gone; the bridge listens only on this Mac and its Tailscale address.
-
-- **Added — Settings → Mobile.** Shows whether Tailscale is connected, switches mobile access on or off, pairs a phone with a one-time QR code, and lists and revokes paired phones. A phone asking to pair shows a code prompt you approve on the Mac, even with Settings closed.
 - **Changed — Tool calls in session chat show what matters.** A failed call stays on its own line with its error, a file edit shows `+N −M` and a short diff, and only finished, successful calls fold into a one-line summary such as "Ran 2 shell commands, read 3 files" — on desktop and phone alike.
 - **Fixed — Session chat no longer shows Claude's own messages as yours.** Background-task notices, messages from other sessions, scheduled check-ins, slash commands and loaded skills now appear as small notes instead of chat bubbles from you.
 - **Added — Session chat shows compaction, questions and plans.** "Conversation compacted" and interruptions appear as dividers, AskUserQuestion prompts show their options, plans render as a card, and runs of tool calls collapse into one expandable line.

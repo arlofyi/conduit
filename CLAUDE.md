@@ -594,7 +594,7 @@ plus install/remove/status), and one listener in `App.tsx`.
   read or set aside, defaults stay in memory and EVERY write is refused so the original
   survives. `Device` carries the hash and never leaves Rust; the UI gets `DeviceView`.
 - **Pairing** (`pairing.rs`): a QR secret is >= 128-bit, single-use, 5 min, and a new QR
-  replaces it; the desktop card calls `pair_cancel` on Cancel, expiry and unmount. A phone
+  replaces it; the desktop card calls `pair_cancel(secret)` (clears only a matching, current secret, so another window's newer QR survives) on Cancel, expiry and unmount. A phone
   that found this Mac via another can instead send a `request`. Either way the Mac shows a
   4-digit-code prompt (`pair-request`, mirroring `ask-request`) and the human approves; a
   request waits 120 s, one per peer IP (newer replaces older). Turning access off calls
@@ -604,8 +604,8 @@ plus install/remove/status), and one listener in `App.tsx`.
   human. `discover` answers only a phone on the same Tailscale user as this Mac.
 - **Port range 8455..=8474**, persisted if free. It ends at 8474 because fleet MCP starts at
   8475 (see the root-chat section for the full carve-up of 8423..=8516).
-- Secrets rule applies: no token, nonce or QR secret is logged; secret-carrying types do not
-  derive `Debug`.
+- Secrets rule applies: no token, nonce or QR secret is logged; types holding a plaintext secret or
+  token do not derive `Debug`.
 
 ## Where the IDE integration lives
 

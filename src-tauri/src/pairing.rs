@@ -257,9 +257,15 @@ impl Pairing {
 
     /// Drop the current QR secret without touching waiting requests. The desktop card
     /// calls it when it closes, so a leftover screenshot of the QR is dead.
-    pub fn cancel_secret(&self) {
+    /// Only when `secret` is the current one: another window may have minted a newer QR.
+    pub fn cancel_secret(&self, secret: &str) {
         let (mut g, _) = self.swept();
-        g.secret = None;
+        if g.secret
+            .as_ref()
+            .is_some_and(|(cur, _)| crate::cli_open::secret_eq(secret, cur))
+        {
+            g.secret = None;
+        }
     }
 
     /// Park a request for the human. A request already waiting from the same peer IP is
@@ -534,8 +540,8 @@ pub fn pair_start(
 
 /// Cancel the QR on screen (Cancel, expiry, or the card unmounting).
 #[tauri::command]
-pub fn pair_cancel(pairing: tauri::State<'_, Arc<Pairing>>) {
-    pairing.cancel_secret();
+pub fn pair_cancel(pairing: tauri::State<'_, Arc<Pairing>>, secret: String) {
+    pairing.cancel_secret(&secret);
 }
 
 #[tauri::command]
@@ -717,8 +723,17 @@ mod tests {
     fn cancel_kills_the_old_secret() {
         let (p, _) = clocked(0);
         let qr = p.start_qr(&mac(), 8455);
-        p.cancel_secret();
+        p.cancel_secret(&qr.secret);
         assert!(!p.consume_secret(&qr.secret));
+    }
+
+    #[test]
+    fn cancel_with_other_secret_is_noop() {
+        let (p, _) = clocked(0);
+        let old = p.start_qr(&mac(), 8455);
+        let new = p.start_qr(&mac(), 8455);
+        p.cancel_secret(&old.secret);
+        assert!(p.consume_secret(&new.secret));
     }
 
     #[test]

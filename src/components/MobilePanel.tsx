@@ -144,23 +144,26 @@ function PairCard({ now, running }: { now: number; running: boolean }) {
   };
 
   // Kill the QR secret on the Mac whenever the card stops showing it.
-  const cancel = () => {
-    setPayload(null);
-    invoke("pair_cancel").catch(() => {});
+  const secretRef = useRef<string | null>(null);
+  const cancelOnMac = () => {
+    if (secretRef.current) invoke("pair_cancel", { secret: secretRef.current }).catch(() => {});
   };
-  const shownRef = useRef(false);
+  const cancel = () => {
+    cancelOnMac();
+    setPayload(null);
+  };
 
   const left = payload ? secondsLeft(startedAt + PAIR_TTL_SECS, now) : 0;
   // The secret is single-use with a 5-minute TTL; once it lapses the QR is dead, so drop it.
   const live = payload && left > 0;
-  shownRef.current = !!payload;
+  secretRef.current = payload?.secret ?? null;
   const expired = !!payload && left <= 0;
   useEffect(() => {
-    if (expired) invoke("pair_cancel").catch(() => {});
+    if (expired) cancelOnMac();
   }, [expired]);
   useEffect(
     () => () => {
-      if (shownRef.current) invoke("pair_cancel").catch(() => {});
+      cancelOnMac();
     },
     [],
   );
