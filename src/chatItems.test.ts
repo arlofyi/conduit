@@ -5,7 +5,8 @@ import {
   groupTools,
   imageSrc,
   taskLine,
-  toolsSummary,
+  groupLabel,
+  type Call,
   type TranscriptItem,
 } from "./chatItems";
 
@@ -21,43 +22,87 @@ const LABELS: Record<string, string> = {
   subagent: "subagent",
   generic: "used a tool",
 };
-const ev = (kind: string, mono: string): Ev => ({ kind: "event", event: kind, label: LABELS[kind], mono });
+const ev = (kind: string, mono: string, id: string | null = null): Ev => ({
+  kind: "event",
+  event: kind,
+  label: LABELS[kind],
+  mono,
+  toolUseId: id,
+});
+const res = (id: string, over: Record<string, unknown> = {}): TranscriptItem =>
+  ({ kind: "result", toolUseId: id, isError: false, errorText: null, diff: null, ...over }) as TranscriptItem;
+const usage: TranscriptItem = { kind: "usage", model: null, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 };
+const asst = (text: string): TranscriptItem => ({ kind: "bubble", role: "assistant", text });
+const diff = { filePath: "a", added: 1, removed: 0, created: false, lines: [], more: 0 };
+const types = (rows: { type: string }[]) => rows.map((r) => r.type);
 
 describe("chatItems", () => {
   it("renders every kind Rust can emit except usage", () => {
     expect([...RENDERED_KINDS].sort()).toEqual(kinds.filter((k) => k !== "usage").sort());
   });
 
-  it("groupTools merges a run of events across usage lines", () => {
+  it("pairs_result_across_interleaved_items", () => {
+    const rows = groupTools([ev("read", "a", "A"), usage, ev("read", "b", "B"), res("A"), res("B")]);
+    expect(types(rows)).toEqual(["tools"]);
+    const r = rows[0];
+    expect(r.type === "tools" && r.calls.map((c) => c.status)).toEqual(["ok", "ok"]);
+    const rows2 = groupTools([ev("read", "a", "A"), asst("hi"), res("A")]);
+    expect(types(rows2)).toEqual(["call", "item"]);
+    expect(rows2[0].type === "call" && rows2[0].call.status).toBe("ok");
+  });
+
+  it("call_without_result_is_running_and_standalone", () => {
+    const rows = groupTools([ev("read", "a", "A"), res("A"), ev("read", "b", "B"), ev("bash", "ls", "C")]);
+    expect(types(rows)).toEqual(["call", "call", "call"]);
+    expect(rows[1].type === "call" && rows[1].call.status).toBe("running");
+    expect(rows[2].type === "call" && rows[2].call.status).toBe("running");
+  });
+
+  it("two quiet calls fold, a failed call between them splits the run", () => {
     const rows = groupTools([
-      { kind: "bubble", role: "user", text: "go" },
-      ev("read", "a.rs"),
-      { kind: "usage", model: null, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
-      ev("edit", "b.rs"),
-      { kind: "bubble", role: "assistant", text: "done" },
+      ev("read", "a", "A"),
+      ev("bash", "x", "B"),
+      ev("read", "c", "C"),
+      res("A"),
+      res("B", { isError: true, errorText: "boom" }),
+      res("C"),
     ]);
-    expect(rows.map((r) => r.type)).toEqual(["item", "tools", "item"]);
-    expect(rows[1].type === "tools" && rows[1].events.length).toBe(2);
+    expect(types(rows)).toEqual(["call", "call", "call"]);
+    expect(rows[1].type === "call" && rows[1].call.errorText).toBe("boom");
+    expect(types(groupTools([ev("read", "a", "A"), ev("read", "b", "B"), res("A"), res("B")]))).toEqual(["tools"]);
   });
 
-  it("groupTools keeps each item's seq, which SessionChat keys rows by", () => {
+  it("three quiet calls fold into tools", () => {
+    const rows = groupTools([ev("read", "a", "A"), ev("read", "b", "B"), ev("bash", "c", "C"), res("A"), res("B"), res("C")]);
+    expect(types(rows)).toEqual(["tools"]);
+    expect(rows[0].type === "tools" && rows[0].calls.length).toBe(3);
+  });
+
+  it("edit with diff stays standalone", () => {
+    const rows = groupTools([ev("edit", "a", "A"), ev("edit", "b", "B"), res("A", { diff }), res("B", { diff })]);
+    expect(types(rows)).toEqual(["call", "call"]);
+    expect(rows[0].type === "call" && rows[0].call.diff).toEqual(diff);
+  });
+
+  it("orphan result is dropped", () => {
+    expect(groupTools([res("ZZ"), asst("x")]).map((r) => r.type)).toEqual(["item"]);
+  });
+
+  it("keys: call by its event seq, tools by first call seq", () => {
     const rows = groupTools([
-      { kind: "bubble", role: "user", text: "go", seq: 401 },
-      { ...ev("read", "a.rs"), seq: 402 },
-      { ...ev("edit", "b.rs"), seq: 404 },
+      { ...ev("read", "a", "A"), seq: 402 },
+      { ...ev("read", "b", "B"), seq: 404 },
+      res("A"),
+      res("B"),
     ]);
-    expect(rows[0].type === "item" && rows[0].item.seq).toBe(401);
-    expect(rows[1].type === "tools" && rows[1].events.map((e) => e.seq)).toEqual([402, 404]);
+    expect(rows[0].type === "tools" && rows[0].calls[0].event.seq).toBe(402);
   });
 
-  it("toolsSummary counts repeated kinds", () => {
-    expect(toolsSummary([ev("search", "busy_sessions"), ev("read", "a"), ev("read", "b"), ev("edit", "c")])).toBe(
-      "searched busy_sessions · read 2 files · edited c",
-    );
-  });
-
-  it("toolsSummary uses times for non-file kinds", () => {
-    expect(toolsSummary([ev("bash", "ls"), ev("bash", "pwd")])).toBe("ran 2 times");
+  it("groupLabel buckets", () => {
+    const c = (kind: string): Call => ({ event: ev(kind, "x"), status: "ok", errorText: null, diff: null });
+    expect(groupLabel([c("bash"), c("bash"), c("read")])).toBe("Ran 2 shell commands, read 1 file");
+    expect(groupLabel([c("search")])).toBe("Searched 1 time");
+    expect(groupLabel([c("generic"), c("subagent"), c("web")])).toBe("Called 2 tools, browsed 1 page");
   });
 
   it("taskLine maps statuses", () => {

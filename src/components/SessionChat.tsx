@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { findSession, useStore, type TranscriptItem } from "../store";
-import { groupTools, imageSrc, taskLine, toolsSummary, type ChatRow } from "../chatItems";
+import { groupLabel, groupTools, imageSrc, taskLine, type Call, type ChatRow, type Diff } from "../chatItems";
 import { AGENTS } from "../agents";
 import { modeLabel, nextMode } from "../permissionMode";
 import { renderMarkdown, splitInsights } from "../markdown";
@@ -47,23 +47,61 @@ const EVENT_MARK: Record<string, string> = {
  *  permission-mode cycle to (auto-accept → plan → normal). */
 const SHIFT_TAB = "\x1b[Z";
 
-type EventItem = Extract<TranscriptItem, { kind: "event" }>;
+const STATUS_GLYPH = { running: "◐", ok: "●", error: "✕" } as const;
 
-function EventLine({ item }: { item: EventItem }) {
-  const mark = EVENT_MARK[item.event ?? "generic"] ?? "tool";
+function DiffBlock({ diff }: { diff: Diff }) {
   return (
-    <div className="hq-tool-line" title={item.mono ?? undefined}>
-      <span className="hq-tool-verb">{mark}</span>
-      {item.mono && <code>{item.mono}</code>}
+    <div className="hq-diff">
+      <div className="hq-diff-head">
+        {diff.created ? (
+          <span className="hq-diff-add">created · +{diff.added} lines</span>
+        ) : (
+          <>
+            <span className="hq-diff-add">+{diff.added}</span>{" "}
+            <span className="hq-diff-del">−{diff.removed}</span>
+          </>
+        )}
+      </div>
+      {diff.lines.map((l, i) =>
+        l.kind === "gap" ? (
+          <div key={i} className="hq-diff-row hq-diff-gap">⋮</div>
+        ) : (
+          <div key={i} className={`hq-diff-row hq-diff-${l.kind}`}>
+            <span className="hq-diff-no">{l.oldNo ?? ""}</span>
+            <span className="hq-diff-no">{l.newNo ?? ""}</span>
+            <span className="hq-diff-mark">{l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}</span>
+            <span className="hq-diff-text">{l.text}</span>
+          </div>
+        ),
+      )}
+      {diff.more > 0 && <div className="hq-diff-row hq-diff-gap">… {diff.more} more lines</div>}
     </div>
   );
 }
 
-/** A run of tool events folded to one digest line; click lists the individual lines.
- *  A single-event run renders exactly as it always did. */
-function ToolsRow({ events }: { events: EventItem[] }) {
+function CallLine({ call }: { call: Call }) {
+  const item = call.event;
+  const mark = EVENT_MARK[item.event ?? "generic"] ?? "tool";
+  return (
+    <div className="hq-call">
+      <div className="hq-tool-line" title={item.mono ?? undefined}>
+        <span className={`hq-call-glyph hq-call-${call.status}`} aria-label={call.status}>
+          {STATUS_GLYPH[call.status]}
+        </span>
+        <span className="hq-tool-verb">{mark}</span>
+        {item.mono && <code>{item.mono}</code>}
+      </div>
+      {call.status === "error" && call.errorText && (
+        <div className="hq-call-err">{call.errorText}</div>
+      )}
+      {call.diff && <DiffBlock diff={call.diff} />}
+    </div>
+  );
+}
+
+/** A run of quiet calls folded to one digest line; click lists the individual lines. */
+function ToolsRow({ calls }: { calls: Call[] }) {
   const [open, setOpen] = useState(false);
-  if (events.length === 1) return <EventLine item={events[0]} />;
   return (
     <div className="hq-tools">
       <button
@@ -73,12 +111,12 @@ function ToolsRow({ events }: { events: EventItem[] }) {
         onClick={() => setOpen((v) => !v)}
       >
         <span className="hq-tool-verb">{open ? "▾" : "▸"}</span>
-        <span className="hq-tool-summary">{toolsSummary(events)}</span>
+        <span className="hq-tool-summary">{groupLabel(calls)}</span>
       </button>
       {open && (
         <div className="hq-tool-list">
-          {events.map((e, i) => (
-            <EventLine key={e.seq ?? i} item={e} />
+          {calls.map((c, i) => (
+            <CallLine key={c.event.seq ?? i} call={c} />
           ))}
         </div>
       )}
@@ -216,7 +254,7 @@ function Item({ item }: { item: TranscriptItem }) {
       </>
     );
   }
-  if (item.kind === "event") return <EventLine item={item} />;
+  if (item.kind === "event") return null; // events render as paired calls via groupTools
   switch (item.kind) {
     case "task": {
       const t = taskLine(item.status);
@@ -378,7 +416,9 @@ export function SessionChat({
             // tail, so an index key moves every row's state once the session passes it.
             rows.map((row, i) =>
               row.type === "tools" ? (
-                <ToolsRow key={row.events[0].seq ?? i} events={row.events} />
+                <ToolsRow key={row.calls[0].event.seq ?? i} calls={row.calls} />
+              ) : row.type === "call" ? (
+                <CallLine key={row.call.event.seq ?? i} call={row.call} />
               ) : (
                 <Item key={row.item.seq ?? i} item={row.item} />
               ),
