@@ -234,9 +234,65 @@ const CONTEXT_EVERY: Duration = Duration::from_secs(15);
 /// Wire protocol version announced in `hello`.
 const PROTOCOL_VERSION: u32 = 1;
 
-/// Build a forwarded hook-status frame.
-fn status_payload(event: &str, body: &serde_json::Value) -> serde_json::Value {
-    json!({ "type": "status", "event": event, "body": body })
+/// How often the tail re-checks which transcript the attached session is writing (a
+/// `/clear` moves it; a phone-spawned chat has none until its first turn).
+const RESOLVE_EVERY: Duration = Duration::from_secs(1);
+/// New sessions a phone may start in [`SPAWN_WINDOW`]. Each one is a real agent process on
+/// the Mac, so a stuck button or a misbehaving client must not be able to start dozens.
+const SPAWNS_MAX: usize = 10;
+const SPAWN_WINDOW: Duration = Duration::from_secs(3600);
+/// Longest session name derived from a phone's first message.
+const SPAWN_NAME_MAX: usize = 40;
+
+/// Build a forwarded hook-status frame for `session_id`.
+fn status_payload(session_id: &str, event: &str, body: &serde_json::Value) -> serde_json::Value {
+    json!({ "type": "status", "sessionId": session_id, "event": event, "body": body })
+}
+
+/// The session a client message acts on, if it is session-scoped. Private sessions are
+/// refused on exactly these.
+fn session_scope(msg: &ClientMsg) -> Option<&str> {
+    match msg {
+        ClientMsg::Attach { session_id }
+        | ClientMsg::Input { session_id, .. }
+        | ClientMsg::Resize { session_id, .. }
+        | ClientMsg::Git { session_id, .. }
+        | ClientMsg::Kill { session_id }
+        | ClientMsg::Interrupt { session_id } => Some(session_id),
+        _ => None,
+    }
+}
+
+/// Take one spawn slot for this phone (`key` = its device id, or the peer IP on loopback).
+/// `false` = the budget is spent; start nothing.
+fn take_spawn_slot(spawns: &Mutex<HashMap<String, VecDeque<Instant>>>, key: &str) -> bool {
+    crate::fleet::rate_limited(spawns, key, SPAWNS_MAX, SPAWN_WINDOW)
+}
+
+/// The agent a `spawn` names, read STRICTLY: `AgentId`'s lenient `Deserialize` turns an
+/// unknown id into Claude, which would start Claude under a name the phone never offered.
+fn spawn_agent(agent: Option<&str>) -> Option<crate::agent::AgentId> {
+    use crate::store::PersistedEnum;
+    crate::agent::AgentId::from_wire(agent.unwrap_or("claude"))
+}
+
+/// A phone-started session's name: the first non-blank line of its first message, at most
+/// [`SPAWN_NAME_MAX`] characters (an ellipsis marks a cut), else "Mobile".
+fn spawn_session_name(prompt: &str) -> String {
+    let Some(line) = prompt.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return "Mobile".to_string();
+    };
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= SPAWN_NAME_MAX {
+        return line;
+    }
+    let cut: String = line.chars().take(SPAWN_NAME_MAX - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// The reply when a phone has spent its spawn budget.
+fn spawn_budget_error() -> serde_json::Value {
+    json!({ "type": "error", "message": "too many new chats — try again later" })
 }
 
 /// Handle a `git` client message: resolve the session's repo dir from the Store,
@@ -294,13 +350,9 @@ fn spawn_reply(
     worktree: bool,
 ) -> serde_json::Value {
     use tauri::Emitter;
-    let agent_id: crate::agent::AgentId =
-        match serde_json::from_value(json!(agent.unwrap_or("claude"))) {
-            Ok(a) => a,
-            Err(_) => {
-                return json!({ "type": "error", "message": "unknown agent" });
-            }
-        };
+    let Some(agent_id) = spawn_agent(agent) else {
+        return json!({ "type": "error", "message": "unknown agent" });
+    };
     let store = app.state::<Arc<Store>>();
     let Some(project) = store.list().into_iter().find(|p| p.id == project_id) else {
         return json!({ "type": "error", "message": "unknown project" });
@@ -311,7 +363,7 @@ fn spawn_reply(
     }
     let Some(session) = store.add_session(
         project_id,
-        "Mobile".to_string(),
+        spawn_session_name(prompt),
         worktree,
         agent_id,
         crate::store::SessionRole::Worker,
@@ -338,13 +390,13 @@ fn wake_session(app: &AppHandle, session_id: &str) {
     let _ = app.emit("bridge-open-session", json!({ "sessionId": session_id }));
 }
 
-/// Build the transcript backfill payload from raw jsonl lines.
-fn history_payload(lines: &[String]) -> serde_json::Value {
+/// Build the transcript backfill payload for `session_id` from raw jsonl lines.
+fn history_payload(session_id: &str, lines: &[String]) -> serde_json::Value {
     let items: Vec<serde_json::Value> = lines
         .iter()
         .flat_map(|l| crate::transcript::parse_line(l))
         .collect();
-    json!({ "type": "history", "items": items })
+    json!({ "type": "history", "sessionId": session_id, "items": items })
 }
 
 /// Read a transcript file fully into trimmed, non-empty lines. Empty on any error.
@@ -412,8 +464,8 @@ fn auth_ok_payload(device_id: &str) -> serde_json::Value {
 /// May this upgrade's `Origin` reach the bridge? No `Origin` (the sidecar, any plain
 /// client) is fine. The phone app DOES send one -- iOS's WebSocket (SocketRocket) always
 /// sets it to the URL it dialled, `http://<host>:<port>`, and JS cannot remove it -- so an
-/// Origin naming THIS listener is accepted too: the literal IP the socket arrived on,
-/// `localhost` on loopback, or this Mac's own MagicDNS name on the tailnet address, each
+/// Origin naming THIS listener is accepted too: the literal IP the socket arrived on
+/// (`127.0.0.1` on loopback), or this Mac's own MagicDNS name on the tailnet address, each
 /// with the bridge's own port. A browser only sends such an Origin for a page served from
 /// that exact host and port, which is the bridge itself, and it serves no pages.
 ///
@@ -440,8 +492,10 @@ fn origin_allowed(origin: Option<&[u8]>, local: SocketAddr, own_dns: &str) -> bo
     if let Ok(ip) = host.parse::<IpAddr>() {
         return ip == local.ip();
     }
+    // `localhost` is NOT this listener: it is any process's origin on the Mac, and the phone
+    // never dials it (the Simulator uses the literal 127.0.0.1).
     if local.ip().is_loopback() {
-        return host == "localhost";
+        return false;
     }
     let own = own_dns.trim_end_matches('.').to_ascii_lowercase();
     !own.is_empty() && host == own && tailscale::is_tailnet_addr(local.ip())
@@ -797,6 +851,8 @@ pub struct BridgeController {
     auth_failures: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Pair prompts raised per peer IP (a budget separate from failures).
     pair_prompts: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// New sessions started per phone (device id; peer IP on loopback).
+    spawns: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Last-message previews for the `projects` frame, keyed by transcript file state.
     last_messages: crate::bridge_view::LastMessageCache,
 }
@@ -813,6 +869,7 @@ impl BridgeController {
             live: Mutex::new(HashMap::new()),
             auth_failures: Mutex::new(HashMap::new()),
             pair_prompts: Mutex::new(HashMap::new()),
+            spawns: Mutex::new(HashMap::new()),
             last_messages: Default::default(),
         }
     }
@@ -1115,6 +1172,11 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     // context meter), and when the next `context` frame is due.
     let mut context_path: Option<PathBuf> = None;
     let mut next_context = Instant::now();
+    // The conversation id the tail was resolved for, whether the attached session is a
+    // Claude one (only those are re-resolved), and when the next re-resolve is due.
+    let mut tail_conversation: Option<String> = None;
+    let mut attached_claude = false;
+    let mut next_resolve = Instant::now();
     // A `discover` probe's reply, produced on its own thread. One probe at a time.
     let (macs_tx, macs_rx) = std::sync::mpsc::channel::<String>();
     let mut discovering = false;
@@ -1215,173 +1277,230 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             }
             // Binary (or anything but text/ping/pong/close) pre-auth: not a phone.
             Ok(Message::Binary(_)) if !authed => break,
-            Ok(Message::Text(text)) => match parse_client_msg(&text) {
-                Some(ClientMsg::List) => {
-                    // Typed, whitelisted tree (see `bridge_view`); never the raw `Project`s.
-                    let running: HashSet<String> = pty.session_ids().into_iter().collect();
-                    // Store is managed as Arc<Store> (lib.rs .manage(Arc::new(Store::new()))) —
-                    // state::<Store>() panics the connection thread on the first `list`.
-                    let store = app.state::<Arc<Store>>();
-                    let fleet = app.state::<Arc<crate::fleet::FleetState>>().snapshot();
-                    let asks = app.state::<Arc<crate::asks::Asks>>().pending();
-                    let view = crate::bridge_view::projects_view(
-                        &store.list(),
-                        &store.list_profiles(),
-                        store.active_profile().as_deref(),
-                        &fleet,
-                        &running,
-                        &asks,
-                        // Resolved exactly as `attach` resolves a transcript; any miss is null.
-                        &|s| {
-                            let conversation = store.claude_conversation_id(&s.id);
-                            crate::pty::session_projects_dir(&store, &s.id)
-                                .and_then(|dir| crate::pty::transcript_path(&conversation, &dir))
-                                .map_or(serde_json::Value::Null, |p| {
-                                    ctrl.last_messages.for_path(&p)
-                                })
-                        },
-                    );
-                    ctrl.last_messages.sweep();
-                    let _ = ws.send(Message::Text(view.to_string()));
-                }
-                Some(ClientMsg::Attach { session_id }) => {
-                    // Auto-wake: an idle session has no live PTY (Conduit spawns it
-                    // lazily when its tab is shown). Ask the desktop to open it, then
-                    // poll briefly for the PTY to come up before giving up — so
-                    // `/conduit use` works on ANY session, not just running ones.
-                    let mut sub = pty.subscribe(&session_id);
-                    if sub.is_none() {
-                        wake_session(&app, &session_id);
-                        for _ in 0..25 {
-                            std::thread::sleep(Duration::from_millis(200));
-                            sub = pty.subscribe(&session_id);
-                            if sub.is_some() {
-                                break;
-                            }
-                        }
-                    }
-                    if let Some((sub_id, rx)) = sub {
-                        // Desktop-authoritative sizing: tell the new viewer the PTY's
-                        // current size so it renders at the desktop's dimensions rather
-                        // than resizing the shared TTY out from under the desktop.
-                        if let Some((cols, rows)) = pty.session_size(&session_id) {
-                            let _ = ws.send(Message::Text(
-                                json!({ "type": "size", "cols": cols, "rows": rows }).to_string(),
-                            ));
-                        }
-                        // Transcript backfill (chat history) + start tailing for appends.
-                        // Keyed by the session's CURRENT conversation, which a `/clear`
-                        // moves off the pinned id (see `Store::claude_conversation_id`).
-                        let store = app.state::<Arc<Store>>();
-                        let conversation = store.claude_conversation_id(&session_id);
-                        transcript = None;
-                        context_path = None;
-                        if let Some(dir) = crate::pty::session_projects_dir(&store, &session_id) {
-                            if let Some(path) = crate::pty::transcript_path(&conversation, &dir) {
-                                let lines = read_lines(&path);
-                                let _ = ws.send(Message::Text(history_payload(&lines).to_string()));
-                                transcript = Some((path.clone(), lines.len()));
-                                if is_claude(&store, &session_id) {
-                                    context_path = Some(path);
-                                }
-                            }
-                        }
-                        // Re-attach: release the subscription this socket already held.
-                        if let Some((old_sid, old_sub)) = crate::bridge_view::replace_attached(
+            Ok(Message::Text(text)) => {
+                let mut msg = parse_client_msg(&text);
+                // A private session is never read or driven from a phone, whoever asks --
+                // refused BEFORE anything is woken, attached or written.
+                let private = msg.as_ref().and_then(session_scope).is_some_and(|sid| {
+                    crate::bridge_view::session_is_private(&app.state::<Arc<Store>>().list(), sid)
+                });
+                if private {
+                    if matches!(msg, Some(ClientMsg::Attach { .. })) {
+                        // The phone has left the old chat: stop streaming it.
+                        if let Some((old_sid, old_sub)) = crate::bridge_view::clear_attachment(
                             &mut attached,
-                            (session_id.clone(), sub_id, rx),
+                            &mut transcript,
+                            &mut context_path,
                         ) {
                             pty.unsubscribe(&old_sid, old_sub);
                         }
-                        next_context = Instant::now();
-                    } else {
+                        tail_conversation = None;
+                    }
+                    let refusal = crate::bridge_view::private_session_error();
+                    let _ = ws.send(Message::Text(refusal.to_string()));
+                    msg = None;
+                }
+                match msg {
+                    Some(ClientMsg::List) => {
+                        // Typed, whitelisted tree (see `bridge_view`); never the raw `Project`s.
+                        let running: HashSet<String> = pty.session_ids().into_iter().collect();
+                        // Store is managed as Arc<Store> (lib.rs .manage(Arc::new(Store::new()))) —
+                        // state::<Store>() panics the connection thread on the first `list`.
+                        let store = app.state::<Arc<Store>>();
+                        let fleet = app.state::<Arc<crate::fleet::FleetState>>().snapshot();
+                        let asks = app.state::<Arc<crate::asks::Asks>>().pending();
+                        let view = crate::bridge_view::projects_view(
+                            &store.list(),
+                            &store.list_profiles(),
+                            store.active_profile().as_deref(),
+                            &fleet,
+                            &running,
+                            &asks,
+                            // Resolved exactly as `attach` resolves a transcript; any miss is null.
+                            &|s| {
+                                let conversation = store.claude_conversation_id(&s.id);
+                                ctrl.last_messages
+                                    .path_for(&s.id, &conversation, || {
+                                        crate::pty::session_projects_dir(&store, &s.id).and_then(
+                                            |dir| crate::pty::transcript_path(&conversation, &dir),
+                                        )
+                                    })
+                                    .map_or(serde_json::Value::Null, |p| {
+                                        ctrl.last_messages.for_path(&p)
+                                    })
+                            },
+                        );
+                        ctrl.last_messages.sweep();
+                        let _ = ws.send(Message::Text(view.to_string()));
+                    }
+                    Some(ClientMsg::Attach { session_id }) => {
+                        // Auto-wake: an idle session has no live PTY (Conduit spawns it
+                        // lazily when its tab is shown). Ask the desktop to open it, then
+                        // poll briefly for the PTY to come up before giving up — so
+                        // `/conduit use` works on ANY session, not just running ones.
+                        let mut sub = pty.subscribe(&session_id);
+                        if sub.is_none() {
+                            wake_session(&app, &session_id);
+                            for _ in 0..25 {
+                                std::thread::sleep(Duration::from_millis(200));
+                                sub = pty.subscribe(&session_id);
+                                if sub.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some((sub_id, rx)) = sub {
+                            // Desktop-authoritative sizing: tell the new viewer the PTY's
+                            // current size so it renders at the desktop's dimensions rather
+                            // than resizing the shared TTY out from under the desktop.
+                            if let Some((cols, rows)) = pty.session_size(&session_id) {
+                                let _ = ws.send(Message::Text(
+                                    json!({ "type": "size", "cols": cols, "rows": rows })
+                                        .to_string(),
+                                ));
+                            }
+                            // Transcript backfill (chat history) + start tailing for appends.
+                            // Keyed by the session's CURRENT conversation, which a `/clear`
+                            // moves off the pinned id (see `Store::claude_conversation_id`).
+                            let store = app.state::<Arc<Store>>();
+                            let conversation = store.claude_conversation_id(&session_id);
+                            transcript = None;
+                            context_path = None;
+                            attached_claude = is_claude(&store, &session_id);
+                            let found = crate::pty::session_projects_dir(&store, &session_id)
+                                .and_then(|dir| crate::pty::transcript_path(&conversation, &dir));
+                            // No transcript yet (a chat opened the moment it was spawned): the
+                            // phone still gets an empty history, and the tail tick picks the
+                            // transcript up as soon as it appears.
+                            let lines = found.as_deref().map(read_lines).unwrap_or_default();
+                            let history = history_payload(&session_id, &lines);
+                            let _ = ws.send(Message::Text(history.to_string()));
+                            if let Some(path) = found {
+                                transcript = Some((path.clone(), lines.len()));
+                                if attached_claude {
+                                    context_path = Some(path);
+                                }
+                            }
+                            tail_conversation = Some(conversation);
+                            next_resolve = Instant::now() + RESOLVE_EVERY;
+                            // Re-attach: release the subscription this socket already held.
+                            if let Some((old_sid, old_sub)) = crate::bridge_view::replace_attached(
+                                &mut attached,
+                                (session_id.clone(), sub_id, rx),
+                            ) {
+                                pty.unsubscribe(&old_sid, old_sub);
+                            }
+                            next_context = Instant::now();
+                        } else {
+                            // Never keep streaming the chat the phone just left into this one.
+                            if let Some((old_sid, old_sub)) = crate::bridge_view::clear_attachment(
+                                &mut attached,
+                                &mut transcript,
+                                &mut context_path,
+                            ) {
+                                pty.unsubscribe(&old_sid, old_sub);
+                            }
+                            tail_conversation = None;
+                            attached_claude = false;
+                            let _ = ws.send(Message::Text(
+                                json!({ "type": "error", "message": "no such session" })
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    Some(ClientMsg::Input { session_id, data }) => {
+                        let _ = pty.write(&session_id, &data);
+                    }
+                    Some(ClientMsg::Resize {
+                        session_id,
+                        cols,
+                        rows,
+                    }) => {
+                        let _ = pty.resize(&session_id, cols, rows);
+                    }
+                    Some(ClientMsg::Git {
+                        session_id,
+                        action,
+                        path,
+                    }) => {
+                        let reply = git_reply(&app, &session_id, &action, path.as_deref());
+                        let _ = ws.send(Message::Text(reply.to_string()));
+                    }
+                    Some(ClientMsg::Kill { session_id }) => {
+                        pty.kill(&session_id);
                         let _ = ws.send(Message::Text(
-                            json!({ "type": "error", "message": "no such session" }).to_string(),
+                            json!({ "type": "killed", "sessionId": session_id }).to_string(),
                         ));
                     }
-                }
-                Some(ClientMsg::Input { session_id, data }) => {
-                    let _ = pty.write(&session_id, &data);
-                }
-                Some(ClientMsg::Resize {
-                    session_id,
-                    cols,
-                    rows,
-                }) => {
-                    let _ = pty.resize(&session_id, cols, rows);
-                }
-                Some(ClientMsg::Git {
-                    session_id,
-                    action,
-                    path,
-                }) => {
-                    let reply = git_reply(&app, &session_id, &action, path.as_deref());
-                    let _ = ws.send(Message::Text(reply.to_string()));
-                }
-                Some(ClientMsg::Kill { session_id }) => {
-                    pty.kill(&session_id);
-                    let _ = ws.send(Message::Text(
-                        json!({ "type": "killed", "sessionId": session_id }).to_string(),
-                    ));
-                }
-                Some(ClientMsg::Spawn {
-                    project_id,
-                    prompt,
-                    agent,
-                    worktree,
-                }) => {
-                    let reply = spawn_reply(&app, &project_id, &prompt, agent.as_deref(), worktree);
-                    let _ = ws.send(Message::Text(reply.to_string()));
-                }
-                Some(ClientMsg::Interrupt { session_id }) => {
-                    // Esc is Claude's interrupt key (spec §6 "Stop").
-                    let _ = pty.write(&session_id, "\x1b");
-                }
-                // Pairing again from a trusted socket: only loopback (the simulator) may,
-                // since a parked wait would also park a remote device's revoke check.
-                Some(ClientMsg::Pair {
-                    secret,
-                    request,
-                    device_name,
-                    nonce,
-                }) => {
-                    if loopback {
-                        let _ = pair_flow(
-                            &ctrl,
-                            &app,
-                            &mut ws,
-                            peer,
-                            secret,
-                            request.unwrap_or(false),
-                            &device_name,
-                            &nonce,
-                        );
-                    } else {
-                        let _ = ws.send(Message::Text(unauthorized().to_string()));
+                    Some(ClientMsg::Spawn {
+                        project_id,
+                        prompt,
+                        agent,
+                        worktree,
+                    }) => {
+                        // Budgeted per phone: its device id, or the peer IP for loopback.
+                        let key = device
+                            .as_ref()
+                            .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
+                        let reply = if take_spawn_slot(&ctrl.spawns, &key) {
+                            spawn_reply(&app, &project_id, &prompt, agent.as_deref(), worktree)
+                        } else {
+                            spawn_budget_error()
+                        };
+                        let _ = ws.send(Message::Text(reply.to_string()));
                     }
-                }
-                // Probe the tailnet off this thread; the reply arrives via `macs_rx`. Only
-                // a phone owned by this Mac's Tailscale user may see the owner's Macs; its
-                // owner is looked up once per connection (loopback is the owner).
-                Some(ClientMsg::Discover) => {
-                    if !discovering {
-                        discovering = true;
-                        let (tx, owner) = (macs_tx.clone(), peer_owner.clone());
-                        thread::spawn(move || {
-                            let reply = pairing::discover_macs(|self_user| {
-                                if loopback {
-                                    Some(self_user)
-                                } else {
-                                    *owner.get_or_init(|| tailscale::whois(peer).map(|w| w.user_id))
-                                }
+                    Some(ClientMsg::Interrupt { session_id }) => {
+                        // Esc is Claude's interrupt key (spec §6 "Stop").
+                        let _ = pty.write(&session_id, "\x1b");
+                    }
+                    // Pairing again from a trusted socket: only loopback (the simulator) may,
+                    // since a parked wait would also park a remote device's revoke check.
+                    Some(ClientMsg::Pair {
+                        secret,
+                        request,
+                        device_name,
+                        nonce,
+                    }) => {
+                        if loopback {
+                            let _ = pair_flow(
+                                &ctrl,
+                                &app,
+                                &mut ws,
+                                peer,
+                                secret,
+                                request.unwrap_or(false),
+                                &device_name,
+                                &nonce,
+                            );
+                        } else {
+                            let _ = ws.send(Message::Text(unauthorized().to_string()));
+                        }
+                    }
+                    // Probe the tailnet off this thread; the reply arrives via `macs_rx`. Only
+                    // a phone owned by this Mac's Tailscale user may see the owner's Macs; its
+                    // owner is looked up once per connection (loopback is the owner).
+                    Some(ClientMsg::Discover) => {
+                        if !discovering {
+                            discovering = true;
+                            let (tx, owner) = (macs_tx.clone(), peer_owner.clone());
+                            thread::spawn(move || {
+                                let reply = pairing::discover_macs(|self_user| {
+                                    if loopback {
+                                        Some(self_user)
+                                    } else {
+                                        *owner.get_or_init(|| {
+                                            tailscale::whois(peer).map(|w| w.user_id)
+                                        })
+                                    }
+                                });
+                                let _ = tx.send(reply.to_string());
                             });
-                            let _ = tx.send(reply.to_string());
-                        });
+                        }
                     }
+                    // Already authenticated (or loopback): a repeat `auth` changes nothing.
+                    Some(ClientMsg::Auth { .. }) | None => {}
                 }
-                // Already authenticated (or loopback): a repeat `auth` changes nothing.
-                Some(ClientMsg::Auth { .. }) | None => {}
-            },
+            }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
             Err(tungstenite::Error::Io(e))
@@ -1431,7 +1550,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                     Ok(ev) if &ev.session == sid => {
                         if ws
                             .send(Message::Text(
-                                status_payload(&ev.event, &ev.body).to_string(),
+                                status_payload(sid, &ev.event, &ev.body).to_string(),
                             ))
                             .is_err()
                         {
@@ -1460,15 +1579,50 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             }
         }
 
-        // 4. Tail the transcript for appended lines -> chat items.
-        if let Some((path, cursor)) = transcript.as_mut() {
+        // 4a. Follow the attached Claude session onto the transcript it is writing NOW: a
+        //     `/clear` moves it to a new conversation, and a chat opened the moment it was
+        //     spawned had none at attach. At most once per RESOLVE_EVERY, and the directory
+        //     scan only runs when the conversation id moved or there is no transcript yet.
+        if attached_claude && Instant::now() >= next_resolve {
+            next_resolve = Instant::now() + RESOLVE_EVERY;
+            if let Some((sid, _, _)) = attached.as_ref() {
+                let store = app.state::<Arc<Store>>();
+                let conversation = store.claude_conversation_id(sid);
+                if crate::bridge_view::needs_resolve(
+                    tail_conversation.as_deref(),
+                    transcript.is_some(),
+                    &conversation,
+                ) {
+                    let resolved = crate::pty::session_projects_dir(&store, sid)
+                        .and_then(|dir| crate::pty::transcript_path(&conversation, &dir));
+                    let current = transcript.as_ref().map(|(p, _)| p.as_path());
+                    if crate::bridge_view::should_switch_tail(current, resolved.as_deref()) {
+                        if let Some(path) = resolved.clone() {
+                            let lines = read_lines(&path);
+                            let history = history_payload(sid, &lines);
+                            let _ = ws.send(Message::Text(history.to_string()));
+                            transcript = Some((path.clone(), lines.len()));
+                            context_path = Some(path);
+                            next_context = Instant::now();
+                        }
+                    }
+                    // Settled only once found: until then, look again next tick.
+                    if resolved.is_some() {
+                        tail_conversation = Some(conversation);
+                    }
+                }
+            }
+        }
+
+        // 4b. Tail the transcript for appended lines -> chat items.
+        if let (Some((path, cursor)), Some((sid, _, _))) = (transcript.as_mut(), attached.as_ref())
+        {
             let lines = read_lines(path);
             if lines.len() > *cursor {
                 for line in &lines[*cursor..] {
                     for item in crate::transcript::parse_line(line) {
-                        let _ = ws.send(Message::Text(
-                            json!({ "type": "chat", "item": item }).to_string(),
-                        ));
+                        let frame = crate::bridge_view::chat_frame(sid, &item);
+                        let _ = ws.send(Message::Text(frame.to_string()));
                     }
                 }
                 *cursor = lines.len();
@@ -1588,6 +1742,89 @@ mod tests {
     }
 
     #[test]
+    fn private_gate_covers_every_session_scoped_message() {
+        let scoped = [
+            r#"{"type":"attach","session_id":"s"}"#,
+            r#"{"type":"input","session_id":"s","data":"x"}"#,
+            r#"{"type":"resize","session_id":"s","cols":1,"rows":1}"#,
+            r#"{"type":"git","session_id":"s","action":"changes"}"#,
+            r#"{"type":"kill","session_id":"s"}"#,
+            r#"{"type":"interrupt","sessionId":"s"}"#,
+        ];
+        for raw in scoped {
+            let m = parse_client_msg(raw).unwrap();
+            assert_eq!(session_scope(&m), Some("s"), "{raw}");
+        }
+        for raw in [
+            r#"{"type":"list"}"#,
+            r#"{"type":"discover"}"#,
+            r#"{"type":"spawn","project_id":"p","prompt":"x"}"#,
+        ] {
+            assert_eq!(
+                session_scope(&parse_client_msg(raw).unwrap()),
+                None,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_agent_is_strict() {
+        use crate::agent::AgentId;
+        assert_eq!(spawn_agent(None), Some(AgentId::Claude));
+        assert_eq!(spawn_agent(Some("claude")), Some(AgentId::Claude));
+        assert_eq!(spawn_agent(Some("hermes")), Some(AgentId::Hermes));
+        // The lenient Deserialize would have made these Claude.
+        assert_eq!(spawn_agent(Some("gpt5-turbo")), None);
+        assert_eq!(spawn_agent(Some("")), None);
+        assert_eq!(spawn_agent(Some("Claude")), None);
+    }
+
+    #[test]
+    fn spawn_name_is_the_first_line_clipped() {
+        assert_eq!(
+            spawn_session_name("Fix the login bug\nmore detail"),
+            "Fix the login bug"
+        );
+        assert_eq!(
+            spawn_session_name("\n  \n  hello   there  \n"),
+            "hello there"
+        );
+        assert_eq!(spawn_session_name(""), "Mobile");
+        assert_eq!(spawn_session_name(" \n\t\n"), "Mobile");
+        let long = spawn_session_name(&"word ".repeat(30));
+        assert!(long.chars().count() <= SPAWN_NAME_MAX, "{long}");
+        assert!(long.ends_with('…'));
+        let exact = "é".repeat(SPAWN_NAME_MAX);
+        assert_eq!(
+            spawn_session_name(&exact),
+            exact,
+            "exactly the limit is kept whole"
+        );
+    }
+
+    #[test]
+    fn spawns_are_budgeted_per_phone() {
+        let spawns = Mutex::new(HashMap::new());
+        for i in 0..SPAWNS_MAX {
+            assert!(take_spawn_slot(&spawns, "dev-a"), "spawn {} allowed", i + 1);
+        }
+        assert!(
+            !take_spawn_slot(&spawns, "dev-a"),
+            "11th in the hour refused"
+        );
+        assert!(
+            take_spawn_slot(&spawns, "dev-b"),
+            "another phone is unaffected"
+        );
+        assert_eq!((SPAWNS_MAX, SPAWN_WINDOW), (10, Duration::from_secs(3600)));
+        assert_eq!(
+            spawn_budget_error(),
+            json!({ "type": "error", "message": "too many new chats — try again later" })
+        );
+    }
+
+    #[test]
     fn pair_result_ok_shape() {
         let v = pair_result_ok("tok", "dev-1");
         assert_eq!(sorted_keys(&v), ["deviceId", "ok", "token", "type"]);
@@ -1616,7 +1853,9 @@ mod tests {
 
     #[test]
     fn status_message_shape() {
-        let msg = status_payload("pretool", &serde_json::json!({ "tool_name": "Bash" }));
+        let msg = status_payload("s1", "pretool", &serde_json::json!({ "tool_name": "Bash" }));
+        assert_eq!(sorted_keys(&msg), ["body", "event", "sessionId", "type"]);
+        assert_eq!(msg["sessionId"], "s1");
         assert_eq!(msg["type"], "status");
         assert_eq!(msg["event"], "pretool");
         assert_eq!(msg["body"]["tool_name"], "Bash");
@@ -1629,8 +1868,9 @@ mod tests {
             serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"yo"}]}})
                 .to_string(),
         ];
-        let msg = history_payload(&lines);
+        let msg = history_payload("s1", &lines);
         assert_eq!(msg["type"], "history");
+        assert_eq!(msg["sessionId"], "s1");
         assert_eq!(msg["items"].as_array().unwrap().len(), 2);
         assert_eq!(msg["items"][0]["role"], "user");
     }
@@ -1924,8 +2164,10 @@ mod tests {
         assert!(!ok("http://100.64.0.1:8456", lo));
         assert!(!ok("https://127.0.0.1:8456", lo));
         assert!(!ok("http://127.0.0.1:8456/x", lo));
-        // localhost only on loopback; our MagicDNS name only on the tailnet address.
+        // localhost is never us (any local web page has it); our MagicDNS name only on the
+        // tailnet address.
         assert!(!ok("http://localhost:8456", tn));
+        assert!(!ok("http://localhost:8456", lo));
         assert!(!ok("http://mac.t.ts.net:8456", lo));
         assert!(!ok("http://other.t.ts.net:8456", tn));
         assert!(!origin_allowed(Some(b"http://:8456"), tn, ""));
@@ -1939,7 +2181,6 @@ mod tests {
         let tn: SocketAddr = "100.64.0.1:8456".parse().unwrap();
         let ok = |o: &str, at: SocketAddr| origin_allowed(Some(o.as_bytes()), at, "Mac.t.ts.net.");
         assert!(ok("http://127.0.0.1:8456", lo));
-        assert!(ok("http://localhost:8456", lo));
         assert!(ok("http://100.64.0.1:8456", tn));
         assert!(ok("http://mac.t.ts.net:8456", tn));
         assert!(ok("http://MAC.t.ts.net.:8456", tn));
@@ -1992,10 +2233,13 @@ mod tests {
 
     #[test]
     fn ios_shaped_handshake_is_accepted() {
-        // The phone app in the Simulator dials ws://127.0.0.1:<port> (or localhost) and
-        // SocketRocket adds the matching Origin; the bridge must take it.
+        // The phone app in the Simulator dials ws://127.0.0.1:<port> and SocketRocket adds
+        // the matching Origin; the bridge must take it. `localhost` it does not.
         assert_eq!(handshake_with_origins(&["http://127.0.0.1:{port}"]), Ok(()));
-        assert_eq!(handshake_with_origins(&["http://localhost:{port}"]), Ok(()));
+        assert_eq!(
+            handshake_with_origins(&["http://localhost:{port}"]),
+            Err(StatusCode::FORBIDDEN)
+        );
         assert_eq!(handshake_with_origins(&[]), Ok(()));
     }
 

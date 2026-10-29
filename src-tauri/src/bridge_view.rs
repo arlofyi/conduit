@@ -156,6 +156,10 @@ pub struct LastMessageCache {
     inner: Mutex<HashMap<PathBuf, CacheEntry>>,
     /// Paths asked for since the last [`sweep`](Self::sweep).
     seen: Mutex<HashSet<PathBuf>>,
+    /// Resolved transcript paths by `(session id, conversation id)`.
+    paths: Mutex<HashMap<(String, String), PathBuf>>,
+    /// Keys of `paths` asked for since the last sweep.
+    seen_paths: Mutex<HashSet<(String, String)>>,
 }
 
 /// `(len, mtime, preview)` of a transcript when it was last read.
@@ -195,6 +199,49 @@ impl LastMessageCache {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|p, _| seen.contains(p));
         seen.clear();
+        let mut seen_paths = self.seen_paths.lock().unwrap_or_else(|e| e.into_inner());
+        self.paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| seen_paths.contains(k));
+        seen_paths.clear();
+    }
+
+    /// The transcript path for `(session, conversation)`, resolved once and then remembered:
+    /// `pty::transcript_path` lists the whole projects directory, which a 10 s `list` poll
+    /// would otherwise repeat for every session. A cached path that no longer exists is
+    /// resolved again; a miss is not cached (the transcript may simply not exist yet).
+    pub fn path_for(
+        &self,
+        session_id: &str,
+        conversation: &str,
+        resolve: impl FnOnce() -> Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        let key = (session_id.to_string(), conversation.to_string());
+        self.seen_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
+        let cached = self
+            .paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
+        if let Some(p) = cached.filter(|p| p.exists()) {
+            return Some(p);
+        }
+        let found = resolve();
+        let mut paths = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        match &found {
+            Some(p) => {
+                paths.insert(key, p.clone());
+            }
+            None => {
+                paths.remove(&key);
+            }
+        }
+        found
     }
 
     /// Cached preview for a transcript file; null when it cannot be statted.
@@ -304,6 +351,59 @@ pub fn context_frame(session_id: &str, u: &ContextUsage) -> Value {
         "fraction": u.fraction,
         "model": u.model,
     })
+}
+
+/// Is this session private (silo'd or local-only)? A private session is listed on the phone
+/// but nothing about it may be read or driven from there: the bridge refuses every
+/// session-scoped request for it, from any peer, loopback included. An unknown id is not
+/// private (the request then fails on its own as "no such session").
+pub fn session_is_private(projects: &[Project], session_id: &str) -> bool {
+    projects
+        .iter()
+        .flat_map(|p| p.sessions.iter())
+        .find(|s| s.id == session_id)
+        .is_some_and(|s| s.silo || s.local_only)
+}
+
+/// The one reply to a refused private-session request.
+pub fn private_session_error() -> Value {
+    json!({ "type": "error", "message": "private session" })
+}
+
+/// A `chat` frame: one transcript item of `session_id`. The id lets the phone drop a frame
+/// that belongs to a chat it has already left.
+pub fn chat_frame(session_id: &str, item: &Value) -> Value {
+    json!({ "type": "chat", "sessionId": session_id, "item": item })
+}
+
+/// Should the tail re-resolve the attached session's transcript on this tick? Only when it
+/// has none yet (attached before the transcript existed -- a chat opened the moment it was
+/// spawned) or its conversation id moved (a `/clear`). Anything else is a wasted directory scan.
+pub fn needs_resolve(
+    tailing_conversation: Option<&str>,
+    have_path: bool,
+    conversation: &str,
+) -> bool {
+    !have_path || tailing_conversation != Some(conversation)
+}
+
+/// Switch the tail to `resolved`? Only for a path that was found and differs from the one
+/// being tailed; a failed lookup keeps the current tail rather than going dark.
+pub fn should_switch_tail(current: Option<&Path>, resolved: Option<&Path>) -> bool {
+    matches!(resolved, Some(r) if current != Some(r))
+}
+
+/// Drop the current attachment (an `attach` that failed or was refused): return the
+/// `(session, subscription id)` the caller must unsubscribe, and clear everything that would
+/// otherwise keep streaming the OLD session into the chat the phone just opened.
+pub fn clear_attachment<R, T>(
+    slot: &mut Option<(String, u64, R)>,
+    transcript: &mut Option<T>,
+    context_path: &mut Option<PathBuf>,
+) -> Option<(String, u64)> {
+    *transcript = None;
+    *context_path = None;
+    slot.take().map(|(s, id, _)| (s, id))
 }
 
 /// Install a new attachment and return the `(session, subscription id)` it displaced, which
@@ -455,11 +555,14 @@ mod tests {
     fn tail_reader_handles_a_multibyte_char_at_the_cut() {
         // "é" is 2 bytes; make the cut land between them.
         let last = format!("{}\n", assistant("fin"));
-        let filler_len = TAIL_BYTES as usize - last.len() + 1;
+        let filler_len = TAIL_BYTES as usize - last.len();
         let mut body = String::from("é");
         body.push_str(&"a".repeat(filler_len - 2));
         body.push('\n');
         body.push_str(&last);
+        // The window starts one byte in: inside the "é", not after it.
+        assert_eq!(body.len() as u64 - TAIL_BYTES, 1);
+        assert!(!body.is_char_boundary(1));
         let p = tmp_file("utf8", body.as_bytes());
         assert_eq!(read_last_message(&p)["text"], "fin");
         std::fs::remove_file(p).ok();
@@ -661,6 +764,115 @@ mod tests {
         assert_eq!(f["type"], "context");
         assert_eq!(f["sessionId"], "s1");
         assert_eq!(f["window"], 200000);
+    }
+
+    #[test]
+    fn private_sessions_are_silo_or_local_only() {
+        let mut silo = sess("a");
+        silo.silo = true;
+        let mut local = sess("b");
+        local.local_only = true;
+        let ps = [project("p", vec![silo, local, sess("c")])];
+        assert!(session_is_private(&ps, "a"));
+        assert!(session_is_private(&ps, "b"));
+        assert!(!session_is_private(&ps, "c"));
+        assert!(!session_is_private(&ps, "missing"));
+        assert_eq!(
+            private_session_error(),
+            json!({ "type": "error", "message": "private session" })
+        );
+    }
+
+    #[test]
+    fn chat_frame_names_its_session() {
+        let f = chat_frame("s1", &json!({ "kind": "bubble" }));
+        assert_eq!(keys(&f), ["item", "sessionId", "type"]);
+        assert_eq!(f["sessionId"], "s1");
+        assert_eq!(f["item"]["kind"], "bubble");
+    }
+
+    #[test]
+    fn tail_resolves_only_when_missing_or_moved() {
+        assert!(needs_resolve(None, false, "c1"), "no transcript yet");
+        assert!(
+            needs_resolve(Some("c1"), false, "c1"),
+            "attached before it existed"
+        );
+        assert!(
+            needs_resolve(Some("c1"), true, "c2"),
+            "a /clear moved the conversation"
+        );
+        assert!(
+            !needs_resolve(Some("c1"), true, "c1"),
+            "nothing changed: no scan"
+        );
+    }
+
+    #[test]
+    fn tail_switches_only_to_a_different_found_path() {
+        let a = Path::new("/t/a.jsonl");
+        let b = Path::new("/t/b.jsonl");
+        assert!(should_switch_tail(None, Some(a)));
+        assert!(should_switch_tail(Some(a), Some(b)));
+        assert!(!should_switch_tail(Some(a), Some(a)));
+        assert!(
+            !should_switch_tail(Some(a), None),
+            "a failed lookup keeps the tail"
+        );
+        assert!(!should_switch_tail(None, None));
+    }
+
+    #[test]
+    fn failed_attach_clears_the_old_stream() {
+        let mut slot: Option<(String, u64, ())> = Some(("old".into(), 7, ()));
+        let mut transcript = Some((PathBuf::from("/t/old.jsonl"), 12usize));
+        let mut ctx = Some(PathBuf::from("/t/old.jsonl"));
+        assert_eq!(
+            clear_attachment(&mut slot, &mut transcript, &mut ctx),
+            Some(("old".to_string(), 7))
+        );
+        assert!(slot.is_none() && transcript.is_none() && ctx.is_none());
+        // Nothing attached: nothing to release, still cleared.
+        assert_eq!(clear_attachment(&mut slot, &mut transcript, &mut ctx), None);
+    }
+
+    #[test]
+    fn path_cache_resolves_once_per_conversation() {
+        use std::cell::Cell;
+        let c = LastMessageCache::default();
+        let f = tmp_file("pc", assistant("a").as_bytes());
+        let calls = Cell::new(0);
+        let resolve = || {
+            calls.set(calls.get() + 1);
+            Some(f.clone())
+        };
+        assert_eq!(c.path_for("s", "c1", resolve), Some(f.clone()));
+        assert_eq!(c.path_for("s", "c1", resolve), Some(f.clone()));
+        assert_eq!(calls.get(), 1, "a cached path is not resolved again");
+        c.path_for("s", "c2", resolve);
+        assert_eq!(calls.get(), 2, "a new conversation resolves");
+        // A miss is not cached.
+        let misses = Cell::new(0);
+        let miss = || {
+            misses.set(misses.get() + 1);
+            None
+        };
+        assert_eq!(c.path_for("t", "c", miss), None);
+        assert_eq!(c.path_for("t", "c", miss), None);
+        assert_eq!(misses.get(), 2);
+        // A cached path that vanished is resolved again.
+        std::fs::remove_file(&f).ok();
+        c.path_for("s", "c1", resolve);
+        assert_eq!(calls.get(), 3);
+        // Sweep keeps keys asked for in the pass and forgets the rest.
+        c.sweep();
+        assert!(c
+            .paths
+            .lock()
+            .unwrap()
+            .contains_key(&("s".into(), "c1".into())));
+        c.sweep(); // a pass that asked for nothing
+        assert!(c.paths.lock().unwrap().is_empty());
     }
 
     #[test]
