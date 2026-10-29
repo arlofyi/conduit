@@ -14,6 +14,15 @@ notification toggles, theme). Opening a chat attaches to that session: its trans
 history renders, new turns stream in, the composer types into the real PTY, and **Stop**
 interrupts the current turn.
 
+**Answering from the phone.** When a session asks a question (AskUserQuestion) or needs
+permission to run a tool, the Mac pushes it to every connected phone at once: a banner, a
+"Needs you" row, and a live card in the chat (numbered options, multi-select, "Something
+else…"; Allow / Deny for a permission). The first answer anywhere wins and every other
+screen clears the card and says where it went ("Answered on your Mac", "Moved to the
+terminal", "Handled in the terminal"). A private session never shows its question on the
+phone. A Deny after the terminal already said Yes cannot stop the tool, and the card says
+so. Logic: `src/logic/pending.ts` (tested); cards: `src/components/PendingCards.tsx`.
+
 Two ways to reach a Mac:
 
 - **Tailscale (a real phone).** The phone and the Mac must be on the same tailnet with mobile
@@ -26,7 +35,10 @@ Two ways to reach a Mac:
   one for you, because the installed Conduit answers there too. Loopback needs no pairing.
 
 Verified end to end in the iOS Simulator against an isolated dev build (2026-10-30): connect,
-chat list, history, send, reply, Stop. **Not yet verified:** a real iPhone over the tailnet
+chat list, history, send, reply, Stop; and over the tailnet address with a device token:
+answering a question, Allow and Deny, Esc / "No" in the terminal clearing the phone's card,
+hand-off when the app is backgrounded or frozen, and a private session's question staying
+on the Mac. **Not yet verified:** a real iPhone over the tailnet
 hop, App Transport Security on a device (the `ts.net` exception plus
 `NSAllowsLocalNetworking` in `app.json`), and the QR camera scan.
 
@@ -106,5 +118,4 @@ src/screens/
 ## Next
 
 - Verify on a real iPhone: the Tailscale hop, ATS on device, and the QR camera scan.
-- Answer questions and permission prompts from the phone (the cards are read-only today).
 - Push notifications (APNs); in-app banners only fire while the app is open.

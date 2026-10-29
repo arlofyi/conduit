@@ -637,6 +637,51 @@ plus install/remove/status), and one listener in `App.tsx`.
   the name comes from the first message's first line (<= 40 chars, else "Mobile"), and each
   phone gets 10 per hour (`take_spawn_slot`, keyed by device id, or peer IP on loopback).
   The phone offers only Claude, the one agent whose chat it can show.
+- **Questions and permissions are held for whoever can see a card** (`hooks::holder_for`,
+  shared by `/ask` and `/permission`): the desktop gate, OR a connected REMOTE phone when
+  the session is not private. Loopback (the Simulator) never counts as a phone -- only an
+  authenticated tailnet socket is in `live`. An item held only for phones
+  (`held_for_phone`) is handed back to the terminal the moment the last phone leaves
+  (`last_phone_left`); a remote socket is pinged every 15 s and dropped after 35 s of
+  silence (`has_remote_phone` stops counting it at once). **Every bridge write is bounded
+  (`WRITE_STALL`, 10 s)**: a frozen phone keeps its socket open at zero window, and an
+  unbounded write blocked the loop before the staleness check -- measured, 70 s frozen and
+  the question still held. The phone also closes its socket itself when backgrounded.
+- **Pushes and `by`.** Each socket diffs `Asks::pending()` + `Broker::pending()` every
+  250 ms (`push_frames`): `pending` once, then `pendingAdded` / `resolved{by}`, `by` from a
+  64-entry ring (`phone|desktop|terminal|timeout|cancelled`; unknown reads `cancelled`).
+  `cancelled` = remove silently. `terminal` means a hand-off for an ask ("Moved to the
+  terminal") but "Handled in the terminal" for a permission -- the event cannot tell a
+  terminal "No" from the last phone leaving. A private item is pushed as exactly
+  `{kind,id,sessionId,private}`; privacy is decided once, when the item is first pushed to
+  a socket, so a session made private later is not redacted retroactively.
+- **Cancellation** (`turn_moved_on`): `stop`/`prompt`/`sessionend` cancel both registries;
+  `tooluse` too, EXCEPT a body with a non-empty `agent_id` -- measured (2.1.312): a
+  background subagent's PreToolUse/PostToolUse carry `agent_id` + `agent_type`, the main
+  thread's never do, so a subagent finishing a tool cannot kill the main turn's question.
+  Never `pretool` (it fires for AskUserQuestion itself). A main-thread sibling PostToolUse
+  does cancel a pending permission -- it fails open (Claude's own dialog is still up).
+- **A dead hook is noticed by writing to it** (`hook_wait.rs`): tiny_http exposes no socket,
+  so while waiting the handler writes `102 Processing` every 500 ms on
+  `request.into_writer()`; a failed write = Esc/"No" in the terminal killed curl ->
+  `by: terminal` (measured: Esc -> phone card cleared in 1.15 s; terminal "No" -> 0.7 s).
+  After `into_writer`, NEVER call `request.respond` -- write the reply with
+  `write_json_response`.
+- **PermissionRequest facts** (spike: `docs/superpowers/specs/2026-10-30-permission-request-hook-findings.md`).
+  No `tool_use_id`, so permission cards are standalone (keyed `perm-N` + session).
+  AskUserQuestion and ExitPlanMode also fire it and are answered `{}` at once. Ceilings
+  300 s < curl 330 < hook 340 (a `const` assert). Only `allow`/`deny` replies act; `{}`
+  falls through to the TUI dialog, which runs in parallel. A terminal "Yes" leaves the
+  hook alive and is invisible until PostToolUse, so "ok" from `approve`/`permission_respond`
+  means "reached the hook", never "stopped the tool" -- copy must stay honest ("Denied --
+  if you'd already allowed it in the terminal, it keeps running").
+- **Desktop side**: `askResolvedPlan` (asks.ts) decides hold/note/toast for `ask-resolved`;
+  `askHandoff.ts` remembers this window's own hand-offs; permission cards live in
+  `.hold-dock` above AskDock, filtered by `permissionsToShow` (no card over the terminal
+  you are watching), listeners registered before the `permission_pending` catch-up, and
+  `resolvedPermissions` stops a stale catch-up resurrecting one. **Phone side**:
+  `logic/pending.ts` -- the Mac is the truth (a snapshot or `added` replaces a settled
+  entry: ids restart per Mac boot), a send that did not go out stays live.
 - **The phone app is `mobile/`** (Expo SDK 56 dev build; run/pairing steps in
   `mobile/README.md`). Pure logic lives in `mobile/src/logic` + `src/bridge` with jest tests;
   `LiveProvider` owns the one socket. Chat messages go into the PTY as a bracketed paste +
