@@ -8,8 +8,9 @@
 //!   [`plan_listeners`] decides it every 30 s (and on the switch), so a restart or a new
 //!   address re-binds within one tick and a stale address is never left bound.
 //! - Never `0.0.0.0` / `::`. Peers outside loopback and the tailnet ranges are dropped
-//!   before the handshake, and any handshake carrying `Origin` is refused with 403 (a
-//!   web page on the Mac must never reach the bridge).
+//!   before the handshake, and a handshake whose `Origin` is not this listener itself is
+//!   refused with 403 (a web page on the Mac must never reach the bridge; the iOS app's
+//!   socket always sends its own dialled origin, see [`origin_allowed`]).
 //!
 //! Every peer is greeted with `hello`. A non-loopback peer must then `auth` with its
 //! device token within 5 s (or `pair`/`discover`); pre-auth frames are capped at 4 KiB,
@@ -21,7 +22,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -408,11 +409,54 @@ fn auth_ok_payload(device_id: &str) -> serde_json::Value {
     json!({ "type": "authOk", "deviceId": device_id })
 }
 
-/// Does the upgrade request carry an `Origin` header? Browsers always send one on a
-/// WebSocket upgrade; the phone app and the sidecar never do.
-fn has_origin(req: &Request) -> bool {
-    req.headers()
-        .contains_key(tungstenite::http::header::ORIGIN)
+/// May this upgrade's `Origin` reach the bridge? No `Origin` (the sidecar, any plain
+/// client) is fine. The phone app DOES send one -- iOS's WebSocket (SocketRocket) always
+/// sets it to the URL it dialled, `http://<host>:<port>`, and JS cannot remove it -- so an
+/// Origin naming THIS listener is accepted too: the literal IP the socket arrived on,
+/// `localhost` on loopback, or this Mac's own MagicDNS name on the tailnet address, each
+/// with the bridge's own port. A browser only sends such an Origin for a page served from
+/// that exact host and port, which is the bridge itself, and it serves no pages.
+///
+/// Never compared against the request's `Host`: under DNS rebinding an attacker's page
+/// sends `Origin: http://evil.example:<port>` with a matching Host, so "Origin equals
+/// Host" would admit exactly the web page this check exists to stop.
+fn origin_allowed(origin: Option<&[u8]>, local: SocketAddr, own_dns: &str) -> bool {
+    let Some(raw) = origin else {
+        return true;
+    };
+    let Ok(o) = std::str::from_utf8(raw) else {
+        return false;
+    };
+    let Some(rest) = o.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((host, port)) = rest.rsplit_once(':') else {
+        return false; // the bridge never runs on 80, so its own origin always has a port
+    };
+    if port.parse::<u16>() != Ok(local.port()) {
+        return false;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip == local.ip();
+    }
+    if local.ip().is_loopback() {
+        return host == "localhost";
+    }
+    let own = own_dns.trim_end_matches('.').to_ascii_lowercase();
+    !own.is_empty() && host == own && tailscale::is_tailnet_addr(local.ip())
+}
+
+fn request_origin_allowed(req: &Request, local: SocketAddr, own_dns: &str) -> bool {
+    let mut values = req
+        .headers()
+        .get_all(tungstenite::http::header::ORIGIN)
+        .iter();
+    match (values.next(), values.next()) {
+        (None, _) => true,
+        (Some(v), None) => origin_allowed(Some(v.as_bytes()), local, own_dns),
+        (Some(_), Some(_)) => false, // two Origins: nothing honest sends that
+    }
 }
 
 /// What to do with the tailnet listener. `close` drops the one bound now; `bind` opens
@@ -503,7 +547,8 @@ fn system_name() -> Option<String> {
     std::env::var("HOSTNAME").ok()
 }
 
-/// Accept a WebSocket. Any `Origin` is refused with 403 before the upgrade completes.
+/// Accept a WebSocket. A foreign `Origin` is refused with 403 before the upgrade completes
+/// (see [`origin_allowed`]).
 /// `preauth_cap` limits frames and messages to [`PREAUTH_MAX_BYTES`] so an
 /// unauthenticated peer cannot make us buffer megabytes; it is lifted on auth.
 ///
@@ -511,18 +556,20 @@ fn system_name() -> Option<String> {
 /// handshake callback signature fixes for us. Boxing it is not an option -- the callback
 /// must return exactly that type -- and this runs once per connection, not in a loop.
 #[allow(clippy::result_large_err)]
-fn accept_ws(stream: TcpStream, preauth_cap: bool) -> Option<WebSocket<TcpStream>> {
-    accept_ws_within(stream, preauth_cap, HANDSHAKE_TIMEOUT)
+fn accept_ws(stream: TcpStream, preauth_cap: bool, own_dns: &str) -> Option<WebSocket<TcpStream>> {
+    accept_ws_within(stream, preauth_cap, own_dns, HANDSHAKE_TIMEOUT)
 }
 
 #[allow(clippy::result_large_err)]
 fn accept_ws_within(
     stream: TcpStream,
     preauth_cap: bool,
+    own_dns: &str,
     deadline: Duration,
 ) -> Option<WebSocket<TcpStream>> {
+    let local = stream.local_addr().ok()?;
     let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-        if has_origin(req) {
+        if !request_origin_allowed(req, local, own_dns) {
             let mut err = ErrorResponse::new(Some("forbidden".to_string()));
             *err.status_mut() = StatusCode::FORBIDDEN;
             Err(err)
@@ -738,6 +785,9 @@ pub struct BridgeController {
     /// The bound port (0 until the loopback listener is up). Same port on both addresses.
     port: AtomicU16,
     mac_name: Mutex<String>,
+    /// This Mac's MagicDNS name ("" until Tailscale has reported one). An `Origin` naming
+    /// it is the phone dialling us by name, see [`origin_allowed`].
+    dns_name: Mutex<String>,
     /// The tailnet listener: its address and its accept loop's stop flag. Held across a
     /// whole reconcile, which serializes reconciles.
     tailnet: Mutex<Option<(Ipv4Addr, Arc<AtomicBool>)>>,
@@ -756,6 +806,7 @@ impl BridgeController {
             app: OnceLock::new(),
             port: AtomicU16::new(0),
             mac_name: Mutex::new("Conduit".to_string()),
+            dns_name: Mutex::new(String::new()),
             tailnet: Mutex::new(None),
             live: Mutex::new(HashMap::new()),
             auth_failures: Mutex::new(HashMap::new()),
@@ -772,7 +823,11 @@ impl BridgeController {
         let me = self.clone();
         thread::spawn(move || {
             // CLI calls happen here, once, never in a connection loop.
-            *lock(&me.mac_name) = mac_name_from(&tailscale::status(), system_name());
+            let ts = tailscale::status();
+            *lock(&me.mac_name) = mac_name_from(&ts, system_name());
+            if let TailscaleState::Running { dns_name, .. } = &ts {
+                *lock(&me.dns_name) = dns_name.clone();
+            }
 
             let persisted = me.devices.port();
             let bound: RefCell<Option<TcpListener>> = RefCell::new(None);
@@ -837,8 +892,9 @@ impl BridgeController {
         } else {
             TailscaleState::Stopped
         };
-        if let TailscaleState::Running { .. } = ts {
+        if let TailscaleState::Running { dns_name, .. } = &ts {
             *lock(&self.mac_name) = mac_name_from(&ts, None);
+            *lock(&self.dns_name) = dns_name.clone();
         }
         let plan = plan_listeners(enabled, &ts, slot.as_ref().map(|(ip, _)| *ip));
         if plan.close {
@@ -899,6 +955,10 @@ impl BridgeController {
 
     fn mac_name(&self) -> String {
         lock(&self.mac_name).clone()
+    }
+
+    fn dns_name(&self) -> String {
+        lock(&self.dns_name).clone()
     }
 
     fn register_live(&self, device_id: &str) -> Arc<AtomicBool> {
@@ -1020,7 +1080,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     {
         return;
     }
-    let Some(mut ws) = accept_ws(stream, !loopback) else {
+    let Some(mut ws) = accept_ws(stream, !loopback, &ctrl.dns_name()) else {
         return;
     };
     if ws.get_ref().set_read_timeout(Some(READ_POLL)).is_err() {
@@ -1833,39 +1893,97 @@ mod tests {
     }
 
     #[test]
-    fn origin_header_is_refused() {
-        let with = Request::builder()
-            .uri("/")
-            .header("Origin", "http://evil.example")
-            .body(())
-            .unwrap();
-        let without = Request::builder().uri("/").body(()).unwrap();
-        assert!(has_origin(&with));
-        assert!(!has_origin(&without));
+    fn foreign_origin_is_refused() {
+        let lo: SocketAddr = "127.0.0.1:8456".parse().unwrap();
+        let tn: SocketAddr = "100.64.0.1:8456".parse().unwrap();
+        let ok = |o: &str, at: SocketAddr| origin_allowed(Some(o.as_bytes()), at, "mac.t.ts.net");
+        // No Origin at all: the sidecar and plain clients.
+        assert!(origin_allowed(None, lo, ""));
+        // A browser page, including a DNS-rebinding one that targets our port.
+        assert!(!ok("http://evil.example", lo));
+        assert!(!ok("http://evil.example:8456", lo));
+        assert!(!ok("https://evil.example:8456", tn));
+        assert!(!ok("null", lo));
+        assert!(!ok("", lo));
+        // The wrong port, another address, a scheme other than http, or a path.
+        assert!(!ok("http://127.0.0.1:8457", lo));
+        assert!(!ok("http://127.0.0.1", lo));
+        assert!(!ok("http://100.64.0.1:8456", lo));
+        assert!(!ok("https://127.0.0.1:8456", lo));
+        assert!(!ok("http://127.0.0.1:8456/x", lo));
+        // localhost only on loopback; our MagicDNS name only on the tailnet address.
+        assert!(!ok("http://localhost:8456", tn));
+        assert!(!ok("http://mac.t.ts.net:8456", lo));
+        assert!(!ok("http://other.t.ts.net:8456", tn));
+        assert!(!origin_allowed(Some(b"http://:8456"), tn, ""));
+        assert!(!origin_allowed(Some(b"http://\xff:8456"), lo, ""));
+    }
 
-        // Real socket: a browser-shaped handshake to loopback gets 403, not a WebSocket.
+    #[test]
+    fn own_origin_is_accepted() {
+        // What iOS's WebSocket sends: the URL it dialled, which it cannot be told to drop.
+        let lo: SocketAddr = "127.0.0.1:8456".parse().unwrap();
+        let tn: SocketAddr = "100.64.0.1:8456".parse().unwrap();
+        let ok = |o: &str, at: SocketAddr| origin_allowed(Some(o.as_bytes()), at, "Mac.t.ts.net.");
+        assert!(ok("http://127.0.0.1:8456", lo));
+        assert!(ok("http://localhost:8456", lo));
+        assert!(ok("http://100.64.0.1:8456", tn));
+        assert!(ok("http://mac.t.ts.net:8456", tn));
+        assert!(ok("http://MAC.t.ts.net.:8456", tn));
+    }
+
+    /// Real socket handshake against `accept_ws`; `{port}` in an Origin is the listener's.
+    fn handshake_with_origins(origins: &[&str]) -> Result<(), StatusCode> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
-            accept_ws(s, false).is_some()
+            accept_ws(s, false, "").is_some()
         });
         let mut req =
             tungstenite::client::IntoClientRequest::into_client_request(format!("ws://{addr}/"))
                 .unwrap();
-        req.headers_mut()
-            .insert("Origin", "http://evil.example".parse().unwrap());
-        let stream = TcpStream::connect(addr).unwrap();
-        match tungstenite::client(req, stream) {
-            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(resp))) => {
-                assert_eq!(resp.status(), StatusCode::FORBIDDEN)
-            }
-            other => panic!("expected 403, got {:?}", other.map(|_| ())),
+        for o in origins {
+            let o = o.replace("{port}", &addr.port().to_string());
+            req.headers_mut().append("Origin", o.parse().unwrap());
         }
-        assert!(
-            !server.join().unwrap(),
-            "server must not complete the upgrade"
+        let stream = TcpStream::connect(addr).unwrap();
+        let out = match tungstenite::client(req, stream) {
+            Ok(_) => Ok(()),
+            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(resp))) => {
+                Err(resp.status())
+            }
+            Err(e) => panic!("unexpected handshake error: {e:?}"),
+        };
+        assert_eq!(
+            server.join().unwrap(),
+            out.is_ok(),
+            "server upgrade must match"
         );
+        out
+    }
+
+    #[test]
+    fn origin_header_is_refused() {
+        // Real socket: a browser-shaped handshake to loopback gets 403, not a WebSocket.
+        assert_eq!(
+            handshake_with_origins(&["http://evil.example:{port}"]),
+            Err(StatusCode::FORBIDDEN)
+        );
+        // Two Origins are refused even when both name us: nothing honest sends that.
+        assert_eq!(
+            handshake_with_origins(&["http://127.0.0.1:{port}", "http://127.0.0.1:{port}"]),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn ios_shaped_handshake_is_accepted() {
+        // The phone app in the Simulator dials ws://127.0.0.1:<port> (or localhost) and
+        // SocketRocket adds the matching Origin; the bridge must take it.
+        assert_eq!(handshake_with_origins(&["http://127.0.0.1:{port}"]), Ok(()));
+        assert_eq!(handshake_with_origins(&["http://localhost:{port}"]), Ok(()));
+        assert_eq!(handshake_with_origins(&[]), Ok(()));
     }
 
     #[test]
@@ -1900,7 +2018,7 @@ mod tests {
             // Per-read timeout is generous; only the overall deadline can end this.
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let t = std::time::Instant::now();
-            let ok = accept_ws_within(s, true, Duration::from_millis(400)).is_some();
+            let ok = accept_ws_within(s, true, "", Duration::from_millis(400)).is_some();
             (ok, t.elapsed())
         });
         let mut c = TcpStream::connect(addr).unwrap();
@@ -1922,7 +2040,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
-            let mut ws = accept_ws(s, true).expect("handshake");
+            let mut ws = accept_ws(s, true, "").expect("handshake");
             let small = ws.read().map(|m| m.into_text().unwrap_or_default());
             let big = ws.read();
             (small.ok(), big.is_err())
