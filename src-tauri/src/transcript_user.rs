@@ -144,7 +144,7 @@ fn classify_text(t: &str) -> Vec<Value> {
 
 /// Items for an array of content blocks. `classify` is false for a human origin, whose
 /// text is taken verbatim; otherwise each text block goes through the tag rules.
-fn parse_blocks(blocks: &[Value], classify: bool) -> Vec<Value> {
+fn parse_blocks(blocks: &[Value], classify: bool, tool_use_result: Option<&Value>) -> Vec<Value> {
     let mut out = Vec::new();
     for b in blocks {
         match b.get("type").and_then(|t| t.as_str()) {
@@ -170,10 +170,131 @@ fn parse_blocks(blocks: &[Value], classify: bool) -> Vec<Value> {
                     .filter(|d| d.len() <= MAX_INLINE_IMAGE);
                 out.push(json!({ "kind": "image", "mediaType": media, "data": data }));
             }
+            Some("tool_result") => out.push(result_item(b, tool_use_result)),
             _ => {}
         }
     }
     out
+}
+
+/// Longest `errorText`, in chars.
+const MAX_ERROR_TEXT: usize = 200;
+/// Rendered diff lines kept before the rest is summarised as `more`.
+const MAX_DIFF_LINES: usize = 16;
+
+/// First non-empty line of a failed result, skipping a leading `Exit code N` line (it says
+/// nothing on its own) unless nothing else follows it. Cut to `MAX_ERROR_TEXT` chars.
+fn error_text(content: &Value) -> Option<String> {
+    let text = flat_text(content);
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next()?;
+    let is_exit = first
+        .strip_prefix("Exit code ")
+        .is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit() || c == '-'));
+    let pick = if is_exit {
+        lines.next().unwrap_or(first)
+    } else {
+        first
+    };
+    Some(pick.chars().take(MAX_ERROR_TEXT).collect())
+}
+
+/// A `tool_result` block as a `result` item. `tool_use_result` is the same line's top-level
+/// `toolUseResult`, the only place an edit's structured patch lives.
+fn result_item(block: &Value, tool_use_result: Option<&Value>) -> Value {
+    let is_error = block.get("is_error").and_then(|e| e.as_bool()) == Some(true);
+    let error_text = if is_error {
+        block.get("content").and_then(error_text)
+    } else {
+        None
+    };
+    json!({
+        "kind": "result",
+        "toolUseId": block.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or(""),
+        "isError": is_error,
+        "errorText": error_text,
+        "diff": tool_use_result.and_then(diff_from),
+    })
+}
+
+type DiffRow = (&'static str, String, Option<i64>, Option<i64>);
+
+fn push_gap(v: &mut Vec<DiffRow>) {
+    if v.last().is_none_or(|l| l.0 != "gap") {
+        v.push(("gap", String::new(), None, None));
+    }
+}
+
+/// A compact diff from an edit's `toolUseResult`; `None` unless it is an object carrying a
+/// non-empty `structuredPatch` or a `create`.
+fn diff_from(r: &Value) -> Option<Value> {
+    let file_path = r.get("filePath").and_then(|f| f.as_str()).unwrap_or("");
+    if r.get("type").and_then(|t| t.as_str()) == Some("create") {
+        let added = r
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map_or(0, |c| c.lines().count());
+        return Some(json!({
+            "filePath": file_path, "added": added, "removed": 0,
+            "created": true, "lines": [], "more": 0,
+        }));
+    }
+    let hunks = r.get("structuredPatch")?.as_array()?;
+    if hunks.is_empty() {
+        return None;
+    }
+    let (mut added, mut removed) = (0usize, 0usize);
+    let mut rendered: Vec<DiffRow> = Vec::new();
+    for (hi, h) in hunks.iter().enumerate() {
+        let mut old = h.get("oldStart").and_then(|n| n.as_i64()).unwrap_or(1);
+        let mut new = h.get("newStart").and_then(|n| n.as_i64()).unwrap_or(1);
+        let raw: Vec<&str> = h
+            .get("lines")
+            .and_then(|l| l.as_array())
+            .map(|a| a.iter().filter_map(|l| l.as_str()).collect())
+            .unwrap_or_default();
+        let changed = |l: &str| l.starts_with('+') || l.starts_with('-');
+        if hi > 0 {
+            push_gap(&mut rendered);
+        }
+        for (i, l) in raw.iter().enumerate() {
+            let text: String = l.chars().skip(1).collect();
+            let row: DiffRow = match l.chars().next() {
+                Some('+') => {
+                    added += 1;
+                    new += 1;
+                    ("add", text, None, Some(new - 1))
+                }
+                Some('-') => {
+                    removed += 1;
+                    old += 1;
+                    ("del", text, Some(old - 1), None)
+                }
+                _ => {
+                    old += 1;
+                    new += 1;
+                    let near = (i > 0 && changed(raw[i - 1]))
+                        || raw.get(i + 1).is_some_and(|x| changed(x));
+                    if !near {
+                        push_gap(&mut rendered);
+                        continue;
+                    }
+                    ("ctx", text, Some(old - 1), Some(new - 1))
+                }
+            };
+            rendered.push(row);
+        }
+    }
+    let more = rendered.len().saturating_sub(MAX_DIFF_LINES);
+    let lines: Vec<Value> = rendered
+        .into_iter()
+        .take(MAX_DIFF_LINES)
+        .map(|(k, t, o, n)| json!({ "kind": k, "text": t, "oldNo": o, "newNo": n }))
+        .collect();
+    Some(json!({
+        "filePath": file_path, "added": added, "removed": removed,
+        "created": false, "lines": lines, "more": more,
+    }))
 }
 
 fn task_item(text: &str) -> Value {
@@ -205,7 +326,7 @@ pub fn parse_user(v: &Value) -> Vec<Value> {
     if origin_kind == "human" {
         return match (s, content.as_array()) {
             (Some(t), _) => vec![bubble(t)],
-            (_, Some(blocks)) => parse_blocks(blocks, false),
+            (_, Some(blocks)) => parse_blocks(blocks, false, None),
             _ => vec![],
         };
     }
@@ -264,9 +385,9 @@ pub fn parse_user(v: &Value) -> Vec<Value> {
             .collect();
         return vec![json!({ "kind": "auto", "label": label, "text": text })];
     }
-    // 9. Array content: typed text, images, interrupts; tool results are dropped.
+    // 9. Array content: typed text, images, interrupts, tool results.
     if let Some(blocks) = content.as_array() {
-        return parse_blocks(blocks, true);
+        return parse_blocks(blocks, true, v.get("toolUseResult"));
     }
     match s {
         Some(t) => classify_text(t),
@@ -537,11 +658,124 @@ mod tests {
         assert_eq!(items[0]["text"], "add rate limiting");
     }
 
+    fn res(content: Value, is_error: Option<bool>, tur: Option<Value>) -> Value {
+        let mut b = json!({"type":"tool_result","tool_use_id":"toolu_1","content":content});
+        if let Some(e) = is_error {
+            b["is_error"] = json!(e);
+        }
+        let mut v = json!({"type":"user","message":{"content":[b]}});
+        if let Some(t) = tur {
+            v["toolUseResult"] = t;
+        }
+        let items = parse_user(&v);
+        assert_eq!(items.len(), 1);
+        items.into_iter().next().unwrap()
+    }
+
     #[test]
-    fn tool_result_blocks_are_dropped() {
-        let v =
-            json!({"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}});
-        assert!(parse_user(&v).is_empty());
+    fn tool_result_blocks_become_result_items() {
+        let i = res(json!("ok"), None, None);
+        assert_eq!(i["kind"], "result");
+        assert_eq!(i["toolUseId"], "toolu_1");
+        assert_eq!(i["isError"], false);
+    }
+
+    #[test]
+    fn ok_result_has_no_error_text() {
+        let i = res(json!("fine"), Some(false), None);
+        assert_eq!(i["isError"], false);
+        assert!(i["errorText"].is_null());
+        assert!(i["diff"].is_null());
+    }
+
+    #[test]
+    fn error_result_has_first_line() {
+        let i = res(json!("Traceback\nline2"), Some(true), None);
+        assert_eq!(i["isError"], true);
+        assert_eq!(i["errorText"], "Traceback");
+    }
+
+    #[test]
+    fn error_text_skips_exit_code_line() {
+        let i = res(
+            json!("Exit code 1\n\nnpm ERR! missing script"),
+            Some(true),
+            None,
+        );
+        assert_eq!(i["errorText"], "npm ERR! missing script");
+        let i = res(json!("Exit code 2"), Some(true), None);
+        assert_eq!(i["errorText"], "Exit code 2");
+    }
+
+    #[test]
+    fn error_text_from_block_array() {
+        let i = res(
+            json!([{"type":"image","source":{}},{"type":"text","text":"\nboom\nmore"}]),
+            Some(true),
+            None,
+        );
+        assert_eq!(i["errorText"], "boom");
+    }
+
+    #[test]
+    fn error_text_capped_at_200() {
+        let i = res(json!("x".repeat(500)), Some(true), None);
+        assert_eq!(i["errorText"].as_str().unwrap().chars().count(), 200);
+    }
+
+    #[test]
+    fn edit_result_has_diff() {
+        let tur = json!({"filePath":"/a.rs","structuredPatch":[{"oldStart":61,"oldLines":5,
+            "newStart":61,"newLines":5,"lines":[" a"," b","-c","+C"," d"," e"]}]});
+        let i = res(json!("ok"), None, Some(tur));
+        let d = &i["diff"];
+        assert_eq!(d["filePath"], "/a.rs");
+        assert_eq!(d["added"], 1);
+        assert_eq!(d["removed"], 1);
+        assert_eq!(d["created"], false);
+        assert_eq!(d["more"], 0);
+        let want = json!([
+            {"kind":"gap","text":"","oldNo":null,"newNo":null},
+            {"kind":"ctx","text":"b","oldNo":62,"newNo":62},
+            {"kind":"del","text":"c","oldNo":63,"newNo":null},
+            {"kind":"add","text":"C","oldNo":null,"newNo":63},
+            {"kind":"ctx","text":"d","oldNo":64,"newNo":64},
+            {"kind":"gap","text":"","oldNo":null,"newNo":null},
+        ]);
+        assert_eq!(d["lines"], want);
+    }
+
+    #[test]
+    fn diff_caps_at_16_lines_with_more() {
+        let lines: Vec<String> = (0..20).map(|i| format!("+l{i}")).collect();
+        let tur =
+            json!({"filePath":"/a","structuredPatch":[{"oldStart":1,"newStart":1,"lines":lines}]});
+        let i = res(json!("ok"), None, Some(tur));
+        assert_eq!(i["diff"]["added"], 20);
+        assert_eq!(i["diff"]["lines"].as_array().unwrap().len(), 16);
+        assert_eq!(i["diff"]["more"], 4);
+    }
+
+    #[test]
+    fn write_create_is_created_diff() {
+        let tur =
+            json!({"type":"create","filePath":"/n.txt","content":"a\nb\nc\n","structuredPatch":[]});
+        let i = res(json!("ok"), None, Some(tur));
+        let d = &i["diff"];
+        assert_eq!(d["created"], true);
+        assert_eq!(d["added"], 3);
+        assert_eq!(d["removed"], 0);
+        assert_eq!(d["lines"].as_array().unwrap().len(), 0);
+        assert_eq!(d["more"], 0);
+        assert_eq!(d["filePath"], "/n.txt");
+    }
+
+    #[test]
+    fn non_object_tool_use_result_has_no_diff() {
+        assert!(res(json!("ok"), None, Some(json!("a string")))["diff"].is_null());
+        assert!(res(json!("ok"), None, Some(json!([1, 2])))["diff"].is_null());
+        let empty = json!({"filePath":"/a","structuredPatch":[]});
+        assert!(res(json!("ok"), None, Some(empty))["diff"].is_null());
     }
 
     #[test]

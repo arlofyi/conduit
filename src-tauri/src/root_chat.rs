@@ -499,11 +499,11 @@ mod tests {
         let init = json!({"type":"system","subtype":"init","session_id":"abc"}).to_string();
         assert!(matches!(classify_line(&init), LineOut::Nothing));
         assert!(matches!(classify_line("not json"), LineOut::Nothing));
-        // A user line carrying only tool_results parses to zero items -> Nothing.
+        // A user line carrying only a tool_result is now a `result` item, not nothing.
         let tr =
             json!({"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}})
                 .to_string();
-        assert!(matches!(classify_line(&tr), LineOut::Nothing));
+        assert!(matches!(classify_line(&tr), LineOut::Items(_)));
     }
 
     fn tdirs() -> Dirs {

@@ -12,7 +12,7 @@ pub const ITEM_KINDS_JSON: &str = include_str!("transcript_item_kinds.json");
 
 /// Map a Claude tool name to the RN timeline event kind + verb (mirror of
 /// mobile/src/logic/status.ts `eventKindFor` / labels).
-fn tool_event(name: &str, input: &Value) -> Value {
+fn tool_event(id: Option<&str>, name: &str, input: &Value) -> Value {
     let (kind, label, mono) = match name {
         "Read" => (
             "read",
@@ -38,7 +38,7 @@ fn tool_event(name: &str, input: &Value) -> Value {
         ),
         _ => ("generic", "used a tool", None),
     };
-    json!({ "kind": "event", "event": kind, "label": label, "mono": mono })
+    json!({ "kind": "event", "event": kind, "label": label, "mono": mono, "toolUseId": id })
 }
 
 /// `AskUserQuestion` → a `question` item, copied from `input.questions` with every field
@@ -131,7 +131,7 @@ pub fn parse_line(line: &str) -> Vec<Value> {
                                     "kind": "plan",
                                     "markdown": input.get("plan").and_then(|p| p.as_str()).unwrap_or(""),
                                 }),
-                                _ => tool_event(name, input),
+                                _ => tool_event(block.get("id").and_then(|i| i.as_str()), name, input),
                             });
                         }
                         _ => {}
@@ -150,7 +150,7 @@ pub fn parse_line(line: &str) -> Vec<Value> {
 /// A conversation view, not an archive: the terminal above it still holds the full
 /// scrollback, and rendering ten thousand markdown blocks to show the last twenty is how a
 /// chat pane becomes the slowest thing in the app.
-pub const VIEW_LIMIT: usize = 400;
+pub const VIEW_LIMIT: usize = 800;
 
 /// Tauri command: a session's transcript, parsed into chat items, newest-last.
 ///
@@ -312,12 +312,13 @@ mod tests {
     }
 
     #[test]
-    fn skips_tool_result_and_meta_lines() {
-        assert!(parse_line(
-            &json!({"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}})
-                .to_string()
-        )
-        .is_empty());
+    fn tool_result_is_a_result_item_and_meta_lines_are_skipped() {
+        let items = parse_line(
+            &json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}})
+                .to_string(),
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "result");
         assert!(parse_line("not json").is_empty());
         assert!(parse_line(&json!({"type":"summary"}).to_string()).is_empty());
     }
@@ -385,6 +386,13 @@ mod tests {
         json!({"type":"assistant","message":{"content":[
             {"type":"tool_use","id":"toolu_01Bw","name":name,"input":input}]}})
         .to_string()
+    }
+
+    #[test]
+    fn event_carries_tool_use_id() {
+        let items = parse_line(&tool_line("Bash", json!({"command":"ls"})));
+        assert_eq!(items[0]["kind"], "event");
+        assert_eq!(items[0]["toolUseId"], "toolu_01Bw");
     }
 
     #[test]
@@ -460,6 +468,7 @@ mod tests {
             json!({"type":"user","origin":{"kind":"human"},"message":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}}),
             json!({"type":"system","subtype":"compact_boundary","content":"Conversation compacted"}),
             json!({"type":"user","message":{"content":"<weird-tag>x</weird-tag>"}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01Bw","content":"ok"}]}}),
         ]
         .into_iter()
         .map(|v| v.to_string())
