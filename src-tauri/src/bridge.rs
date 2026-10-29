@@ -24,7 +24,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -38,6 +38,8 @@ use tungstenite::http::StatusCode;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{accept_hdr_with_config, Message, WebSocket};
 
+use crate::asks::{AskGate, AskView, Asks};
+use crate::bridge_view::read_lines;
 use crate::hookbus::HookBus;
 use crate::mobile_devices::MobileDevices;
 use crate::pairing::{self, Decision, PairRequest, Pairing, Resolution, Via, WaitEnd};
@@ -113,6 +115,13 @@ pub enum ClientMsg {
     Interrupt {
         session_id: String,
     },
+    /// Answer a pending `AskUserQuestion` (an `ask` item from `pending`/`pendingAdded`):
+    /// exact question texts as keys. First answer wins; acked with `answerResult`.
+    #[serde(rename_all = "camelCase")]
+    Answer {
+        ask_id: String,
+        answers: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 /// Manual `Debug`: `Auth.token`, `Pair.secret` and `Pair.nonce` are plaintext secrets and
@@ -185,6 +194,12 @@ impl std::fmt::Debug for ClientMsg {
                 .debug_struct("Interrupt")
                 .field("session_id", session_id)
                 .finish(),
+            // What the user typed stays out of logs; how many answers is enough to debug.
+            Self::Answer { ask_id, answers } => f
+                .debug_struct("Answer")
+                .field("ask_id", ask_id)
+                .field("answers", &answers.len())
+                .finish(),
         }
     }
 }
@@ -233,6 +248,27 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 const CONTEXT_EVERY: Duration = Duration::from_secs(15);
 /// Wire protocol version announced in `hello`.
 const PROTOCOL_VERSION: u32 = 1;
+
+/// How often a connection diffs the pending questions against what it has pushed.
+const PUSH_EVERY: Duration = Duration::from_millis(250);
+/// How often a connection re-checks that the session it streams has not been made private.
+const PRIVATE_RECHECK_EVERY: Duration = Duration::from_secs(1);
+
+/// May a phone's `answer` resolve this ask? Only a still-pending ask (None = someone else
+/// already answered), never a private session's, and only a valid set of answers.
+fn phone_may_answer(
+    view: Option<&AskView>,
+    private: bool,
+    answers: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    view.is_some_and(|v| !private && crate::asks::validate_answers(&v.questions, answers).is_ok())
+}
+
+/// The attached session, if it has become private since it was attached (a phone must stop
+/// streaming it). Checked on a ~1 s tick.
+fn attached_now_private(attached: Option<&str>, is_private: impl Fn(&str) -> bool) -> Option<&str> {
+    attached.filter(|sid| is_private(sid))
+}
 
 /// How often the tail re-checks which transcript the attached session is writing (a
 /// `/clear` moves it; a phone-spawned chat has none until its first turn).
@@ -397,18 +433,6 @@ fn history_payload(session_id: &str, lines: &[String]) -> serde_json::Value {
         .flat_map(|l| crate::transcript::parse_line(l))
         .collect();
     json!({ "type": "history", "sessionId": session_id, "items": items })
-}
-
-/// Read a transcript file fully into trimmed, non-empty lines. Empty on any error.
-fn read_lines(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .map(|s| {
-            s.lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The generic failure reply. Identical for a wrong token, a revoked device, a bad or
@@ -855,6 +879,9 @@ pub struct BridgeController {
     spawns: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Last-message previews for the `projects` frame, keyed by transcript file state.
     last_messages: crate::bridge_view::LastMessageCache,
+    /// The question registry and the desktop gate, so the last phone leaving can hand
+    /// back the asks only it was holding. Wired once at startup (`wire_asks`).
+    asks: OnceLock<(Arc<Asks>, Arc<AskGate>)>,
 }
 
 impl BridgeController {
@@ -871,6 +898,29 @@ impl BridgeController {
             pair_prompts: Mutex::new(HashMap::new()),
             spawns: Mutex::new(HashMap::new()),
             last_messages: Default::default(),
+            asks: OnceLock::new(),
+        }
+    }
+
+    /// Hand the controller the question registry and desktop gate. Once; later calls no-op.
+    pub fn wire_asks(&self, asks: Arc<Asks>, gate: Arc<AskGate>) {
+        let _ = self.asks.set((asks, gate));
+    }
+
+    /// Is an authenticated REMOTE phone connected? Loopback peers (sidecar, simulator) never
+    /// register, so they never hold a question.
+    pub fn has_remote_phone(&self) -> bool {
+        !lock(&self.live).is_empty()
+    }
+
+    /// The last remote phone just left. Every ask it alone was holding goes back to the
+    /// terminal now -- unless the desktop is watching, in which case its card still can.
+    /// Called with the `live` lock released.
+    fn last_phone_left(&self) {
+        if let Some((asks, gate)) = self.asks.get() {
+            if !gate.is_open() {
+                asks.hand_off_where(|_, held_for_phone| held_for_phone);
+            }
         }
     }
 
@@ -988,18 +1038,31 @@ impl BridgeController {
     /// Close every open socket of a device (revoke). Immediate: each connection checks
     /// its flag on every 20 ms tick.
     pub fn disconnect_device(&self, device_id: &str) {
-        if let Some(flags) = lock(&self.live).remove(device_id) {
+        let (removed, now_empty) = {
+            let mut live = lock(&self.live);
+            let removed = live.remove(device_id);
+            (removed, live.is_empty())
+        };
+        if let Some(flags) = removed {
             for f in flags {
                 f.store(true, Ordering::SeqCst);
+            }
+            if now_empty {
+                self.last_phone_left();
             }
         }
     }
 
     pub(crate) fn disconnect_all_devices(&self) {
-        for (_, flags) in lock(&self.live).drain() {
+        let drained: Vec<_> = lock(&self.live).drain().collect();
+        let any = !drained.is_empty();
+        for (_, flags) in drained {
             for f in flags {
                 f.store(true, Ordering::SeqCst);
             }
+        }
+        if any {
+            self.last_phone_left();
         }
     }
 
@@ -1031,12 +1094,19 @@ impl BridgeController {
     }
 
     fn unregister_live(&self, device_id: &str, flag: &Arc<AtomicBool>) {
-        let mut live = lock(&self.live);
-        if let Some(v) = live.get_mut(device_id) {
+        let last_left = {
+            let mut live = lock(&self.live);
+            let Some(v) = live.get_mut(device_id) else {
+                return;
+            };
             v.retain(|f| !Arc::ptr_eq(f, flag));
             if v.is_empty() {
                 live.remove(device_id);
             }
+            live.is_empty()
+        };
+        if last_left {
+            self.last_phone_left();
         }
     }
 
@@ -1182,6 +1252,11 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut discovering = false;
     // The phone's Tailscale user id, from one `whois` the first time it is needed.
     let peer_owner: Arc<OnceLock<Option<u64>>> = Arc::new(OnceLock::new());
+    // Ids of the pending questions this socket has pushed (None = `pending` not sent yet),
+    // and when the next diff is due.
+    let mut pushed: Option<HashSet<String>> = None;
+    let mut next_push = Instant::now();
+    let mut next_private_check = Instant::now() + PRIVATE_RECHECK_EVERY;
 
     loop {
         // 0. Gates: an unauthenticated peer gets AUTH_DEADLINE; a revoked device is
@@ -1281,10 +1356,17 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                 let mut msg = parse_client_msg(&text);
                 // A private session is never read or driven from a phone, whoever asks --
                 // refused BEFORE anything is woken, attached or written.
-                let private = msg.as_ref().and_then(session_scope).is_some_and(|sid| {
-                    crate::bridge_view::session_is_private(&app.state::<Arc<Store>>().list(), sid)
-                });
-                if private {
+                let private_sid = msg
+                    .as_ref()
+                    .and_then(session_scope)
+                    .filter(|sid| {
+                        crate::bridge_view::session_is_private(
+                            &app.state::<Arc<Store>>().list(),
+                            sid,
+                        )
+                    })
+                    .map(str::to_string);
+                if let Some(private_sid) = private_sid {
                     if matches!(msg, Some(ClientMsg::Attach { .. })) {
                         // The phone has left the old chat: stop streaming it.
                         if let Some((old_sid, old_sub)) = crate::bridge_view::clear_attachment(
@@ -1296,7 +1378,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         }
                         tail_conversation = None;
                     }
-                    let refusal = crate::bridge_view::private_session_error();
+                    let refusal = crate::bridge_view::private_session_error(&private_sid);
                     let _ = ws.send(Message::Text(refusal.to_string()));
                     msg = None;
                 }
@@ -1497,6 +1579,28 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             });
                         }
                     }
+                    // First answer wins: `resolve` is the check-and-set, so a phone that taps
+                    // after the desktop (or another phone) answered gets `ok: false`.
+                    Some(ClientMsg::Answer { ask_id, answers }) => {
+                        let asks = app.state::<Arc<Asks>>();
+                        let view = asks.get(&ask_id);
+                        let private = view.as_ref().is_some_and(|v| {
+                            crate::bridge_view::session_is_private(
+                                &app.state::<Arc<Store>>().list(),
+                                &v.session,
+                            )
+                        });
+                        let ok = phone_may_answer(view.as_ref(), private, &answers)
+                            && asks.resolve(
+                                &ask_id,
+                                crate::asks::AskOutcome::Answered {
+                                    answers,
+                                    by: crate::asks::By::Phone,
+                                },
+                            );
+                        let reply = crate::bridge_view::answer_result_frame(&ask_id, ok);
+                        let _ = ws.send(Message::Text(reply.to_string()));
+                    }
                     // Already authenticated (or loopback): a repeat `auth` changes nothing.
                     Some(ClientMsg::Auth { .. }) | None => {}
                 }
@@ -1509,6 +1613,41 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
             Err(_) => break,
+        }
+
+        // 1b. The attached session was made private while streaming: stop, and say so.
+        if attached.is_some() && Instant::now() >= next_private_check {
+            next_private_check = Instant::now() + PRIVATE_RECHECK_EVERY;
+            let projects = app.state::<Arc<Store>>().list();
+            let sid = attached_now_private(attached.as_ref().map(|(s, _, _)| s.as_str()), |s| {
+                crate::bridge_view::session_is_private(&projects, s)
+            })
+            .map(str::to_string);
+            if let Some(sid) = sid {
+                if let Some((old_sid, old_sub)) = crate::bridge_view::clear_attachment(
+                    &mut attached,
+                    &mut transcript,
+                    &mut context_path,
+                ) {
+                    pty.unsubscribe(&old_sid, old_sub);
+                }
+                tail_conversation = None;
+                attached_claude = false;
+                let refusal = crate::bridge_view::private_session_error(&sid);
+                if ws.send(Message::Text(refusal.to_string())).is_err() {
+                    break;
+                }
+            }
+        }
+
+        // 1c. Pending questions: the whole list once trusted, then what changed, at most
+        //     every PUSH_EVERY. Every socket diffs on its own, so every phone collapses a
+        //     card whoever answered it.
+        if authed && (pushed.is_none() || Instant::now() >= next_push) {
+            next_push = Instant::now() + PUSH_EVERY;
+            if !push_pending(&app, &mut ws, &mut pushed) {
+                break;
+            }
         }
 
         // 2. Flush any buffered PTY output for the attached session.
@@ -1597,6 +1736,13 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         .and_then(|dir| crate::pty::transcript_path(&conversation, &dir));
                     let current = transcript.as_ref().map(|(p, _)| p.as_path());
                     if crate::bridge_view::should_switch_tail(current, resolved.as_deref()) {
+                        // Whatever the OLD conversation wrote since the last tail pass
+                        // goes out first, or it is lost with the switch.
+                        if let Some((old, cursor)) = transcript.as_mut() {
+                            for frame in crate::bridge_view::tail_frames(old, cursor, sid) {
+                                let _ = ws.send(Message::Text(frame.to_string()));
+                            }
+                        }
                         if let Some(path) = resolved.clone() {
                             let lines = read_lines(&path);
                             let history = history_payload(sid, &lines);
@@ -1617,21 +1763,72 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
         // 4b. Tail the transcript for appended lines -> chat items.
         if let (Some((path, cursor)), Some((sid, _, _))) = (transcript.as_mut(), attached.as_ref())
         {
-            let lines = read_lines(path);
-            if lines.len() > *cursor {
-                for line in &lines[*cursor..] {
-                    for item in crate::transcript::parse_line(line) {
-                        let frame = crate::bridge_view::chat_frame(sid, &item);
-                        let _ = ws.send(Message::Text(frame.to_string()));
-                    }
-                }
-                *cursor = lines.len();
+            for frame in crate::bridge_view::tail_frames(path, cursor, sid) {
+                let _ = ws.send(Message::Text(frame.to_string()));
             }
         }
     }
 
     unsubscribe_bus(&bus, &mut bus_sub);
     detach(&pty, &attached);
+}
+
+/// Send `pending` (first call) or the `pendingAdded` / `resolved` frames for what changed
+/// since this socket last pushed. A resolution older than the ring reads as `cancelled`.
+fn push_pending(
+    app: &AppHandle,
+    ws: &mut WebSocket<TcpStream>,
+    pushed: &mut Option<HashSet<String>>,
+) -> bool {
+    let asks = app.state::<Arc<Asks>>();
+    let views = asks.pending();
+    let unchanged = pushed
+        .as_ref()
+        .is_some_and(|p| p.len() == views.len() && views.iter().all(|v| p.contains(&v.id)));
+    if unchanged {
+        return true;
+    }
+    // The store is read only when there is something to classify.
+    let projects = if views.is_empty() {
+        Vec::new()
+    } else {
+        app.state::<Arc<Store>>().list()
+    };
+    let items = crate::bridge_view::ask_push_items(&views, |sid| {
+        crate::bridge_view::session_is_private(&projects, sid)
+    });
+    let ids: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
+    match pushed.as_ref() {
+        None => {
+            let frame = crate::bridge_view::pending_frame(&items);
+            if ws.send(Message::Text(frame.to_string())).is_err() {
+                return false;
+            }
+        }
+        Some(prev) => {
+            let (added, gone) = crate::bridge_view::diff_pending(prev, &items);
+            let recent = asks.recent_resolutions();
+            for item in &added {
+                let frame = crate::bridge_view::pending_added_frame(item);
+                if ws.send(Message::Text(frame.to_string())).is_err() {
+                    return false;
+                }
+            }
+            for id in &gone {
+                let by = recent
+                    .iter()
+                    .rev()
+                    .find(|(i, _)| i == id)
+                    .map_or(crate::asks::By::Cancelled, |(_, by)| *by);
+                let frame = crate::bridge_view::resolved_frame(id, by.as_str());
+                if ws.send(Message::Text(frame.to_string())).is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+    *pushed = Some(ids);
+    true
 }
 
 fn unsubscribe_bus(
@@ -2411,6 +2608,113 @@ mod tests {
         let b = c.register_live("d2");
         c.disconnect_all_devices();
         assert!(a.load(Ordering::SeqCst) && b.load(Ordering::SeqCst));
+    }
+
+    fn wired_controller() -> (
+        BridgeController,
+        Arc<crate::asks::Asks>,
+        Arc<crate::asks::AskGate>,
+    ) {
+        let c = controller();
+        let asks = Arc::new(crate::asks::Asks::default());
+        let gate = Arc::new(crate::asks::AskGate::default());
+        c.wire_asks(asks.clone(), gate.clone());
+        (c, asks, gate)
+    }
+
+    #[test]
+    fn last_phone_leaving_hands_off() {
+        use crate::asks::AskOutcome;
+        let (c, asks, _gate) = wired_controller();
+        assert!(!c.has_remote_phone());
+        let a = c.register_live("d1");
+        let b = c.register_live("d2");
+        assert!(c.has_remote_phone());
+        let (held, rx_held) =
+            asks.register_held("s".into(), "t".into(), serde_json::json!([]), 1, true);
+        let (desk, rx_desk) =
+            asks.register_held("s".into(), "t".into(), serde_json::json!([]), 2, false);
+        c.unregister_live("d1", &a);
+        assert!(rx_held.try_recv().is_err(), "another phone still holds it");
+        c.unregister_live("d2", &b);
+        assert!(!c.has_remote_phone());
+        assert_eq!(rx_held.try_recv().unwrap(), AskOutcome::HandOff);
+        assert!(asks.get(&held).is_none());
+        assert!(
+            rx_desk.try_recv().is_err() && asks.get(&desk).is_some(),
+            "the desktop's own question is untouched"
+        );
+    }
+
+    #[test]
+    fn last_phone_leaving_keeps_asks_while_the_desktop_watches() {
+        let (c, asks, gate) = wired_controller();
+        gate.set(true);
+        let a = c.register_live("d1");
+        let (held, rx) = asks.register_held("s".into(), "t".into(), serde_json::json!([]), 1, true);
+        c.unregister_live("d1", &a);
+        assert!(rx.try_recv().is_err() && asks.get(&held).is_some());
+    }
+
+    #[test]
+    fn revoking_the_last_phone_hands_off_too() {
+        use crate::asks::AskOutcome;
+        let (c, asks, _gate) = wired_controller();
+        let _a = c.register_live("d1");
+        let (_, rx) = asks.register_held("s".into(), "t".into(), serde_json::json!([]), 1, true);
+        c.disconnect_device("d1");
+        assert_eq!(rx.try_recv().unwrap(), AskOutcome::HandOff);
+        let _b = c.register_live("d2");
+        let (_, rx2) = asks.register_held("s".into(), "t".into(), serde_json::json!([]), 1, true);
+        c.disconnect_all_devices();
+        assert_eq!(rx2.try_recv().unwrap(), AskOutcome::HandOff);
+    }
+
+    #[test]
+    fn answer_msg_parses_camel_case() {
+        let m = parse_client_msg(r#"{"type":"answer","askId":"ask-3","answers":{"Q?":"A"}}"#);
+        match m {
+            Some(ClientMsg::Answer { ask_id, answers }) => {
+                assert_eq!(ask_id, "ask-3");
+                assert_eq!(answers["Q?"], "A");
+            }
+            other => panic!("expected Answer, got {other:?}"),
+        }
+        assert!(parse_client_msg(r#"{"type":"answer","ask_id":"x","answers":{}}"#).is_none());
+        assert!(parse_client_msg(r#"{"type":"answer","askId":"x","answers":"A"}"#).is_none());
+    }
+
+    #[test]
+    fn a_session_made_private_while_attached_stops_streaming() {
+        let private = |s: &str| s == "secret";
+        assert_eq!(
+            attached_now_private(Some("secret"), private),
+            Some("secret")
+        );
+        assert_eq!(attached_now_private(Some("open"), private), None);
+        assert_eq!(attached_now_private(None, private), None);
+    }
+
+    #[test]
+    fn answer_refused_for_silo() {
+        let view = crate::asks::AskView {
+            id: "ask-1".into(),
+            session: "s".into(),
+            tool_use_id: "t".into(),
+            questions: serde_json::json!([{"question":"Q?","options":[{"label":"A"}]}]),
+            created_ms: 0,
+        };
+        let good: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Q?":"A"})).unwrap();
+        let bad: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Other?":"A"})).unwrap();
+        assert!(phone_may_answer(Some(&view), false, &good));
+        assert!(
+            !phone_may_answer(Some(&view), true, &good),
+            "a private session is never answered from a phone"
+        );
+        assert!(!phone_may_answer(Some(&view), false, &bad), "validated");
+        assert!(!phone_may_answer(None, false, &good), "already resolved");
     }
 
     #[test]

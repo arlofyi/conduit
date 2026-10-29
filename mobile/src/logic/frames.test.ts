@@ -1,4 +1,4 @@
-import { acceptsFrame, frameSession, isSpawnError, SPAWN_ERRORS, spawnErrorText } from "./frames";
+import { acceptsFrame, frameSession, isSpawnError, refusesOpenChat, SPAWN_ERRORS, spawnErrorText } from "./frames";
 
 describe("session-tagged frames", () => {
   it("keeps frames for the open chat and drops the one the reader left", () => {
@@ -16,6 +16,19 @@ describe("session-tagged frames", () => {
     expect(frameSession("s2", "s1")).toBe("s2");
     expect(frameSession(undefined, "s1")).toBe("s1");
     expect(frameSession(undefined, null)).toBeNull();
+  });
+});
+
+describe("private-session refusals", () => {
+  it("refuse the open chat, never one the reader already left", () => {
+    expect(refusesOpenChat("private session", "s1", "s1")).toBe(true);
+    expect(refusesOpenChat("private session", "old", "s1")).toBe(false);
+    expect(refusesOpenChat("private session", "s1", null)).toBe(false);
+    expect(refusesOpenChat("no such session", "s1", "s1")).toBe(false);
+  });
+
+  it("an untagged refusal from an older Mac still counts", () => {
+    expect(refusesOpenChat("private session", undefined, "s1")).toBe(true);
   });
 });
 

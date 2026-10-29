@@ -1725,7 +1725,13 @@ fn ask_answer(
         return Ok(false);
     };
     asks::validate_answers(&view.questions, &answers)?;
-    Ok(asks.resolve(&id, asks::AskOutcome::Answered(answers)))
+    Ok(asks.resolve(
+        &id,
+        asks::AskOutcome::Answered {
+            answers,
+            by: asks::By::Desktop,
+        },
+    ))
 }
 
 #[tauri::command]
@@ -3372,9 +3378,15 @@ pub fn run() {
                 asks_state,
                 ask_gate,
             );
-            app.state::<Arc<bridge::BridgeController>>()
-                .inner()
-                .start(app.handle().clone());
+            {
+                let bridge = app.state::<Arc<bridge::BridgeController>>().inner().clone();
+                // Before `start`: the last phone leaving must be able to hand off asks.
+                bridge.wire_asks(
+                    app.state::<Arc<asks::Asks>>().inner().clone(),
+                    app.state::<Arc<asks::AskGate>>().inner().clone(),
+                );
+                bridge.start(app.handle().clone());
+            }
             continuity_watch::start(app.handle().clone());
 
             // IDE announce: hand the host to the PTY manager (teardown needs it) and

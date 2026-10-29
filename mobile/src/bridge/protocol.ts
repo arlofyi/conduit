@@ -143,7 +143,7 @@ export const PROTOCOL_VERSION = 1;
 export type ServerMsg =
   | { type: "hello"; macName: string; conduitVersion: string; protocolVersion: number }
   | { type: "authOk"; deviceId: string }
-  | { type: "error"; message: string }
+  | { type: "error"; message: string; sessionId?: string }
   | { type: "pairPending"; requestId: string }
   | { type: "pairResult"; ok: true; token: string; deviceId: string }
   | { type: "pairResult"; ok: false; reason: string }

@@ -17,7 +17,7 @@ import type { ContextInfo } from "../logic/chatHeader";
 import { chatUnread, nextUnread } from "../logic/chatList";
 import { connErrorText } from "../logic/connCopy";
 import { capFeed } from "../logic/feed";
-import { acceptsFrame, frameSession, isSpawnError, PRIVATE_SESSION, spawnErrorText } from "../logic/frames";
+import { acceptsFrame, frameSession, isSpawnError, PRIVATE_SESSION, refusesOpenChat, spawnErrorText } from "../logic/frames";
 import { loopbackMac, type PairEndpoint } from "../logic/macs";
 import { addressesFor, confirmCode, makeNonce, type QrPayload } from "../logic/pairing";
 import { BridgeClient } from "./BridgeClient";
@@ -317,8 +317,12 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               break;
             case "error":
               if (m.message === PRIVATE_SESSION) {
-                // The Mac refused the chat that was opened: say so instead of an empty feed.
-                if (attachedRef.current) setSessionLive({ ...EMPTY_LIVE, refused: "private" });
+                // The Mac refused the chat that is open (at attach, or because it was made
+                // private while streaming): say so instead of an empty feed. A refusal for a
+                // chat already left is stale and ignored.
+                if (refusesOpenChat(m.message, m.sessionId, attachedRef.current)) {
+                  setSessionLive({ ...EMPTY_LIVE, refused: "private" });
+                }
               } else if (spawnPending.current && isSpawnError(m.message)) {
                 // Only the spawn's own errors answer a spawn; anything else is about another request.
                 spawnPending.current = false;

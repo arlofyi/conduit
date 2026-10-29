@@ -368,6 +368,12 @@ pub fn start(
                 store.set_session_agent_state(&session, Some(&state));
             }
 
+            // The turn moved past any question this session was holding: cancel it, so
+            // the blocked `/ask` answers `{}` and no surface keeps a dead card.
+            if turn_moved_on(&event, &parsed) {
+                asks.cancel_session(&session);
+            }
+
             // Capture Command Code's own session id, once, so the next spawn can resume
             // this conversation with `--session <id>`. Command Code has no `--session-id`
             // to pin OUR id up front, so the id has to come back from the agent.
@@ -635,26 +641,43 @@ enum AskDecision {
         session: String,
         tool_use_id: String,
         questions: Value,
+        /// Only a connected phone holds it (see `Asks::register_held`).
+        held_for_phone: bool,
     },
+}
+
+/// Who could show a card right now: the desktop gate (`set_ask_gate`) and whether an
+/// authenticated remote phone is connected (`BridgeController::has_remote_phone`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Holders {
+    desktop: bool,
+    phone: bool,
 }
 
 /// Every reason `/ask` declines to hold a question, in one pure place. `has_origin` is
 /// checked FIRST (a browser page must not raise cards), then the gate, then whether the
 /// session is one of ours -- the same settings file is read by a `claude` the user runs by
-/// hand in that checkout, which posts `session=unknown`.
+/// hand in that checkout, which posts `session=unknown`. A private (silo / local-only)
+/// session's question is held ONLY by the desktop: a phone never sees it, so a phone being
+/// connected is no reason to park it.
 fn ask_decision(
-    gate_open: bool,
+    holders: Holders,
     has_origin: bool,
     session: Option<&str>,
     body: &Value,
     known_session: impl Fn(&str) -> bool,
+    private_session: impl Fn(&str) -> bool,
 ) -> AskDecision {
-    if has_origin || !gate_open {
+    if has_origin || !(holders.desktop || holders.phone) {
         return AskDecision::Skip;
     }
     let Some(session) = session.filter(|s| known_session(s)) else {
         return AskDecision::Skip;
     };
+    let phone_may_hold = holders.phone && !private_session(session);
+    if !holders.desktop && !phone_may_hold {
+        return AskDecision::Skip;
+    }
     let Some(questions) = body
         .get("tool_input")
         .and_then(crate::asks::supported_questions)
@@ -669,6 +692,24 @@ fn ask_decision(
             .unwrap_or("")
             .to_string(),
         questions,
+        held_for_phone: !holders.desktop,
+    }
+}
+
+/// Did this hook say the session's turn has moved past any question it was asking? Then
+/// a held question is dead (the user pressed Esc, typed a new prompt, the session ended,
+/// or another tool ran) and every surface must drop it. NOT `pretool`: the no-matcher
+/// `PreToolUse` row fires for `AskUserQuestion` itself, beside the blocking row. And not a
+/// SUBAGENT's tool finishing (`agent_id` set): a background subagent keeps working while
+/// the main turn waits on its question.
+fn turn_moved_on(event: &str, body: &Value) -> bool {
+    match event {
+        "stop" | "prompt" | "sessionend" => true,
+        "tooluse" => body
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty),
+        _ => false,
     }
 }
 
@@ -703,16 +744,25 @@ fn handle_ask(
             .iter()
             .any(|p| p.sessions.iter().any(|s| s.id == id))
     };
+    let bridge = app.try_state::<Arc<crate::bridge::BridgeController>>();
+    let phone = || bridge.as_ref().is_some_and(|b| b.has_remote_phone());
+    let holders = Holders {
+        desktop: gate.is_open(),
+        phone: phone(),
+    };
+    let private = |id: &str| crate::bridge_view::session_is_private(&store.list(), id);
     let AskDecision::Hold {
         session,
         tool_use_id,
         questions,
+        held_for_phone,
     } = ask_decision(
-        gate.is_open(),
+        holders,
         has_origin,
         session.as_deref(),
         &parsed,
         known,
+        private,
     )
     else {
         let _ = request.respond(Response::from_string("{}"));
@@ -723,7 +773,12 @@ fn handle_ask(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let (id, rx) = asks.register(session, tool_use_id, questions, now_ms);
+    let (id, rx) = asks.register_held(session, tool_use_id, questions, now_ms, held_for_phone);
+    // The last phone may have left between reading `holders` and registering, in which
+    // case its departure found nothing to hand off: re-check, or this waits 600 s unseen.
+    if held_for_phone && !gate.is_open() && !phone() {
+        asks.resolve(&id, crate::asks::AskOutcome::HandOff);
+    }
     if let Some(view) = asks.get(&id) {
         let _ = app.emit("ask-request", &view);
     }
@@ -734,10 +789,17 @@ fn handle_ask(
     asks.forget(&id);
     let outcome = crate::asks::pick_outcome(received, rx.try_recv().ok());
     let how = crate::asks::how(&outcome);
+    let by = crate::asks::by_of(&outcome);
     let _ = request.respond(Response::from_string(
         crate::asks::ask_response(&input, outcome.as_ref()).to_string(),
     ));
-    let _ = app.emit("ask-resolved", json!({ "id": id, "how": how }));
+    let _ = app.emit("ask-resolved", ask_resolved_payload(&id, how, by));
+}
+
+/// The `ask-resolved` event: `{id, how, by}`. `how` is kept for the existing desktop
+/// listener; `by` names who resolved it.
+fn ask_resolved_payload(id: &str, how: &str, by: crate::asks::By) -> Value {
+    json!({ "id": id, "how": how, "by": by.as_str() })
 }
 
 /// How long the hook holds its request open waiting for a human.
@@ -2001,53 +2063,137 @@ mod tests {
         assert!(!is_conduit_entry(&foreign));
     }
 
+    const DESK: Holders = Holders {
+        desktop: true,
+        phone: false,
+    };
+    const NONE: Holders = Holders {
+        desktop: false,
+        phone: false,
+    };
+    const PHONE: Holders = Holders {
+        desktop: false,
+        phone: true,
+    };
+
+    fn ask_body() -> Value {
+        json!({"tool_name":"AskUserQuestion","tool_use_id":"tu",
+            "tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}})
+    }
+
     #[test]
     fn ask_decision_fails_open_on_every_refusal() {
         let known = |s: &str| s == "sess-1";
-        let body = json!({"tool_name":"AskUserQuestion","tool_use_id":"tu",
-            "tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}});
-        match ask_decision(true, false, Some("sess-1"), &body, known) {
+        let public = |_: &str| false;
+        let body = ask_body();
+        match ask_decision(DESK, false, Some("sess-1"), &body, known, public) {
             AskDecision::Hold {
                 session,
                 tool_use_id,
                 questions,
+                held_for_phone,
             } => {
                 assert_eq!(session, "sess-1");
                 assert_eq!(tool_use_id, "tu");
                 assert_eq!(questions, body["tool_input"]["questions"]);
+                assert!(!held_for_phone, "the desktop gate holds it");
             }
             other => panic!("expected Hold, got {other:?}"),
         }
         let no_id =
             json!({"tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}});
-        match ask_decision(true, false, Some("sess-1"), &no_id, known) {
+        match ask_decision(DESK, false, Some("sess-1"), &no_id, known, public) {
             AskDecision::Hold { tool_use_id, .. } => assert_eq!(tool_use_id, ""),
             other => panic!("expected Hold, got {other:?}"),
         }
         assert_eq!(
-            ask_decision(true, true, Some("sess-1"), &body, known),
+            ask_decision(DESK, true, Some("sess-1"), &body, known, public),
             AskDecision::Skip,
             "Origin refused"
         );
         assert_eq!(
-            ask_decision(false, false, Some("sess-1"), &body, known),
+            ask_decision(NONE, false, Some("sess-1"), &body, known, public),
             AskDecision::Skip,
-            "gate closed"
+            "gate closed and no phone"
         );
         assert_eq!(
-            ask_decision(true, false, Some("unknown"), &body, known),
+            ask_decision(DESK, false, Some("unknown"), &body, known, public),
             AskDecision::Skip,
             "a claude outside Conduit reads the same settings file"
         );
         assert_eq!(
-            ask_decision(true, false, None, &body, known),
+            ask_decision(DESK, false, None, &body, known, public),
             AskDecision::Skip
         );
         let bad = json!({"tool_input":{"questions":[]}});
         assert_eq!(
-            ask_decision(true, false, Some("sess-1"), &bad, known),
+            ask_decision(DESK, false, Some("sess-1"), &bad, known, public),
             AskDecision::Skip
         );
+    }
+
+    #[test]
+    fn a_connected_phone_holds_a_question_the_desktop_cannot_see() {
+        let known = |s: &str| s == "sess-1";
+        match ask_decision(PHONE, false, Some("sess-1"), &ask_body(), known, |_| false) {
+            AskDecision::Hold { held_for_phone, .. } => assert!(held_for_phone),
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        // Both open: the desktop is a holder, so the phone leaving must not hand it off.
+        let both = Holders {
+            desktop: true,
+            phone: true,
+        };
+        match ask_decision(both, false, Some("sess-1"), &ask_body(), known, |_| false) {
+            AskDecision::Hold { held_for_phone, .. } => assert!(!held_for_phone),
+            other => panic!("expected Hold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_resolved_names_who_resolved_it() {
+        let p = ask_resolved_payload("ask-1", "answered", crate::asks::By::Phone);
+        assert_eq!(
+            p,
+            json!({ "id": "ask-1", "how": "answered", "by": "phone" })
+        );
+    }
+
+    #[test]
+    fn silo_ask_not_held_for_phone() {
+        let known = |s: &str| s == "sess-1";
+        let private = |_: &str| true;
+        assert_eq!(
+            ask_decision(PHONE, false, Some("sess-1"), &ask_body(), known, private),
+            AskDecision::Skip,
+            "a phone never holds a private session's question"
+        );
+        match ask_decision(DESK, false, Some("sess-1"), &ask_body(), known, private) {
+            AskDecision::Hold { held_for_phone, .. } => assert!(!held_for_phone),
+            other => panic!("the desktop still holds it: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_moving_on_cancels_but_its_own_pretool_does_not() {
+        let none = json!({});
+        for e in ["stop", "prompt", "sessionend", "tooluse"] {
+            assert!(turn_moved_on(e, &none), "{e}");
+        }
+        // `pretool` fires for AskUserQuestion ITSELF, beside the blocking row.
+        for e in [
+            "pretool",
+            "notification",
+            "todos",
+            "precompact",
+            "sessionstart",
+        ] {
+            assert!(!turn_moved_on(e, &none), "{e}");
+        }
+        // A subagent's tool finishing says nothing about the main turn's question.
+        let sub = json!({"agent_id": "a1", "tool_name": "Read"});
+        assert!(!turn_moved_on("tooluse", &sub));
+        assert!(turn_moved_on("tooluse", &json!({"agent_id": ""})));
     }
 
     #[test]

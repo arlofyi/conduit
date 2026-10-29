@@ -17,6 +17,13 @@ export function acceptsFrame(frameSessionId: unknown, open: string | null): bool
   return frameSessionId === open;
 }
 
+/** Is this `error` the Mac refusing the chat that is open? A refusal tagged with another
+ * session is a late answer about a chat the reader already left; untagged (older Macs)
+ * still counts, as before. */
+export function refusesOpenChat(message: string, frameSessionId: unknown, open: string | null): boolean {
+  return message === PRIVATE_SESSION && open !== null && acceptsFrame(frameSessionId, open);
+}
+
 /** The session a frame is about: its own tag when present, else whatever this socket streams. */
 export function frameSession(frameSessionId: unknown, streaming: string | null): string | null {
   return typeof frameSessionId === "string" ? frameSessionId : streaming;

@@ -365,9 +365,120 @@ pub fn session_is_private(projects: &[Project], session_id: &str) -> bool {
         .is_some_and(|s| s.silo || s.local_only)
 }
 
-/// The one reply to a refused private-session request.
-pub fn private_session_error() -> Value {
-    json!({ "type": "error", "message": "private session" })
+/// The one reply to a refused private-session request. Tagged with the session it is
+/// about, so a phone that has already left that chat can ignore a late refusal.
+pub fn private_session_error(session_id: &str) -> Value {
+    json!({ "type": "error", "message": "private session", "sessionId": session_id })
+}
+
+/// One pending item pushed to phones: its id (what a connection diffs on) and the wire
+/// object (`AskPush`; Task 3 adds `PermissionPush`, told apart by `kind`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PushItem {
+    pub id: String,
+    pub item: Value,
+}
+
+/// An ask as a phone sees it. A private (silo / local-only) session's question carries
+/// only that it EXISTS -- never its text or options.
+pub fn ask_push(view: &AskView, private: bool) -> Value {
+    if private {
+        return json!({ "kind": "ask", "id": view.id, "sessionId": view.session, "private": true });
+    }
+    json!({
+        "kind": "ask",
+        "id": view.id,
+        "sessionId": view.session,
+        "toolUseId": view.tool_use_id,
+        "questions": view.questions,
+        "createdMs": view.created_ms,
+    })
+}
+
+/// The pending asks as push items, oldest first, each classified private or not.
+pub fn ask_push_items(views: &[AskView], is_private: impl Fn(&str) -> bool) -> Vec<PushItem> {
+    views
+        .iter()
+        .map(|v| PushItem {
+            id: v.id.clone(),
+            item: ask_push(v, is_private(&v.session)),
+        })
+        .collect()
+}
+
+/// The full list, sent once right after auth (and on a loopback connect).
+pub fn pending_frame(items: &[PushItem]) -> Value {
+    let of = |kind: &str| -> Vec<Value> {
+        items
+            .iter()
+            .filter(|i| i.item.get("kind").and_then(Value::as_str) == Some(kind))
+            .map(|i| i.item.clone())
+            .collect()
+    };
+    json!({ "type": "pending", "asks": of("ask"), "permissions": of("permission") })
+}
+
+pub fn pending_added_frame(item: &PushItem) -> Value {
+    json!({ "type": "pendingAdded", "item": item.item })
+}
+
+/// An item left the pending list; `by` names who resolved it (`asks::By`, lowercase).
+pub fn resolved_frame(id: &str, by: &str) -> Value {
+    json!({ "type": "resolved", "id": id, "by": by })
+}
+
+/// The reply to a phone's `answer`: `ok: false` = already answered elsewhere, refused
+/// (private session) or invalid -- nothing was sent to the agent.
+pub fn answer_result_frame(ask_id: &str, ok: bool) -> Value {
+    json!({ "type": "answerResult", "askId": ask_id, "ok": ok })
+}
+
+/// What changed since this connection last pushed: items it has not sent yet (in `now`'s
+/// order), and ids it sent that are no longer pending. Each connection keeps its own
+/// `prev`, so two phones each learn of the same resolution.
+pub fn diff_pending(prev: &HashSet<String>, now: &[PushItem]) -> (Vec<PushItem>, Vec<String>) {
+    let added: Vec<PushItem> = now
+        .iter()
+        .filter(|i| !prev.contains(&i.id))
+        .cloned()
+        .collect();
+    let still: HashSet<&str> = now.iter().map(|i| i.id.as_str()).collect();
+    let mut gone: Vec<String> = prev
+        .iter()
+        .filter(|id| !still.contains(id.as_str()))
+        .cloned()
+        .collect();
+    gone.sort();
+    (added, gone)
+}
+
+/// A transcript's non-blank lines.
+pub fn read_lines(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `chat` frames for every line appended to `path` since `cursor`, advancing it. Used by
+/// the regular tail AND just before the tail switches transcript after a `/clear`, so
+/// lines the old conversation wrote since the last pass are not lost.
+pub fn tail_frames(path: &Path, cursor: &mut usize, session_id: &str) -> Vec<Value> {
+    let lines = read_lines(path);
+    if lines.len() <= *cursor {
+        return Vec::new();
+    }
+    let frames = lines[*cursor..]
+        .iter()
+        .flat_map(|l| crate::transcript::parse_line(l))
+        .map(|item| chat_frame(session_id, &item))
+        .collect();
+    *cursor = lines.len();
+    frames
 }
 
 /// A `chat` frame: one transcript item of `session_id`. The id lets the phone drop a frame
@@ -778,9 +889,126 @@ mod tests {
         assert!(!session_is_private(&ps, "c"));
         assert!(!session_is_private(&ps, "missing"));
         assert_eq!(
-            private_session_error(),
-            json!({ "type": "error", "message": "private session" })
+            private_session_error("a"),
+            json!({ "type": "error", "message": "private session", "sessionId": "a" })
         );
+    }
+
+    fn ask(id: &str, session: &str) -> AskView {
+        AskView {
+            id: id.into(),
+            session: session.into(),
+            tool_use_id: "tu".into(),
+            questions: json!([{"question":"Q?","options":[{"label":"A"}]}]),
+            created_ms: 7,
+        }
+    }
+
+    fn item(id: &str) -> PushItem {
+        PushItem {
+            id: id.into(),
+            item: ask_push(&ask(id, "s"), false),
+        }
+    }
+
+    #[test]
+    fn ask_push_shape_and_private_shape() {
+        let open = ask_push(&ask("ask-1", "s1"), false);
+        assert_eq!(
+            keys(&open),
+            [
+                "createdMs",
+                "id",
+                "kind",
+                "questions",
+                "sessionId",
+                "toolUseId"
+            ]
+        );
+        assert_eq!(open["kind"], "ask");
+        assert_eq!(open["id"], "ask-1");
+        assert_eq!(open["sessionId"], "s1");
+        assert_eq!(open["toolUseId"], "tu");
+        assert_eq!(open["createdMs"], 7);
+        assert_eq!(open["questions"][0]["question"], "Q?");
+        // A private session's question: that it exists, nothing of what it says.
+        let private = ask_push(&ask("ask-2", "s2"), true);
+        assert_eq!(
+            private,
+            json!({ "kind": "ask", "id": "ask-2", "sessionId": "s2", "private": true })
+        );
+        // The frames that carry them.
+        let items = [PushItem {
+            id: "ask-1".into(),
+            item: open.clone(),
+        }];
+        assert_eq!(
+            pending_frame(&items),
+            json!({ "type": "pending", "asks": [open.clone()], "permissions": [] })
+        );
+        assert_eq!(
+            pending_added_frame(&items[0]),
+            json!({ "type": "pendingAdded", "item": open })
+        );
+        assert_eq!(
+            resolved_frame("ask-1", "phone"),
+            json!({ "type": "resolved", "id": "ask-1", "by": "phone" })
+        );
+        assert_eq!(
+            answer_result_frame("ask-1", false),
+            json!({ "type": "answerResult", "askId": "ask-1", "ok": false })
+        );
+    }
+
+    #[test]
+    fn diff_pending_added_and_gone() {
+        let none: HashSet<String> = HashSet::new();
+        let (added, gone) = diff_pending(&none, &[item("a"), item("b")]);
+        assert_eq!(
+            added.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(gone.is_empty());
+        // Two phones, each with its own view of what it was sent: one answers `a`, both
+        // see it gone on their next diff, and only `c` is new to either.
+        let phone1: HashSet<String> = ["a".to_string(), "b".to_string()].into();
+        let phone2 = phone1.clone();
+        let now = [item("b"), item("c")];
+        for prev in [&phone1, &phone2] {
+            let (added, gone) = diff_pending(prev, &now);
+            assert_eq!(
+                added.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+                ["c"]
+            );
+            assert_eq!(gone, ["a"]);
+        }
+        let (added, gone) = diff_pending(&phone1, &[item("a"), item("b")]);
+        assert!(added.is_empty() && gone.is_empty(), "no change, no frames");
+    }
+
+    #[test]
+    fn tail_flush_sends_only_what_was_appended() {
+        let dir = std::env::temp_dir().join(format!("conduit-tail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.jsonl");
+        let line = |t: &str| {
+            json!({"type":"user","message":{"role":"user","content":t},"uuid":t}).to_string()
+        };
+        std::fs::write(&path, format!("{}\n", line("one"))).unwrap();
+        let mut cursor = 1;
+        // Appended after the last tail pass, just before the `/clear` moved the session.
+        std::fs::write(&path, format!("{}\n{}\n", line("one"), line("two"))).unwrap();
+        let frames = tail_frames(&path, &mut cursor, "s1");
+        assert_eq!(cursor, 2);
+        assert!(!frames.is_empty(), "the late line reaches the phone");
+        assert!(frames
+            .iter()
+            .all(|f| f["sessionId"] == "s1" && f["type"] == "chat"));
+        assert!(
+            tail_frames(&path, &mut cursor, "s1").is_empty(),
+            "nothing twice"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
