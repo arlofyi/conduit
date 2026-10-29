@@ -273,6 +273,17 @@ const PING_EVERY: Duration = Duration::from_secs(15);
 /// nothing to write, the Mac would otherwise never notice, and the phone would keep holding
 /// every question it was sent (`has_remote_phone`) while the terminal showed nothing.
 const STALE_AFTER: Duration = Duration::from_secs(35);
+/// A write that has not completed in this long fails, which ends the connection. A frozen
+/// or wedged phone stops reading while its kernel keeps the socket open (zero window), so
+/// an unbounded write blocks the loop forever: it never reaches the [`STALE_AFTER`] check,
+/// and the phone keeps holding questions until the hook's own ceiling. Shorter than
+/// `STALE_AFTER` so a stalled write is noticed no later than a silent read would be.
+const WRITE_STALL: Duration = Duration::from_secs(10);
+
+/// Bound every write on a bridge socket (see [`WRITE_STALL`]).
+fn bound_writes(stream: &TcpStream, stall: Duration) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(stall))
+}
 
 /// Has a connection last heard from at `last_read` gone silent for good?
 fn conn_is_stale(last_read: Instant, now: Instant) -> bool {
@@ -1298,6 +1309,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     // the handshake wants blocking reads, bounded by a timeout.
     if stream.set_nonblocking(false).is_err()
         || stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err()
+        || bound_writes(&stream, WRITE_STALL).is_err()
     {
         return;
     }
@@ -2924,6 +2936,35 @@ mod tests {
         assert!(ping_due(t0, t0 + Duration::from_secs(15)));
         // Two pings go unanswered before a connection is given up on.
         assert!(STALE_AFTER > PING_EVERY * 2);
+    }
+
+    #[test]
+    fn a_peer_that_stops_reading_cannot_stall_the_loop() {
+        // A frozen phone stops reading but its kernel keeps the socket open (zero window),
+        // so an unbounded write blocks forever and the loop never reaches the staleness
+        // check. Measured in the Simulator: 70 s frozen, never dropped, question held.
+        assert!(WRITE_STALL < STALE_AFTER);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap(); // never reads
+        let (server, _) = listener.accept().unwrap();
+        bound_writes(&server, Duration::from_millis(300)).unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        let start = Instant::now();
+        let mut w = &server;
+        use std::io::Write;
+        let failed = loop {
+            if let Err(e) = w.write_all(&chunk) {
+                break e;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "write never gave up"
+            );
+        };
+        assert!(matches!(
+            failed.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
     }
 
     #[test]
