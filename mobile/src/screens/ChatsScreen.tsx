@@ -212,7 +212,7 @@ function ChipView({ chip, on, onPress }: { chip: Chip; on: boolean; onPress: () 
       })}
     >
       {chip.color && <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: chip.color }} />}
-      <Text style={{ fontSize: TYPE.footnote, color: fg, fontWeight: on ? "600" : "500", fontVariant: ["tabular-nums"] }}>
+      <Text maxFontSizeMultiplier={1.6} style={{ fontSize: TYPE.footnote, color: fg, fontWeight: on ? "600" : "500", fontVariant: ["tabular-nums"] }}>
         {chip.label}
       </Text>
     </Pressable>
@@ -291,7 +291,7 @@ function ChatRowView({ row, onOpen }: { row: Row; onOpen: (row: Row) => void }) 
                 justifyContent: "center",
               }}
             >
-              <Text style={{ color: p.meText, fontSize: TYPE.caption, fontWeight: "700", fontVariant: ["tabular-nums"] }}>
+              <Text maxFontSizeMultiplier={1.3} style={{ color: p.meText, fontSize: TYPE.caption, fontWeight: "700", fontVariant: ["tabular-nums"] }}>
                 {row.unread}
               </Text>
             </View>

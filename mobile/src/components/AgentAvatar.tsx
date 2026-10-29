@@ -6,34 +6,21 @@
  * stays on the native driver) and hold still under Reduce Motion — the ring alone still tells
  * the states apart.
  */
-import React, { useEffect, useRef, useState } from "react";
-import { AccessibilityInfo, Animated, Easing, Text, View } from "react-native";
+import React, { useEffect, useRef } from "react";
+import { Animated, Easing, Text, View } from "react-native";
 import Svg, { Path } from "react-native-svg";
 import { AGENT_MARKS, agentInfo, GLYPH_STATE_TITLE, pulsePeriod, type GlyphState } from "../logic/agents";
 import { glyphInk, mix } from "../logic/color";
 import { useTheme } from "../theme/ThemeContext";
+import { useReduceMotion } from "./ReduceMotion";
 
-export function useReduceMotion(): boolean {
-  const [reduce, setReduce] = useState(false);
-  useEffect(() => {
-    let alive = true;
-    AccessibilityInfo.isReduceMotionEnabled()
-      .then((v) => alive && setReduce(v))
-      .catch(() => undefined);
-    const sub = AccessibilityInfo.addEventListener("reduceMotionChanged", setReduce);
-    return () => {
-      alive = false;
-      sub.remove();
-    };
-  }, []);
-  return reduce;
-}
+export { useReduceMotion };
 
 export function AgentMarkGlyph({ agent, size, color }: { agent: string; size: number; color: string }) {
   const mark = AGENT_MARKS[agent];
   if (!mark) {
     return (
-      <Text style={{ color, fontSize: Math.round(size * 0.82), fontWeight: "700", lineHeight: Math.round(size * 1.0) }}>
+      <Text allowFontScaling={false} style={{ color, fontSize: Math.round(size * 0.82), fontWeight: "700", lineHeight: Math.round(size * 1.0) }}>
         {agentInfo(agent).letter}
       </Text>
     );

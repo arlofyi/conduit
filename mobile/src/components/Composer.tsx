@@ -8,7 +8,7 @@
  */
 import React, { useCallback, useRef, useState } from "react";
 import { Pressable, Text, TextInput, View, type LayoutChangeEvent } from "react-native";
-import { COMPOSER, composerHeight } from "../logic/composer";
+import { COMPOSER, composerHeight, composerMetrics } from "../logic/composer";
 import { useTheme } from "../theme/ThemeContext";
 import { TYPE } from "../theme/type";
 import { GlassCircle, GlassSurface, Icon } from "./Glass";
@@ -34,8 +34,11 @@ export function Composer({
   const { palette: p } = useTheme();
   const [draft, setDraft] = useState("");
   const [content, setContent] = useState<number | null>(null);
+  // One line of text as it is actually drawn (Dynamic Type can make it far taller than 21 pt).
+  const [oneLine, setOneLine] = useState<number | null>(null);
   const input = useRef<TextInput>(null);
-  const height = composerHeight(draft, content);
+  const metrics = composerMetrics(oneLine, PAD_V);
+  const height = composerHeight(draft, content, metrics);
   const canSend = draft.trim().length > 0;
 
   // Measured from an invisible mirror of the text, not from the field's onContentSizeChange:
@@ -66,7 +69,17 @@ export function Composer({
       }}
     >
       <GlassCircle symbol="plus" label="Quick actions: stop, compact, clear" onPress={onActions} size={COMPOSER.min} symbolSize={17} />
-      <GlassSurface style={{ flex: 1, borderRadius: COMPOSER.min / 2, minHeight: COMPOSER.min }}>
+      <GlassSurface style={{ flex: 1, borderRadius: COMPOSER.min / 2, minHeight: metrics.min }}>
+        <Text
+          onLayout={(e) => setOneLine(e.nativeEvent.layout.height)}
+          aria-hidden
+          importantForAccessibility="no-hide-descendants"
+          pointerEvents="none"
+          numberOfLines={1}
+          style={{ position: "absolute", left: 14, right: 14, top: 0, opacity: 0, fontSize: TYPE.callout, lineHeight: 21 }}
+        >
+          {" "}
+        </Text>
         <Text
           onLayout={onMirror}
           aria-hidden
@@ -82,7 +95,7 @@ export function Composer({
           value={draft}
           onChangeText={setDraft}
           multiline
-          scrollEnabled={height >= COMPOSER.max}
+          scrollEnabled={height >= metrics.max}
           placeholder="Message"
           placeholderTextColor={p.textMid}
           accessibilityLabel={`Message ${name}`}

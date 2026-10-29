@@ -1,4 +1,20 @@
-import { COMPOSER, composerHeight } from "./composer";
+import { COMPOSER, composerHeight, composerMetrics } from "./composer";
+
+describe("composerMetrics", () => {
+  it("is the design size at the default text size or before a measurement", () => {
+    expect(composerMetrics(null, 8)).toEqual(COMPOSER);
+    expect(composerMetrics(21, 8)).toEqual(COMPOSER);
+    expect(composerMetrics(Number.NaN, 8)).toEqual(COMPOSER);
+  });
+
+  it("grows with large Dynamic Type so one line is never clipped", () => {
+    const m = composerMetrics(40, 8);
+    expect(m.min).toBe(56);
+    expect(m.max).toBe(216);
+    expect(composerHeight("a", null, m)).toBe(56);
+    expect(composerHeight("", 300, m)).toBe(56);
+  });
+});
 
 describe("composerHeight", () => {
   it("grows with the content up to about five lines", () => {

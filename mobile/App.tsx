@@ -15,6 +15,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { LiveProvider, useLive } from "./src/bridge/LiveProvider";
 import { Banner } from "./src/components/Banner";
+import { ReduceMotionProvider } from "./src/components/ReduceMotion";
 import type { Banner as BannerData } from "./src/logic/banner";
 import { PrefsProvider, usePrefs } from "./src/data/PrefsProvider";
 import type { RootStackParamList, TabParamList } from "./src/navigation";
@@ -156,11 +157,13 @@ export default function App() {
       <SafeAreaProvider>
         <PrefsProvider>
           <ThemeProvider>
-            <LiveProvider>
-              <ListSelectionProvider>
-                <Inner />
-              </ListSelectionProvider>
-            </LiveProvider>
+            <ReduceMotionProvider>
+              <LiveProvider>
+                <ListSelectionProvider>
+                  <Inner />
+                </ListSelectionProvider>
+              </LiveProvider>
+            </ReduceMotionProvider>
           </ThemeProvider>
         </PrefsProvider>
       </SafeAreaProvider>
