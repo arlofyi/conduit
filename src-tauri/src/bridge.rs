@@ -51,7 +51,7 @@ use crate::tailscale::{self, TailscaleState};
 /// Wire spelling: the original messages carry `session_id` (snake_case) and stay that
 /// way; every message added for Tailscale pairing is camelCase with an explicit rename.
 /// Tests pin both.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientMsg {
     List,
@@ -114,6 +114,80 @@ pub enum ClientMsg {
     },
 }
 
+/// Manual `Debug`: `Auth.token`, `Pair.secret` and `Pair.nonce` are plaintext secrets and
+/// must never reach a log through a stray `{:?}`.
+impl std::fmt::Debug for ClientMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const R: &str = "<redacted>";
+        match self {
+            Self::List => f.write_str("List"),
+            Self::Attach { session_id } => f
+                .debug_struct("Attach")
+                .field("session_id", session_id)
+                .finish(),
+            Self::Input { session_id, data } => f
+                .debug_struct("Input")
+                .field("session_id", session_id)
+                .field("data", data)
+                .finish(),
+            Self::Resize {
+                session_id,
+                cols,
+                rows,
+            } => f
+                .debug_struct("Resize")
+                .field("session_id", session_id)
+                .field("cols", cols)
+                .field("rows", rows)
+                .finish(),
+            Self::Git {
+                session_id,
+                action,
+                path,
+            } => f
+                .debug_struct("Git")
+                .field("session_id", session_id)
+                .field("action", action)
+                .field("path", path)
+                .finish(),
+            Self::Kill { session_id } => f
+                .debug_struct("Kill")
+                .field("session_id", session_id)
+                .finish(),
+            Self::Spawn {
+                project_id,
+                prompt,
+                agent,
+                worktree,
+            } => f
+                .debug_struct("Spawn")
+                .field("project_id", project_id)
+                .field("prompt", prompt)
+                .field("agent", agent)
+                .field("worktree", worktree)
+                .finish(),
+            Self::Auth { .. } => f.debug_struct("Auth").field("token", &R).finish(),
+            Self::Pair {
+                secret,
+                request,
+                device_name,
+                ..
+            } => f
+                .debug_struct("Pair")
+                .field("secret", &secret.as_ref().map(|_| R))
+                .field("request", request)
+                .field("device_name", device_name)
+                .field("nonce", &R)
+                .finish(),
+            Self::Discover => f.write_str("Discover"),
+            Self::Interrupt { session_id } => f
+                .debug_struct("Interrupt")
+                .field("session_id", session_id)
+                .finish(),
+        }
+    }
+}
+
 /// Parse one client text frame. None on malformed JSON or an unknown `type`.
 pub fn parse_client_msg(text: &str) -> Option<ClientMsg> {
     serde_json::from_str(text).ok()
@@ -127,7 +201,8 @@ const READ_POLL: Duration = Duration::from_millis(20);
 pub const BRIDGE_PORTS: RangeInclusive<u16> = 8455..=8474;
 /// A non-loopback peer must authenticate (or start pairing) within this long.
 const AUTH_DEADLINE: Duration = Duration::from_secs(5);
-/// Bound on the HTTP upgrade itself, so a silent peer cannot hold a thread.
+/// Bound on the WHOLE HTTP upgrade (total, not per read), so a silent or dribbling peer
+/// cannot hold a thread.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest frame/message an unauthenticated peer may send.
 const PREAUTH_MAX_BYTES: usize = 4 * 1024;
@@ -445,6 +520,15 @@ fn system_name() -> Option<String> {
 /// must return exactly that type -- and this runs once per connection, not in a loop.
 #[allow(clippy::result_large_err)]
 fn accept_ws(stream: TcpStream, preauth_cap: bool) -> Option<WebSocket<TcpStream>> {
+    accept_ws_within(stream, preauth_cap, HANDSHAKE_TIMEOUT)
+}
+
+#[allow(clippy::result_large_err)]
+fn accept_ws_within(
+    stream: TcpStream,
+    preauth_cap: bool,
+    deadline: Duration,
+) -> Option<WebSocket<TcpStream>> {
     let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
         if has_origin(req) {
             let mut err = ErrorResponse::new(Some("forbidden".to_string()));
@@ -459,7 +543,20 @@ fn accept_ws(stream: TcpStream, preauth_cap: bool) -> Option<WebSocket<TcpStream
         max_frame_size: Some(PREAUTH_MAX_BYTES),
         ..Default::default()
     });
-    accept_hdr_with_config(stream, check, config).ok()
+    // One deadline for the WHOLE upgrade, not per read: a watchdog shuts the socket down
+    // when it passes, so a peer dribbling a byte at a time cannot hold the thread.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    if let Ok(guard) = stream.try_clone() {
+        thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(deadline)
+            {
+                let _ = guard.shutdown(std::net::Shutdown::Both);
+            }
+        });
+    }
+    let ws = accept_hdr_with_config(stream, check, config).ok();
+    drop(done_tx);
+    ws
 }
 
 /// Lift the pre-auth cap back to tungstenite's defaults (what every peer had before).
@@ -790,7 +887,7 @@ impl BridgeController {
         }
     }
 
-    fn disconnect_all_devices(&self) {
+    pub(crate) fn disconnect_all_devices(&self) {
         for (_, flags) in lock(&self.live).drain() {
             for f in flags {
                 f.store(true, Ordering::SeqCst);
@@ -1715,6 +1812,54 @@ mod tests {
             !server.join().unwrap(),
             "server must not complete the upgrade"
         );
+    }
+
+    #[test]
+    fn client_msg_debug_redacts_secrets() {
+        let a = format!(
+            "{:?}",
+            ClientMsg::Auth {
+                token: "abc123".into()
+            }
+        );
+        assert!(!a.contains("abc123"), "{a}");
+        let p = format!(
+            "{:?}",
+            ClientMsg::Pair {
+                secret: Some("sekret9".into()),
+                request: None,
+                device_name: "Pixel".into(),
+                nonce: "nonce77".into(),
+            }
+        );
+        assert!(!p.contains("sekret9") && !p.contains("nonce77"), "{p}");
+        assert!(p.contains("Pixel"));
+    }
+
+    #[test]
+    fn handshake_has_one_overall_deadline() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            // Per-read timeout is generous; only the overall deadline can end this.
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let t = std::time::Instant::now();
+            let ok = accept_ws_within(s, true, Duration::from_millis(400)).is_some();
+            (ok, t.elapsed())
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(2500) {
+            if c.write_all(b"G").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let (ok, took) = server.join().unwrap();
+        assert!(!ok);
+        assert!(took < Duration::from_millis(2000), "took {took:?}");
     }
 
     #[test]

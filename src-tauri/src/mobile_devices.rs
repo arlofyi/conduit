@@ -90,7 +90,7 @@ pub fn sha256_hex(s: &str) -> String {
 
 impl MobileDevices {
     /// Only `NotFound` means "defaults". An unparseable file is renamed to a unique
-    /// `.bak.<secs>` (never overwriting an earlier backup). Any other failure keeps
+    /// `.bak.<secs>-<8 hex>` (never overwriting an earlier backup). Any other failure keeps
     /// defaults in memory but refuses all writes.
     pub fn load(path: PathBuf) -> Self {
         let mut read_failed = false;
@@ -98,7 +98,12 @@ impl MobileDevices {
             Ok(bytes) => match serde_json::from_slice::<FileV1>(&bytes) {
                 Ok(f) => f,
                 Err(_) => {
-                    let bak = PathBuf::from(format!("{}.bak.{}", path.display(), now_secs()));
+                    let bak = PathBuf::from(format!(
+                        "{}.bak.{}-{}",
+                        path.display(),
+                        now_secs(),
+                        &uuid::Uuid::new_v4().simple().to_string()[..8]
+                    ));
                     if fs::rename(&path, &bak).is_err() {
                         read_failed = true;
                     }
@@ -145,10 +150,6 @@ impl MobileDevices {
         file.write_all(&json)?;
         file.sync_all()?;
         drop(file);
-        #[cfg(windows)]
-        {
-            let _ = fs::remove_file(&self.path);
-        }
         fs::rename(&tmp, &self.path)
     }
 
@@ -273,6 +274,9 @@ pub fn mobile_set_enabled(
     if !on {
         // Off ends pairing at once: the QR secret and every waiting request.
         pairing.clear_and_announce(&app);
+        // Drop every authenticated phone NOW. Needs only the `live` lock, so a Tailscale
+        // CLI call holding the `tailnet` lock inside reconcile cannot delay it.
+        bridge.disconnect_all_devices();
     }
     bridge.reconcile();
     Ok(())

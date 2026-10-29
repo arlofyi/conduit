@@ -262,7 +262,8 @@ fn run_cli_at(cli: &Path, args: &[&str]) -> Result<String, String> {
             Ok(None) if start.elapsed() >= CLI_DEADLINE => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
+                // Detach, never join: a grandchild holding the pipe would block forever.
+                drop(reader);
                 return Err("tailscale timed out".into());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
