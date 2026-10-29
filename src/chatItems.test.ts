@@ -120,7 +120,9 @@ describe("chatItems", () => {
     const c = (kind: string): Call => ({ event: ev(kind, "x"), status: "ok", errorText: null, diff: null });
     expect(groupLabel([c("bash"), c("bash"), c("read")])).toBe("Ran 2 shell commands, read 1 file");
     expect(groupLabel([c("search")])).toBe("Searched 1 time");
-    expect(groupLabel([c("generic"), c("subagent"), c("web")])).toBe("Called 2 tools, browsed 1 page");
+    expect(groupLabel([c("generic"), c("generic"), c("web")])).toBe("Called 2 tools, browsed 1 page");
+    expect(groupLabel([c("subagent"), c("subagent"), c("read")])).toBe("Ran 2 subagents, read 1 file");
+    expect(groupLabel([c("subagent")])).toBe("Ran 1 subagent");
   });
 
   it("taskLine maps statuses", () => {

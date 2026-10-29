@@ -115,7 +115,9 @@ export function groupLabel(calls: Call[]): string {
           ? ["search", "searched %d time"]
           : k === "web"
             ? ["web", "browsed %d page"]
-            : ["other", "called %d tool"];
+            : k === "subagent"
+              ? ["subagent", "ran %d subagent"]
+              : ["other", "called %d tool"];
   for (const c of calls) {
     const sp = spec(c.event.event);
     if (!counts.has(sp[0])) buckets.push(sp);

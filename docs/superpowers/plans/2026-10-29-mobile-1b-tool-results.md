@@ -14,7 +14,7 @@
 
 - One classifier: only `transcript.rs` / `transcript_user.rs` read raw transcript lines; renderers pair and fold typed items only.
 - Desktop and phone fold with the SAME rule: a call is **quiet** when it has a result, `isError` is false, and it has no `diff`. A run of ≥ 2 consecutive quiet calls folds into one summary row; everything else (no result yet, failed, edit with diff, a lone quiet call) renders on its own line.
-- Summary label: buckets in descending count, joined with `, `, first letter capitalised: Bash → `ran N shell command(s)`, Read → `read N file(s)`, Grep/Glob (event `search`) → `searched N time(s)`, web → `browsed N page(s)`, everything else → `called N tool(s)`. Singular when N = 1 (`ran 1 shell command`).
+- Summary label: buckets in descending count, joined with `, `, first letter capitalised: Bash → `ran N shell command(s)`, Read → `read N file(s)`, Grep/Glob (event `search`) → `searched N time(s)`, web → `browsed N page(s)`, subagent → `ran N subagent(s)`, everything else → `called N tool(s)`. Singular when N = 1 (`ran 1 shell command`).
 - Status glyphs: no result → `◐` (running), ok → `●`, error → `✕`; colours ink-3 / green / red tokens.
 - Diff cap: 16 rendered lines, then `… N more lines`; new file shows `created · +N lines` with no body.
 - `errorText` is the first non-empty line of the result content, cut to 200 chars.
