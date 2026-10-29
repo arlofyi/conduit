@@ -1,19 +1,20 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  FlatList,
   Image,
   KeyboardAvoidingView,
   Platform,
   Pressable,
-  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Markdown from "react-native-markdown-display";
 import { useLive } from "../bridge/LiveProvider";
-import { NeedsPill, ThemeButton } from "../components/atoms";
 import type {
   ApprovalItem,
   BubbleItem,
@@ -25,7 +26,10 @@ import type {
   QuestionItem,
   TodosItem,
 } from "../data/types";
+import { tint } from "../logic/accent";
+import { chatHeader } from "../logic/chatHeader";
 import { outputPreview, splitRecommended } from "../logic/chatView";
+import { holdPosition, isPinned, newItemCount, shouldFollow } from "../logic/follow";
 import { imageDataUri } from "../logic/image";
 import type { WireDiff } from "../bridge/protocol";
 import { groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
@@ -38,88 +42,166 @@ const STATUS_GLYPH: Record<Call["status"], string> = { running: "◐", ok: "●"
 const DIFF_CAP = 16;
 
 export function ChatScreen({ route, navigation }: ChatProps) {
-  const { sessionId, name, branch } = route.params;
+  const { sessionId, projectId, name } = route.params;
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
-  const { sessionLive, attach, detach, prompt } = useLive();
+  const { sessionLive, context, view, attach, detach, prompt, interrupt } = useLive();
   const [draft, setDraft] = useState("");
-  const scroller = useRef<ScrollView>(null);
+  const list = useRef<FlatList<FeedRow>>(null);
 
-  // Attach to this session's live stream (transcript history + tail + status)
-  // while the screen is mounted; detach on leave.
+  // Attach to this session's live stream (transcript history + tail + status) while the screen
+  // is mounted. Attaching also clears its unread count. Detach names the session, so a chat
+  // replaced by another (banner tap) cannot detach its successor.
   useEffect(() => {
     attach(sessionId);
-    return () => detach();
+    return () => detach(sessionId);
   }, [sessionId, attach, detach]);
+
+  const header = chatHeader({
+    view,
+    sessionId,
+    projectId,
+    fallbackName: name,
+    live: { status: sessionLive.status, at: sessionLive.statusAt },
+    context,
+  });
 
   const feed = sessionLive.feed;
   const rows = useMemo(() => groupFeed(feed), [feed]);
-  const showNeeds = sessionLive.status === "needsInput";
+  // Inverted list: newest first, so offset 0 is the bottom of the conversation.
+  const data = useMemo(() => [...rows].reverse(), [rows]);
 
-  const scrollToEnd = () => requestAnimationFrame(() => scroller.current?.scrollToEnd({ animated: true }));
+  // Follow rule (logic/follow.ts): only a reader at the bottom follows new rows.
+  const pinnedRef = useRef(true);
+  const [pinned, setPinned] = useState(true);
+  const sentRef = useRef(false);
+  const prevLen = useRef(0);
+  const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const pin = isPinned(e.nativeEvent.contentOffset.y);
+    if (pin !== pinnedRef.current) {
+      pinnedRef.current = pin;
+      setPinned(pin);
+    }
+  }, []);
+  useEffect(() => {
+    const added = newItemCount(prevLen.current, rows.length);
+    prevLen.current = rows.length;
+    if (shouldFollow(pinnedRef.current, added, sentRef.current)) {
+      list.current?.scrollToOffset({ offset: 0, animated: true });
+    }
+    if (added > 0) sentRef.current = false;
+  }, [rows.length]);
 
   const send = () => {
     if (!draft.trim()) return;
-    prompt(sessionId, draft); // optimistic echo + write to the live PTY
+    prompt(sessionId, draft); // input: text + "\r" into the live PTY; the echo comes back as a chat frame
     setDraft("");
-    scrollToEnd();
+    sentRef.current = true;
+    pinnedRef.current = true;
+    setPinned(true);
+    list.current?.scrollToOffset({ offset: 0, animated: true });
   };
 
-  const decide = (_id: string, _decision: "allow" | "deny") => {
+  const decide = useCallback((_id: string, _decision: "allow" | "deny") => {
     // approvals arrive via the broker (a later phase); no-op in the read channel
-  };
+  }, []);
+
+  const renderItem = useCallback(
+    ({ item }: { item: FeedRow }) => <FeedRowView row={item} onDecide={decide} />,
+    [decide],
+  );
+
+  const stateColor = header.state === "needs" ? p.amber : header.state === "running" ? p.green : p.textMid;
 
   return (
     <KeyboardAvoidingView
       style={{ flex: 1, backgroundColor: p.panelBg }}
       behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
-      {/* header */}
+      {/* header: back, avatar, "Project · title", state sub-line, Stop */}
       <View
         style={{
           paddingTop: insets.top + 6,
-          paddingHorizontal: 8,
-          paddingBottom: 10,
+          paddingLeft: 4,
+          paddingRight: 12,
+          paddingBottom: 9,
           backgroundColor: p.sidebarBg,
           borderBottomWidth: StyleSheet.hairlineWidth,
           borderBottomColor: p.border,
           flexDirection: "row",
           alignItems: "center",
-          gap: 4,
+          gap: 8,
         }}
       >
         <Pressable
           onPress={() => navigation.goBack()}
           hitSlop={8}
-          style={{ width: 40, height: MIN_TOUCH, alignItems: "center", justifyContent: "center" }}
+          accessibilityRole="button"
+          accessibilityLabel="Back to chats"
+          style={{ width: 36, height: MIN_TOUCH, alignItems: "center", justifyContent: "center" }}
         >
           <Text style={{ color: p.accent, fontSize: 30, lineHeight: 30 }}>‹</Text>
         </Pressable>
-        <Text style={{ fontWeight: "600", fontSize: TYPE.headline, color: p.textBright }}>{name}</Text>
-        <Text style={{ fontSize: TYPE.footnote, color: p.textMid, fontFamily: MONO }}>{branch ?? ""}</Text>
-        <View style={{ flex: 1 }} />
-        {showNeeds ? (
-          <NeedsPill />
-        ) : sessionLive.status === "running" && sessionLive.activity ? (
-          <Text style={{ fontSize: TYPE.caption, color: p.textMid, maxWidth: 130 }} numberOfLines={1}>
-            {sessionLive.activity}
+        <View
+          style={{
+            width: 36,
+            height: 36,
+            borderRadius: 18,
+            backgroundColor: (header.color && tint(header.color, 0.18)) ?? p.selectionBg,
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Text style={{ color: header.color ?? p.textMid, fontWeight: "700", fontSize: TYPE.caption }}>
+            {header.initials}
           </Text>
-        ) : null}
-        <ThemeButton />
+        </View>
+        <View style={{ flex: 1, minWidth: 0 }} accessible accessibilityLabel={`${header.title}, ${header.subline}`}>
+          <Text style={{ fontWeight: "600", fontSize: TYPE.callout, color: p.textBright }} numberOfLines={1}>
+            {header.title}
+          </Text>
+          <Text style={{ fontSize: TYPE.caption, color: stateColor, marginTop: 1 }} numberOfLines={1}>
+            {header.subline}
+          </Text>
+        </View>
+        {header.canStop && (
+          <Pressable
+            onPress={() => interrupt(sessionId)}
+            hitSlop={{ top: 10, bottom: 10, left: 6, right: 6 }}
+            accessibilityRole="button"
+            accessibilityLabel="Stop the current turn"
+            style={({ pressed }) => ({
+              borderWidth: StyleSheet.hairlineWidth,
+              borderColor: p.red,
+              borderRadius: 12,
+              paddingHorizontal: 11,
+              paddingVertical: 5,
+              backgroundColor: pressed ? p.selectionBg : "transparent",
+            })}
+          >
+            <Text style={{ color: p.red, fontSize: TYPE.caption, fontWeight: "600" }}>Stop</Text>
+          </Pressable>
+        )}
       </View>
 
-      {/* feed */}
-      <ScrollView
-        ref={scroller}
+      {/* feed: inverted and virtualized; holds the reader's place unless they are at the bottom */}
+      <FlatList
+        ref={list}
+        inverted
+        data={data}
+        keyExtractor={rowKey}
+        renderItem={renderItem}
         style={{ flex: 1 }}
-        contentContainerStyle={{ padding: 12, gap: 9 }}
+        contentContainerStyle={{ padding: 12 }}
+        ItemSeparatorComponent={Gap}
         keyboardShouldPersistTaps="handled"
-        onContentSizeChange={scrollToEnd}
-      >
-        {rows.map((row) => (
-          <FeedRowView key={rowKey(row)} row={row} onDecide={decide} />
-        ))}
-      </ScrollView>
+        keyboardDismissMode="interactive"
+        onScroll={onScroll}
+        scrollEventThrottle={32}
+        maintainVisibleContentPosition={holdPosition(pinned)}
+        initialNumToRender={20}
+        windowSize={11}
+      />
 
       {/* composer */}
       <View
@@ -138,10 +220,9 @@ export function ChatScreen({ route, navigation }: ChatProps) {
         <TextInput
           value={draft}
           onChangeText={setDraft}
-          placeholder={`Reply to ${name}…`}
+          placeholder={`Message ${header.name}…`}
           placeholderTextColor={p.textDim}
-          onSubmitEditing={send}
-          returnKeyType="send"
+          accessibilityLabel={`Message ${header.name}`}
           multiline
           style={{
             flex: 1,
@@ -159,11 +240,15 @@ export function ChatScreen({ route, navigation }: ChatProps) {
         />
         <Pressable
           onPress={send}
+          disabled={!draft.trim()}
+          accessibilityRole="button"
+          accessibilityLabel="Send"
           style={{
             width: MIN_TOUCH,
             height: MIN_TOUCH,
             borderRadius: MIN_TOUCH / 2,
             backgroundColor: p.accent,
+            opacity: draft.trim() ? 1 : 0.45,
             alignItems: "center",
             justifyContent: "center",
           }}
@@ -173,6 +258,10 @@ export function ChatScreen({ route, navigation }: ChatProps) {
       </View>
     </KeyboardAvoidingView>
   );
+}
+
+function Gap() {
+  return <View style={{ height: 9 }} />;
 }
 
 function rowKey(row: FeedRow): string {

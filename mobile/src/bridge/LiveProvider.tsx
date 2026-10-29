@@ -8,16 +8,19 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Platform } from "react-native";
+import { AppState, Platform } from "react-native";
+import { usePrefs } from "../data/PrefsProvider";
 import { macStore } from "../data/secureBackend";
 import type { ChatItem, ProjectsView, SavedMac, SessionStatus, TodoProgress } from "../data/types";
+import { bannerFromStatus, bannersFromView, type Banner, type Signals } from "../logic/banner";
+import type { ContextInfo } from "../logic/chatHeader";
 import { chatUnread, nextUnread } from "../logic/chatList";
 import { connErrorText } from "../logic/connCopy";
 import { loopbackMac, type PairEndpoint } from "../logic/macs";
 import { addressesFor, confirmCode, makeNonce, type QrPayload } from "../logic/pairing";
 import { BridgeClient } from "./BridgeClient";
 import { initialConn, type ConnError, type ConnState } from "./connection";
-import { appendWire, mapHistory, mapProjectsView, statusPatch, type LivePatch } from "./live";
+import { appendWire, mapHistory, mapProjectsView, sameView, statusPatch, type LivePatch } from "./live";
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
 import { discoverMsg, pairMsg, type WireMac } from "./protocol";
 
@@ -70,12 +73,16 @@ export interface HelloInfo {
 export interface SessionLive {
   feed: ChatItem[];
   status: SessionStatus;
+  /** when `status` last came from a hook (or the phone's own Stop); 0 = none since attach */
+  statusAt: number;
   activity?: string;
   compacting?: boolean;
   todos?: TodoProgress;
 }
 
-const EMPTY_LIVE: SessionLive = { feed: [], status: "idle" };
+const EMPTY_LIVE: SessionLive = { feed: [], status: "idle", statusAt: 0 };
+
+let localSeq = 0;
 
 export interface LiveValue {
   /** false until the Keychain Mac list has been read; render nothing route-deciding before */
@@ -117,10 +124,19 @@ export interface LiveValue {
   lastSeen: number | null;
   /** live data for the currently-attached session */
   sessionLive: SessionLive;
+  /** the attached session's context-window use (Claude only; null until the Mac sends one) */
+  context: ContextInfo | null;
   attach: (sessionId: string) => void;
-  detach: () => void;
-  /** send a prompt to a session */
+  /** stop streaming into the chat; with an id, only if that session is still the attached one
+   * (a chat replaced by another must not detach its successor) */
+  detach: (sessionId?: string) => void;
+  /** send a prompt to a session (text + Enter) */
   prompt: (sessionId: string, text: string) => void;
+  /** Stop the session's current turn (Esc on the Mac) and mark it in the open feed */
+  interrupt: (sessionId: string) => void;
+  /** the in-app banner on screen, if any */
+  banner: Banner | null;
+  dismissBanner: () => void;
 }
 
 const Ctx = createContext<LiveValue | null>(null);
@@ -129,6 +145,7 @@ function applyPatch(prev: SessionLive, patch: LivePatch): SessionLive {
   return {
     feed: prev.feed,
     status: patch.status ?? prev.status,
+    statusAt: patch.status ? Date.now() : prev.statusAt,
     activity: patch.clearActivity ? undefined : patch.activity ?? prev.activity,
     compacting: patch.compacting ?? prev.compacting,
     todos: patch.todos ?? prev.todos,
@@ -156,6 +173,16 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
    * would re-render every consumer on each streamed chunk) */
   const lastFrameAt = useRef<number | null>(null);
   const [sessionLive, setSessionLive] = useState<SessionLive>(EMPTY_LIVE);
+  const [context, setContext] = useState<ContextInfo | null>(null);
+  const [banner, setBanner] = useState<Banner | null>(null);
+  /** each session's last known needs/status, shared by the view and status-frame banner paths */
+  const signalsRef = useRef<Signals>({});
+  /** read inside socket callbacks, which are created once per Mac */
+  const { prefs } = usePrefs();
+  const prefsRef = useRef(prefs);
+  prefsRef.current = prefs;
+  /** false while the app is in the background: the list poll pauses */
+  const [foreground, setForeground] = useState(AppState.currentState === "active");
   const clientRef = useRef<BridgeClient | null>(null);
   const attachedRef = useRef<string | null>(null);
   const pairClientRef = useRef<BridgeClient | null>(null);
@@ -211,6 +238,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     setUnread({});
     setLastSeen(null);
     viewRef.current = null;
+    signalsRef.current = {};
+    setBanner(null);
+    setContext(null);
     streamingRef.current = null;
     lastFrameAt.current = null;
     setDiscovered(null);
@@ -255,14 +285,23 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               setDiscovered(m.macs);
               break;
             case "projects": {
-              const next = mapProjectsView(m);
               const prev = viewRef.current;
+              const mapped = mapProjectsView(m);
+              // a poll that brought nothing new keeps the old reference: nothing re-renders
+              const next = sameView(prev, mapped) && prev ? prev : mapped;
               viewRef.current = next;
-              setUnread((u) => nextUnread(u, prev, next, attachedRef.current));
+              const open = attachedRef.current;
+              setUnread((u) => nextUnread(u, prev, next, open));
+              const b = bannersFromView(signalsRef.current, next, open, prefsRef.current);
+              signalsRef.current = b.signals;
+              if (b.banners.length > 0) setBanner(b.banners[0]);
               setView(next);
               setViewAt(Date.now());
               break;
             }
+            case "context":
+              if (m.sessionId === attachedRef.current) setContext({ fraction: m.fraction, model: m.model });
+              break;
             case "history":
               setSessionLive((prev) => ({ ...prev, feed: mapHistory(m.items) }));
               break;
@@ -273,9 +312,25 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               if (attachedRef.current) setSessionLive((prev) => ({ ...prev, feed: appendWire(prev.feed, m.item) }));
               break;
             }
-            case "status":
-              setSessionLive((prev) => applyPatch(prev, statusPatch(m.event, m.body as never)));
+            case "status": {
+              // status frames carry no session id either: they are the streamed session's
+              const patch = statusPatch(m.event, m.body as never);
+              const streaming = streamingRef.current;
+              if (attachedRef.current) setSessionLive((prev) => applyPatch(prev, patch));
+              if (patch.status && streaming) {
+                const r = bannerFromStatus(
+                  signalsRef.current,
+                  viewRef.current,
+                  streaming,
+                  patch.status,
+                  attachedRef.current,
+                  prefsRef.current,
+                );
+                signalsRef.current = r.signals;
+                if (r.banner) setBanner(r.banner);
+              }
               break;
+            }
             // size / output / error are not used by the chat UI
           }
         },
@@ -444,13 +499,26 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     [refreshMacs],
   );
 
-  // Keep the list fresh while connected: the Mac only sends a view when asked.
+  // Track foreground/background: a backgrounded app polls nothing.
+  useEffect(() => {
+    let was = AppState.currentState === "active";
+    const sub = AppState.addEventListener("change", (s) => {
+      const active = s === "active";
+      // back in front: ask at once rather than wait out the interval
+      if (active && !was) clientRef.current?.list();
+      was = active;
+      setForeground(active);
+    });
+    return () => sub.remove();
+  }, []);
+
+  // Keep the list fresh while connected and in front: the Mac only sends a view when asked.
   const ready = conn.phase === "ready";
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || !foreground) return;
     const t = setInterval(() => clientRef.current?.list(), LIST_POLL_MS);
     return () => clearInterval(t);
-  }, [ready, macKey]);
+  }, [ready, foreground, macKey]);
 
   const refreshProjects = useCallback(() => {
     clientRef.current?.list();
@@ -460,18 +528,39 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     attachedRef.current = sessionId;
     streamingRef.current = sessionId;
     setSessionLive(EMPTY_LIVE);
-    // opening a chat reads it
+    setContext(null);
+    // opening a chat reads it, and answers its banner
     setUnread((u) => {
       if (!(sessionId in u)) return u;
       const { [sessionId]: _read, ...rest } = u;
       return rest;
     });
+    setBanner((b) => (b?.sessionId === sessionId ? null : b));
     clientRef.current?.attach(sessionId);
   }, []);
 
-  const detach = useCallback(() => {
-    attachedRef.current = null;
+  const detach = useCallback((sessionId?: string) => {
+    if (sessionId === undefined || attachedRef.current === sessionId) attachedRef.current = null;
   }, []);
+
+  const interrupt = useCallback((sessionId: string) => {
+    clientRef.current?.interrupt(sessionId);
+    // Esc ends the turn without a Stop hook, so the phone records the idle state itself: the
+    // header drops Stop, and a later poll does not read the end of this turn as "finished".
+    const prev = signalsRef.current[sessionId];
+    if (prev) signalsRef.current = { ...signalsRef.current, [sessionId]: { needs: null, status: "idle" } };
+    if (attachedRef.current !== sessionId) return;
+    localSeq += 1;
+    setSessionLive((s) => ({
+      ...s,
+      status: "idle",
+      statusAt: Date.now(),
+      activity: undefined,
+      feed: [...s.feed, { kind: "divider", id: `local-interrupt-${localSeq}`, label: "■ Interrupted by you", tone: "warning" }],
+    }));
+  }, []);
+
+  const dismissBanner = useCallback(() => setBanner(null), []);
 
   const prompt = useCallback((sessionId: string, text: string) => {
     const trimmed = text.trim();
@@ -509,9 +598,13 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       unread,
       lastSeen,
       sessionLive,
+      context,
       attach,
       detach,
       prompt,
+      interrupt,
+      banner,
+      dismissBanner,
     }),
     [
       loaded,
@@ -537,9 +630,13 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       unread,
       lastSeen,
       sessionLive,
+      context,
       attach,
       detach,
       prompt,
+      interrupt,
+      banner,
+      dismissBanner,
     ],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

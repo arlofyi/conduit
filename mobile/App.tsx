@@ -3,6 +3,8 @@ import {
   DarkTheme,
   DefaultTheme,
   NavigationContainer,
+  StackActions,
+  createNavigationContainerRef,
   type Theme,
 } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
@@ -12,6 +14,8 @@ import { View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { LiveProvider, useLive } from "./src/bridge/LiveProvider";
+import { Banner } from "./src/components/Banner";
+import type { Banner as BannerData } from "./src/logic/banner";
 import { PrefsProvider, usePrefs } from "./src/data/PrefsProvider";
 import type { RootStackParamList, TabParamList } from "./src/navigation";
 import { ChatScreen } from "./src/screens/ChatScreen";
@@ -24,6 +28,16 @@ import { TYPE } from "./src/theme/type";
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 const Tab = createBottomTabNavigator<TabParamList>();
+const navigationRef = createNavigationContainerRef<RootStackParamList>();
+
+/** A banner tap opens its chat. Over another chat it REPLACES it (one chat streams at a time,
+ * and a stack of chats would leave the one below detached); elsewhere it pushes as usual. */
+function openFromBanner(b: BannerData) {
+  if (!navigationRef.isReady()) return;
+  const params = { sessionId: b.sessionId, projectId: b.projectId, name: b.name, branch: b.branch };
+  if (navigationRef.getCurrentRoute()?.name === "Chat") navigationRef.dispatch(StackActions.replace("Chat", params));
+  else navigationRef.navigate("Chat", params);
+}
 
 function Tabs() {
   const { palette } = useTheme();
@@ -68,7 +82,7 @@ function Inner() {
   if (!loaded || !prefsLoaded) return <View style={{ flex: 1, backgroundColor: palette.panelBg }} />;
 
   return (
-    <NavigationContainer theme={navTheme}>
+    <NavigationContainer ref={navigationRef} theme={navTheme}>
       <StatusBar style={palette.appearance === "dark" ? "light" : "dark"} />
       <Stack.Navigator
         screenOptions={{
@@ -94,6 +108,7 @@ function Inner() {
           </Stack.Group>
         )}
       </Stack.Navigator>
+      {currentMac && <Banner onOpen={openFromBanner} />}
     </NavigationContainer>
   );
 }
