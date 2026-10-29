@@ -295,6 +295,80 @@ fn ping_due(last_ping: Instant, now: Instant) -> bool {
     now.saturating_duration_since(last_ping) >= PING_EVERY
 }
 
+/// Does a failed `send` end the connection? An I/O error does -- above all the
+/// `TimedOut`/`WouldBlock` that [`WRITE_STALL`] produces: on Windows a timed-out send leaves
+/// the socket in an indeterminate state, and tungstenite would retry the half-written frame
+/// on the next send, corrupting the stream. A closed socket does too. Only a refusal of THIS
+/// frame (too large, buffer full) leaves the socket usable.
+fn send_failure_is_fatal(e: &tungstenite::Error) -> bool {
+    matches!(
+        e,
+        tungstenite::Error::Io(_)
+            | tungstenite::Error::ConnectionClosed
+            | tungstenite::Error::AlreadyClosed
+    )
+}
+
+/// Send one text frame. `false` = the connection is finished (see [`send_failure_is_fatal`]);
+/// the caller breaks its loop rather than writing to it again.
+fn send_text(ws: &mut WebSocket<TcpStream>, text: String) -> bool {
+    match ws.send(Message::Text(text)) {
+        Ok(()) => true,
+        Err(e) => !send_failure_is_fatal(&e),
+    }
+}
+
+/// Is raw PTY `output` streamed to this socket? Only to loopback (the matrix sidecar and the
+/// Simulator's terminal view). The phone app renders the transcript, never raw output, and
+/// a TUI spinner repaints at ~19 KB/s -- ~70 MB per working hour of cellular data for
+/// nothing, and the bulk that filled a frozen phone's window.
+fn streams_raw_output(remote_device: bool) -> bool {
+    !remote_device
+}
+
+/// How long a phone-spawned Claude session may go without its `sessionstart` hook before the
+/// phone is told it is waiting on the Mac. Claude asks "do you trust this folder?" before it
+/// runs any hook, and the phone cannot answer that prompt.
+const TRUST_STALL: Duration = Duration::from_secs(20);
+
+/// The phone-spawned Claude sessions this socket is waiting to hear `sessionstart` from.
+#[derive(Default)]
+struct SpawnWatch {
+    waiting: Vec<(String, Instant)>,
+}
+
+impl SpawnWatch {
+    fn watch(&mut self, session_id: String, at: Instant) {
+        self.waiting.push((session_id, at));
+    }
+
+    /// The session's `sessionstart` arrived: it is running, nothing to say.
+    fn started(&mut self, session_id: &str) {
+        self.waiting.retain(|(s, _)| s != session_id);
+    }
+
+    /// Sessions silent for [`TRUST_STALL`]. Each is returned once, then forgotten.
+    fn stalled(&mut self, now: Instant) -> Vec<String> {
+        let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .partition(|(_, at)| now.saturating_duration_since(*at) >= TRUST_STALL);
+        self.waiting = keep;
+        due.into_iter().map(|(s, _)| s).collect()
+    }
+}
+
+/// What the phone is told about a spawned session stuck before its first hook.
+fn trust_stall_frame(session_id: &str) -> serde_json::Value {
+    json!({
+        "type": "error",
+        "sessionId": session_id,
+        "message": TRUST_STALL_MESSAGE,
+    })
+}
+
+const TRUST_STALL_MESSAGE: &str =
+    "Claude is waiting on your Mac \u{2014} open this folder there once to trust it";
+
 /// May a phone's `answer` resolve this ask? Only a still-pending ask (None = someone else
 /// already answered), never a private session's, and only a valid set of answers.
 fn phone_may_answer(
@@ -1362,8 +1436,10 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut next_private_check = Instant::now() + PRIVATE_RECHECK_EVERY;
     // When this (remote, authenticated) socket last sent a keepalive ping.
     let mut last_ping = Instant::now();
+    // Claude sessions this socket spawned that have not sent `sessionstart` yet.
+    let mut spawn_watch = SpawnWatch::default();
 
-    loop {
+    'conn: loop {
         // 0. Gates: an unauthenticated peer gets AUTH_DEADLINE; a revoked device is
         //    closed on the next tick rather than at its next reconnect.
         if !authed && Instant::now() >= deadline {
@@ -1491,7 +1567,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         tail_conversation = None;
                     }
                     let refusal = crate::bridge_view::private_session_error(&private_sid);
-                    let _ = ws.send(Message::Text(refusal.to_string()));
+                    if !send_text(&mut ws, refusal.to_string()) {
+                        break 'conn;
+                    }
                     msg = None;
                 }
                 match msg {
@@ -1525,7 +1603,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             },
                         );
                         ctrl.last_messages.sweep();
-                        let _ = ws.send(Message::Text(view.to_string()));
+                        if !send_text(&mut ws, view.to_string()) {
+                            break 'conn;
+                        }
                     }
                     Some(ClientMsg::Attach { session_id }) => {
                         // Auto-wake: an idle session has no live PTY (Conduit spawns it
@@ -1548,10 +1628,13 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             // current size so it renders at the desktop's dimensions rather
                             // than resizing the shared TTY out from under the desktop.
                             if let Some((cols, rows)) = pty.session_size(&session_id) {
-                                let _ = ws.send(Message::Text(
+                                if !send_text(
+                                    &mut ws,
                                     json!({ "type": "size", "cols": cols, "rows": rows })
                                         .to_string(),
-                                ));
+                                ) {
+                                    break 'conn;
+                                }
                             }
                             // Transcript backfill (chat history) + start tailing for appends.
                             // Keyed by the session's CURRENT conversation, which a `/clear`
@@ -1568,7 +1651,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             // transcript up as soon as it appears.
                             let lines = found.as_deref().map(read_lines).unwrap_or_default();
                             let history = history_payload(&session_id, &lines);
-                            let _ = ws.send(Message::Text(history.to_string()));
+                            if !send_text(&mut ws, history.to_string()) {
+                                break 'conn;
+                            }
                             if let Some(path) = found {
                                 transcript = Some((path.clone(), lines.len()));
                                 if attached_claude {
@@ -1596,10 +1681,13 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             }
                             tail_conversation = None;
                             attached_claude = false;
-                            let _ = ws.send(Message::Text(
+                            if !send_text(
+                                &mut ws,
                                 json!({ "type": "error", "message": "no such session" })
                                     .to_string(),
-                            ));
+                            ) {
+                                break 'conn;
+                            }
                         }
                     }
                     Some(ClientMsg::Input { session_id, data }) => {
@@ -1618,13 +1706,18 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         path,
                     }) => {
                         let reply = git_reply(&app, &session_id, &action, path.as_deref());
-                        let _ = ws.send(Message::Text(reply.to_string()));
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
                     }
                     Some(ClientMsg::Kill { session_id }) => {
                         pty.kill(&session_id);
-                        let _ = ws.send(Message::Text(
+                        if !send_text(
+                            &mut ws,
                             json!({ "type": "killed", "sessionId": session_id }).to_string(),
-                        ));
+                        ) {
+                            break 'conn;
+                        }
                     }
                     Some(ClientMsg::Spawn {
                         project_id,
@@ -1641,7 +1734,17 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         } else {
                             spawn_budget_error()
                         };
-                        let _ = ws.send(Message::Text(reply.to_string()));
+                        // Only Claude has a folder-trust prompt that stalls before any hook.
+                        if reply["type"] == "spawned"
+                            && spawn_agent(agent.as_deref()) == Some(crate::agent::AgentId::Claude)
+                        {
+                            if let Some(sid) = reply["sessionId"].as_str() {
+                                spawn_watch.watch(sid.to_string(), Instant::now());
+                            }
+                        }
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
                     }
                     Some(ClientMsg::Interrupt { session_id }) => {
                         // Esc is Claude's interrupt key (spec §6 "Stop").
@@ -1667,7 +1770,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                                 &nonce,
                             );
                         } else {
-                            let _ = ws.send(Message::Text(unauthorized().to_string()));
+                            if !send_text(&mut ws, unauthorized().to_string()) {
+                                break 'conn;
+                            }
                         }
                     }
                     // Probe the tailnet off this thread; the reply arrives via `macs_rx`. Only
@@ -1711,7 +1816,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                                 },
                             );
                         let reply = crate::bridge_view::answer_result_frame(&ask_id, ok);
-                        let _ = ws.send(Message::Text(reply.to_string()));
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
                     }
                     // Same rule for a permission: `resolve` is the check-and-set. A private
                     // session's is refused like every private request, tagged with its
@@ -1739,7 +1846,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             }
                         };
                         for frame in frames {
-                            let _ = ws.send(Message::Text(frame.to_string()));
+                            if !send_text(&mut ws, frame.to_string()) {
+                                break 'conn;
+                            }
                         }
                     }
                     // Already authenticated (or loopback): a repeat `auth` changes nothing.
@@ -1804,10 +1913,13 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             }
         }
 
-        // 2. Flush any buffered PTY output for the attached session.
+        // 2. Flush any buffered PTY output for the attached session -- to loopback only; a
+        //    remote phone's subscription is drained and dropped (see `streams_raw_output`).
+        let raw_output = streams_raw_output(device.is_some());
         if let Some((_, _, rx)) = attached.as_ref() {
             for _ in 0..DRAIN_PER_TICK {
                 match rx.try_recv() {
+                    Ok(_) if !raw_output => {}
                     Ok(frame) => {
                         if ws
                             .send(Message::Text(
@@ -1839,7 +1951,13 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
         };
         if let Some((sid, _, _)) = attached.as_ref() {
             for _ in 0..DRAIN_PER_TICK {
-                match bus_rx.try_recv() {
+                let next = bus_rx.try_recv();
+                if let Ok(ev) = next.as_ref() {
+                    if ev.event == "sessionstart" {
+                        spawn_watch.started(&ev.session);
+                    }
+                }
+                match next {
                     Ok(ev) if &ev.session == sid => {
                         if ws
                             .send(Message::Text(
@@ -1858,7 +1976,19 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             }
         } else {
             // Not attached: drain-and-discard so the bus buffer can't back up.
-            while bus_rx.try_recv().is_ok() {}
+            while let Ok(ev) = bus_rx.try_recv() {
+                if ev.event == "sessionstart" {
+                    spawn_watch.started(&ev.session);
+                }
+            }
+        }
+
+        // 3b. A Claude session this phone spawned that has not started: it is on the Mac's
+        //     "trust this folder?" prompt, which the phone cannot answer. Say so, once.
+        for sid in spawn_watch.stalled(Instant::now()) {
+            if !send_text(&mut ws, trust_stall_frame(&sid).to_string()) {
+                break 'conn;
+            }
         }
 
         // 5. Context meter for the attached session: on attach, then every CONTEXT_EVERY.
@@ -1867,7 +1997,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                 next_context = Instant::now() + CONTEXT_EVERY;
                 if let Some(u) = crate::context_window::for_transcript(path) {
                     let frame = crate::bridge_view::context_frame(sid, &u);
-                    let _ = ws.send(Message::Text(frame.to_string()));
+                    if !send_text(&mut ws, frame.to_string()) {
+                        break 'conn;
+                    }
                 }
             }
         }
@@ -1894,13 +2026,17 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         // goes out first, or it is lost with the switch.
                         if let Some((old, cursor)) = transcript.as_mut() {
                             for frame in crate::bridge_view::tail_frames(old, cursor, sid) {
-                                let _ = ws.send(Message::Text(frame.to_string()));
+                                if !send_text(&mut ws, frame.to_string()) {
+                                    break 'conn;
+                                }
                             }
                         }
                         if let Some(path) = resolved.clone() {
                             let lines = read_lines(&path);
                             let history = history_payload(sid, &lines);
-                            let _ = ws.send(Message::Text(history.to_string()));
+                            if !send_text(&mut ws, history.to_string()) {
+                                break 'conn;
+                            }
                             transcript = Some((path.clone(), lines.len()));
                             context_path = Some(path);
                             next_context = Instant::now();
@@ -1918,7 +2054,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
         if let (Some((path, cursor)), Some((sid, _, _))) = (transcript.as_mut(), attached.as_ref())
         {
             for frame in crate::bridge_view::tail_frames(path, cursor, sid) {
-                let _ = ws.send(Message::Text(frame.to_string()));
+                if !send_text(&mut ws, frame.to_string()) {
+                    break 'conn;
+                }
             }
         }
     }
@@ -2965,6 +3103,57 @@ mod tests {
             failed.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
         ));
+    }
+
+    #[test]
+    fn a_timed_out_send_ends_the_connection() {
+        use std::io::{Error as IoError, ErrorKind};
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::BrokenPipe,
+        ] {
+            assert!(
+                send_failure_is_fatal(&tungstenite::Error::Io(IoError::from(kind))),
+                "{kind:?} must end the connection"
+            );
+        }
+        assert!(send_failure_is_fatal(&tungstenite::Error::ConnectionClosed));
+        assert!(send_failure_is_fatal(&tungstenite::Error::AlreadyClosed));
+        // Refusing one oversized frame leaves the socket itself usable.
+        assert!(!send_failure_is_fatal(&tungstenite::Error::Capacity(
+            tungstenite::error::CapacityError::MessageTooLong {
+                size: 2,
+                max_size: 1
+            }
+        )));
+    }
+
+    #[test]
+    fn raw_output_goes_to_loopback_only() {
+        assert!(streams_raw_output(false), "loopback: sidecar + Simulator");
+        assert!(!streams_raw_output(true), "a remote phone never renders it");
+    }
+
+    #[test]
+    fn a_spawn_that_never_starts_is_reported_once() {
+        let t0 = Instant::now();
+        let mut w = SpawnWatch::default();
+        w.watch("s1".into(), t0);
+        w.watch("s2".into(), t0);
+        assert!(w
+            .stalled(t0 + TRUST_STALL - Duration::from_millis(1))
+            .is_empty());
+        w.started("s2");
+        assert_eq!(w.stalled(t0 + TRUST_STALL), vec!["s1".to_string()]);
+        assert!(w.stalled(t0 + TRUST_STALL * 3).is_empty(), "said once");
+        let f = trust_stall_frame("s1");
+        assert_eq!(f["type"], "error");
+        assert_eq!(f["sessionId"], "s1");
+        assert_eq!(
+            f["message"],
+            "Claude is waiting on your Mac \u{2014} open this folder there once to trust it"
+        );
     }
 
     #[test]
