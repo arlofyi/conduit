@@ -8,9 +8,38 @@ import React, {
   useState,
 } from "react";
 import type { ChatItem, Project, SessionStatus, TodoProgress } from "../data/types";
-import { BridgeClient, type ConnState } from "./BridgeClient";
+import { BridgeClient } from "./BridgeClient";
+import type { ConnState as Conn } from "./connection";
 import { appendWire, mapHistory, mapProjects, statusPatch, type LivePatch } from "./live";
-import { DEFAULT_BRIDGE_URL } from "./protocol";
+import type { WireProject, WireProjectsView } from "./protocol";
+
+/**
+ * TEMPORARY (Task 4 replaces this): until the Connect/Pair screens and the Keychain Mac list
+ * exist, connect to the desktop on loopback with no saved Mac (the desktop trusts loopback).
+ * Task 4 must drive BridgeClient from the saved current Mac (addresses from addressesFor).
+ */
+const LOOPBACK_URL = "ws://127.0.0.1:8455";
+
+/** Coarse state the current screens render; Task 4 moves them to the full Conn phase. */
+type ConnState = "connecting" | "open" | "closed";
+const coarse = (c: Conn): ConnState =>
+  c.phase === "ready" ? "open" : c.phase === "failed" || c.phase === "idle" ? "closed" : "connecting";
+
+/** Adapt the typed projects view to the legacy shape live.ts maps (Task 5 removes this). */
+function legacyProjects(v: WireProjectsView): WireProject[] {
+  return v.projects.map((p) => ({
+    id: p.id,
+    name: p.name,
+    path: "",
+    sessions: p.sessions.map((s) => ({
+      id: s.id,
+      name: s.name,
+      branch: s.branch,
+      agent: s.agent as WireProject["sessions"][number]["agent"],
+      running: s.running,
+    })),
+  }));
+}
 
 export interface SessionLive {
   feed: ChatItem[];
@@ -51,7 +80,7 @@ function applyPatch(prev: SessionLive, patch: LivePatch): SessionLive {
 }
 
 export function LiveProvider({ children }: { children: React.ReactNode }) {
-  const [url, setUrl] = useState(DEFAULT_BRIDGE_URL);
+  const [url, setUrl] = useState(LOOPBACK_URL);
   const [token, setToken] = useState("");
   const [connState, setConnState] = useState<ConnState>("connecting");
   const [projects, setProjects] = useState<Project[]>([]);
@@ -60,10 +89,14 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const attachedRef = useRef<string | null>(null);
 
   useEffect(() => {
-    const client = new BridgeClient(url, {
-      onState: (s) => {
-        setConnState(s);
-        if (s === "open") {
+    let wasReady = false;
+    const client = new BridgeClient({ addresses: [url], mac: null }, {
+      onState: (c) => {
+        setConnState(coarse(c));
+        const ready = c.phase === "ready";
+        const justReady = ready && !wasReady;
+        wasReady = ready;
+        if (justReady) {
           client.list();
           // re-attach across reconnects (desktop is source of truth)
           if (attachedRef.current) {
@@ -75,7 +108,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       onMessage: (m) => {
         switch (m.type) {
           case "projects":
-            setProjects(mapProjects(m.projects));
+            setProjects(mapProjects(legacyProjects(m)));
             break;
           case "history":
             setSessionLive((prev) => ({ ...prev, feed: mapHistory(m.items) }));
@@ -89,7 +122,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           // size / output / error are not used by the chat UI
         }
       },
-    }, token || undefined);
+    });
     clientRef.current = client;
     return () => client.close();
   }, [url, token]);

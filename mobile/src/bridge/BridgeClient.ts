@@ -1,90 +1,131 @@
-import type { ClientMsg, ServerMsg } from "./protocol";
+import type { SavedMac } from "../data/types";
+import { initialConn, step, type ConnEvent, type ConnState, type Effect } from "./connection";
+import { attachMsg, inputMsg, interruptMsg, listMsg, type ClientMsg, type ServerMsg } from "./protocol";
 
-export type ConnState = "connecting" | "open" | "closed";
+export interface BridgeOptions {
+  /** ws:// URLs tried in order, advancing on every reconnect */
+  addresses: string[];
+  /** the saved Mac to authenticate as; null = loopback (no auth) or a pairing connection */
+  mac: SavedMac | null;
+  /** single-shot connection used to pair; the UI sends the `pair` frame once state is "pairing" */
+  pairing?: boolean;
+}
 
-interface Handlers {
+export interface BridgeHandlers {
   onMessage: (m: ServerMsg) => void;
   onState?: (s: ConnState) => void;
+  /** forgetMac / saveToken; reconnects are handled internally */
+  onEffect?: (e: Effect) => void;
 }
 
 /**
- * Thin typed WebSocket wrapper for the bridge, with auto-reconnect (exponential
- * backoff, capped). Uses React Native's global WebSocket. The desktop is the
- * source of truth, so on reconnect the caller re-issues `list`/`attach`.
+ * Owns the WebSocket and the reconnect timer; every decision is made by the pure reducer
+ * in connection.ts. No token is ever put in the URL, and no Origin header is set (RN's
+ * WebSocket sends none, and the desktop 403s any upgrade that carries one).
  */
 export class BridgeClient {
   private ws: WebSocket | null = null;
+  private state: ConnState = initialConn;
+  private timer: ReturnType<typeof setTimeout> | null = null;
   private closedByUser = false;
-  private backoff = 500;
 
   constructor(
-    private readonly url: string,
-    private readonly handlers: Handlers,
-    private readonly token?: string,
+    opts: BridgeOptions,
+    private readonly handlers: BridgeHandlers,
   ) {
+    this.apply({ t: "start", mac: opts.mac, addresses: opts.addresses, pairing: opts.pairing });
     this.connect();
   }
 
+  get connState(): ConnState {
+    return this.state;
+  }
+
+  private apply(ev: ConnEvent) {
+    const r = step(this.state, ev);
+    const changed = r.state !== this.state;
+    this.state = r.state;
+    for (const m of r.send) this.send(m);
+    for (const e of r.effects) {
+      if (e.k === "reconnect") this.scheduleReconnect(e.delayMs);
+      else this.handlers.onEffect?.(e);
+    }
+    if (changed) this.handlers.onState?.(this.state);
+  }
+
   private connect() {
-    this.handlers.onState?.("connecting");
-    // Append the dev shared token as a query param when set; the desktop bridge
-    // (CONDUIT_BRIDGE_TOKEN) rejects the handshake without it. No token => loopback.
-    const target = this.token
-      ? `${this.url}${this.url.includes("?") ? "&" : "?"}token=${encodeURIComponent(this.token)}`
-      : this.url;
-    const ws = new WebSocket(target);
+    if (this.closedByUser) return;
+    const url = this.state.addresses[this.state.addressIndex];
+    if (!url) return;
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      this.apply({ t: "close" });
+      return;
+    }
     this.ws = ws;
     ws.onopen = () => {
-      this.backoff = 500;
-      this.handlers.onState?.("open");
+      if (this.ws === ws) this.apply({ t: "open" });
     };
     ws.onmessage = (e) => {
-      if (typeof e.data !== "string") return;
+      if (this.ws !== ws || typeof e.data !== "string") return;
+      let msg: ServerMsg;
       try {
-        this.handlers.onMessage(JSON.parse(e.data) as ServerMsg);
+        msg = JSON.parse(e.data) as ServerMsg;
       } catch {
-        /* ignore malformed frame */
+        return; // malformed frame
       }
+      this.apply({ t: "frame", msg });
+      this.handlers.onMessage(msg);
     };
     ws.onclose = () => {
-      this.handlers.onState?.("closed");
-      this.scheduleReconnect();
+      if (this.ws !== ws) return;
+      this.ws = null;
+      this.apply({ t: "close" });
     };
     ws.onerror = () => {
-      /* onclose fires next; reconnect handled there */
+      /* onclose fires next */
     };
   }
 
-  private scheduleReconnect() {
+  private scheduleReconnect(delayMs: number) {
     if (this.closedByUser) return;
-    const wait = Math.min(this.backoff, 8000);
-    this.backoff = Math.min(this.backoff * 2, 8000);
-    setTimeout(() => {
-      if (!this.closedByUser) this.connect();
-    }, wait);
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.connect();
+    }, delayMs);
   }
 
-  private send(msg: ClientMsg) {
+  send(msg: ClientMsg) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
     }
   }
 
   list() {
-    this.send({ type: "list" });
+    this.send(listMsg());
   }
 
   attach(sessionId: string) {
-    this.send({ type: "attach", session_id: sessionId });
+    this.send(attachMsg(sessionId));
+  }
+
+  interrupt(sessionId: string) {
+    this.send(interruptMsg(sessionId));
   }
 
   /** Send a prompt: type the text + Enter into the live PTY (same as desktop typing). */
   prompt(sessionId: string, text: string) {
-    this.send({ type: "input", session_id: sessionId, data: text + "\r" });
+    this.send(inputMsg(sessionId, text + "\r"));
   }
 
   close() {
     this.closedByUser = true;
-    this.ws?.close();
+    if (this.timer) clearTimeout(this.timer);
+    const ws = this.ws;
+    this.ws = null;
+    ws?.close();
   }
 }

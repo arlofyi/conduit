@@ -87,22 +87,113 @@ export type WireChatItem =
   | { kind: "plan"; markdown: string }
   | { kind: "note"; tag: string; text: string };
 
+// ---- typed `projects` view (desktop bridge_view.rs) ----
+// WireProject / WireSession above are the legacy shapes live.ts still maps; Task 5 migrates it.
+
+export type WireStatus = "idle" | "running" | "needsInput" | "done";
+
+export type WireNeeds = { kind: "ask"; text: string | null } | { kind: "input"; text: null } | null;
+
+export interface WireViewSession {
+  id: string;
+  name: string;
+  /** lowercase desktop AgentId; unknown ids render as "?" */
+  agent: string;
+  branch: string | null;
+  model: string | null;
+  stopped: boolean;
+  running: boolean;
+  /** private / local-only: listed but never previewed or openable */
+  silo: boolean;
+  status: WireStatus;
+  activity: string | null;
+  /** unix ms */
+  updatedAt: number | null;
+  needs: WireNeeds;
+}
+
+export interface WireViewProject {
+  id: string;
+  name: string;
+  profileId: string | null;
+  /** user-chosen colour only; the phone derives the accent otherwise */
+  color: string | null;
+  sessions: WireViewSession[];
+}
+
+export interface WireProfile {
+  id: string | null;
+  name: string;
+}
+
+export interface WireProjectsView {
+  profiles: WireProfile[];
+  activeProfileId: string | null;
+  projects: WireViewProject[];
+}
+
+export interface WireMac {
+  name: string;
+  dnsName: string;
+  ip: string;
+  port: number;
+  online: boolean;
+  conduitVersion: string;
+}
+
+export type PairFailReason = "declined" | "expired" | "replaced" | "off" | "error";
+
+/** The only protocol version this build speaks. */
+export const PROTOCOL_VERSION = 1;
+
 export type ServerMsg =
-  | { type: "projects"; projects: WireProject[] }
+  | { type: "hello"; macName: string; conduitVersion: string; protocolVersion: number }
+  | { type: "authOk"; deviceId: string }
+  | { type: "error"; message: string }
+  | { type: "pairPending"; requestId: string }
+  | { type: "pairResult"; ok: true; token: string; deviceId: string }
+  | { type: "pairResult"; ok: false; reason: string }
+  | { type: "macs"; macs: WireMac[] }
+  | ({ type: "projects" } & WireProjectsView)
+  | { type: "context"; sessionId: string; used: number; window: number; fraction: number; model: string | null }
   | { type: "size"; cols: number; rows: number }
   | { type: "history"; items: WireChatItem[] }
   | { type: "chat"; item: WireChatItem }
   | { type: "status"; event: string; body: unknown }
   | { type: "output"; data: string } // base64 PTY bytes — chat UI ignores
-  | { type: "error"; message: string };
+  | { type: "killed"; sessionId: string }
+  | { type: "gitresult"; action: string; [k: string]: unknown }
+  | { type: "spawned"; sessionId: string; name: string; projectId: string };
 
 // ---- client → server ----
+// Spellings are mixed ON PURPOSE (pinned by Rust tests): attach/input/resize/git/kill/spawn use
+// snake_case, pair uses camelCase deviceName, interrupt uses camelCase sessionId.
 
 export type ClientMsg =
+  | { type: "auth"; token: string }
+  | { type: "pair"; secret?: string; request?: true; deviceName: string; nonce: string }
+  | { type: "discover" }
   | { type: "list" }
   | { type: "attach"; session_id: string }
   | { type: "input"; session_id: string; data: string }
-  | { type: "resize"; session_id: string; cols: number; rows: number };
+  | { type: "resize"; session_id: string; cols: number; rows: number }
+  | { type: "git"; session_id: string; action: "changes" | "diff"; path?: string }
+  | { type: "kill"; session_id: string }
+  | { type: "spawn"; project_id: string; prompt: string; agent?: string; worktree?: boolean }
+  | { type: "interrupt"; sessionId: string };
 
-/** Default dev endpoint: the desktop bridge on loopback (Simulator reaches this). */
-export const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:8456";
+export const authMsg = (token: string): ClientMsg => ({ type: "auth", token });
+
+export function pairMsg(
+  a: { secret: string; deviceName: string; nonce: string } | { request: true; deviceName: string; nonce: string },
+): ClientMsg {
+  return "secret" in a
+    ? { type: "pair", secret: a.secret, deviceName: a.deviceName, nonce: a.nonce }
+    : { type: "pair", request: true, deviceName: a.deviceName, nonce: a.nonce };
+}
+
+export const discoverMsg = (): ClientMsg => ({ type: "discover" });
+export const listMsg = (): ClientMsg => ({ type: "list" });
+export const attachMsg = (id: string): ClientMsg => ({ type: "attach", session_id: id });
+export const inputMsg = (id: string, data: string): ClientMsg => ({ type: "input", session_id: id, data });
+export const interruptMsg = (id: string): ClientMsg => ({ type: "interrupt", sessionId: id });

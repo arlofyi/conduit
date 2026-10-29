@@ -4,7 +4,18 @@
 
 import type { WireDiff, WireQuestion } from "../bridge/protocol";
 
-export type AgentKind = "claude" | "codex" | "gemini";
+/** A paired Mac as stored in the Keychain (one slot per Mac). */
+export interface SavedMac {
+  deviceId: string;
+  token: string;
+  macName: string;
+  dnsName: string;
+  ip: string;
+  port: number;
+  pairedAt: number;
+}
+
+export type AgentKind ="claude" | "codex" | "gemini";
 
 /** Same four states as the desktop `SessionStatus` (src/store.ts). */
 export type SessionStatus = "idle" | "running" | "needsInput" | "done";
