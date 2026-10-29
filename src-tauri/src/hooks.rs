@@ -378,7 +378,9 @@ pub fn start(
             // "Yes" clears the card: the hook is left running, but PostToolUse follows.
             if turn_moved_on(&event, &parsed) {
                 asks.cancel_session(&session);
-                broker.cancel_session(&session);
+                broker.cancel_session_where(&session, |tool| {
+                    permission_moved_on(&event, &parsed, tool)
+                });
             }
 
             // Capture Command Code's own session id, once, so the next spawn can resume
@@ -728,6 +730,16 @@ fn turn_moved_on(event: &str, body: &Value) -> bool {
             .is_none_or(str::is_empty),
         _ => false,
     }
+}
+
+/// [`turn_moved_on`], narrowed for a pending PERMISSION whose tool is `permission_tool`: a
+/// finished tool cancels it only when it is that same tool (a terminal "Yes" -- the hook is
+/// left running, and its own `PostToolUse` is what clears the card). A sibling tool in the
+/// same batch finishing first says nothing about this tool's dialog, which is still up.
+fn permission_moved_on(event: &str, body: &Value, permission_tool: &str) -> bool {
+    turn_moved_on(event, body)
+        && (event != "tooluse"
+            || body.get("tool_name").and_then(Value::as_str) == Some(permission_tool))
 }
 
 /// Blocking `AskUserQuestion` handler (own thread, like `/permission`). The HTTP response is
@@ -2417,6 +2429,25 @@ mod tests {
         let sub = json!({"agent_id": "a1", "tool_name": "Read"});
         assert!(!turn_moved_on("tooluse", &sub));
         assert!(turn_moved_on("tooluse", &json!({"agent_id": ""})));
+    }
+
+    #[test]
+    fn a_finished_tool_cancels_only_its_own_permission() {
+        let bash_done = json!({"tool_name": "Bash"});
+        // A sibling tool in the same batch finishing says nothing about Bash's dialog.
+        assert!(!permission_moved_on("tooluse", &bash_done, "Write"));
+        // Bash itself finishing (a terminal "Yes") clears Bash's card.
+        assert!(permission_moved_on("tooluse", &bash_done, "Bash"));
+        // A tooluse with no tool name cannot be matched: keep the card.
+        assert!(!permission_moved_on("tooluse", &json!({}), "Bash"));
+        // Still never a subagent's tool, even one with the same name.
+        let sub = json!({"agent_id": "a1", "tool_name": "Bash"});
+        assert!(!permission_moved_on("tooluse", &sub, "Bash"));
+        // The turn-level events cancel every permission, whatever its tool.
+        for e in ["stop", "prompt", "sessionend"] {
+            assert!(permission_moved_on(e, &json!({}), "Bash"), "{e}");
+        }
+        assert!(!permission_moved_on("pretool", &bash_done, "Bash"));
     }
 
     fn perm_body(tool: &str) -> Value {

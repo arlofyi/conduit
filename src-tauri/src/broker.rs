@@ -178,7 +178,20 @@ impl Broker {
     /// After a terminal "Yes" this is what clears the card -- the hook is left running and
     /// its reply ignored, but `PostToolUse` / `Stop` follow.
     pub fn cancel_session(&self, session: &str) -> Vec<String> {
-        self.fall_through_where(|v, _| v.session == session, By::Cancelled)
+        self.cancel_session_where(session, |_| true)
+    }
+
+    /// [`Self::cancel_session`], only for the session's requests whose tool name passes
+    /// `tool_matches` (`hooks::permission_moved_on`: a finished tool clears only its own).
+    pub fn cancel_session_where(
+        &self,
+        session: &str,
+        tool_matches: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        self.fall_through_where(
+            |v, _| v.session == session && tool_matches(&v.tool_name),
+            By::Cancelled,
+        )
     }
 
     /// Hand back to the terminal every pending request matching `pred(view, held_for_phone)`.
@@ -290,6 +303,19 @@ mod tests {
         assert!(b.get(&id).is_none());
         assert_eq!(b.recent_resolutions(), vec![(id, By::Phone)]);
         assert!(!b.resolve("missing", Decision::Allow, By::Phone));
+    }
+
+    #[test]
+    fn a_finished_sibling_tool_leaves_the_permission_pending() {
+        let b = Broker::default();
+        let (bash, rx_bash) = reg(&b, "s1", 1); // tool "Bash"
+        assert!(b.cancel_session_where("s1", |t| t == "Read").is_empty());
+        assert!(rx_bash.try_recv().is_err() && b.get(&bash).is_some());
+        assert_eq!(b.cancel_session_where("s1", |t| t == "Bash"), vec![bash]);
+        assert_eq!(
+            rx_bash.try_recv().unwrap(),
+            (Decision::FallThrough, By::Cancelled)
+        );
     }
 
     #[test]
