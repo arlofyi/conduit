@@ -1923,6 +1923,7 @@ mod tests {
     #[test]
     fn codex_windows_relay_runs_in_powershell_5_and_7() {
         use std::process::{Command, Stdio};
+        use std::time::Duration;
 
         let dir = fresh_test_dir("codex relay with spaces");
         let relay = dir.join("codex-hook-relay.cmd");

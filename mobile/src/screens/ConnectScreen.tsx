@@ -1,7 +1,7 @@
 import { useIsFocused } from "@react-navigation/native";
 import { CameraView, useCameraPermissions, type BarcodeScanningResult } from "expo-camera";
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Linking, ScrollView, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, AppState, Linking, ScrollView, Text, TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { IS_SIMULATOR_OR_DEV, useLive, type PairTarget } from "../bridge/LiveProvider";
 import type { LoopbackFound } from "../bridge/probe";
@@ -23,6 +23,19 @@ export function ConnectScreen({ navigation }: ConnectProps) {
   const { currentMac, conn, macs, notice, clearNotice, discover, discovered, pair, selectMac } = live;
   const [mode, setMode] = useState<Mode>("menu");
   const [error, setError] = useState<string | null>(null);
+  const scroller = useRef<ScrollView>(null);
+
+  // Each form swap changes the content height a lot (the viewfinder is a square); start
+  // the new form from the top, and re-settle when the app returns from the background.
+  useEffect(() => {
+    scroller.current?.scrollTo({ y: 0, animated: false });
+  }, [mode]);
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (s) => {
+      if (s === "active") scroller.current?.scrollTo({ y: 0, animated: false });
+    });
+    return () => sub.remove();
+  }, []);
 
   const startPair = useCallback(
     (target: PairTarget) => {
@@ -52,7 +65,14 @@ export function ConnectScreen({ navigation }: ConnectProps) {
     <View style={{ flex: 1, backgroundColor: p.panelBg }}>
       <ScreenHeader onBack={navigation.canGoBack() ? () => navigation.goBack() : undefined} />
       <ScrollView
+        ref={scroller}
+        style={{ flex: 1 }}
         contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: insets.bottom + 32 }}
+        // The header already pads for the safe area, and the keyboard inset must be undone
+        // when it hides: a stale automatic inset left the content shifted up and clipped
+        // after returning from the Settings app.
+        contentInsetAdjustmentBehavior="never"
+        automaticallyAdjustKeyboardInsets
         keyboardShouldPersistTaps="handled"
       >
         <BigTitle>Connect to your Mac</BigTitle>
