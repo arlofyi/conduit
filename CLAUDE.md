@@ -666,12 +666,36 @@ plus install/remove/status), and one listener in `App.tsx`.
   the phone (`logic/frames.ts trustStallNotice`) shows it as a notice in that chat, and the
   `history` re-sent when Claude does start replaces it. Claude only -- other agents have no
   such prompt and some fire no `sessionstart` at all.
-- **Pushes and `by`.** Each socket diffs `Asks::pending()` + `Broker::pending()` every
+- **The hook decides, once, at hook time** (`hooks::holder_for`, shared by `/ask` and
+  `/permission`, pinned by `holder_decision_table`). Not ours (Origin, unknown session) ->
+  `{}`, nothing recorded. Else: a connected remote phone and a non-private session -> HOLD
+  (`held_for_phone` = the desktop cannot show it); else the gate open and the focused
+  session (`set_ask_gate {open, focused}`, `asks::desktop_can_show`) is NOT this one ->
+  HOLD for the desktop card; else -> `{}` at once and OBSERVE. Nothing moves a held item to
+  the terminal by itself afterwards -- only the card's "Answer in terminal", the last phone
+  leaving (`last_phone_left`: held_for_phone AND no desktop card is right for it NOW), a
+  timeout, or the hook hanging up. The desktop's old automatic hand-off (`admitAsk` +
+  a store subscription + `ask_auto_handoff`) is gone; do not bring a second decider back.
+- **Every question and permission from a known session is RECORDED** (`Asks::observe`,
+  `Broker::observe`): an observed entry (`held: false`, no channel) carries the same data,
+  replies `{}` immediately, is never on the desktop's wire (`pending()`/`get()` and both
+  Tauri events are held-only; `all()` is what phones get), can never be resolved (`resolve`
+  refuses it, `phone_may_answer`/`phone_may_approve` check `held`), and is cleared by the
+  same turn-moved-on rules as a held one -- recorded `by: terminal` when the clearing hook
+  is its own tool's PostToolUse (`observed_clear_by`; matched by `tool_use_id` for a
+  question, tool name for a permission), `cancelled` otherwise -- or by a 10-minute TTL
+  (`OBSERVED_TTL`, swept on each push tick and each new observe). A terminal "No" fires no
+  PostToolUse, so a denied observed permission ends `cancelled`, never claimed as run.
+- **Pushes and `by`.** Each socket diffs `Asks::all()` + `Broker::all()` every
   250 ms (`push_frames`): `pending` once, then `pendingAdded` / `resolved{by}`, `by` from a
   64-entry ring (`phone|desktop|terminal|timeout|cancelled`; unknown reads `cancelled`).
-  `cancelled` = remove silently. `terminal` means a hand-off for an ask ("Moved to the
-  terminal") but "Handled in the terminal" for a permission -- the event cannot tell a
-  terminal "No" from the last phone leaving. A private item is pushed as exactly
+  Every non-private item carries `held` (absent = true, for older desktops); the phone
+  draws `held:false` in full, read-only, "Waiting for an answer in the terminal on your
+  Mac" -- still needs-you, still a banner.
+  `cancelled` = remove silently. `terminal` means a hand-off for a HELD ask ("Moved to the
+  terminal"), "Answered in the terminal" for an observed one, and "Handled in the terminal"
+  for a permission -- the event cannot tell a terminal "No" from the last phone leaving. A
+  private item is pushed as exactly
   `{kind,id,sessionId,private}`; privacy is decided once, when the item is first pushed to
   a socket, so a session made private later is not redacted retroactively.
 - **Cancellation** (`turn_moved_on`): `stop`/`prompt`/`sessionend` cancel both registries;
@@ -700,7 +724,8 @@ plus install/remove/status), and one listener in `App.tsx`.
 - **Desktop side**: `askResolvedPlan` (asks.ts) decides hold/note/toast for `ask-resolved`;
   `askHandoff.ts` remembers this window's own hand-offs; permission cards live in
   `.hold-dock` above AskDock, filtered by `permissionsToShow` (no card over the terminal
-  you are watching), listeners registered before the `permission_pending` catch-up, and
+  you are watching -- it HIDES, never resolves; a held QUESTION is never hidden, because its
+  terminal shows no menu while the hook holds it), listeners registered before the `permission_pending` catch-up, and
   `resolvedPermissions` stops a stale catch-up resurrecting one. **Phone side**:
   `logic/pending.ts` -- the Mac is the truth (a snapshot or `added` replaces a settled
   entry: ids restart per Mac boot), a send that did not go out stays live, and an answer
@@ -910,13 +935,15 @@ animal avatars linked by the Continuity messages they exchange, plus Claude Code
   `timeout: 660` — the default hook timeout is 60 s, so dropping the entry's `timeout` would
   silently kill every card after a minute.
 - **The gate is closed unless a card can be seen** (`set_ask_gate`, `asks.ts askGateOpen`):
-  the Continuity view enabled AND (view open or a Conduit window focused). A connected,
-  authenticated remote phone also holds a non-private session's questions and permissions
-  (`hooks::holder_for`; see "Where the mobile bridge lives"), gate closed or not. The same
+  the Continuity view enabled AND (view open or a Conduit window focused), plus the session
+  whose terminal is in front (`asks.ts focusedTerminal`). The hook decides from those once,
+  when Claude asks (`hooks::holder_for`; see "Where the mobile bridge lives"): a connected,
+  authenticated remote phone holds a non-private session's items gate closed or not; the
+  desktop card holds one only when its session's terminal is NOT the one in front. The same
   `settings.local.json` is read by a `claude`
   the user runs by hand in that checkout; it posts `session=unknown` and is answered `{}` at once.
-- **Hand-off is to the session's own terminal** (`askShouldHandOff`), and `ask_answer`
-  returning `false` means "already answered there" — not an error.
+- **Hand-off is explicit only**: the card's "Answer in terminal" (`ask_handoff`), and
+  `ask_answer` returning `false` means "already answered there" — not an error.
 - **The card's answer model is Claude's, not ours.** Answers are numbered (keys 1–N); a
   `(Recommended)` label suffix becomes a tag; multi-select is checkboxes with "Send K";
   "Something else…" is a free-text answer. The card opens on whichever side of the avatar is
@@ -949,8 +976,10 @@ animal avatars linked by the Continuity messages they exchange, plus Claude Code
   `project_toplevels` is memoized 30 s per (project, dir list) — one `continuity-changed`
   fans out into several reads, each forking `git rev-parse` per worktree. The frontend
   refetches are debounced with a 3 s ceiling (`debounce.ts`) so a steady stream still refreshes.
-- **An ask for the terminal already in front of the user never becomes a card**: `App.tsx`
-  `admitAsk` hands it off before `addAsk`. Listeners are registered before the
+- **An ask for the terminal already in front of the user (and no phone) never becomes a
+  card**: the hook answered it `{}` at once, so it never reaches `App.tsx`. Every ask that
+  does arrive is held and `admitAsk` always shows it -- with a phone connected its terminal
+  shows no menu, so the card is the Mac's only way to answer. Listeners are registered before the
   `ask_pending` catch-up, and the "moved to the terminal" toast is for timeouts only.
 - **Tables read through `continuity_tables.rs`, scoped by the same `resolve_session_ids` as the
   map, and refetch on `continuity-changed`.** Task "open" means status is not `completed` or
