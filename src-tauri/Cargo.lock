@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-tauri"
-version = "0.48.1"
+version = "0.48.2"
 dependencies = [
  "base64 0.22.1",
  "dashmap",

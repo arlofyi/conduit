@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.48.2 — 2026-10-30
+
 - **Fixed — Questions stay answerable on the phone while you look at that session on the Mac.** Conduit handed a question back to the terminal as soon as its session was on screen, even with a phone connected, so the phone only ever showed it as text. While a phone is connected, the question now stays with the phone and the Mac's question card.
 
 ## 0.48.1 — 2026-10-30
