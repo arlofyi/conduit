@@ -3,9 +3,16 @@
  * frames into a per-session status patch. The reducer is a port of the desktop
  * verb→status switch in `src/App.tsx`.
  */
-import type { Agent, ChatItem, EventKind, Project, SessionStatus, TodoProgress } from "../data/types";
+import type { ChatItem, EventKind, SessionStatus, TodoProgress } from "../data/types";
 import { toolActivity } from "../logic/status";
-import type { WireChatItem, WireProject, WireSession } from "./protocol";
+import type {
+  WireChatItem,
+  WireLastMessage,
+  WireNeeds,
+  WireProjectsView,
+  WireStatus,
+  WireViewSession,
+} from "./protocol";
 
 let idSeq = 0;
 function nextId(prefix = "w"): string {
@@ -69,8 +76,15 @@ function taskLine(status: string): { tone: "ok" | "bad" | "info"; text: string }
   }
 }
 
-/** Transcript-derived wire item to UI ChatItem (assigns a render id). Null = not shown on the phone. */
+/** Transcript-derived wire item to UI ChatItem (assigns a render id, keeps the line's `at`).
+ * Null = not shown on the phone. */
 export function mapChatItem(w: WireChatItem): ChatItem | null {
+  const item = mapBody(w);
+  if (item && typeof w.at === "string" && w.at !== "") item.at = w.at;
+  return item;
+}
+
+function mapBody(w: WireChatItem): ChatItem | null {
   switch (w.kind) {
     case "bubble":
       return { kind: "bubble", id: nextId("b"), role: w.role, text: w.text };
@@ -136,24 +150,87 @@ export function mapHistory(ws: WireChatItem[]): ChatItem[] {
   return ws.reduce<ChatItem[]>(appendWire, []);
 }
 
-export function mapSession(s: WireSession): Agent {
+const STATUSES: readonly WireStatus[] = ["idle", "running", "needsInput", "done"];
+
+const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+
+function needsOf(v: unknown): WireNeeds {
+  const n = v as { kind?: unknown; text?: unknown } | null;
+  if (n?.kind === "ask") return { kind: "ask", text: str(n.text) };
+  if (n?.kind === "input") return { kind: "input", text: null };
+  return null;
+}
+
+function sessionOf(v: unknown): WireViewSession | null {
+  const s = v as Record<string, unknown> | null;
+  if (!s || typeof s.id !== "string") return null;
+  const silo = s.silo === true;
+  const needs = needsOf(s.needs);
   return {
     id: s.id,
-    name: s.name,
-    branch: s.branch ?? "",
-    kind: s.agent,
-    // Baseline from the PTY-alive flag; live `status` frames refine it once attached.
-    status: s.running ? "running" : "idle",
+    name: str(s.name) ?? s.id,
+    agent: str(s.agent) ?? "",
+    branch: str(s.branch),
+    model: str(s.model),
+    stopped: s.stopped === true,
+    running: s.running === true,
+    silo,
+    status: STATUSES.includes(s.status as WireStatus) ? (s.status as WireStatus) : "idle",
+    // The Mac already withholds these for a silo session; never let one through regardless.
+    activity: silo ? null : str(s.activity),
+    updatedAt: typeof s.updatedAt === "number" && s.updatedAt > 0 ? s.updatedAt : null,
+    needs: silo && needs ? { kind: "input", text: null } : needs,
+    // The Mac sends null for a silo session; never show one regardless.
+    lastMessage: silo ? null : lastMessageOf(s.lastMessage),
   };
 }
 
-export function mapProjects(ps: WireProject[]): Project[] {
-  return ps.map((p) => ({
-    id: p.id,
-    name: p.name,
-    path: p.path,
-    agents: p.sessions.map(mapSession),
-  }));
+function lastMessageOf(v: unknown): WireLastMessage | null {
+  const m = v as { role?: unknown; text?: unknown; at?: unknown } | null;
+  if (!m || (m.role !== "user" && m.role !== "assistant") || typeof m.text !== "string") return null;
+  return { role: m.role, text: m.text, at: str(m.at) };
+}
+
+/**
+ * The `projects` frame as the typed view the Chats list reads (shape: src-tauri/src/bridge_view.rs).
+ * Defensive: a malformed entry is dropped or defaulted rather than crashing the list, and the
+ * frame's `type` tag is not carried along.
+ */
+export function mapProjectsView(m: unknown): WireProjectsView {
+  const v = (m ?? {}) as Record<string, unknown>;
+  const profiles = Array.isArray(v.profiles)
+    ? v.profiles.flatMap((p) => {
+        const pr = p as { id?: unknown; name?: unknown } | null;
+        if (!pr || typeof pr.name !== "string") return [];
+        return [{ id: str(pr.id), name: pr.name }];
+      })
+    : [];
+  const projects = Array.isArray(v.projects)
+    ? v.projects.flatMap((p) => {
+        const pr = p as Record<string, unknown> | null;
+        if (!pr || typeof pr.id !== "string") return [];
+        const sessions = Array.isArray(pr.sessions)
+          ? pr.sessions.map(sessionOf).filter((s): s is WireViewSession => s !== null)
+          : [];
+        return [{ id: pr.id, name: str(pr.name) ?? pr.id, profileId: str(pr.profileId), color: str(pr.color), sessions }];
+      })
+    : [];
+  return {
+    profiles: profiles.length > 0 ? profiles : [{ id: null, name: "Default" }],
+    activeProfileId: str(v.activeProfileId),
+    projects,
+  };
+}
+
+/**
+ * Deep equality of two mapped views. `mapProjectsView` builds every object with a fixed key
+ * order, so comparing serializations is exact; the provider keeps the previous reference when
+ * a poll brings nothing new, so the list re-renders nothing.
+ */
+export function sameView(a: WireProjectsView | null, b: WireProjectsView | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 // ---- live status reducer (subset of desktop src/App.tsx hook switch) ----

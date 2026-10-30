@@ -1,250 +1,626 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Animated,
+  AppState,
+  Easing,
+  FlatList,
   Image,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
-  ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   View,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import Markdown from "react-native-markdown-display";
 import { useLive } from "../bridge/LiveProvider";
-import { NeedsPill, ThemeButton } from "../components/atoms";
+import type { WireDiff } from "../bridge/protocol";
+import { AgentAvatar, useReduceMotion } from "../components/AgentAvatar";
+import { AssistantMarkdown } from "../components/AssistantMarkdown";
+import { ChatBubble } from "../components/ChatBubble";
+import { Composer } from "../components/Composer";
+import { GlassCircle, GlassSurface, Icon, MaterialBar } from "../components/Glass";
+import { cardStyle, QuestionCard, Tag, TrailingCard, type OnAnswer, type OnApprove } from "../components/PendingCards";
 import type {
   ApprovalItem,
-  BubbleItem,
   CommandItem,
   DividerItem,
   ImageItem,
   NoticeItem,
   PlanItem,
-  QuestionItem,
   TodosItem,
 } from "../data/types";
-import { outputPreview, splitRecommended } from "../logic/chatView";
+import { chatOnPhone, glyphStateFor, NO_PHONE_CHAT_TEXT } from "../logic/agents";
+import { PRIVATE_SESSION_TEXT } from "../logic/frames";
+import { chatHeader } from "../logic/chatHeader";
+import { outputPreview } from "../logic/chatView";
+import { mix, readableInk } from "../logic/color";
+import { callVerb, groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
+import { holdPosition, isPinned, newItemCount, newKeys, shouldFollow } from "../logic/follow";
 import { imageDataUri } from "../logic/image";
-import type { WireDiff } from "../bridge/protocol";
-import { groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
+import { cardView, entryForToolUse, nextExpiry, sameCard, trailingEntries, type CardView } from "../logic/pending";
+import { layoutThread, sameFeedRow, type ThreadRow } from "../logic/thread";
 import type { ChatProps } from "../navigation";
-import type { Palette } from "../theme/palettes";
+import { hq } from "../theme/hq";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, MONO, TYPE } from "../theme/type";
 
-const STATUS_GLYPH: Record<Call["status"], string> = { running: "◐", ok: "●", error: "✕", unknown: "○" };
 const DIFF_CAP = 16;
+/** Only the newest few rows animate in: a re-attach re-maps the whole history, and a wall of
+ * bubbles all sliding at once would be noise, not arrival. */
+const ANIMATE_NEWEST = 3;
 
 export function ChatScreen({ route, navigation }: ChatProps) {
-  const { agent } = route.params;
+  const { sessionId, projectId, name } = route.params;
   const { palette: p } = useTheme();
+  const h = hq(p);
   const insets = useSafeAreaInsets();
-  const { sessionLive, attach, detach, prompt } = useLive();
-  const [draft, setDraft] = useState("");
-  const scroller = useRef<ScrollView>(null);
+  const { sessionLive, context, view, attach, detach, prompt, pending, answer, approve } = useLive();
+  const list = useRef<FlatList<DisplayRow>>(null);
 
-  // Attach to this session's live stream (transcript history + tail + status)
-  // while the screen is mounted; detach on leave.
+  // Attach to this session's live stream (transcript history + tail + status) while the screen
+  // is mounted. Attaching also clears its unread count. Detach names the session, so a chat
+  // replaced by another (banner tap) cannot detach its successor.
   useEffect(() => {
-    attach(agent.id);
-    return () => detach();
-  }, [agent.id, attach, detach]);
+    attach(sessionId);
+    return () => detach(sessionId);
+  }, [sessionId, attach, detach]);
+
+  const header = chatHeader({
+    view,
+    sessionId,
+    projectId,
+    fallbackName: name,
+    live: { status: sessionLive.status, at: sessionLive.statusAt },
+    context,
+  });
+  const session = useMemo(() => {
+    for (const pr of view?.projects ?? []) {
+      const s = pr.sessions.find((x) => x.id === sessionId);
+      if (s) return { project: pr, session: s };
+    }
+    return null;
+  }, [view, sessionId]);
+  const projectName = session?.project.name ?? null;
+  const agent = session?.session.agent ?? "";
+  // The Mac follows the session onto a new transcript itself (/clear, a just-spawned chat) and
+  // re-sends `history`, so the chat never has to re-attach to catch up.
 
   const feed = sessionLive.feed;
   const rows = useMemo(() => groupFeed(feed), [feed]);
-  const showNeeds = sessionLive.status === "needsInput";
+  // "Today"/"Yesterday" go stale past midnight: re-read the clock every minute and on return
+  // to the foreground (a timer does not run while the app is suspended).
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const tick = () => setNow(Date.now());
+    const t = setInterval(tick, 60_000);
+    const sub = AppState.addEventListener("change", (s) => s === "active" && tick());
+    return () => {
+      clearInterval(t);
+      sub.remove();
+    };
+  }, []);
+  const thread = useMemo(() => layoutThread(rows, now), [rows, now]);
 
-  const scrollToEnd = () => requestAnimationFrame(() => scroller.current?.scrollToEnd({ animated: true }));
+  // Rows that arrived while the chat was open animate in; the first history load does not.
+  const firstLoad = useRef<number | null>(null);
+  if (firstLoad.current === null && rows.length > 0) firstLoad.current = rows.length;
+  const animateFrom = firstLoad.current === null ? Infinity : Math.max(firstLoad.current, rows.length - ANIMATE_NEWEST);
+  // Inverted list: newest first, so offset 0 is the bottom of the conversation. Each row carries
+  // its own animateIn, so renderItem never changes and a memoised row re-renders only when ITS
+  // content does.
+  // A question the Mac is holding joins its transcript card by tool_use id and makes it live;
+  // permissions (and questions whose transcript card has not landed yet) sit at the end.
+  // `pendingNow` moves only when a settled standalone card's linger ends.
+  const [pendingNow, setPendingNow] = useState(() => Date.now());
+  useEffect(() => {
+    const at = nextExpiry(pending, Date.now());
+    if (at === null) return;
+    const t = setTimeout(() => setPendingNow(Date.now()), Math.max(0, at - Date.now()) + 50);
+    return () => clearTimeout(t);
+  }, [pending, pendingNow]);
+  const data = useMemo(() => {
+    const index = new Map(rows.map((r, i) => [r, i]));
+    const asked = new Set<string>();
+    const out = thread.map((t): DisplayRow => {
+      if (t.type === "date") return t;
+      const it = t.row.type === "item" ? t.row.item : null;
+      let card: CardView | undefined;
+      if (it?.kind === "question") {
+        asked.add(it.toolUseId);
+        const e = entryForToolUse(pending, sessionId, it.toolUseId);
+        if (e) card = cardView(e);
+      }
+      return { ...t, animateIn: (index.get(t.row) ?? 0) >= animateFrom, card };
+    });
+    const trailing = trailingEntries(pending, sessionId, asked, pendingNow).map(
+      (e): DisplayRow => ({ type: "pending", key: `pending-${e.item.id}`, card: cardView(e) }),
+    );
+    return [...out, ...trailing].reverse();
+  }, [thread, rows, animateFrom, pending, sessionId, pendingNow]);
 
-  const send = () => {
-    if (!draft.trim()) return;
-    prompt(agent.id, draft); // optimistic echo + write to the live PTY
-    setDraft("");
-    scrollToEnd();
+  // Follow rule (logic/follow.ts): only a reader at the bottom follows new rows.
+  const pinnedRef = useRef(true);
+  const [pinned, setPinned] = useState(true);
+  const [unseen, setUnseen] = useState(0);
+  const sentRef = useRef(false);
+  const prevLen = useRef(0);
+  const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const pin = isPinned(e.nativeEvent.contentOffset.y);
+    if (pin !== pinnedRef.current) {
+      pinnedRef.current = pin;
+      setPinned(pin);
+      if (pin) setUnseen(0);
+    }
+  }, []);
+  useEffect(() => {
+    const added = newItemCount(prevLen.current, rows.length);
+    prevLen.current = rows.length;
+    if (shouldFollow(pinnedRef.current, added, sentRef.current)) {
+      list.current?.scrollToOffset({ offset: 0, animated: true });
+    } else if (added > 0 && !pinnedRef.current) {
+      setUnseen((n) => n + added);
+    }
+    if (added > 0) sentRef.current = false;
+  }, [rows.length]);
+  // A permission or question card arriving at the end of the feed has no transcript row, so
+  // the count above never sees it: a reader scrolled up hears of it through the "new" pill.
+  const trailingKeys = useMemo(() => data.filter((d) => d.type === "pending").map((d) => d.key), [data]);
+  const seenTrailing = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const added = newKeys(seenTrailing.current, trailingKeys);
+    seenTrailing.current = new Set(trailingKeys);
+    if (added > 0 && !pinnedRef.current) setUnseen((n) => n + added);
+  }, [trailingKeys]);
+  // A question or permission turning live (on open, or as it arrives) is the one thing the
+  // reader must see whole. Its card is taller than the static one it replaces, and it grows
+  // after the list has settled, so a reader at the bottom is put back at offset 0 once it has
+  // laid out -- never a reader scrolled up into history.
+  const liveCards = useMemo(
+    () => data.flatMap((d) => (d.type !== "date" && d.card && (d.card.mode === "live" || d.card.mode === "sending") ? [d.card.item.id] : [])),
+    [data],
+  );
+  const seenLive = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const added = newKeys(seenLive.current, liveCards);
+    seenLive.current = new Set(liveCards);
+    if (!shouldFollow(pinnedRef.current, added)) return;
+    const t = setTimeout(() => list.current?.scrollToOffset({ offset: 0, animated: true }), 60);
+    return () => clearTimeout(t);
+  }, [liveCards]);
+
+  const jumpToLatest = () => {
+    list.current?.scrollToOffset({ offset: 0, animated: true });
+    setUnseen(0);
   };
 
-  const decide = (_id: string, _decision: "allow" | "deny") => {
-    // approvals arrive via the broker (a later phase); no-op in the read channel
+  const send = (text: string) => {
+    prompt(sessionId, text); // bracketed paste + Enter into the live PTY; the echo comes back as a chat frame
+    sentRef.current = true;
+    pinnedRef.current = true;
+    setPinned(true);
+    setUnseen(0);
+    list.current?.scrollToOffset({ offset: 0, animated: true });
   };
+
+  // "Copied" confirmation for a long-pressed bubble.
+  const [copiedAt, setCopiedAt] = useState(0);
+  const onCopied = useCallback(() => setCopiedAt(Date.now()), []);
+
+  const decide = useCallback((_id: string, _decision: "allow" | "deny") => {
+    // legacy transcript approval items carry no broker id; live permissions use PermissionCard
+  }, []);
+
+  const renderItem = useCallback(
+    ({ item }: { item: DisplayRow }) => {
+      if (item.type === "date") return <DatePill label={item.label} />;
+      if (item.type === "pending") return <PendingRowView card={item.card} onAnswer={answer} onApprove={approve} />;
+      return (
+        <ThreadRowView
+          t={item}
+          animateIn={item.animateIn}
+          card={item.card}
+          onDecide={decide}
+          onAnswer={answer}
+          onCopied={onCopied}
+        />
+      );
+    },
+    [decide, onCopied, answer, approve],
+  );
+  const refused = sessionLive.refused === "private";
+  // Only Claude's conversation reaches the phone (its transcript); say so rather than show nothing.
+  const notice = refused ? PRIVATE_SESSION_TEXT : session && !chatOnPhone(agent) && feed.length === 0 ? NO_PHONE_CHAT_TEXT : null;
+
+  // With the keyboard up there is no home indicator to clear, so the composer sits on the keys.
+  const [keyboardUp, setKeyboardUp] = useState(false);
+  useEffect(() => {
+    const show = Keyboard.addListener("keyboardWillShow", () => setKeyboardUp(true));
+    const hide = Keyboard.addListener("keyboardWillHide", () => setKeyboardUp(false));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+
+  const [headerH, setHeaderH] = useState(insets.top + 56);
+  const [composerH, setComposerH] = useState(insets.bottom + 54);
+  const running = header.state === "running";
+  // A private chat shows only its notice: no typing bubble and no rows under it. The Mac sends
+  // nothing of that session, so the bubble would only be guessing, and any card for it is a
+  // private one that repeats the notice -- either would be drawn beneath the centred notice.
+  const typing = running && !refused;
+  const rowsShown = refused ? NO_ROWS : data;
+  const stateColor = header.state === "needs" ? p.amber : running ? p.green : p.textMid;
+  const ringState = glyphStateFor(
+    header.state === "needs" ? "needsInput" : header.state === "running" ? "running" : sessionLive.status === "done" ? "done" : "idle",
+    session?.session.running ?? false,
+  );
+  const accent = readableInk(session ? (header.color ?? p.accent) : p.accent, p.textBright, p.panelBg);
 
   return (
-    <KeyboardAvoidingView
-      style={{ flex: 1, backgroundColor: p.panelBg }}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-    >
-      {/* header */}
-      <View
-        style={{
-          paddingTop: insets.top + 6,
-          paddingHorizontal: 8,
-          paddingBottom: 10,
-          backgroundColor: p.sidebarBg,
-          borderBottomWidth: StyleSheet.hairlineWidth,
-          borderBottomColor: p.border,
-          flexDirection: "row",
-          alignItems: "center",
-          gap: 4,
-        }}
-      >
-        <Pressable
-          onPress={() => navigation.goBack()}
-          hitSlop={8}
-          style={{ width: 40, height: MIN_TOUCH, alignItems: "center", justifyContent: "center" }}
-        >
-          <Text style={{ color: p.accent, fontSize: 30, lineHeight: 30 }}>‹</Text>
-        </Pressable>
-        <Text style={{ fontWeight: "600", fontSize: TYPE.headline, color: p.textBright }}>{agent.name}</Text>
-        <Text style={{ fontSize: TYPE.footnote, color: p.textMid, fontFamily: MONO }}>{agent.branch}</Text>
-        <View style={{ flex: 1 }} />
-        {showNeeds ? (
-          <NeedsPill />
-        ) : sessionLive.status === "running" && sessionLive.activity ? (
-          <Text style={{ fontSize: TYPE.caption, color: p.textMid, maxWidth: 130 }} numberOfLines={1}>
-            {sessionLive.activity}
-          </Text>
-        ) : null}
-        <ThemeButton />
-      </View>
-
-      {/* feed */}
-      <ScrollView
-        ref={scroller}
-        style={{ flex: 1 }}
-        contentContainerStyle={{ padding: 12, gap: 9 }}
-        keyboardShouldPersistTaps="handled"
-        onContentSizeChange={scrollToEnd}
-      >
-        {rows.map((row) => (
-          <FeedRowView key={rowKey(row)} row={row} onDecide={decide} />
-        ))}
-      </ScrollView>
-
-      {/* composer */}
-      <View
-        style={{
-          flexDirection: "row",
-          alignItems: "flex-end",
-          gap: 8,
-          paddingHorizontal: 12,
-          paddingTop: 9,
-          paddingBottom: insets.bottom + 8,
-          borderTopWidth: StyleSheet.hairlineWidth,
-          borderTopColor: p.border,
-          backgroundColor: p.sidebarBg,
-        }}
-      >
-        <TextInput
-          value={draft}
-          onChangeText={setDraft}
-          placeholder={`Reply to ${agent.name}…`}
-          placeholderTextColor={p.textDim}
-          onSubmitEditing={send}
-          returnKeyType="send"
-          multiline
-          style={{
-            flex: 1,
-            minHeight: MIN_TOUCH,
-            maxHeight: 120,
-            backgroundColor: p.panelBg,
-            borderWidth: StyleSheet.hairlineWidth,
-            borderColor: p.border,
-            borderRadius: 20,
-            paddingHorizontal: 15,
-            paddingVertical: 11,
-            color: p.textBright,
-            fontSize: TYPE.body,
-          }}
+    <View style={{ flex: 1, backgroundColor: p.panelBg }}>
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+        {/* KAV pads itself; this inner view shrinks with it, so the absolute composer rides the keyboard */}
+        <View style={{ flex: 1 }}>
+        {/* the conversation scrolls under both floating bars */}
+        <FlatList
+          ref={list}
+          inverted
+          data={rowsShown}
+          keyExtractor={threadKey}
+          renderItem={renderItem}
+          style={{ flex: 1 }}
+          // inverted: paddingTop is the visual BOTTOM (above the composer), paddingBottom the top
+          contentContainerStyle={{ paddingHorizontal: 10, paddingTop: composerH + 6, paddingBottom: headerH + 10 }}
+          scrollIndicatorInsets={{ top: composerH, bottom: headerH }}
+          ListHeaderComponent={typing ? <WorkingBubble activity={sessionLive.activity} /> : null}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="interactive"
+          onScroll={onScroll}
+          scrollEventThrottle={32}
+          maintainVisibleContentPosition={holdPosition(pinned)}
+          initialNumToRender={20}
+          windowSize={11}
         />
-        <Pressable
-          onPress={send}
-          style={{
-            width: MIN_TOUCH,
-            height: MIN_TOUCH,
-            borderRadius: MIN_TOUCH / 2,
-            backgroundColor: p.accent,
-            alignItems: "center",
-            justifyContent: "center",
-          }}
+
+        {notice ? (
+          <View pointerEvents="none" style={{ position: "absolute", left: 24, right: 24, top: headerH, bottom: composerH, justifyContent: "center", alignItems: "center" }}>
+            <View
+              accessible
+              accessibilityRole="text"
+              style={{ maxWidth: 320, flexDirection: "row", alignItems: "flex-start", gap: 10, paddingHorizontal: 16, paddingVertical: 14, borderRadius: 14, backgroundColor: p.sidebarBg, borderWidth: StyleSheet.hairlineWidth, borderColor: p.border }}
+            >
+              <Icon name={refused ? "lock.fill" : "laptopcomputer"} size={16} color={p.textMid} />
+              <Text style={{ flex: 1, color: p.textMid, fontSize: TYPE.subhead, lineHeight: 20 }}>{notice}</Text>
+            </View>
+          </View>
+        ) : null}
+
+        <View style={{ position: "absolute", left: 0, right: 0, bottom: 0 }}>
+          {!pinned && (
+            <View style={{ position: "absolute", right: 12, top: -52, alignItems: "center" }}>
+              <GlassCircle symbol="chevron.down" label={unseen > 0 ? `Jump to latest, ${unseen} new` : "Jump to latest"} onPress={jumpToLatest} size={40} />
+              {unseen > 0 && (
+                <View
+                  pointerEvents="none"
+                  style={{
+                    position: "absolute",
+                    top: -6,
+                    right: -4,
+                    minWidth: 20,
+                    height: 20,
+                    borderRadius: 10,
+                    paddingHorizontal: 5,
+                    backgroundColor: p.accent,
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  <Text maxFontSizeMultiplier={1.3} style={{ color: p.meText, fontSize: TYPE.caption, fontWeight: "700", fontVariant: ["tabular-nums"] }}>{unseen}</Text>
+                </View>
+              )}
+            </View>
+          )}
+          {refused ? null : (
+            <Composer
+              name={header.name}
+              bottomInset={keyboardUp ? 0 : insets.bottom}
+              onSend={send}
+              onActions={() => navigation.navigate("QuickActions", { sessionId, running, agent })}
+              onHeight={setComposerH}
+            />
+          )}
+        </View>
+        </View>
+      </KeyboardAvoidingView>
+
+      {/* header: system material, the project's colour as a thin rule under it */}
+      <MaterialBar style={{ position: "absolute", top: 0, left: 0, right: 0 }}>
+        <View
+          onLayout={(e) => setHeaderH(e.nativeEvent.layout.height)}
+          style={{ paddingTop: insets.top + 4, paddingBottom: 8, paddingHorizontal: 10, flexDirection: "row", alignItems: "center", gap: 10 }}
         >
-          <Text style={{ color: p.meText, fontSize: 20, fontWeight: "700" }}>↑</Text>
-        </Pressable>
-      </View>
-    </KeyboardAvoidingView>
+          <GlassCircle symbol="chevron.left" label="Back to chats" onPress={() => navigation.goBack()} size={38} symbolSize={16} />
+          <Pressable
+            onPress={() => navigation.navigate("SessionInfo", { sessionId, projectId })}
+            accessibilityRole="button"
+            accessibilityLabel={`${header.name}, ${projectName ?? ""} ${header.subline}. Session details`}
+            style={({ pressed }) => ({ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 9, opacity: pressed ? 0.7 : 1 })}
+          >
+            <AgentAvatar agent={session?.session.agent ?? ""} projectColor={header.color} state={ringState} size={34} />
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={{ fontWeight: "600", fontSize: TYPE.callout, color: p.textBright }} numberOfLines={1}>
+                {header.name}
+              </Text>
+              <Text style={{ fontSize: TYPE.caption, marginTop: 1 }} numberOfLines={1}>
+                {projectName ? <Text style={{ color: accent, fontWeight: "600" }}>{projectName}</Text> : null}
+                {projectName ? <Text style={{ color: p.textDim }}>{"  ·  "}</Text> : null}
+                <Text style={{ color: stateColor }}>{header.subline}</Text>
+              </Text>
+            </View>
+          </Pressable>
+          {header.canStop && (
+            <Pressable
+              onPress={() => navigation.navigate("QuickActions", { sessionId, running: true, agent })}
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel="Stop or steer the current turn"
+            >
+              <GlassSurface interactive style={{ height: 34, borderRadius: 17, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", gap: 5 }}>
+                <Icon name="stop.fill" size={11} color={p.red} />
+                <Text maxFontSizeMultiplier={1.6} style={{ color: p.red, fontSize: TYPE.footnote, fontWeight: "600" }}>Stop</Text>
+              </GlassSurface>
+            </Pressable>
+          )}
+        </View>
+        <View style={{ height: 1, backgroundColor: header.color ? mix(header.color, p.panelBg, 0.55) : h.hairline }} />
+      </MaterialBar>
+
+      <CopiedToast at={copiedAt} top={headerH + 10} />
+    </View>
   );
 }
 
-function rowKey(row: FeedRow): string {
-  return row.type === "tools" ? row.id : row.type === "call" ? row.call.event.id : row.item.id;
+type DisplayRow =
+  | Extract<ThreadRow, { type: "date" }>
+  | (Extract<ThreadRow, { type: "row" }> & { animateIn: boolean; card?: CardView })
+  | { type: "pending"; key: string; card: CardView };
+
+const NO_ROWS: DisplayRow[] = [];
+
+function threadKey(t: DisplayRow): string {
+  return t.key;
 }
 
-function FeedRowView({
-  row,
-  onDecide,
-}: {
-  row: FeedRow;
+type RowProps = {
+  t: Extract<ThreadRow, { type: "row" }>;
+  animateIn: boolean;
+  /** the live state of a question card the Mac is holding; undefined = history */
+  card?: CardView;
   onDecide: (id: string, d: "allow" | "deny") => void;
-}) {
-  if (row.type === "tools") return <ToolsRow calls={row.calls} />;
-  if (row.type === "call") return <CallLine call={row.call} />;
+  onAnswer: OnAnswer;
+  onCopied: () => void;
+};
+
+type PendingRowProps = { card: CardView; onAnswer: OnAnswer; onApprove: OnApprove };
+
+/** A standalone card at the end of the feed (a permission, or a question ahead of its transcript card). */
+const PendingRowView = React.memo(
+  function PendingRowBody({ card, onAnswer, onApprove }: PendingRowProps) {
+    return (
+      <View style={{ marginTop: 8 }}>
+        <TrailingCard card={card} onAnswer={onAnswer} onApprove={onApprove} />
+      </View>
+    );
+  },
+  (a: PendingRowProps, b: PendingRowProps) => sameCard(a.card, b.card) && a.onAnswer === b.onAnswer && a.onApprove === b.onApprove,
+);
+
+/** A row re-renders only when what it draws changed (see `sameFeedRow`), not on every new message. */
+const ThreadRowView = React.memo(
+  ThreadRowBody,
+  (a: RowProps, b: RowProps) =>
+    sameFeedRow(a.t.row, b.t.row) &&
+    a.t.first === b.t.first &&
+    a.t.time === b.t.time &&
+    a.animateIn === b.animateIn &&
+    sameCard(a.card, b.card) &&
+    a.onDecide === b.onDecide &&
+    a.onAnswer === b.onAnswer &&
+    a.onCopied === b.onCopied,
+);
+
+function ThreadRowBody({
+  t,
+  animateIn,
+  card,
+  onDecide,
+  onAnswer,
+  onCopied,
+}: RowProps) {
+  const row: FeedRow = t.row;
+  const pad = { marginTop: 8 };
+  if (row.type === "tools") return <View style={pad}><ToolsRow calls={row.calls} /></View>;
+  if (row.type === "call") return <View style={pad}><CallLine call={row.call} /></View>;
   const item = row.item;
   switch (item.kind) {
     case "bubble":
-      return <Bubble item={item} />;
+      return <ChatBubble role={item.role} text={item.text} time={t.time} first={t.first} animateIn={animateIn} onCopied={onCopied} />;
     case "todos":
-      return <TodosCard item={item} />;
+      return <View style={pad}><TodosCard item={item} /></View>;
     case "approval":
-      return <ApprovalCard item={item} onDecide={onDecide} />;
+      return <View style={pad}><ApprovalCard item={item} onDecide={onDecide} /></View>;
     case "notice":
-      return <NoticePill item={item} />;
+      return <View style={pad}><NotePill item={item} /></View>;
     case "divider":
-      return <DividerRow item={item} />;
+      return <View style={pad}><DividerRow item={item} /></View>;
     case "command":
-      return <CommandChip item={item} />;
+      return <View style={pad}><CommandChip item={item} /></View>;
     case "image":
-      return <ImageRow item={item} />;
+      return <View style={pad}><ImageRow item={item} /></View>;
     case "question":
-      return <QuestionCard item={item} />;
+      return <View style={pad}><QuestionCard questions={item.questions} card={card} onAnswer={onAnswer} /></View>;
     case "plan":
-      return <PlanCard item={item} />;
+      return <View style={pad}><PlanCard item={item} /></View>;
   }
 }
 
-function NoticePill({ item }: { item: NoticeItem }) {
+/** "Today" / "Yesterday" / date, centred between days. */
+function DatePill({ label }: { label: string }) {
   const { palette: p } = useTheme();
-  const [open, setOpen] = useState(false);
-  const color = item.tone === "ok" ? p.green : item.tone === "bad" ? p.red : p.textMid;
   return (
-    <View style={{ alignSelf: "center", maxWidth: "92%", alignItems: "center", gap: 4 }}>
-      <Pressable
-        disabled={!item.detail}
-        onPress={() => setOpen((o) => !o)}
+    <View style={{ alignItems: "center", marginTop: 14, marginBottom: 4 }}>
+      <View
         style={{
-          backgroundColor: p.chipBg,
-          borderRadius: 12,
-          paddingHorizontal: 12,
-          paddingVertical: 5,
+          paddingHorizontal: 11,
+          paddingVertical: 4,
+          borderRadius: 9,
+          backgroundColor: p.sidebarBg,
+          borderWidth: StyleSheet.hairlineWidth,
+          borderColor: p.border,
         }}
       >
-        <Text style={{ color, fontSize: TYPE.footnote }}>
-          {item.text}
-          {item.detail ? (open ? " ▾" : " ▸") : ""}
+        <Text style={{ fontSize: TYPE.caption, fontWeight: "600", color: p.textMid }}>{label}</Text>
+      </View>
+    </View>
+  );
+}
+
+/** The agent at work: WhatsApp's typing bubble, carrying what it is doing right now (hook `activity`). */
+function WorkingBubble({ activity }: { activity?: string }) {
+  const { palette: p } = useTheme();
+  const reduce = useReduceMotion();
+  const t = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (reduce) return;
+    const loop = Animated.loop(Animated.timing(t, { toValue: 1, duration: 1200, easing: Easing.linear, useNativeDriver: true }));
+    loop.start();
+    return () => loop.stop();
+  }, [reduce, t]);
+  const dot = (i: number) => {
+    const a = i / 3;
+    const opacity = reduce
+      ? 0.6
+      : t.interpolate({ inputRange: [0, a, a + 0.2, Math.min(1, a + 0.4), 1], outputRange: [0.3, 0.3, 1, 0.3, 0.3], extrapolate: "clamp" });
+    return <Animated.View key={i} style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: p.textMid, opacity }} />;
+  };
+  return (
+    <View
+      accessible
+      accessibilityLabel={activity ? `Working: ${activity}` : "Working"}
+      style={{ flexDirection: "row", alignItems: "center", gap: 10, marginTop: 8, marginLeft: 8 }}
+    >
+      <View
+        style={{
+          flexDirection: "row",
+          gap: 4,
+          paddingHorizontal: 13,
+          paddingVertical: 12,
+          borderRadius: 16,
+          borderTopLeftRadius: 4,
+          backgroundColor: p.selectionBg,
+        }}
+      >
+        {[0, 1, 2].map(dot)}
+      </View>
+      {activity ? (
+        <Text style={{ flexShrink: 1, fontSize: TYPE.footnote, color: p.textMid }} numberOfLines={1}>
+          {activity}
         </Text>
-      </Pressable>
-      {open && item.detail ? (
-        <Text style={{ color: p.textMid, fontSize: TYPE.footnote, fontFamily: MONO }}>{item.detail}</Text>
       ) : null}
     </View>
   );
 }
 
+function CopiedToast({ at, top }: { at: number; top: number }) {
+  const { palette: p } = useTheme();
+  const o = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (!at) return;
+    o.setValue(0);
+    Animated.sequence([
+      Animated.timing(o, { toValue: 1, duration: 160, useNativeDriver: true }),
+      Animated.delay(1100),
+      Animated.timing(o, { toValue: 0, duration: 260, useNativeDriver: true }),
+    ]).start();
+  }, [at, o]);
+  return (
+    <Animated.View pointerEvents="none" style={{ position: "absolute", top, alignSelf: "center", opacity: o }}>
+      <GlassSurface style={{ borderRadius: 16, paddingHorizontal: 14, height: 32, flexDirection: "row", alignItems: "center", gap: 6 }}>
+        <Icon name="doc.on.doc" size={13} color={p.textBright} />
+        <Text maxFontSizeMultiplier={1.6} style={{ color: p.textBright, fontSize: TYPE.footnote, fontWeight: "600" }}>Copied</Text>
+      </GlassSurface>
+    </Animated.View>
+  );
+}
+
+// ---- the desktop chat mode's language (src/theme.css .hq-*) ----
+
+/** `.hq-note`: a quiet centred pill; tap shows its body under a hairline rule. */
+function NotePill({ item }: { item: NoticeItem }) {
+  const { palette: p } = useTheme();
+  const h = hq(p);
+  const [open, setOpen] = useState(false);
+  const mark = item.tone === "ok" ? p.green : item.tone === "bad" ? p.red : p.textMid;
+  return (
+    <View style={{ alignItems: "center", gap: 6 }}>
+      <Pressable
+        disabled={!item.detail}
+        onPress={() => setOpen((o) => !o)}
+        accessibilityRole={item.detail ? "button" : "text"}
+        accessibilityState={item.detail ? { expanded: open } : undefined}
+        style={{
+          maxWidth: "92%",
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 6,
+          paddingHorizontal: 12,
+          paddingVertical: 4,
+          borderRadius: 999,
+          backgroundColor: mix(p.selectionBg, p.panelBg, 0.4),
+          borderWidth: StyleSheet.hairlineWidth,
+          borderColor: mix(p.border, p.panelBg, 0.6),
+        }}
+      >
+        <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: mark }} />
+        <Text style={{ color: p.textMid, fontSize: TYPE.footnote, flexShrink: 1 }} numberOfLines={1}>
+          {item.text}
+        </Text>
+        {item.detail ? <Icon name={open ? "chevron.up" : "chevron.down"} size={9} color={p.textDim} /> : null}
+      </Pressable>
+      {open && item.detail ? (
+        <Text
+          style={{
+            alignSelf: "stretch",
+            marginHorizontal: 8,
+            paddingHorizontal: 12,
+            paddingVertical: 6,
+            borderLeftWidth: 1,
+            borderLeftColor: h.line2,
+            color: h.ink2,
+            fontSize: TYPE.footnote,
+            lineHeight: 18,
+          }}
+        >
+          {item.detail}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+/** `.hq-divider`: a label between two hairlines; amber for a warning (an interruption). */
 function DividerRow({ item }: { item: DividerItem }) {
   const { palette: p } = useTheme();
-  const color = item.tone === "warning" ? p.amber : p.textMid;
-  const line = { flex: 1, height: StyleSheet.hairlineWidth, backgroundColor: color, opacity: 0.6 };
+  const warn = item.tone === "warning";
+  const color = warn ? p.amber : p.textMid;
+  const line = { flex: 1, height: StyleSheet.hairlineWidth, backgroundColor: warn ? mix(p.amber, p.panelBg, 0.4) : p.border };
   return (
-    <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginVertical: 4 }}>
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 12, marginVertical: 4, paddingHorizontal: 6 }}>
       <View style={line} />
       <Text style={{ color, fontSize: TYPE.caption }}>{item.label}</Text>
       <View style={line} />
@@ -252,15 +628,15 @@ function DividerRow({ item }: { item: DividerItem }) {
   );
 }
 
-/** A slash/`!` command chip with its output beneath. A nameless command is output that
- * arrived without one (e.g. a `!` command's stderr), so it draws only the output block. */
+/** `.hq-command`: the slash command in mono on the accent wash, output beneath. */
 function CommandChip({ item }: { item: CommandItem }) {
   const { palette: p } = useTheme();
+  const h = hq(p);
   return (
-    <View style={{ alignSelf: "flex-end", maxWidth: "84%", alignItems: "flex-end", gap: 4 }}>
+    <View style={{ alignSelf: "flex-end", maxWidth: "86%", alignItems: "flex-end", gap: 5, marginRight: 8 }}>
       {item.name ? (
-        <View style={{ backgroundColor: p.chipBg, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 6 }}>
-          <Text style={{ color: p.chipText, fontFamily: MONO, fontSize: TYPE.footnote }}>
+        <View style={{ backgroundColor: h.roseSoft, borderWidth: 1, borderColor: h.roseLine, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 4 }}>
+          <Text style={{ color: p.accent, fontFamily: MONO, fontSize: 13 }}>
             {item.name}
             {item.args ? ` ${item.args}` : ""}
           </Text>
@@ -271,9 +647,9 @@ function CommandChip({ item }: { item: CommandItem }) {
   );
 }
 
-/** Output collapsed to its first lines with a tap to expand, as desktop shows it. */
 function CommandOutput({ text }: { text: string }) {
   const { palette: p } = useTheme();
+  const h = hq(p);
   const [open, setOpen] = useState(false);
   const view = outputPreview(text, open);
   const long = open || view.hidden > 0;
@@ -283,23 +659,10 @@ function CommandOutput({ text }: { text: string }) {
       onPress={() => setOpen((o) => !o)}
       accessibilityRole={long ? "button" : undefined}
       accessibilityState={long ? { expanded: open } : undefined}
-      style={{
-        alignSelf: "stretch",
-        backgroundColor: p.panelBg,
-        borderWidth: StyleSheet.hairlineWidth,
-        borderColor: p.border,
-        borderRadius: 8,
-        paddingHorizontal: 10,
-        paddingVertical: 8,
-        gap: 4,
-      }}
+      style={{ alignSelf: "stretch", backgroundColor: h.code, borderWidth: StyleSheet.hairlineWidth, borderColor: p.border, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 7, gap: 4 }}
     >
-      <Text style={{ color: p.textMid, fontFamily: MONO, fontSize: TYPE.footnote }}>{view.text}</Text>
-      {long ? (
-        <Text style={{ color: p.accent, fontSize: TYPE.caption }}>
-          {open ? "Show less" : `… ${view.hidden} more lines`}
-        </Text>
-      ) : null}
+      <Text style={{ color: h.ink2, fontFamily: MONO, fontSize: 12.5, lineHeight: 17 }}>{view.text}</Text>
+      {long ? <Text style={{ color: p.textMid, fontSize: TYPE.caption }}>{open ? "Show less" : `${view.hidden} more lines`}</Text> : null}
     </Pressable>
   );
 }
@@ -311,241 +674,95 @@ function ImageRow({ item }: { item: ImageItem }) {
     return (
       <Image
         source={{ uri }}
-        resizeMode="contain"
+        resizeMode="cover"
         accessibilityLabel="Image"
-        style={{ alignSelf: "flex-end", width: 220, height: 220, borderRadius: 10 }}
+        style={{ alignSelf: "flex-end", width: 220, height: 220, borderRadius: 12, marginRight: 8, borderWidth: StyleSheet.hairlineWidth, borderColor: p.border }}
       />
     );
   }
   return (
-    <View
-      style={{
-        alignSelf: "flex-end",
-        backgroundColor: p.chipBg,
-        borderRadius: 10,
-        paddingHorizontal: 11,
-        paddingVertical: 6,
-      }}
-    >
-      <Text style={{ color: p.chipText, fontSize: TYPE.footnote }}>Image</Text>
+    <View style={{ alignSelf: "flex-end", flexDirection: "row", alignItems: "center", gap: 6, marginRight: 8, backgroundColor: p.sidebarBg, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 6 }}>
+      <Icon name="photo" size={13} color={p.textMid} />
+      <Text style={{ color: p.textMid, fontSize: TYPE.footnote }}>Image</Text>
     </View>
   );
 }
 
-/** A question Claude asked earlier in the transcript. Neutral, not amber: this is history,
- * not a pending prompt (answering from the phone arrives with the broker). */
-function QuestionCard({ item }: { item: QuestionItem }) {
-  const { palette: p } = useTheme();
-  const chip = {
-    alignSelf: "flex-start" as const,
-    backgroundColor: p.chipBg,
-    borderRadius: 6,
-    paddingHorizontal: 7,
-    paddingVertical: 2,
-  };
-  return (
-    <View
-      style={{
-        backgroundColor: p.sidebarBg,
-        borderWidth: StyleSheet.hairlineWidth,
-        borderColor: p.border,
-        borderRadius: 11,
-        padding: 13,
-        gap: 12,
-      }}
-    >
-      {item.questions.map((q, i) => (
-        <View key={i} style={{ gap: 6 }}>
-          {q.header ? (
-            <View style={chip}>
-              <Text style={{ color: p.chipText, fontSize: TYPE.caption, fontWeight: "600" }}>{q.header}</Text>
-            </View>
-          ) : null}
-          <Text style={{ color: p.textBright, fontWeight: "700", fontSize: TYPE.callout }}>{q.question}</Text>
-          {q.options.map((o, j) => {
-            const { label, recommended } = splitRecommended(o.label);
-            return (
-              <View key={j} style={{ flexDirection: "row", gap: 8 }}>
-                <Text style={{ color: p.textDim, fontSize: TYPE.subhead, fontFamily: MONO, width: 16 }}>
-                  {j + 1}
-                </Text>
-                <View style={{ flex: 1, gap: 2 }}>
-                  <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
-                    <Text style={{ color: p.textBright, fontSize: TYPE.subhead }}>{label}</Text>
-                    {recommended ? (
-                      <View style={chip}>
-                        <Text style={{ color: p.chipText, fontSize: TYPE.caption }}>Recommended</Text>
-                      </View>
-                    ) : null}
-                  </View>
-                  {o.description ? (
-                    <Text style={{ color: p.textMid, fontSize: TYPE.footnote }}>{o.description}</Text>
-                  ) : null}
-                </View>
-              </View>
-            );
-          })}
-        </View>
-      ))}
-    </View>
-  );
-}
-
-/** An ExitPlanMode plan, rendered as Markdown in an assistant-style bubble (desktop's
- * PlanCard renders the same markdown). */
 function PlanCard({ item }: { item: PlanItem }) {
   const { palette: p } = useTheme();
   return (
-    <View
-      style={{
-        maxWidth: "94%",
-        alignSelf: "flex-start",
-        backgroundColor: p.selectionBg,
-        borderRadius: 16,
-        borderBottomLeftRadius: 5,
-        paddingHorizontal: 14,
-        paddingTop: 10,
-        paddingBottom: 4,
-      }}
-    >
-      <Text style={{ fontSize: TYPE.subhead, fontWeight: "700", color: p.textBright }}>Plan</Text>
-      <Markdown style={mdStyles(p)}>{item.markdown}</Markdown>
+    <View style={[cardStyle(p), { gap: 8 }]}>
+      <Tag text="Plan" />
+      <AssistantMarkdown text={item.markdown} />
     </View>
   );
 }
 
-function Bubble({ item }: { item: BubbleItem }) {
+/** `.hq-call-glyph`: a dot that says how the call went (shape + label, never hue alone). */
+function CallMark({ status }: { status: Call["status"] }) {
   const { palette: p } = useTheme();
-  if (item.role === "user") {
-    return (
-      <View
-        style={{
-          maxWidth: "84%",
-          alignSelf: "flex-end",
-          backgroundColor: p.accent,
-          borderRadius: 16,
-          borderBottomRightRadius: 5,
-          paddingHorizontal: 14,
-          paddingVertical: 10,
-        }}
-      >
-        <Text style={{ color: p.meText, fontSize: TYPE.callout, lineHeight: 22, fontWeight: "500" }}>
-          {item.text}
-        </Text>
-      </View>
-    );
-  }
-  // assistant — render Markdown (bold/lists/code/tables); wider for long-form content
+  const size = 7;
+  if (status === "error") return <Icon name="xmark" size={9} color={p.red} weight="bold" />;
+  const filled = status === "ok";
   return (
     <View
+      accessibilityLabel={status}
       style={{
-        maxWidth: "94%",
-        alignSelf: "flex-start",
-        backgroundColor: p.selectionBg,
-        borderRadius: 16,
-        borderBottomLeftRadius: 5,
-        paddingHorizontal: 14,
-        paddingVertical: 4,
+        width: size,
+        height: size,
+        borderRadius: size / 2,
+        backgroundColor: filled ? p.green : "transparent",
+        borderWidth: filled ? 0 : 1.2,
+        borderColor: status === "running" ? p.accent : p.textDim,
       }}
-    >
-      <Markdown style={mdStyles(p)}>{item.text}</Markdown>
-    </View>
+    />
   );
 }
 
-/** Markdown theme matching the active palette (react-native-markdown-display). */
-function mdStyles(p: Palette) {
-  const codeBox = {
-    backgroundColor: p.panelBg,
-    color: p.textBright,
-    fontFamily: MONO,
-    fontSize: TYPE.footnote,
-    padding: 10,
-    borderRadius: 8,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: p.border,
-  };
-  return {
-    body: { color: p.textBright, fontSize: TYPE.callout, lineHeight: 22 },
-    heading1: { color: p.textBright, fontSize: 22, fontWeight: "700" as const, marginTop: 6, marginBottom: 4 },
-    heading2: { color: p.textBright, fontSize: TYPE.headline, fontWeight: "700" as const, marginTop: 6, marginBottom: 3 },
-    heading3: { color: p.textBright, fontSize: TYPE.callout, fontWeight: "700" as const, marginTop: 4, marginBottom: 2 },
-    strong: { fontWeight: "700" as const, color: p.textBright },
-    em: { fontStyle: "italic" as const },
-    link: { color: p.accent },
-    bullet_list: { marginVertical: 2 },
-    ordered_list: { marginVertical: 2 },
-    list_item: { marginVertical: 1 },
-    code_inline: {
-      backgroundColor: p.panelBg,
-      color: p.accent,
-      fontFamily: MONO,
-      fontSize: TYPE.footnote,
-      borderRadius: 4,
-      paddingHorizontal: 4,
-    },
-    code_block: codeBox,
-    fence: codeBox,
-    blockquote: { backgroundColor: p.panelBg, borderLeftColor: p.accent, borderLeftWidth: 3, paddingHorizontal: 10 },
-    table: { borderColor: p.border, borderWidth: StyleSheet.hairlineWidth, borderRadius: 6, marginVertical: 4 },
-    th: { padding: 6, color: p.textBright, fontWeight: "700" as const },
-    td: { padding: 6, color: p.textBright },
-    tr: { borderColor: p.border, borderBottomWidth: StyleSheet.hairlineWidth },
-    hr: { backgroundColor: p.border, height: StyleSheet.hairlineWidth, marginVertical: 6 },
-  };
-}
-
+/** `.hq-tool-line`: verb in the quiet ink, the object in mono. */
 function CallLine({ call }: { call: Call }) {
   const { palette: p } = useTheme();
   const e = call.event;
-  const glyphColor =
-    call.status === "ok" ? p.green : call.status === "error" ? p.red : p.textDim;
   return (
-    <View style={{ gap: 4 }}>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-        <Text
-          accessibilityLabel={call.status}
-          style={{ width: 16, fontSize: TYPE.footnote, color: glyphColor }}
-        >
-          {STATUS_GLYPH[call.status]}
-        </Text>
-        <Text style={{ fontSize: TYPE.footnote, color: p.textMid }}>{e.label}</Text>
-        {e.mono && (
-          <Text
-            numberOfLines={1}
-            style={{ flexShrink: 1, fontSize: TYPE.footnote, color: p.textBright, fontFamily: MONO }}
-          >
+    <View style={{ gap: 4, paddingHorizontal: 10 }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: 20 }}>
+        <View style={{ width: 10, alignItems: "center" }}>
+          <CallMark status={call.status} />
+        </View>
+        <Text style={{ fontSize: TYPE.footnote, color: p.textMid }}>{callVerb(call, e.label)}</Text>
+        {e.mono ? (
+          <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: 12.5, color: p.textMid, fontFamily: MONO }}>
             {e.mono}
           </Text>
-        )}
+        ) : null}
       </View>
-      {call.status === "error" && call.errorText && (
-        <Text style={{ marginLeft: 24, fontSize: TYPE.footnote, color: p.red, fontFamily: MONO }}>
-          {call.errorText}
-        </Text>
-      )}
-      {call.diff && <DiffBlock diff={call.diff} />}
+      {call.status === "error" && call.errorText ? (
+        <Text style={{ marginLeft: 18, fontSize: TYPE.footnote, color: p.red, lineHeight: 18 }}>{call.errorText}</Text>
+      ) : null}
+      {call.diff ? <DiffBlock diff={call.diff} /> : null}
     </View>
   );
 }
 
-/** A run of quiet calls folded to one dim digest line; tap lists the individual calls. */
+/** A run of quiet calls folded to one digest line; tap lists them. */
 function ToolsRow({ calls }: { calls: Call[] }) {
   const { palette: p } = useTheme();
   const [open, setOpen] = useState(false);
   return (
-    <View style={{ gap: 8 }}>
+    <View style={{ gap: 6 }}>
       <Pressable
         onPress={() => setOpen((v) => !v)}
         accessibilityRole="button"
         accessibilityState={{ expanded: open }}
-        style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: MIN_TOUCH }}
+        style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: MIN_TOUCH - 12, paddingHorizontal: 10 }}
       >
-        <Text style={{ width: 16, fontSize: TYPE.footnote, color: p.textDim }}>{open ? "▾" : "▸"}</Text>
-        <Text style={{ fontSize: TYPE.footnote, color: p.textDim }}>{groupLabel(calls)}</Text>
+        <View style={{ width: 10, alignItems: "center" }}>
+          <Icon name={open ? "chevron.down" : "chevron.right"} size={9} color={p.textDim} weight="semibold" />
+        </View>
+        <Text style={{ fontSize: TYPE.footnote, color: p.textMid }}>{groupLabel(calls)}</Text>
       </Pressable>
       {open && (
-        <View style={{ borderLeftWidth: 2, borderLeftColor: p.border, marginLeft: 6, paddingLeft: 12, gap: 8 }}>
+        <View style={{ marginLeft: 14, paddingLeft: 4, borderLeftWidth: StyleSheet.hairlineWidth, borderLeftColor: p.border, gap: 6 }}>
           {calls.map((c) => (
             <CallLine key={c.event.id} call={c} />
           ))}
@@ -555,30 +772,20 @@ function ToolsRow({ calls }: { calls: Call[] }) {
   );
 }
 
+/** `.hq-diff`: mono, add/del in the ok/bad inks, a rule down its left like the desktop's. */
 function DiffBlock({ diff }: { diff: WireDiff }) {
   const { palette: p } = useTheme();
   const rows = diff.lines.slice(0, DIFF_CAP);
   const hidden = diff.more + (diff.lines.length - rows.length);
-  const tint = (k: string) => (k === "add" ? p.green : k === "del" ? p.red : p.textMid);
+  const ink = (k: string) => (k === "add" ? p.green : k === "del" ? p.red : p.textMid);
   const mark = (k: string) => (k === "add" ? "+" : k === "del" ? "-" : " ");
+  const mono = { fontSize: 11.5, lineHeight: 16, fontFamily: MONO };
   return (
-    <View
-      style={{
-        marginLeft: 24,
-        backgroundColor: p.panelBg,
-        borderWidth: StyleSheet.hairlineWidth,
-        borderColor: p.border,
-        borderRadius: 8,
-        padding: 8,
-        gap: 2,
-      }}
-    >
+    <View style={{ marginLeft: 18, borderLeftWidth: 2, borderLeftColor: p.textDim, paddingLeft: 8, gap: 1 }}>
       {diff.created ? (
-        <Text style={{ fontSize: TYPE.footnote, color: p.green, fontFamily: MONO }}>
-          created · +{diff.added} lines
-        </Text>
+        <Text style={[mono, { color: p.green }]}>created · +{diff.added} lines</Text>
       ) : (
-        <Text style={{ fontSize: TYPE.footnote, fontFamily: MONO }}>
+        <Text style={mono}>
           <Text style={{ color: p.green }}>+{diff.added}</Text>
           <Text style={{ color: p.textDim }}> </Text>
           <Text style={{ color: p.red }}>−{diff.removed}</Text>
@@ -586,51 +793,37 @@ function DiffBlock({ diff }: { diff: WireDiff }) {
       )}
       {rows.map((l, i) =>
         l.kind === "gap" ? (
-          <Text key={i} style={{ fontSize: TYPE.footnote, color: p.textDim, fontFamily: MONO }}>
+          <Text key={i} style={[mono, { color: p.textDim }]}>
             ⋮
           </Text>
         ) : (
-          <Text
-            key={i}
-            numberOfLines={1}
-            style={{ fontSize: TYPE.footnote, color: tint(l.kind), fontFamily: MONO }}
-          >
+          <Text key={i} numberOfLines={1} style={[mono, { color: ink(l.kind) }]}>
             {mark(l.kind)} {l.text}
           </Text>
         ),
       )}
-      {hidden > 0 && (
-        <Text style={{ fontSize: TYPE.footnote, color: p.textDim, fontFamily: MONO }}>… {hidden} more lines</Text>
-      )}
+      {hidden > 0 && <Text style={[mono, { color: p.textDim }]}>{hidden} more lines</Text>}
     </View>
   );
 }
 
 function TodosCard({ item }: { item: TodosItem }) {
   const { palette: p } = useTheme();
-  const icon = (s: TodosItem["items"][number]["status"]) =>
-    s === "completed" ? "✓" : s === "in_progress" ? "◐" : "○";
-  const color = (s: TodosItem["items"][number]["status"]) =>
-    s === "completed" ? p.green : s === "in_progress" ? p.accent : p.textDim;
   return (
-    <View
-      style={{
-        backgroundColor: p.sidebarBg,
-        borderWidth: StyleSheet.hairlineWidth,
-        borderColor: p.border,
-        borderRadius: 12,
-        padding: 13,
-        gap: 7,
-      }}
-    >
-      <Text style={{ fontSize: TYPE.subhead, fontWeight: "700", color: p.textBright }}>
+    <View style={[cardStyle(p), { gap: 8 }]}>
+      <Text style={{ fontSize: TYPE.subhead, fontWeight: "600", color: p.textBright, fontVariant: ["tabular-nums"] }}>
         To-dos · {item.done}/{item.total}
       </Text>
       {item.items.map((t, i) => (
         <View key={i} style={{ flexDirection: "row", alignItems: "center", gap: 9 }}>
-          <Text style={{ color: color(t.status), fontSize: 15, width: 16 }}>{icon(t.status)}</Text>
+          <Icon
+            name={t.status === "completed" ? "checkmark.circle.fill" : t.status === "in_progress" ? "circle.lefthalf.filled" : "circle"}
+            size={15}
+            color={t.status === "completed" ? p.green : t.status === "in_progress" ? p.accent : p.textDim}
+          />
           <Text
             style={{
+              flex: 1,
               fontSize: TYPE.subhead,
               color: t.status === "pending" ? p.textMid : p.textBright,
               textDecorationLine: t.status === "completed" ? "line-through" : "none",
@@ -644,98 +837,40 @@ function TodosCard({ item }: { item: TodosItem }) {
   );
 }
 
-function ApprovalCard({
-  item,
-  onDecide,
-}: {
-  item: ApprovalItem;
-  onDecide: (id: string, d: "allow" | "deny") => void;
-}) {
+function ApprovalCard({ item, onDecide }: { item: ApprovalItem; onDecide: (id: string, d: "allow" | "deny") => void }) {
   const { palette: p } = useTheme();
-
   if (item.resolved) {
     const allowed = item.resolved === "allow";
     return (
-      <View
-        style={{
-          borderWidth: StyleSheet.hairlineWidth,
-          borderColor: p.border,
-          borderRadius: 10,
-          paddingHorizontal: 12,
-          paddingVertical: 10,
-          flexDirection: "row",
-          alignItems: "center",
-          gap: 8,
-        }}
-      >
-        <Text style={{ color: allowed ? p.green : p.red, fontWeight: "700", fontSize: TYPE.callout }}>
-          {allowed ? "✓" : "✕"}
-        </Text>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 10 }}>
+        <Icon name={allowed ? "checkmark" : "xmark"} size={11} color={allowed ? p.green : p.red} weight="bold" />
         <Text style={{ color: p.textMid, fontSize: TYPE.footnote }}>
           {allowed ? "Approved" : "Denied"} · {item.tool}
         </Text>
-        <Text style={{ color: p.textDim, fontSize: TYPE.footnote, fontFamily: MONO, flexShrink: 1 }} numberOfLines={1}>
+        <Text style={{ color: p.textDim, fontSize: 12.5, fontFamily: MONO, flexShrink: 1 }} numberOfLines={1}>
           {item.input}
         </Text>
       </View>
     );
   }
-
   return (
-    <View
-      style={{
-        backgroundColor: p.pillNeedsBg,
-        borderWidth: 1,
-        borderColor: p.amber,
-        borderLeftWidth: 3,
-        borderRadius: 11,
-        padding: 13,
-        gap: 11,
-      }}
-    >
-      <Text style={{ color: p.pillNeedsText, fontWeight: "700", fontSize: TYPE.callout }}>
-        ⚠︎ Approval needed · {item.tool}
-      </Text>
-      <View
-        style={{
-          backgroundColor: p.panelBg,
-          borderWidth: StyleSheet.hairlineWidth,
-          borderColor: p.border,
-          borderRadius: 8,
-          paddingHorizontal: 11,
-          paddingVertical: 9,
-        }}
-      >
-        <Text style={{ color: p.textBright, fontFamily: MONO, fontSize: TYPE.subhead }}>{item.input}</Text>
+    <View style={{ marginHorizontal: 8, backgroundColor: p.pillNeedsBg, borderWidth: 1, borderColor: mix(p.amber, p.panelBg, 0.6), borderRadius: 12, padding: 13, gap: 11 }}>
+      <Text style={{ color: p.pillNeedsText, fontWeight: "600", fontSize: TYPE.callout }}>Approval needed · {item.tool}</Text>
+      <View style={{ backgroundColor: p.panelBg, borderRadius: 8, paddingHorizontal: 11, paddingVertical: 9 }}>
+        <Text style={{ color: p.textBright, fontFamily: MONO, fontSize: 13 }}>{item.input}</Text>
       </View>
       <View style={{ flexDirection: "row", gap: 10 }}>
         <Pressable
           onPress={() => onDecide(item.id, "deny")}
-          style={{
-            flex: 1,
-            minHeight: MIN_TOUCH,
-            alignItems: "center",
-            justifyContent: "center",
-            borderRadius: 10,
-            backgroundColor: p.selectionBg,
-            borderWidth: StyleSheet.hairlineWidth,
-            borderColor: p.border,
-          }}
+          style={{ flex: 1, minHeight: MIN_TOUCH, alignItems: "center", justifyContent: "center", borderRadius: 22, backgroundColor: p.selectionBg }}
         >
-          <Text style={{ color: p.red, fontWeight: "700", fontSize: TYPE.callout }}>Deny</Text>
+          <Text style={{ color: p.red, fontWeight: "600", fontSize: TYPE.callout }}>Deny</Text>
         </Pressable>
         <Pressable
           onPress={() => onDecide(item.id, "allow")}
-          style={{
-            flex: 1,
-            minHeight: MIN_TOUCH,
-            alignItems: "center",
-            justifyContent: "center",
-            borderRadius: 10,
-            backgroundColor: p.green,
-          }}
+          style={{ flex: 1, minHeight: MIN_TOUCH, alignItems: "center", justifyContent: "center", borderRadius: 22, backgroundColor: p.green }}
         >
-          <Text style={{ color: p.onGreen, fontWeight: "700", fontSize: TYPE.callout }}>Approve</Text>
+          <Text style={{ color: p.onGreen, fontWeight: "600", fontSize: TYPE.callout }}>Approve</Text>
         </Pressable>
       </View>
     </View>

@@ -2,6 +2,7 @@ import type { ChatItem, EventItem, ResultItem } from "../data/types";
 import {
   appendAssistantReply,
   appendPrompt,
+  callVerb,
   groupFeed,
   groupLabel,
   type Call,
@@ -182,5 +183,29 @@ describe("groupLabel", () => {
     expect(groupLabel([c("generic"), c("generic"), c("web")])).toBe("Called 2 tools, browsed 1 page");
     expect(groupLabel([c("subagent"), c("subagent"), c("read")])).toBe("Ran 2 subagents, read 1 file");
     expect(groupLabel([c("subagent")])).toBe("Ran 1 subagent");
+  });
+});
+
+describe("callVerb (keep identical to src/chatItems.ts)", () => {
+  const call = (kind: EventItem["event"], status: Call["status"], errorText: string | null = null): Call => ({
+    event: { kind: "event", id: "e1", event: kind, label: "x", mono: "touch a.txt", toolUseId: "T" },
+    status,
+    errorText,
+    diff: null,
+  });
+  it("keeps the normal verb unless the result is an error", () => {
+    for (const s of ["ok", "running", "unknown"] as const) expect(callVerb(call("bash", s), "ran")).toBe("ran");
+  });
+  it("says Denied for a refused tool, whoever refused it", () => {
+    expect(callVerb(call("bash", "error", "Denied from Conduit"), "ran")).toBe("Denied: Bash");
+    expect(
+      callVerb(call("edit", "error", "The user doesn't want to proceed with this tool use."), "edited"),
+    ).toBe("Denied: Edit");
+    expect(callVerb(call("bash", "error", "Permission to use Bash has been denied."), "ran")).toBe("Denied: Bash");
+  });
+  it("says Failed for any other error", () => {
+    expect(callVerb(call("bash", "error", "Exit code 1"), "ran")).toBe("Failed: Bash");
+    expect(callVerb(call("read", "error", null), "read")).toBe("Failed: Read");
+    expect(callVerb(call("generic", "error", "boom"), "used a tool")).toBe("Failed: tool");
   });
 });

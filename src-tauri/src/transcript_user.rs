@@ -69,6 +69,53 @@ fn flat_text(content: &Value) -> String {
     }
 }
 
+/// `content` minus reminder-only text blocks; `None` when nothing is left to show.
+fn without_reminders(content: &Value) -> Option<Value> {
+    match content {
+        Value::String(t) => (!only_system_reminders(t)).then(|| content.clone()),
+        Value::Array(blocks) => {
+            let kept: Vec<Value> = blocks
+                .iter()
+                .filter(|b| {
+                    let is_text = b.get("type").and_then(|t| t.as_str()) == Some("text");
+                    let txt = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    !(is_text && only_system_reminders(txt))
+                })
+                .cloned()
+                .collect();
+            if kept.is_empty() && !blocks.is_empty() {
+                None
+            } else if kept.len() == blocks.len() {
+                Some(content.clone())
+            } else {
+                Some(Value::Array(kept))
+            }
+        }
+        _ => Some(content.clone()),
+    }
+}
+
+/// True when `text` is one or more `<system-reminder>…</system-reminder>` blocks and
+/// nothing else (whitespace between them allowed).
+fn only_system_reminders(text: &str) -> bool {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut rest = text.trim();
+    if !rest.starts_with(OPEN) {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(after) = rest.strip_prefix(OPEN) else {
+            return false;
+        };
+        let Some(end) = after.find(CLOSE) else {
+            return false;
+        };
+        rest = after[end + CLOSE.len()..].trim_start();
+    }
+    true
+}
+
 fn bubble(text: &str) -> Value {
     json!({ "kind": "bubble", "role": "user", "text": text })
 }
@@ -335,7 +382,7 @@ fn task_item(text: &str) -> Value {
 
 /// Classify a user line into chat items (possibly none).
 pub fn parse_user(v: &Value) -> Vec<Value> {
-    let Some(content) = v.pointer("/message/content") else {
+    let Some(raw) = v.pointer("/message/content") else {
         return vec![];
     };
     let origin = v.get("origin");
@@ -344,16 +391,23 @@ pub fn parse_user(v: &Value) -> Vec<Value> {
         .and_then(|k| k.as_str())
         .unwrap_or("");
     let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
-    let s = content.as_str();
 
     // 1. A human origin is authoritative, even over a leading tag in what they pasted.
     if origin_kind == "human" {
-        return match (s, content.as_array()) {
+        return match (raw.as_str(), raw.as_array()) {
             (Some(t), _) => vec![bubble(t)],
             (_, Some(blocks)) => parse_blocks(blocks, false, None),
             _ => vec![],
         };
     }
+    // 1b. Injected `<system-reminder>` text is machinery. A line holding nothing else is
+    // hidden; one that also carries a tool result keeps that result (dropping it would
+    // orphan the call it answers).
+    let Some(filtered) = without_reminders(raw) else {
+        return vec![];
+    };
+    let content = &filtered;
+    let s = content.as_str();
     // 2. The compact_boundary system line draws the divider; the summary text is noise.
     if flag("isCompactSummary") {
         return vec![];
@@ -862,11 +916,24 @@ mod tests {
 
     #[test]
     fn array_text_with_unknown_tag_is_note() {
-        let v = json!({"type":"user","message":{"content":[{"type":"text","text":"<system-reminder>x</system-reminder>"}]}});
+        let v = json!({"type":"user","message":{"content":[{"type":"text","text":"<ide-thing>x</ide-thing>"}]}});
         let items = parse_user(&v);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["kind"], "note");
-        assert_eq!(items[0]["tag"], "system-reminder");
+        assert_eq!(items[0]["tag"], "ide-thing");
+    }
+
+    #[test]
+    fn reminder_block_beside_tool_result_keeps_the_result() {
+        let v = json!({"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"t1","content":"ok"},
+            {"type":"text","text":"<system-reminder>x</system-reminder>"}]}});
+        let items = parse_user(&v);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "result");
+        let only = json!({"type":"user","message":{"content":[
+            {"type":"text","text":"<system-reminder>x</system-reminder>"}]}});
+        assert!(parse_user(&only).is_empty());
     }
 
     #[test]

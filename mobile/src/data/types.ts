@@ -1,10 +1,19 @@
 /** Data model for the mobile companion. Mirrors the desktop's session/status
  * vocabulary (src/store.ts LiveState + src/themes.ts) so the two stay legible
- * to each other. Backed by mock data in this shell; by the bridge later. */
+ * to each other. Filled from the desktop bridge. */
 
-import type { WireDiff, WireQuestion } from "../bridge/protocol";
+import type { WireDiff, WireProjectsView, WireQuestion, WireViewProject, WireViewSession } from "../bridge/protocol";
 
-export type AgentKind = "claude" | "codex" | "gemini";
+/** A paired Mac as stored in the Keychain (one slot per Mac). */
+export interface SavedMac {
+  deviceId: string;
+  token: string;
+  macName: string;
+  dnsName: string;
+  ip: string;
+  port: number;
+  pairedAt: number;
+}
 
 /** Same four states as the desktop `SessionStatus` (src/store.ts). */
 export type SessionStatus = "idle" | "running" | "needsInput" | "done";
@@ -14,38 +23,10 @@ export interface TodoProgress {
   total: number;
 }
 
-export interface ApprovalRequest {
-  id: string;
-  /** tool name, e.g. "Bash" */
-  tool: string;
-  /** the thing being approved, e.g. "rm -rf node_modules && npm i" */
-  input: string;
-}
-
-export interface Agent {
-  id: string;
-  name: string;
-  branch: string;
-  kind: AgentKind;
-  status: SessionStatus;
-  /** running: "Editing src/store.ts" (mirror of desktop `activity`) */
-  activity?: string;
-  todos?: TodoProgress;
-  compacting?: boolean;
-  /** needsInput sub-line: "approval · Bash: rm -rf…" | "waiting · your reply" */
-  attention?: string;
-  /** done: "3m ago" */
-  doneAgo?: string;
-  /** present when this agent is blocked on an approval */
-  pendingApproval?: ApprovalRequest;
-}
-
-export interface Project {
-  id: string;
-  name: string;
-  path: string;
-  agents: Agent[];
-}
+/** The Mac's typed projects view, as the Chats list reads it (src-tauri/src/bridge_view.rs). */
+export type ProjectsView = WireProjectsView;
+export type ViewProject = WireViewProject;
+export type ViewSession = WireViewSession;
 
 // ---- chat feed items ----
 
@@ -53,14 +34,20 @@ export type ChatRole = "user" | "assistant";
 export type EventKind = "read" | "bash" | "edit" | "search" | "web" | "subagent" | "generic";
 export type TodoStatus = "pending" | "in_progress" | "completed";
 
-export interface BubbleItem {
+/** Every feed item: `at` is the transcript line's ISO time when it had one (none for items the
+ * phone made itself, e.g. its own "Interrupted" divider). */
+export interface ItemBase {
+  at?: string;
+}
+
+export interface BubbleItem extends ItemBase {
   kind: "bubble";
   id: string;
   role: ChatRole;
   text: string;
 }
 
-export interface EventItem {
+export interface EventItem extends ItemBase {
   kind: "event";
   id: string;
   event: EventKind;
@@ -75,7 +62,7 @@ export interface EventItem {
 }
 
 /** A tool call's outcome. Never rendered on its own; `groupFeed` folds it into its call. */
-export interface ResultItem {
+export interface ResultItem extends ItemBase {
   kind: "result";
   id: string;
   toolUseId: string;
@@ -84,7 +71,7 @@ export interface ResultItem {
   diff: WireDiff | null;
 }
 
-export interface TodosItem {
+export interface TodosItem extends ItemBase {
   kind: "todos";
   id: string;
   done: number;
@@ -92,7 +79,7 @@ export interface TodosItem {
   items: { text: string; status: TodoStatus }[];
 }
 
-export interface ApprovalItem {
+export interface ApprovalItem extends ItemBase {
   kind: "approval";
   id: string;
   tool: string;
@@ -101,7 +88,7 @@ export interface ApprovalItem {
   resolved?: "allow" | "deny";
 }
 
-export interface NoticeItem {
+export interface NoticeItem extends ItemBase {
   kind: "notice";
   id: string;
   tone: "ok" | "bad" | "info";
@@ -109,14 +96,14 @@ export interface NoticeItem {
   detail?: string;
 }
 
-export interface DividerItem {
+export interface DividerItem extends ItemBase {
   kind: "divider";
   id: string;
   label: string;
   tone: "info" | "warning";
 }
 
-export interface CommandItem {
+export interface CommandItem extends ItemBase {
   kind: "command";
   id: string;
   name: string;
@@ -124,21 +111,21 @@ export interface CommandItem {
   output?: string;
 }
 
-export interface ImageItem {
+export interface ImageItem extends ItemBase {
   kind: "image";
   id: string;
   mediaType: string;
   data: string | null;
 }
 
-export interface QuestionItem {
+export interface QuestionItem extends ItemBase {
   kind: "question";
   id: string;
   toolUseId: string;
   questions: WireQuestion[];
 }
 
-export interface PlanItem {
+export interface PlanItem extends ItemBase {
   kind: "plan";
   id: string;
   markdown: string;

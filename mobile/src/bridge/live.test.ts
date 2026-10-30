@@ -1,5 +1,5 @@
-import { PHONE_KINDS, appendWire, mapChatItem, mapHistory, mapProjects, statusPatch } from "./live";
-import type { WireChatItem, WireProject } from "./protocol";
+import { PHONE_KINDS, appendWire, mapChatItem, mapHistory, mapProjectsView, sameView, statusPatch } from "./live";
+import type { WireChatItem } from "./protocol";
 
 describe("mapChatItem", () => {
   it("maps a user bubble", () => {
@@ -32,6 +32,12 @@ describe("mapChatItem", () => {
       diff: null,
     });
     expect(feed.map((i) => i.kind)).toEqual(["event", "result"]);
+  });
+  it("carries the line's time and omits it when absent", () => {
+    expect(mapChatItem({ kind: "bubble", role: "user", text: "hi", at: "2026-10-29T20:11:42.123Z" })?.at).toBe(
+      "2026-10-29T20:11:42.123Z",
+    );
+    expect(mapChatItem({ kind: "divider", label: "x", tone: "info" })).not.toHaveProperty("at");
   });
   it("assigns an id", () => {
     expect(mapChatItem({ kind: "bubble", role: "assistant", text: "yo" })?.id).toBeTruthy();
@@ -93,23 +99,83 @@ describe("task status table", () => {
   });
 });
 
-describe("mapProjects", () => {
-  it("maps wire projects to UI projects with running→status", () => {
-    const wire: WireProject[] = [
+describe("mapProjectsView", () => {
+  const session = {
+    id: "s1",
+    name: "auth",
+    agent: "claude",
+    branch: "feat/x",
+    model: "opus",
+    stopped: false,
+    running: true,
+    silo: false,
+    status: "running",
+    activity: "Editing x.ts",
+    updatedAt: 1700000000000,
+    needs: { kind: "ask", text: "Ship it?" },
+    lastMessage: { role: "assistant", text: "Done: tests pass.", at: "2026-10-29T20:11:42.123Z" },
+  };
+  const frame = {
+    type: "projects",
+    profiles: [{ id: null, name: "Default" }, { id: "w", name: "Work" }],
+    activeProfileId: "w",
+    projects: [{ id: "p1", name: "Conduit", profileId: "w", color: "#123456", sessions: [session] }],
+  };
+
+  it("carries the typed view through without the frame tag", () => {
+    const v = mapProjectsView(frame);
+    expect(v).not.toHaveProperty("type");
+    expect(v.activeProfileId).toBe("w");
+    expect(v.profiles).toEqual(frame.profiles);
+    expect(v.projects[0]).toEqual({ ...frame.projects[0], sessions: [session] });
+  });
+
+  it("never lets a silo session carry activity or question text", () => {
+    const v = mapProjectsView({
+      ...frame,
+      projects: [{ ...frame.projects[0], sessions: [{ ...session, silo: true }] }],
+    });
+    expect(v.projects[0].sessions[0]).toMatchObject({
+      silo: true,
+      activity: null,
+      needs: { kind: "input", text: null },
+      lastMessage: null,
+    });
+  });
+
+  it("reads lastMessage defensively (Task 8a shape)", () => {
+    const one = (lastMessage: unknown) =>
+      mapProjectsView({ ...frame, projects: [{ ...frame.projects[0], sessions: [{ ...session, lastMessage }] }] })
+        .projects[0].sessions[0].lastMessage;
+    expect(one({ role: "user", text: "hi", at: null })).toEqual({ role: "user", text: "hi", at: null });
+    expect(one({ role: "system", text: "x", at: null })).toBeNull();
+    expect(one({ role: "user", text: 3 })).toBeNull();
+    expect(one(undefined)).toBeNull();
+  });
+
+  it("degrades a malformed frame instead of throwing", () => {
+    const v = mapProjectsView({
+      projects: [{ id: "p", sessions: [{ id: "s", status: "weird", updatedAt: 0 }, { name: "no id" }] }, { name: "x" }],
+    });
+    expect(v.profiles).toEqual([{ id: null, name: "Default" }]);
+    expect(v.projects).toHaveLength(1);
+    expect(v.projects[0].sessions).toEqual([
       {
-        id: "p1",
-        name: "Conduit",
-        path: "/repo",
-        sessions: [
-          { id: "s1", name: "auth", branch: "feat/x", agent: "claude", running: true },
-          { id: "s2", name: "idle-one", branch: null, agent: "codex", running: false },
-        ],
+        id: "s",
+        name: "s",
+        agent: "",
+        branch: null,
+        model: null,
+        stopped: false,
+        running: false,
+        silo: false,
+        status: "idle",
+        activity: null,
+        updatedAt: null,
+        needs: null,
+        lastMessage: null,
       },
-    ];
-    const out = mapProjects(wire);
-    expect(out[0]).toMatchObject({ id: "p1", name: "Conduit", path: "/repo" });
-    expect(out[0].agents[0]).toMatchObject({ id: "s1", name: "auth", branch: "feat/x", kind: "claude", status: "running" });
-    expect(out[0].agents[1]).toMatchObject({ id: "s2", branch: "", kind: "codex", status: "idle" });
+    ]);
   });
 });
 
@@ -134,5 +200,23 @@ describe("statusPatch", () => {
   });
   it("unknown verb → empty patch", () => {
     expect(statusPatch("mystery", {})).toEqual({});
+  });
+});
+
+describe("sameView", () => {
+  const frame = () => ({
+    type: "projects",
+    profiles: [{ id: null, name: "Default" }],
+    activeProfileId: null,
+    projects: [{ id: "p", name: "P", profileId: null, color: null, sessions: [{ id: "s", name: "S", status: "running" }] }],
+  });
+
+  it("is true for a deep-equal frame and false for any change", () => {
+    const a = mapProjectsView(frame());
+    expect(sameView(a, mapProjectsView(frame()))).toBe(true);
+    const f = frame();
+    f.projects[0].sessions[0].status = "done";
+    expect(sameView(a, mapProjectsView(f))).toBe(false);
+    expect(sameView(null, a)).toBe(false);
   });
 });

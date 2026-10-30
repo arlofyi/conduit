@@ -17,7 +17,9 @@ import {
 } from "./store";
 import { type AgentId } from "./agents";
 import { applyCliOpenPayload, inThisWindow, type CliOpenPayload } from "./cliOpen";
-import { askGateOpen, askResolvedToast, askShouldHandOff, type PendingAsk } from "./asks";
+import { askGateOpen, askResolvedPlan, askShouldHandOff, type PendingAsk } from "./asks";
+import { parseBy, resolutionHold, type PendingPermission } from "./permissionView";
+import { handedOff, handOffView } from "./askHandoff";
 import { effectiveCenterMode } from "./centerViews";
 import { type PendingDiff } from "./ideBridge";
 import {
@@ -46,6 +48,7 @@ import { TmuxNotice } from "./components/TmuxNotice";
 import { ConversationRepairNotice } from "./components/ConversationRepairNotice";
 import { Toasts } from "./components/Toasts";
 import { AskDock } from "./components/AskDock";
+import { PermissionDock } from "./components/PermissionCard";
 import { PairPrompt } from "./components/PairPrompt";
 import type { PairRequest } from "./mobilePairing";
 import { NewProjectDialog } from "./components/NewProjectDialog";
@@ -63,6 +66,20 @@ import { initPlugins, feedHook, feedFleet } from "./plugins";
 
 /** How long an answered question card stays up showing its done state. */
 const ASK_DONE_HOLD_MS = 1600;
+/** Longer when the answer came from elsewhere: "Answered on your phone" is news to read. */
+const REMOTE_DONE_HOLD_MS = 2600;
+/** A resolved permission card's hold. Covers the Deny caveat, the longest line it shows. */
+const PERMISSION_DONE_HOLD_MS = 3200;
+
+/** Permission ids already resolved, so a stale catch-up cannot resurrect one. Bounded. */
+const resolvedPermissions = new Set<string>();
+function rememberResolvedPermission(id: string) {
+  resolvedPermissions.add(id);
+  if (resolvedPermissions.size > 128) {
+    const oldest = resolvedPermissions.values().next().value;
+    if (oldest !== undefined) resolvedPermissions.delete(oldest);
+  }
+}
 
 interface HookPayload {
   session: string;
@@ -80,18 +97,6 @@ function runEditorAction(id: string): void {
   }
 }
 
-/** Ask ids already handed back to the terminal (see the hand-off subscription). */
-const handedOff = new Set<string>();
-
-/** Where the user is looking, for the hand-off rule. */
-function handOffView(s: ReturnType<typeof useStore.getState>) {
-  return {
-    selectedSessionId: globalSelectedSessionId(s),
-    continuityVisible:
-      !!s.selectedProjectId && effectiveCenterMode(s.centerMode[s.selectedProjectId], s) === "continuity",
-    windowFocused: s.windowFocused,
-  };
-}
 
 /** An incoming ask (live or catch-up). One for the terminal the user is already watching
  *  goes straight back to it and never becomes a card: adding it first would flash a docked
@@ -912,18 +917,27 @@ export default function App() {
     void (async () => {
       const ready = await Promise.all([
         listen<PendingAsk>("ask-request", ({ payload }) => admitAsk(payload)),
-        listen<{ id: string; how: string }>("ask-resolved", ({ payload }) => {
+        listen<{ id: string; how: string; by?: string }>("ask-resolved", ({ payload }) => {
           const s = useStore.getState();
-          const shown = payload.id in s.asks;
+          const by = parseBy(payload.by);
+          const plan = askResolvedPlan({
+            how: payload.how,
+            by,
+            shown: payload.id in s.asks,
+            handedOffHere: handedOff.has(payload.id),
+          });
           // An answer from a card: Rust resolves before the card's own ask_answer reply lands,
           // so hold the card long enough for its "Sent to …" confirmation to be seen — and
-          // stop it reading as "needs you" meanwhile.
-          if (payload.how === "answered") {
-            s.markAskAnswered(payload.id);
-            setTimeout(() => useStore.getState().removeAsk(payload.id), ASK_DONE_HOLD_MS);
+          // stop it reading as "needs you" meanwhile. An answer from elsewhere (the phone,
+          // the terminal, another window) holds a little longer so the card can say where.
+          if (plan.answered) s.markAskAnswered(payload.id);
+          if (plan.note) s.noteAskResolved(payload.id, plan.note);
+          if (plan.hold) {
+            const ms = plan.note && plan.note !== "desktop" ? REMOTE_DONE_HOLD_MS : ASK_DONE_HOLD_MS;
+            setTimeout(() => useStore.getState().removeAsk(payload.id), ms);
           } else s.removeAsk(payload.id);
           handedOff.delete(payload.id);
-          if (askResolvedToast(payload.how, shown)) s.pushToast("Question moved to the session's terminal");
+          if (plan.toast) s.pushToast("Question moved to the session's terminal");
         }),
       ]).catch(() => [] as (() => void)[]);
       if (disposed) {
@@ -943,6 +957,46 @@ export default function App() {
       uns.forEach((f) => f());
       window.removeEventListener("focus", onFocus);
       window.removeEventListener("blur", onBlur);
+    };
+  }, []);
+
+  // Tool-permission cards (broker.rs). Same contract as the ask cards: both listeners are
+  // registered BEFORE the `permission_pending` catch-up, so one raised in between still
+  // gets a card. A catch-up that read a permission just before it resolved must not bring
+  // the card back, hence `resolvedPermissions`.
+  useEffect(() => {
+    let disposed = false;
+    const uns: (() => void)[] = [];
+    const admit = (p: PendingPermission) => {
+      if (!resolvedPermissions.has(p.id)) useStore.getState().addPermission(p);
+    };
+    void (async () => {
+      const ready = await Promise.all([
+        listen<PendingPermission>("permission-request", ({ payload }) => admit(payload)),
+        listen<{ id: string; by?: string }>("permission-resolved", ({ payload }) => {
+          const s = useStore.getState();
+          const by = parseBy(payload.by);
+          rememberResolvedPermission(payload.id);
+          // A card hidden behind its own terminal (the dock's hand-off rule) was never seen:
+          // drop it now, or looking away during the hold would surface a stale card.
+          const held = s.permissions[payload.id];
+          if (resolutionHold(by, !!held && !askShouldHandOff(held, handOffView(s)))) {
+            s.notePermissionResolved(payload.id, by!);
+            setTimeout(() => useStore.getState().removePermission(payload.id), PERMISSION_DONE_HOLD_MS);
+          } else s.removePermission(payload.id);
+        }),
+      ]).catch(() => [] as (() => void)[]);
+      if (disposed) {
+        ready.forEach((f) => f());
+        return;
+      }
+      uns.push(...ready);
+      const list = await invoke<PendingPermission[]>("permission_pending").catch(() => [] as PendingPermission[]);
+      if (!disposed) list.forEach(admit);
+    })();
+    return () => {
+      disposed = true;
+      uns.forEach((f) => f());
     };
   }, []);
 
@@ -1133,7 +1187,12 @@ export default function App() {
       <TmuxNotice />
       <ConversationRepairNotice />
       <Toasts />
-      <AskDock />
+      {/* One bottom-right column: permissions above the docked question. A sibling overlay,
+          never inside the terminal tree. */}
+      <div className="hold-dock">
+        <PermissionDock />
+        <AskDock />
+      </div>
       <PairPrompt />
       <PendingDecisions />
       {showSettings && (

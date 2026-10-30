@@ -29,8 +29,9 @@ export type Diff = {
 
 /** Fields every item may carry. `seq` is the item's absolute index in the whole parsed
  *  conversation, stamped by `session_transcript` BEFORE it tails to the view limit -- a
- *  stable row key as the window slides. Absent on the bridge and root-chat paths. */
-type ItemBase = { seq?: number };
+ *  stable row key as the window slides. Absent on the bridge and root-chat paths.
+ *  `at` is the transcript line's ISO-8601 timestamp, absent when the line had none. */
+type ItemBase = { seq?: number; at?: string };
 
 type ItemBody =
   | { kind: "bubble"; role: "user" | "assistant"; text: string }
@@ -152,6 +153,30 @@ export function groupTools(items: TranscriptItem[]): ChatRow[] {
   });
   flush();
   return rows;
+}
+
+/** The tool a call kind names, for a line that no longer has a verb of its own. */
+const CALL_NOUN: Record<string, string> = {
+  read: "Read",
+  bash: "Bash",
+  edit: "Edit",
+  search: "Search",
+  web: "Web",
+  subagent: "Agent",
+};
+
+/** A refusal, whoever refused: Conduit's own deny (`broker::DENY_MESSAGE`), a terminal "No",
+ *  or a permission rule. */
+const DENIED = /\b(denied|rejected)\b|doesn't want to proceed/i;
+
+/** The verb a call line shows. The transcript fixes it when the tool is CALLED ("ran"), so a
+ *  call whose result is an error would still read "ran touch a.txt" beside its ✕ -- which
+ *  contradicts an honest "Denied". Once the result is an error the line says what happened.
+ *  Keep identical to `callVerb` in mobile/src/logic/feed.ts. */
+export function callVerb(call: Call, verb: string): string {
+  if (call.status !== "error") return verb;
+  const noun = CALL_NOUN[call.event.event] ?? "tool";
+  return `${call.errorText && DENIED.test(call.errorText) ? "Denied" : "Failed"}: ${noun}`;
 }
 
 /** One-line digest of a folded run: buckets in descending count (stable on first seen). */

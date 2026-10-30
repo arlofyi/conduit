@@ -3,10 +3,19 @@
   "version": "1.0.0",
   "main": "index.ts",
   "dependencies": {
+    "@react-navigation/bottom-tabs": "7.21.0",
     "@react-navigation/native": "^7.3.4",
     "@react-navigation/native-stack": "^7.17.6",
     "expo": "~56.0.12",
+    "expo-blur": "~56.0.4",
+    "expo-camera": "~56.0.8",
+    "expo-clipboard": "~56.0.4",
+    "expo-crypto": "~56.0.5",
+    "expo-font": "~56.0.7",
+    "expo-glass-effect": "~56.0.4",
+    "expo-secure-store": "~56.0.4",
     "expo-status-bar": "~56.0.4",
+    "expo-symbols": "~56.0.7",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-native": "0.85.3",
@@ -14,6 +23,7 @@
     "react-native-markdown-display": "^7.0.2",
     "react-native-safe-area-context": "~5.7.0",
     "react-native-screens": "4.25.2",
+    "react-native-svg": "15.15.4",
     "react-native-web": "^0.21.2"
   },
   "devDependencies": {
@@ -24,6 +34,7 @@
     "typescript": "~6.0.3"
   },
   "overrides": {
+    "expo-font": "$expo-font",
     "markdown-it": "^14.2.0",
     "linkify-it": "^5.0.1",
     "uuid": "^11.1.1"

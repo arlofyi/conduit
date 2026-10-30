@@ -438,11 +438,14 @@ expands `%VAR%` and turns `>NUL` into a FILE, so the old inline cmd-syntax hook 
 `session=%CONDUIT_SESSION_ID%` (every event dropped by the provenance gate) and left
 `NUL` files in agents' working dirs.
 
-- `hooks::command` / `ask_command` emit only `"<dataDir>/conduit-hook.cmd" <event> <port>`
-  (forward slashes: they survive a shell that drops quotes, backslashes do not). The
-  relays (`HOOK_RELAY_CMD`, `ASK_RELAY_CMD`, written by `write_hook_relays`) run under
-  cmd's own rules, prefer the session's `CONDUIT_HOOK_PORT`, post nothing without
-  `CONDUIT_SESSION_ID`, and keep the reply off stdout (`-o NUL`) except for `/ask`.
+- `hooks::command` emits only `"<dataDir>/conduit-hook.cmd" <event> <port>`, and
+  `ask_command` / `permission_command` only `"<dataDir>/conduit-ask.cmd" <port> <max secs>` /
+  `"<dataDir>/conduit-permission.cmd" <port> <max secs>` (forward slashes: they survive a
+  shell that drops quotes, backslashes do not). The relays (`HOOK_RELAY_CMD`, `ASK_RELAY_CMD`,
+  `PERMISSION_RELAY_CMD`, written by `write_hook_relays`) run under cmd's own rules, prefer
+  the session's `CONDUIT_HOOK_PORT`, post nothing without `CONDUIT_SESSION_ID`, and keep the
+  reply off stdout (`-o NUL`) except for `/ask` and `/permission`, whose reply IS the
+  hook's answer.
 - **Never put `%VAR%`, a redirect or `||` back into a Windows hook command string.** A
   test (`windows_hook_commands_are_shell_neutral`) pins it.
 - `session_files::remove_stray_nul_files` cleans up the old files; it needs `\\?\`
@@ -582,12 +585,22 @@ plus install/remove/status), and one listener in `App.tsx`.
 - **`tailscale.rs` only reads** (`status`/`whois --json`). Never add `up`/`down`/`set`/
   `serve`/`funnel`/`login`; the CLI call has a 3 s deadline.
 - **Peers and handshake.** A peer outside loopback and the tailnet ranges is dropped before
-  the handshake; any upgrade carrying `Origin` gets 403 (a web page on the Mac must never
-  reach the bridge). Every peer gets `hello`; a non-loopback peer must `auth` with its device
-  token (or `pair`/`discover`) within 5 s; the WebSocket upgrade itself has ONE 5 s overall deadline (a watchdog shuts the socket down, so a byte-dribbling peer cannot hold the thread). Pre-auth frames are capped at 4 KiB and the cap is
+  the handshake; an upgrade whose `Origin` is not the bridge itself gets 403 (a web page on
+  the Mac must never reach the bridge). `origin_allowed` admits only the listener's own
+  origin (the arrival IP -- `127.0.0.1` on loopback -- or this Mac's MagicDNS name on the
+  tailnet address, with the bridge port), because iOS's WebSocket ALWAYS sends `Origin:
+  http://<dialled host>:<port>` and JS cannot remove it -- a blanket "no Origin" rule
+  refused every phone. `localhost` is NOT admitted: any local web page has that origin, and
+  the Simulator dials the literal IP. Never compare it to `Host` (DNS rebinding).
+  Every peer gets `hello`; a non-loopback peer must `auth` with its device token (or
+  `pair`/`discover`) within 5 s; the WebSocket upgrade itself has ONE 5 s overall deadline
+  (a watchdog shuts the socket down, so a byte-dribbling peer cannot hold the thread).
+  Pre-auth frames are capped at 4 KiB and the cap is
   lifted on auth. Success is acked with an `authOk` frame; a pair request waiting on the Mac
   sends `pairPending`. Failures answer one generic `unauthorized` (no oracle) and are
-  rate-limited 5 per 60 s per IP.
+  rate-limited 5 per 60 s per IP -- except an `auth` refused by the rate limit or the access
+  switch, which is decided BEFORE the token is checked and answers `unavailable`
+  (`auth_outcome`), because the phone forgets a Mac on `unauthorized`.
 - **`mobile-devices.json`, never `state.json`** (the orphan-sweep rule). It holds the switch,
   the port and SHA-256 token hashes; plaintext is returned once. An unparseable file is moved
   to `.bak.<secs>-<8 hex>` (a uuid fragment, so names never collide) and defaults load; if it cannot be
@@ -607,6 +620,103 @@ plus install/remove/status), and one listener in `App.tsx`.
   8475 (see the root-chat section for the full carve-up of 8423..=8516).
 - Secrets rule applies: no token, nonce or QR secret is logged; types holding a plaintext secret or
   token (`ClientMsg`) hand-write `Debug` and print them as `<redacted>`; the rest never derive it.
+- **What leaves the Mac is a whitelist.** The `projects` frame is built by `bridge_view.rs`
+  (`projects_view`) field by field, never by serializing `Project`/`Session` (those carry
+  `seedMemory`, account ids, paths). Add a field there deliberately, and to the key-list test.
+- **Private sessions are refused, not just hidden.** `bridge_view::session_is_private`
+  (`silo || local_only`) gates every session-scoped message (`session_scope`: attach, input,
+  resize, git, kill, interrupt) from ANY peer, loopback included, with `{error: "private
+  session"}` -- BEFORE `wake_session`, so not even the PTY is started. The list still names
+  them (no preview, activity or question text).
+- **Frames carry `sessionId`** (`chat`, `history`, `status`); the phone drops one that is
+  not the open chat's and accepts untagged ones from older desktops. A failed or refused
+  `attach` clears the old subscription and tail (`clear_attachment`) so the left chat never
+  streams into the new one. The tail re-resolves the attached Claude session's transcript at
+  most once a second, scanning only when the conversation id moved or none was found
+  (`needs_resolve`/`should_switch_tail`), and re-sends `history` on a switch -- that is how a
+  `/clear` and a just-spawned chat are followed. Don't move that back to the phone.
+- **Phones can start sessions** (`spawn`, the "+" new chat). The agent is read STRICTLY
+  (`AgentId::from_wire`; the lenient deserialize would start Claude under an invented id),
+  the name comes from the first message's first line (<= 40 chars, else "Mobile"), and each
+  phone gets 10 per hour (`take_spawn_slot`, keyed by device id, or peer IP on loopback).
+  The phone offers only Claude, the one agent whose chat it can show.
+- **Questions and permissions are held for whoever can see a card** (`hooks::holder_for`,
+  shared by `/ask` and `/permission`): the desktop gate, OR a connected REMOTE phone when
+  the session is not private. Loopback (the Simulator) never counts as a phone -- only an
+  authenticated tailnet socket is in `live`. An item held only for phones
+  (`held_for_phone`) is handed back to the terminal the moment the last phone leaves
+  (`last_phone_left`); a remote socket is pinged every 15 s and dropped after 35 s of
+  silence (`has_remote_phone` stops counting it at once). **Every bridge write is bounded
+  (`WRITE_STALL`, 10 s)**: a frozen phone keeps its socket open at zero window, and an
+  unbounded write blocked the loop before the staleness check -- measured, 70 s frozen and
+  the question still held. The phone also closes its socket itself when backgrounded.
+  **Any send that fails with an I/O error ends the connection** (`send_text` /
+  `send_failure_is_fatal`): never `let _ = ws.send(..)` and carry on -- on Windows a
+  timed-out send leaves the socket indeterminate, and tungstenite would retry the
+  half-written frame into a corrupt stream.
+- **Raw PTY `output` frames go to LOOPBACK only** (`streams_raw_output`: the matrix sidecar
+  and the Simulator). A remote phone renders the transcript and never used them; a TUI
+  spinner repaints at ~19 KB/s (~70 MB per working hour of cellular data), and that stream
+  is what filled a frozen phone's window. The subscription is still taken (it is how
+  `attach` wakes the PTY) and drained.
+- **A phone-spawned Claude chat that never starts is reported** (`SpawnWatch`,
+  `TRUST_STALL` 20 s): no `sessionstart` hook within 20 s of a spawn means Claude is on its
+  "trust this folder?" prompt, which runs before any hook and which only the Mac can answer.
+  The spawning socket gets ONE `{type:"error", sessionId, message: TRUST_STALL_MESSAGE}`;
+  the phone (`logic/frames.ts trustStallNotice`) shows it as a notice in that chat, and the
+  `history` re-sent when Claude does start replaces it. Claude only -- other agents have no
+  such prompt and some fire no `sessionstart` at all.
+- **Pushes and `by`.** Each socket diffs `Asks::pending()` + `Broker::pending()` every
+  250 ms (`push_frames`): `pending` once, then `pendingAdded` / `resolved{by}`, `by` from a
+  64-entry ring (`phone|desktop|terminal|timeout|cancelled`; unknown reads `cancelled`).
+  `cancelled` = remove silently. `terminal` means a hand-off for an ask ("Moved to the
+  terminal") but "Handled in the terminal" for a permission -- the event cannot tell a
+  terminal "No" from the last phone leaving. A private item is pushed as exactly
+  `{kind,id,sessionId,private}`; privacy is decided once, when the item is first pushed to
+  a socket, so a session made private later is not redacted retroactively.
+- **Cancellation** (`turn_moved_on`): `stop`/`prompt`/`sessionend` cancel both registries;
+  `tooluse` too, EXCEPT a body with a non-empty `agent_id` -- measured (2.1.312): a
+  background subagent's PreToolUse/PostToolUse carry `agent_id` + `agent_type`, the main
+  thread's never do, so a subagent finishing a tool cannot kill the main turn's question.
+  Never `pretool` (it fires for AskUserQuestion itself). A PERMISSION is narrower
+  (`permission_moved_on`): a finished tool cancels it only when its `tool_name` is the
+  permission's own tool (its PostToolUse after a terminal "Yes"), so a sibling tool in the
+  same batch finishing first leaves the card up. Two pending permissions for the same tool
+  name in one session can still clear each other; that fails open (Claude's dialog stays).
+- **A dead hook is noticed by writing to it** (`hook_wait.rs`): tiny_http exposes no socket,
+  so while waiting the handler writes `102 Processing` every 500 ms on
+  `request.into_writer()`; a failed write = Esc/"No" in the terminal killed curl ->
+  `by: terminal` (measured: Esc -> phone card cleared in 1.15 s; terminal "No" -> 0.7 s).
+  After `into_writer`, NEVER call `request.respond` -- write the reply with
+  `write_json_response`.
+- **PermissionRequest facts** (spike: `docs/superpowers/specs/2026-10-30-permission-request-hook-findings.md`).
+  No `tool_use_id`, so permission cards are standalone (keyed `perm-N` + session).
+  AskUserQuestion and ExitPlanMode also fire it and are answered `{}` at once. Ceilings
+  300 s < curl 330 < hook 340 (a `const` assert). Only `allow`/`deny` replies act; `{}`
+  falls through to the TUI dialog, which runs in parallel. A terminal "Yes" leaves the
+  hook alive and is invisible until PostToolUse, so "ok" from `approve`/`permission_respond`
+  means "reached the hook", never "stopped the tool" -- copy must stay honest ("Denied --
+  if you'd already allowed it in the terminal, it keeps running").
+- **Desktop side**: `askResolvedPlan` (asks.ts) decides hold/note/toast for `ask-resolved`;
+  `askHandoff.ts` remembers this window's own hand-offs; permission cards live in
+  `.hold-dock` above AskDock, filtered by `permissionsToShow` (no card over the terminal
+  you are watching), listeners registered before the `permission_pending` catch-up, and
+  `resolvedPermissions` stops a stale catch-up resurrecting one. **Phone side**:
+  `logic/pending.ts` -- the Mac is the truth (a snapshot or `added` replaces a settled
+  entry: ids restart per Mac boot), a send that did not go out stays live, and an answer
+  the Mac REFUSED (`answerResult ok:false` with no `resolved` naming a winner -- e.g. over
+  `MAX_ANSWER_BYTES`) is not a settlement: the card goes back to live with "Couldn't send
+  that answer" (`rejected`), and a later `resolved` still settles it honestly.
+- **The phone app is `mobile/`** (Expo SDK 56 dev build; run/pairing steps in
+  `mobile/README.md`). Pure logic lives in `mobile/src/logic` + `src/bridge` with jest tests;
+  `LiveProvider` owns the one socket. Chat messages go into the PTY as a bracketed paste +
+  `\r` (`promptInput`, the twin of `pty::paste_and_submit`) -- a bare `text + "\r"` leaves a
+  long message unsent in Claude's composer. To drive it end to end, run the desktop as
+  `CONDUIT_DATA_DIR_NAME=ConduitTauri-dev pnpm tauri dev` and pick ITS port in the
+  Simulator's loopback scan (the installed Conduit answers on loopback too, usually 8455).
+  A dev build launched from a terminal inside the installed Conduit inherits that app's
+  `CONDUIT_HOOK_*` env; `build_script` now exports `CONDUIT_HOOK_ENDPOINT` so its sessions'
+  hooks still reach the dev build, not the installed one.
 
 ## Where the IDE integration lives
 
@@ -682,8 +792,9 @@ the spawn path underneath.
   `approve_root_proposal_inner` both call `Proposals::sweep` first — `get` alone never
   expires anything, only `register`/`pending` do — so a proposal past `EXPIRY_SECS` can
   neither be reported as pending nor approved late.
-- **`proposals.rs` is not `broker.rs`.** The broker hands its caller a receiver to block
-  on and forgets an answered entry (right for a 45 s approval hook). A proposal is
+- **`proposals.rs` is not `broker.rs`.** The broker is the PermissionRequest registry: it
+  hands the blocked `/permission` hook a receiver (300 s `PERMISSION_CEILING`) and drops an
+  answered entry, keeping only a short `(id, by)` ring for the push diff. A proposal is
   non-blocking, lives 24 h, and must stay readable after the answer so `dispatch_status`
   can report it. The UI merges the two queues; the registries stay separate.
 - **The agent is resolved at APPROVE time, in TypeScript.** `routing.rs` owns the
@@ -799,7 +910,10 @@ animal avatars linked by the Continuity messages they exchange, plus Claude Code
   `timeout: 660` — the default hook timeout is 60 s, so dropping the entry's `timeout` would
   silently kill every card after a minute.
 - **The gate is closed unless a card can be seen** (`set_ask_gate`, `asks.ts askGateOpen`):
-  view open or a Conduit window focused. The same `settings.local.json` is read by a `claude`
+  the Continuity view enabled AND (view open or a Conduit window focused). A connected,
+  authenticated remote phone also holds a non-private session's questions and permissions
+  (`hooks::holder_for`; see "Where the mobile bridge lives"), gate closed or not. The same
+  `settings.local.json` is read by a `claude`
   the user runs by hand in that checkout; it posts `session=unknown` and is answered `{}` at once.
 - **Hand-off is to the session's own terminal** (`askShouldHandOff`), and `ask_answer`
   returning `false` means "already answered there" — not an error.

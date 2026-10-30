@@ -5,15 +5,21 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.uziiuzair.mobile-app",
       "appleTeamId": "Y4SXF5YHY6",
       "infoPlist": {
-        "NSLocalNetworkUsageDescription": "Conduit connects to your Mac on the same Wi-Fi to mirror your Claude Code sessions.",
+        "NSLocalNetworkUsageDescription": "Conduit connects to your Mac over Tailscale to mirror your agent sessions.",
         "NSAppTransportSecurity": {
-          "NSAllowsLocalNetworking": true
+          "NSAllowsLocalNetworking": true,
+          "NSExceptionDomains": {
+            "ts.net": {
+              "NSIncludesSubdomains": true,
+              "NSExceptionAllowsInsecureHTTPLoads": true
+            }
+          }
         }
       }
     },
@@ -28,6 +34,18 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Conduit uses the camera to scan the pairing code shown on your Mac.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      "expo-secure-store",
+      "expo-font"
+    ]
   }
 }

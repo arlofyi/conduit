@@ -1,6 +1,7 @@
 /** AskUserQuestion cards: pure rules. The Rust side holds the question open (asks.rs);
  *  this decides when a card may capture one and when to give it back to the terminal. */
 import { MULTISELECT_JOIN } from "./askProtocol";
+import type { ResolvedBy } from "./permissionView";
 
 export type AskOption = { label: string; description?: string };
 export type AskQuestion = { question: string; header?: string; options: AskOption[]; multiSelect?: boolean };
@@ -14,11 +15,18 @@ export function askGateOpen(i: { enabled: boolean; viewOpen: boolean; windowFocu
 
 /** Hand back once the user is looking at that session's own terminal — the menu is about
  *  to be useful there, and a card elsewhere would be a second copy of the same question. */
-export function askShouldHandOff(
-  ask: PendingAsk,
-  v: { selectedSessionId: string | null; continuityVisible: boolean; windowFocused: boolean },
-): boolean {
+export type HandOffView = { selectedSessionId: string | null; continuityVisible: boolean; windowFocused: boolean };
+
+export function askShouldHandOff(ask: Pick<PendingAsk, "session">, v: HandOffView): boolean {
   return v.windowFocused && !v.continuityVisible && v.selectedSessionId === ask.session;
+}
+
+/** The permission cards worth drawing. Claude's own dialog is already up in every
+ *  session's terminal, so a permission for the terminal in front of the user is HIDDEN
+ *  (same rule as an ask's hand-off) — never resolved: it comes back when the user looks
+ *  away, and the terminal stays the one place to answer it meanwhile. */
+export function permissionsToShow<P extends { session: string }>(list: P[], v: HandOffView): P[] {
+  return list.filter((p) => !askShouldHandOff(p, v));
 }
 
 /** Sessions with at least one ask still unanswered. An ask in `answered` is only holding
@@ -34,6 +42,28 @@ export function sessionsAwaitingAnswer(asks: Iterable<PendingAsk>, answered: Rec
  *  only a card the user could see running into the ceiling needs telling where it went. */
 export function askResolvedToast(how: string, cardWasShown: boolean): boolean {
   return how === "timeout" && cardWasShown;
+}
+
+/** What an `ask-resolved` does to its card. `hold`: keep it up briefly; `answered`: it no
+ *  longer makes its avatar "need" you; `note`: the remote resolution the card should name
+ *  ("Answered on your phone") unless it shows its own "Sent to …"; `toast`: the timeout toast.
+ *  A cancellation leaves silently. A hand-off THIS window made (the user is at the terminal)
+ *  leaves at once; one another side made (Esc in the terminal, another window, the last
+ *  phone leaving) is held with note `terminal`, which an ask card reads as "Moved to the
+ *  terminal" — a hand-off answers nothing. */
+export function askResolvedPlan(i: {
+  how: string;
+  by: ResolvedBy | null;
+  shown: boolean;
+  handedOffHere: boolean;
+}): { hold: boolean; answered: boolean; note: ResolvedBy | null; toast: boolean } {
+  const drop = { hold: false, answered: false, note: null, toast: false };
+  if (i.by === "cancelled" || i.how === "cancelled") return drop;
+  if (i.how === "timeout") return { ...drop, toast: askResolvedToast(i.how, i.shown) };
+  if (i.how === "answered")
+    return { hold: true, answered: true, note: i.by === "phone" || i.by === "desktop" ? i.by : null, toast: false };
+  if (i.how === "handoff" && i.shown && !i.handedOffHere) return { ...drop, hold: true, note: "terminal" };
+  return drop;
 }
 
 /** The `answers` map for ask_answer, or null while any question is unanswered. Free text

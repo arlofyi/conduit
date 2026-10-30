@@ -8,8 +8,9 @@
 //!   [`plan_listeners`] decides it every 30 s (and on the switch), so a restart or a new
 //!   address re-binds within one tick and a stale address is never left bound.
 //! - Never `0.0.0.0` / `::`. Peers outside loopback and the tailnet ranges are dropped
-//!   before the handshake, and any handshake carrying `Origin` is refused with 403 (a
-//!   web page on the Mac must never reach the bridge).
+//!   before the handshake, and a handshake whose `Origin` is not this listener itself is
+//!   refused with 403 (a web page on the Mac must never reach the bridge; the iOS app's
+//!   socket always sends its own dialled origin, see [`origin_allowed`]).
 //!
 //! Every peer is greeted with `hello`. A non-loopback peer must then `auth` with its
 //! device token within 5 s (or `pair`/`discover`); pre-auth frames are capped at 4 KiB,
@@ -21,9 +22,9 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -37,6 +38,9 @@ use tungstenite::http::StatusCode;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{accept_hdr_with_config, Message, WebSocket};
 
+use crate::asks::{AskGate, AskView, Asks};
+use crate::bridge_view::read_lines;
+use crate::broker::{Broker, PermissionView};
 use crate::hookbus::HookBus;
 use crate::mobile_devices::MobileDevices;
 use crate::pairing::{self, Decision, PairRequest, Pairing, Resolution, Via, WaitEnd};
@@ -112,6 +116,19 @@ pub enum ClientMsg {
     Interrupt {
         session_id: String,
     },
+    /// Answer a pending `AskUserQuestion` (an `ask` item from `pending`/`pendingAdded`):
+    /// exact question texts as keys. First answer wins; acked with `answerResult`.
+    #[serde(rename_all = "camelCase")]
+    Answer {
+        ask_id: String,
+        answers: serde_json::Map<String, serde_json::Value>,
+    },
+    /// Decide a pending tool permission (a `permission` item from `pending`/`pendingAdded`).
+    /// First decision wins; acked with `approveResult`.
+    Approve {
+        id: String,
+        allow: bool,
+    },
 }
 
 /// Manual `Debug`: `Auth.token`, `Pair.secret` and `Pair.nonce` are plaintext secrets and
@@ -184,6 +201,17 @@ impl std::fmt::Debug for ClientMsg {
                 .debug_struct("Interrupt")
                 .field("session_id", session_id)
                 .finish(),
+            // What the user typed stays out of logs; how many answers is enough to debug.
+            Self::Answer { ask_id, answers } => f
+                .debug_struct("Answer")
+                .field("ask_id", ask_id)
+                .field("answers", &answers.len())
+                .finish(),
+            Self::Approve { id, allow } => f
+                .debug_struct("Approve")
+                .field("id", id)
+                .field("allow", allow)
+                .finish(),
         }
     }
 }
@@ -228,51 +256,234 @@ fn take_prompt_slot(prompts: &Mutex<HashMap<String, VecDeque<Instant>>>, ip: IpA
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 /// How often the tailnet listener is re-planned against Tailscale's state.
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
+/// How often the attached session's context meter is re-sent.
+const CONTEXT_EVERY: Duration = Duration::from_secs(15);
 /// Wire protocol version announced in `hello`.
 const PROTOCOL_VERSION: u32 = 1;
 
-/// Build the `projects` payload: the persisted tree with a `running` flag per session.
-fn projects_payload(
-    projects: &[serde_json::Value],
-    running: &HashSet<String>,
-) -> serde_json::Value {
-    let with_flags: Vec<serde_json::Value> = projects
-        .iter()
-        .map(|p| {
-            let sessions: Vec<serde_json::Value> = p
-                .get("sessions")
-                .and_then(|s| s.as_array())
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|mut s| {
-                    let id = s
-                        .get("id")
-                        .and_then(|i| i.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(obj) = s.as_object_mut() {
-                        obj.insert(
-                            "running".into(),
-                            serde_json::Value::Bool(running.contains(&id)),
-                        );
-                    }
-                    s
-                })
-                .collect();
-            let mut p = p.clone();
-            if let Some(obj) = p.as_object_mut() {
-                obj.insert("sessions".into(), serde_json::Value::Array(sessions));
-            }
-            p
-        })
-        .collect();
-    json!({ "type": "projects", "projects": with_flags })
+/// How often a connection diffs the pending questions against what it has pushed.
+const PUSH_EVERY: Duration = Duration::from_millis(250);
+/// How often a connection re-checks that the session it streams has not been made private.
+const PRIVATE_RECHECK_EVERY: Duration = Duration::from_secs(1);
+/// How often an authenticated remote connection is pinged. A phone answers with a pong
+/// from its socket layer, so a live but quiet phone still reads as heard from.
+const PING_EVERY: Duration = Duration::from_secs(15);
+/// A remote connection that has read nothing (no frame, no pong) for this long is dropped.
+/// iOS suspends a backgrounded app and a dropped network leaves the socket half-open; with
+/// nothing to write, the Mac would otherwise never notice, and the phone would keep holding
+/// every question it was sent (`has_remote_phone`) while the terminal showed nothing.
+const STALE_AFTER: Duration = Duration::from_secs(35);
+/// A write that has not completed in this long fails, which ends the connection. A frozen
+/// or wedged phone stops reading while its kernel keeps the socket open (zero window), so
+/// an unbounded write blocks the loop forever: it never reaches the [`STALE_AFTER`] check,
+/// and the phone keeps holding questions until the hook's own ceiling. Shorter than
+/// `STALE_AFTER` so a stalled write is noticed no later than a silent read would be.
+const WRITE_STALL: Duration = Duration::from_secs(10);
+
+/// Bound every write on a bridge socket (see [`WRITE_STALL`]).
+fn bound_writes(stream: &TcpStream, stall: Duration) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(stall))
 }
 
-/// Build a forwarded hook-status frame.
-fn status_payload(event: &str, body: &serde_json::Value) -> serde_json::Value {
-    json!({ "type": "status", "event": event, "body": body })
+/// Has a connection last heard from at `last_read` gone silent for good?
+fn conn_is_stale(last_read: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_read) >= STALE_AFTER
+}
+
+/// Is the next keepalive ping due?
+fn ping_due(last_ping: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_ping) >= PING_EVERY
+}
+
+/// Does a failed `send` end the connection? An I/O error does -- above all the
+/// `TimedOut`/`WouldBlock` that [`WRITE_STALL`] produces: on Windows a timed-out send leaves
+/// the socket in an indeterminate state, and tungstenite would retry the half-written frame
+/// on the next send, corrupting the stream. A closed socket does too. Only a refusal of THIS
+/// frame (too large, buffer full) leaves the socket usable.
+fn send_failure_is_fatal(e: &tungstenite::Error) -> bool {
+    matches!(
+        e,
+        tungstenite::Error::Io(_)
+            | tungstenite::Error::ConnectionClosed
+            | tungstenite::Error::AlreadyClosed
+    )
+}
+
+/// Send one text frame. `false` = the connection is finished (see [`send_failure_is_fatal`]);
+/// the caller breaks its loop rather than writing to it again.
+fn send_text(ws: &mut WebSocket<TcpStream>, text: String) -> bool {
+    match ws.send(Message::Text(text)) {
+        Ok(()) => true,
+        Err(e) => !send_failure_is_fatal(&e),
+    }
+}
+
+/// Is raw PTY `output` streamed to this socket? Only to loopback (the matrix sidecar and the
+/// Simulator's terminal view). The phone app renders the transcript, never raw output, and
+/// a TUI spinner repaints at ~19 KB/s -- ~70 MB per working hour of cellular data for
+/// nothing, and the bulk that filled a frozen phone's window.
+fn streams_raw_output(remote_device: bool) -> bool {
+    !remote_device
+}
+
+/// How long a phone-spawned Claude session may go without its `sessionstart` hook before the
+/// phone is told it is waiting on the Mac. Claude asks "do you trust this folder?" before it
+/// runs any hook, and the phone cannot answer that prompt.
+const TRUST_STALL: Duration = Duration::from_secs(20);
+
+/// The phone-spawned Claude sessions this socket is waiting to hear `sessionstart` from.
+#[derive(Default)]
+struct SpawnWatch {
+    waiting: Vec<(String, Instant)>,
+}
+
+impl SpawnWatch {
+    fn watch(&mut self, session_id: String, at: Instant) {
+        self.waiting.push((session_id, at));
+    }
+
+    /// The session's `sessionstart` arrived: it is running, nothing to say.
+    fn started(&mut self, session_id: &str) {
+        self.waiting.retain(|(s, _)| s != session_id);
+    }
+
+    /// Sessions silent for [`TRUST_STALL`]. Each is returned once, then forgotten.
+    fn stalled(&mut self, now: Instant) -> Vec<String> {
+        let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .partition(|(_, at)| now.saturating_duration_since(*at) >= TRUST_STALL);
+        self.waiting = keep;
+        due.into_iter().map(|(s, _)| s).collect()
+    }
+}
+
+/// What the phone is told about a spawned session stuck before its first hook.
+fn trust_stall_frame(session_id: &str) -> serde_json::Value {
+    json!({
+        "type": "error",
+        "sessionId": session_id,
+        "message": TRUST_STALL_MESSAGE,
+    })
+}
+
+const TRUST_STALL_MESSAGE: &str =
+    "Claude is waiting on your Mac \u{2014} open this folder there once to trust it";
+
+/// May a phone's `answer` resolve this ask? Only a still-pending ask (None = someone else
+/// already answered), never a private session's, and only a valid set of answers.
+fn phone_may_answer(
+    view: Option<&AskView>,
+    private: bool,
+    answers: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    view.is_some_and(|v| !private && crate::asks::validate_answers(&v.questions, answers).is_ok())
+}
+
+/// May a phone decide this permission? Only a still-pending one (None = already decided
+/// elsewhere), and never a private session's.
+fn phone_may_approve(view: Option<&PermissionView>, private: bool) -> bool {
+    view.is_some() && !private
+}
+
+/// What a phone is sent when it tries to decide a private session's permission: the
+/// session-tagged refusal every private request gets, then the `approveResult` that settles
+/// its button.
+fn approve_refusal(view: &PermissionView) -> Vec<serde_json::Value> {
+    vec![
+        crate::bridge_view::private_session_error(&view.session),
+        crate::bridge_view::approve_result_frame(&view.id, false),
+    ]
+}
+
+/// The attached session, if it has become private since it was attached (a phone must stop
+/// streaming it). Checked on a ~1 s tick.
+fn attached_now_private(attached: Option<&str>, is_private: impl Fn(&str) -> bool) -> Option<&str> {
+    attached.filter(|sid| is_private(sid))
+}
+
+/// The attached session has been made private while streaming: unsubscribe its PTY stream,
+/// drop the transcript tail and context meter, and return the (session-tagged) refusal to
+/// send. None, with nothing touched, while it is still open.
+fn stop_streaming_if_private<R>(
+    attached: &mut Option<(String, u64, R)>,
+    transcript: &mut Option<(PathBuf, usize)>,
+    context_path: &mut Option<PathBuf>,
+    tail_conversation: &mut Option<String>,
+    attached_claude: &mut bool,
+    is_private: impl Fn(&str) -> bool,
+    unsubscribe: impl FnOnce(&str, u64),
+) -> Option<serde_json::Value> {
+    let sid = attached_now_private(attached.as_ref().map(|(s, _, _)| s.as_str()), is_private)?
+        .to_string();
+    if let Some((old_sid, old_sub)) =
+        crate::bridge_view::clear_attachment(attached, transcript, context_path)
+    {
+        unsubscribe(&old_sid, old_sub);
+    }
+    *tail_conversation = None;
+    *attached_claude = false;
+    Some(crate::bridge_view::private_session_error(&sid))
+}
+
+/// How often the tail re-checks which transcript the attached session is writing (a
+/// `/clear` moves it; a phone-spawned chat has none until its first turn).
+const RESOLVE_EVERY: Duration = Duration::from_secs(1);
+/// New sessions a phone may start in [`SPAWN_WINDOW`]. Each one is a real agent process on
+/// the Mac, so a stuck button or a misbehaving client must not be able to start dozens.
+const SPAWNS_MAX: usize = 10;
+const SPAWN_WINDOW: Duration = Duration::from_secs(3600);
+/// Longest session name derived from a phone's first message.
+const SPAWN_NAME_MAX: usize = 40;
+
+/// Build a forwarded hook-status frame for `session_id`.
+fn status_payload(session_id: &str, event: &str, body: &serde_json::Value) -> serde_json::Value {
+    json!({ "type": "status", "sessionId": session_id, "event": event, "body": body })
+}
+
+/// The session a client message acts on, if it is session-scoped. Private sessions are
+/// refused on exactly these.
+fn session_scope(msg: &ClientMsg) -> Option<&str> {
+    match msg {
+        ClientMsg::Attach { session_id }
+        | ClientMsg::Input { session_id, .. }
+        | ClientMsg::Resize { session_id, .. }
+        | ClientMsg::Git { session_id, .. }
+        | ClientMsg::Kill { session_id }
+        | ClientMsg::Interrupt { session_id } => Some(session_id),
+        _ => None,
+    }
+}
+
+/// Take one spawn slot for this phone (`key` = its device id, or the peer IP on loopback).
+/// `false` = the budget is spent; start nothing.
+fn take_spawn_slot(spawns: &Mutex<HashMap<String, VecDeque<Instant>>>, key: &str) -> bool {
+    crate::fleet::rate_limited(spawns, key, SPAWNS_MAX, SPAWN_WINDOW)
+}
+
+/// The agent a `spawn` names, read STRICTLY: `AgentId`'s lenient `Deserialize` turns an
+/// unknown id into Claude, which would start Claude under a name the phone never offered.
+fn spawn_agent(agent: Option<&str>) -> Option<crate::agent::AgentId> {
+    use crate::store::PersistedEnum;
+    crate::agent::AgentId::from_wire(agent.unwrap_or("claude"))
+}
+
+/// A phone-started session's name: the first non-blank line of its first message, at most
+/// [`SPAWN_NAME_MAX`] characters (an ellipsis marks a cut), else "Mobile".
+fn spawn_session_name(prompt: &str) -> String {
+    let Some(line) = prompt.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return "Mobile".to_string();
+    };
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= SPAWN_NAME_MAX {
+        return line;
+    }
+    let cut: String = line.chars().take(SPAWN_NAME_MAX - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// The reply when a phone has spent its spawn budget.
+fn spawn_budget_error() -> serde_json::Value {
+    json!({ "type": "error", "message": "too many new chats — try again later" })
 }
 
 /// Handle a `git` client message: resolve the session's repo dir from the Store,
@@ -330,13 +541,9 @@ fn spawn_reply(
     worktree: bool,
 ) -> serde_json::Value {
     use tauri::Emitter;
-    let agent_id: crate::agent::AgentId =
-        match serde_json::from_value(json!(agent.unwrap_or("claude"))) {
-            Ok(a) => a,
-            Err(_) => {
-                return json!({ "type": "error", "message": "unknown agent" });
-            }
-        };
+    let Some(agent_id) = spawn_agent(agent) else {
+        return json!({ "type": "error", "message": "unknown agent" });
+    };
     let store = app.state::<Arc<Store>>();
     let Some(project) = store.list().into_iter().find(|p| p.id == project_id) else {
         return json!({ "type": "error", "message": "unknown project" });
@@ -347,7 +554,7 @@ fn spawn_reply(
     }
     let Some(session) = store.add_session(
         project_id,
-        "Mobile".to_string(),
+        spawn_session_name(prompt),
         worktree,
         agent_id,
         crate::store::SessionRole::Worker,
@@ -374,31 +581,48 @@ fn wake_session(app: &AppHandle, session_id: &str) {
     let _ = app.emit("bridge-open-session", json!({ "sessionId": session_id }));
 }
 
-/// Build the transcript backfill payload from raw jsonl lines.
-fn history_payload(lines: &[String]) -> serde_json::Value {
+/// Build the transcript backfill payload for `session_id` from raw jsonl lines.
+fn history_payload(session_id: &str, lines: &[String]) -> serde_json::Value {
     let items: Vec<serde_json::Value> = lines
         .iter()
         .flat_map(|l| crate::transcript::parse_line(l))
         .collect();
-    json!({ "type": "history", "items": items })
+    json!({ "type": "history", "sessionId": session_id, "items": items })
 }
 
-/// Read a transcript file fully into trimmed, non-empty lines. Empty on any error.
-fn read_lines(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .map(|s| {
-            s.lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The generic failure reply. Identical for a wrong token, a revoked device, a
-/// rate-limited peer, a bad or spent pairing secret and a pre-auth `discover` -- no oracle.
+/// The generic failure reply. Identical for a wrong token, a revoked device, a bad or
+/// spent pairing secret and a pre-auth `discover` -- no oracle.
 fn unauthorized() -> serde_json::Value {
     json!({ "type": "error", "message": "unauthorized" })
+}
+
+/// Reply to an `auth` this Mac will not even check right now (peer rate-limited, or
+/// mobile access off). Decided BEFORE the token is looked at, so it says nothing about
+/// the token -- and it tells the phone not to forget a Mac that never judged its token.
+fn unavailable() -> serde_json::Value {
+    json!({ "type": "error", "message": "unavailable" })
+}
+
+/// What an `auth` frame gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthOutcome {
+    Accepted,
+    /// gates refused before the token was examined
+    Unavailable,
+    /// the token was examined and is not a paired device's
+    Unauthorized,
+}
+
+/// The gates come first: `verified` only counts once the peer is under its rate limit
+/// and mobile access is on. Callers must not run `verify` unless both pass.
+fn auth_outcome(rate_ok: bool, enabled: bool, verified: bool) -> AuthOutcome {
+    if !rate_ok || !enabled {
+        AuthOutcome::Unavailable
+    } else if verified {
+        AuthOutcome::Accepted
+    } else {
+        AuthOutcome::Unauthorized
+    }
 }
 
 /// First frame to every peer, before auth.
@@ -416,11 +640,56 @@ fn auth_ok_payload(device_id: &str) -> serde_json::Value {
     json!({ "type": "authOk", "deviceId": device_id })
 }
 
-/// Does the upgrade request carry an `Origin` header? Browsers always send one on a
-/// WebSocket upgrade; the phone app and the sidecar never do.
-fn has_origin(req: &Request) -> bool {
-    req.headers()
-        .contains_key(tungstenite::http::header::ORIGIN)
+/// May this upgrade's `Origin` reach the bridge? No `Origin` (the sidecar, any plain
+/// client) is fine. The phone app DOES send one -- iOS's WebSocket (SocketRocket) always
+/// sets it to the URL it dialled, `http://<host>:<port>`, and JS cannot remove it -- so an
+/// Origin naming THIS listener is accepted too: the literal IP the socket arrived on
+/// (`127.0.0.1` on loopback), or this Mac's own MagicDNS name on the tailnet address, each
+/// with the bridge's own port. A browser only sends such an Origin for a page served from
+/// that exact host and port, which is the bridge itself, and it serves no pages.
+///
+/// Never compared against the request's `Host`: under DNS rebinding an attacker's page
+/// sends `Origin: http://evil.example:<port>` with a matching Host, so "Origin equals
+/// Host" would admit exactly the web page this check exists to stop.
+fn origin_allowed(origin: Option<&[u8]>, local: SocketAddr, own_dns: &str) -> bool {
+    let Some(raw) = origin else {
+        return true;
+    };
+    let Ok(o) = std::str::from_utf8(raw) else {
+        return false;
+    };
+    let Some(rest) = o.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((host, port)) = rest.rsplit_once(':') else {
+        return false; // the bridge never runs on 80, so its own origin always has a port
+    };
+    if port.parse::<u16>() != Ok(local.port()) {
+        return false;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip == local.ip();
+    }
+    // `localhost` is NOT this listener: it is any process's origin on the Mac, and the phone
+    // never dials it (the Simulator uses the literal 127.0.0.1).
+    if local.ip().is_loopback() {
+        return false;
+    }
+    let own = own_dns.trim_end_matches('.').to_ascii_lowercase();
+    !own.is_empty() && host == own && tailscale::is_tailnet_addr(local.ip())
+}
+
+fn request_origin_allowed(req: &Request, local: SocketAddr, own_dns: &str) -> bool {
+    let mut values = req
+        .headers()
+        .get_all(tungstenite::http::header::ORIGIN)
+        .iter();
+    match (values.next(), values.next()) {
+        (None, _) => true,
+        (Some(v), None) => origin_allowed(Some(v.as_bytes()), local, own_dns),
+        (Some(_), Some(_)) => false, // two Origins: nothing honest sends that
+    }
 }
 
 /// What to do with the tailnet listener. `close` drops the one bound now; `bind` opens
@@ -511,7 +780,8 @@ fn system_name() -> Option<String> {
     std::env::var("HOSTNAME").ok()
 }
 
-/// Accept a WebSocket. Any `Origin` is refused with 403 before the upgrade completes.
+/// Accept a WebSocket. A foreign `Origin` is refused with 403 before the upgrade completes
+/// (see [`origin_allowed`]).
 /// `preauth_cap` limits frames and messages to [`PREAUTH_MAX_BYTES`] so an
 /// unauthenticated peer cannot make us buffer megabytes; it is lifted on auth.
 ///
@@ -519,18 +789,20 @@ fn system_name() -> Option<String> {
 /// handshake callback signature fixes for us. Boxing it is not an option -- the callback
 /// must return exactly that type -- and this runs once per connection, not in a loop.
 #[allow(clippy::result_large_err)]
-fn accept_ws(stream: TcpStream, preauth_cap: bool) -> Option<WebSocket<TcpStream>> {
-    accept_ws_within(stream, preauth_cap, HANDSHAKE_TIMEOUT)
+fn accept_ws(stream: TcpStream, preauth_cap: bool, own_dns: &str) -> Option<WebSocket<TcpStream>> {
+    accept_ws_within(stream, preauth_cap, own_dns, HANDSHAKE_TIMEOUT)
 }
 
 #[allow(clippy::result_large_err)]
 fn accept_ws_within(
     stream: TcpStream,
     preauth_cap: bool,
+    own_dns: &str,
     deadline: Duration,
 ) -> Option<WebSocket<TcpStream>> {
+    let local = stream.local_addr().ok()?;
     let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-        if has_origin(req) {
+        if !request_origin_allowed(req, local, own_dns) {
             let mut err = ErrorResponse::new(Some("forbidden".to_string()));
             *err.status_mut() = StatusCode::FORBIDDEN;
             Err(err)
@@ -746,15 +1018,27 @@ pub struct BridgeController {
     /// The bound port (0 until the loopback listener is up). Same port on both addresses.
     port: AtomicU16,
     mac_name: Mutex<String>,
+    /// This Mac's MagicDNS name ("" until Tailscale has reported one). An `Origin` naming
+    /// it is the phone dialling us by name, see [`origin_allowed`].
+    dns_name: Mutex<String>,
     /// The tailnet listener: its address and its accept loop's stop flag. Held across a
     /// whole reconcile, which serializes reconciles.
     tailnet: Mutex<Option<(Ipv4Addr, Arc<AtomicBool>)>>,
-    /// Authenticated connections by device id; setting a flag closes that socket.
-    live: Mutex<HashMap<String, Vec<Arc<AtomicBool>>>>,
+    /// Authenticated connections by device id; closing a slot closes that socket.
+    live: Mutex<HashMap<String, Vec<Arc<LiveSlot>>>>,
     /// Failed auth attempts per peer IP (`fleet::rate_limited`'s map shape).
     auth_failures: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Pair prompts raised per peer IP (a budget separate from failures).
     pair_prompts: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// New sessions started per phone (device id; peer IP on loopback).
+    spawns: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// Last-message previews for the `projects` frame, keyed by transcript file state.
+    last_messages: crate::bridge_view::LastMessageCache,
+    /// The question registry and the desktop gate, so the last phone leaving can hand
+    /// back the asks only it was holding. Wired once at startup (`wire_asks`).
+    asks: OnceLock<(Arc<Asks>, Arc<AskGate>)>,
+    /// The permission registry, for the same hand-off (`wire_permissions`).
+    permissions: OnceLock<Arc<Broker>>,
 }
 
 impl BridgeController {
@@ -764,10 +1048,55 @@ impl BridgeController {
             app: OnceLock::new(),
             port: AtomicU16::new(0),
             mac_name: Mutex::new("Conduit".to_string()),
+            dns_name: Mutex::new(String::new()),
             tailnet: Mutex::new(None),
             live: Mutex::new(HashMap::new()),
             auth_failures: Mutex::new(HashMap::new()),
             pair_prompts: Mutex::new(HashMap::new()),
+            spawns: Mutex::new(HashMap::new()),
+            last_messages: Default::default(),
+            asks: OnceLock::new(),
+            permissions: OnceLock::new(),
+        }
+    }
+
+    /// Hand the controller the question registry and desktop gate. Once; later calls no-op.
+    pub fn wire_asks(&self, asks: Arc<Asks>, gate: Arc<AskGate>) {
+        let _ = self.asks.set((asks, gate));
+    }
+
+    /// Hand the controller the permission registry. Once; later calls no-op. The desktop
+    /// gate comes from `wire_asks` -- one gate holds both.
+    pub fn wire_permissions(&self, broker: Arc<Broker>) {
+        let _ = self.permissions.set(broker);
+    }
+
+    /// Is an authenticated REMOTE phone connected AND still heard from? Loopback peers
+    /// (sidecar, simulator) never register, so they never hold a question. A socket gone
+    /// silent past [`STALE_AFTER`] stops counting at once, before its loop gets round to
+    /// dropping it (which then hands its questions back, see `last_phone_left`).
+    pub fn has_remote_phone(&self) -> bool {
+        self.has_remote_phone_at(Instant::now())
+    }
+
+    fn has_remote_phone_at(&self, now: Instant) -> bool {
+        lock(&self.live)
+            .values()
+            .flatten()
+            .any(|slot| !conn_is_stale(slot.last_heard(), now))
+    }
+
+    /// The last remote phone just left. Every ask or permission it alone was holding goes back to the
+    /// terminal now -- unless the desktop is watching, in which case its card still can.
+    /// Called with the `live` lock released.
+    fn last_phone_left(&self) {
+        if let Some((asks, gate)) = self.asks.get() {
+            if !gate.is_open() {
+                asks.hand_off_where(|_, held_for_phone| held_for_phone);
+                if let Some(broker) = self.permissions.get() {
+                    broker.hand_off_where(|_, held_for_phone| held_for_phone);
+                }
+            }
         }
     }
 
@@ -780,7 +1109,11 @@ impl BridgeController {
         let me = self.clone();
         thread::spawn(move || {
             // CLI calls happen here, once, never in a connection loop.
-            *lock(&me.mac_name) = mac_name_from(&tailscale::status(), system_name());
+            let ts = tailscale::status();
+            *lock(&me.mac_name) = mac_name_from(&ts, system_name());
+            if let TailscaleState::Running { dns_name, .. } = &ts {
+                *lock(&me.dns_name) = dns_name.clone();
+            }
 
             let persisted = me.devices.port();
             let bound: RefCell<Option<TcpListener>> = RefCell::new(None);
@@ -845,8 +1178,9 @@ impl BridgeController {
         } else {
             TailscaleState::Stopped
         };
-        if let TailscaleState::Running { .. } = ts {
+        if let TailscaleState::Running { dns_name, .. } = &ts {
             *lock(&self.mac_name) = mac_name_from(&ts, None);
+            *lock(&self.dns_name) = dns_name.clone();
         }
         let plan = plan_listeners(enabled, &ts, slot.as_ref().map(|(ip, _)| *ip));
         if plan.close {
@@ -880,18 +1214,31 @@ impl BridgeController {
     /// Close every open socket of a device (revoke). Immediate: each connection checks
     /// its flag on every 20 ms tick.
     pub fn disconnect_device(&self, device_id: &str) {
-        if let Some(flags) = lock(&self.live).remove(device_id) {
+        let (removed, now_empty) = {
+            let mut live = lock(&self.live);
+            let removed = live.remove(device_id);
+            (removed, live.is_empty())
+        };
+        if let Some(flags) = removed {
             for f in flags {
-                f.store(true, Ordering::SeqCst);
+                f.close();
+            }
+            if now_empty {
+                self.last_phone_left();
             }
         }
     }
 
     pub(crate) fn disconnect_all_devices(&self) {
-        for (_, flags) in lock(&self.live).drain() {
+        let drained: Vec<_> = lock(&self.live).drain().collect();
+        let any = !drained.is_empty();
+        for (_, flags) in drained {
             for f in flags {
-                f.store(true, Ordering::SeqCst);
+                f.close();
             }
+        }
+        if any {
+            self.last_phone_left();
         }
     }
 
@@ -909,8 +1256,12 @@ impl BridgeController {
         lock(&self.mac_name).clone()
     }
 
-    fn register_live(&self, device_id: &str) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
+    fn dns_name(&self) -> String {
+        lock(&self.dns_name).clone()
+    }
+
+    fn register_live(&self, device_id: &str) -> Arc<LiveSlot> {
+        let flag = Arc::new(LiveSlot::new(Instant::now()));
         lock(&self.live)
             .entry(device_id.to_string())
             .or_default()
@@ -918,13 +1269,20 @@ impl BridgeController {
         flag
     }
 
-    fn unregister_live(&self, device_id: &str, flag: &Arc<AtomicBool>) {
-        let mut live = lock(&self.live);
-        if let Some(v) = live.get_mut(device_id) {
+    fn unregister_live(&self, device_id: &str, flag: &Arc<LiveSlot>) {
+        let last_left = {
+            let mut live = lock(&self.live);
+            let Some(v) = live.get_mut(device_id) else {
+                return;
+            };
             v.retain(|f| !Arc::ptr_eq(f, flag));
             if v.is_empty() {
                 live.remove(device_id);
             }
+            live.is_empty()
+        };
+        if last_left {
+            self.last_phone_left();
         }
     }
 
@@ -959,15 +1317,19 @@ impl BridgeController {
     }
 
     /// Verify a device token from `peer`. None for every failure, alike.
-    fn authenticate(&self, peer: IpAddr, token: &str) -> Option<String> {
-        if !self.auth_allowed(peer) || !self.devices.enabled() {
-            return None;
+    fn authenticate(&self, peer: IpAddr, token: &str) -> Result<String, AuthOutcome> {
+        let (rate_ok, enabled) = (self.auth_allowed(peer), self.devices.enabled());
+        if auth_outcome(rate_ok, enabled, false) == AuthOutcome::Unavailable {
+            return Err(AuthOutcome::Unavailable);
         }
         let id = self.devices.verify(token);
-        if id.is_none() {
-            self.record_auth_failure(peer);
+        match (auth_outcome(rate_ok, enabled, id.is_some()), id) {
+            (AuthOutcome::Accepted, Some(id)) => Ok(id),
+            (outcome, _) => {
+                self.record_auth_failure(peer);
+                Err(outcome)
+            }
         }
-        id
     }
 }
 
@@ -1021,10 +1383,11 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     // the handshake wants blocking reads, bounded by a timeout.
     if stream.set_nonblocking(false).is_err()
         || stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err()
+        || bound_writes(&stream, WRITE_STALL).is_err()
     {
         return;
     }
-    let Some(mut ws) = accept_ws(stream, !loopback) else {
+    let Some(mut ws) = accept_ws(stream, !loopback, &ctrl.dns_name()) else {
         return;
     };
     if ws.get_ref().set_read_timeout(Some(READ_POLL)).is_err() {
@@ -1052,13 +1415,31 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut attached: Option<(String, u64, std::sync::mpsc::Receiver<String>)> = None;
     // (transcript path, lines already sent) — set on attach, advanced while tailing.
     let mut transcript: Option<(PathBuf, usize)> = None;
+    // Transcript of the attached session when it is a Claude one (the only agent with a
+    // context meter), and when the next `context` frame is due.
+    let mut context_path: Option<PathBuf> = None;
+    let mut next_context = Instant::now();
+    // The conversation id the tail was resolved for, whether the attached session is a
+    // Claude one (only those are re-resolved), and when the next re-resolve is due.
+    let mut tail_conversation: Option<String> = None;
+    let mut attached_claude = false;
+    let mut next_resolve = Instant::now();
     // A `discover` probe's reply, produced on its own thread. One probe at a time.
     let (macs_tx, macs_rx) = std::sync::mpsc::channel::<String>();
     let mut discovering = false;
     // The phone's Tailscale user id, from one `whois` the first time it is needed.
     let peer_owner: Arc<OnceLock<Option<u64>>> = Arc::new(OnceLock::new());
+    // Ids of the pending questions this socket has pushed (None = `pending` not sent yet),
+    // and when the next diff is due.
+    let mut pushed: Option<HashSet<String>> = None;
+    let mut next_push = Instant::now();
+    let mut next_private_check = Instant::now() + PRIVATE_RECHECK_EVERY;
+    // When this (remote, authenticated) socket last sent a keepalive ping.
+    let mut last_ping = Instant::now();
+    // Claude sessions this socket spawned that have not sent `sessionstart` yet.
+    let mut spawn_watch = SpawnWatch::default();
 
-    loop {
+    'conn: loop {
         // 0. Gates: an unauthenticated peer gets AUTH_DEADLINE; a revoked device is
         //    closed on the next tick rather than at its next reconnect.
         if !authed && Instant::now() >= deadline {
@@ -1070,8 +1451,15 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             break;
         }
 
-        // 1. Read a control message if one is ready (times out quickly otherwise).
-        match ws.read() {
+        // 1. Read a control message if one is ready (times out quickly otherwise). Anything
+        //    read at all -- a pong included -- is the phone being heard from.
+        let read = ws.read();
+        if read.is_ok() {
+            if let Some(conn) = device.as_ref() {
+                conn.heard(Instant::now());
+            }
+        }
+        match read {
             Ok(Message::Text(text)) if !authed => {
                 // Belt and braces with the handshake's WebSocketConfig cap.
                 if text.len() > PREAUTH_MAX_BYTES {
@@ -1080,9 +1468,14 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                 // (device id, came from `auth` -- which is acked with `authOk`).
                 let newly_authed = match parse_client_msg(&text) {
                     Some(ClientMsg::Auth { token }) => match ctrl.authenticate(peer, &token) {
-                        Some(id) => Some((id, true)),
-                        None => {
-                            let _ = ws.send(Message::Text(unauthorized().to_string()));
+                        Ok(id) => Some((id, true)),
+                        Err(outcome) => {
+                            let reply = if outcome == AuthOutcome::Unavailable {
+                                unavailable()
+                            } else {
+                                unauthorized()
+                            };
+                            let _ = ws.send(Message::Text(reply.to_string()));
                             let _ = ws.close(None);
                             let _ = ws.flush();
                             break;
@@ -1147,146 +1540,321 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             }
             // Binary (or anything but text/ping/pong/close) pre-auth: not a phone.
             Ok(Message::Binary(_)) if !authed => break,
-            Ok(Message::Text(text)) => match parse_client_msg(&text) {
-                Some(ClientMsg::List) => {
-                    // Real project tree (names + branches) with a per-session running flag.
-                    let running: HashSet<String> = pty.session_ids().into_iter().collect();
-                    // Store is managed as Arc<Store> (lib.rs .manage(Arc::new(Store::new()))) —
-                    // state::<Store>() panics the connection thread on the first `list`.
-                    let projects = serde_json::to_value(app.state::<Arc<Store>>().list())
-                        .ok()
-                        .and_then(|v| v.as_array().cloned())
-                        .unwrap_or_default();
-                    let _ = ws.send(Message::Text(
-                        projects_payload(&projects, &running).to_string(),
-                    ));
-                }
-                Some(ClientMsg::Attach { session_id }) => {
-                    // Auto-wake: an idle session has no live PTY (Conduit spawns it
-                    // lazily when its tab is shown). Ask the desktop to open it, then
-                    // poll briefly for the PTY to come up before giving up — so
-                    // `/conduit use` works on ANY session, not just running ones.
-                    let mut sub = pty.subscribe(&session_id);
-                    if sub.is_none() {
-                        wake_session(&app, &session_id);
-                        for _ in 0..25 {
-                            std::thread::sleep(Duration::from_millis(200));
-                            sub = pty.subscribe(&session_id);
-                            if sub.is_some() {
-                                break;
-                            }
+            Ok(Message::Text(text)) => {
+                let mut msg = parse_client_msg(&text);
+                // A private session is never read or driven from a phone, whoever asks --
+                // refused BEFORE anything is woken, attached or written.
+                let private_sid = msg
+                    .as_ref()
+                    .and_then(session_scope)
+                    .filter(|sid| {
+                        crate::bridge_view::session_is_private(
+                            &app.state::<Arc<Store>>().list(),
+                            sid,
+                        )
+                    })
+                    .map(str::to_string);
+                if let Some(private_sid) = private_sid {
+                    if matches!(msg, Some(ClientMsg::Attach { .. })) {
+                        // The phone has left the old chat: stop streaming it.
+                        if let Some((old_sid, old_sub)) = crate::bridge_view::clear_attachment(
+                            &mut attached,
+                            &mut transcript,
+                            &mut context_path,
+                        ) {
+                            pty.unsubscribe(&old_sid, old_sub);
                         }
+                        tail_conversation = None;
                     }
-                    if let Some((sub_id, rx)) = sub {
-                        // Desktop-authoritative sizing: tell the new viewer the PTY's
-                        // current size so it renders at the desktop's dimensions rather
-                        // than resizing the shared TTY out from under the desktop.
-                        if let Some((cols, rows)) = pty.session_size(&session_id) {
-                            let _ = ws.send(Message::Text(
-                                json!({ "type": "size", "cols": cols, "rows": rows }).to_string(),
-                            ));
-                        }
-                        // Transcript backfill (chat history) + start tailing for appends.
-                        // Keyed by the session's CURRENT conversation, which a `/clear`
-                        // moves off the pinned id (see `Store::claude_conversation_id`).
+                    let refusal = crate::bridge_view::private_session_error(&private_sid);
+                    if !send_text(&mut ws, refusal.to_string()) {
+                        break 'conn;
+                    }
+                    msg = None;
+                }
+                match msg {
+                    Some(ClientMsg::List) => {
+                        // Typed, whitelisted tree (see `bridge_view`); never the raw `Project`s.
+                        let running: HashSet<String> = pty.session_ids().into_iter().collect();
+                        // Store is managed as Arc<Store> (lib.rs .manage(Arc::new(Store::new()))) —
+                        // state::<Store>() panics the connection thread on the first `list`.
                         let store = app.state::<Arc<Store>>();
-                        let conversation = store.claude_conversation_id(&session_id);
-                        if let Some(dir) = crate::pty::session_projects_dir(&store, &session_id) {
-                            if let Some(path) = crate::pty::transcript_path(&conversation, &dir) {
-                                let lines = read_lines(&path);
-                                let _ = ws.send(Message::Text(history_payload(&lines).to_string()));
-                                transcript = Some((path, lines.len()));
+                        let fleet = app.state::<Arc<crate::fleet::FleetState>>().snapshot();
+                        let asks = app.state::<Arc<crate::asks::Asks>>().pending();
+                        let view = crate::bridge_view::projects_view(
+                            &store.list(),
+                            &store.list_profiles(),
+                            store.active_profile().as_deref(),
+                            &fleet,
+                            &running,
+                            &asks,
+                            // Resolved exactly as `attach` resolves a transcript; any miss is null.
+                            &|s| {
+                                let conversation = store.claude_conversation_id(&s.id);
+                                ctrl.last_messages
+                                    .path_for(&s.id, &conversation, || {
+                                        crate::pty::session_projects_dir(&store, &s.id).and_then(
+                                            |dir| crate::pty::transcript_path(&conversation, &dir),
+                                        )
+                                    })
+                                    .map_or(serde_json::Value::Null, |p| {
+                                        ctrl.last_messages.for_path(&p)
+                                    })
+                            },
+                        );
+                        ctrl.last_messages.sweep();
+                        if !send_text(&mut ws, view.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::Attach { session_id }) => {
+                        // Auto-wake: an idle session has no live PTY (Conduit spawns it
+                        // lazily when its tab is shown). Ask the desktop to open it, then
+                        // poll briefly for the PTY to come up before giving up — so
+                        // `/conduit use` works on ANY session, not just running ones.
+                        let mut sub = pty.subscribe(&session_id);
+                        if sub.is_none() {
+                            wake_session(&app, &session_id);
+                            for _ in 0..25 {
+                                std::thread::sleep(Duration::from_millis(200));
+                                sub = pty.subscribe(&session_id);
+                                if sub.is_some() {
+                                    break;
+                                }
                             }
                         }
-                        attached = Some((session_id, sub_id, rx));
-                    } else {
-                        let _ = ws.send(Message::Text(
-                            json!({ "type": "error", "message": "no such session" }).to_string(),
-                        ));
-                    }
-                }
-                Some(ClientMsg::Input { session_id, data }) => {
-                    let _ = pty.write(&session_id, &data);
-                }
-                Some(ClientMsg::Resize {
-                    session_id,
-                    cols,
-                    rows,
-                }) => {
-                    let _ = pty.resize(&session_id, cols, rows);
-                }
-                Some(ClientMsg::Git {
-                    session_id,
-                    action,
-                    path,
-                }) => {
-                    let reply = git_reply(&app, &session_id, &action, path.as_deref());
-                    let _ = ws.send(Message::Text(reply.to_string()));
-                }
-                Some(ClientMsg::Kill { session_id }) => {
-                    pty.kill(&session_id);
-                    let _ = ws.send(Message::Text(
-                        json!({ "type": "killed", "sessionId": session_id }).to_string(),
-                    ));
-                }
-                Some(ClientMsg::Spawn {
-                    project_id,
-                    prompt,
-                    agent,
-                    worktree,
-                }) => {
-                    let reply = spawn_reply(&app, &project_id, &prompt, agent.as_deref(), worktree);
-                    let _ = ws.send(Message::Text(reply.to_string()));
-                }
-                Some(ClientMsg::Interrupt { session_id }) => {
-                    // Esc is Claude's interrupt key (spec §6 "Stop").
-                    let _ = pty.write(&session_id, "\x1b");
-                }
-                // Pairing again from a trusted socket: only loopback (the simulator) may,
-                // since a parked wait would also park a remote device's revoke check.
-                Some(ClientMsg::Pair {
-                    secret,
-                    request,
-                    device_name,
-                    nonce,
-                }) => {
-                    if loopback {
-                        let _ = pair_flow(
-                            &ctrl,
-                            &app,
-                            &mut ws,
-                            peer,
-                            secret,
-                            request.unwrap_or(false),
-                            &device_name,
-                            &nonce,
-                        );
-                    } else {
-                        let _ = ws.send(Message::Text(unauthorized().to_string()));
-                    }
-                }
-                // Probe the tailnet off this thread; the reply arrives via `macs_rx`. Only
-                // a phone owned by this Mac's Tailscale user may see the owner's Macs; its
-                // owner is looked up once per connection (loopback is the owner).
-                Some(ClientMsg::Discover) => {
-                    if !discovering {
-                        discovering = true;
-                        let (tx, owner) = (macs_tx.clone(), peer_owner.clone());
-                        thread::spawn(move || {
-                            let reply = pairing::discover_macs(|self_user| {
-                                if loopback {
-                                    Some(self_user)
-                                } else {
-                                    *owner.get_or_init(|| tailscale::whois(peer).map(|w| w.user_id))
+                        if let Some((sub_id, rx)) = sub {
+                            // Desktop-authoritative sizing: tell the new viewer the PTY's
+                            // current size so it renders at the desktop's dimensions rather
+                            // than resizing the shared TTY out from under the desktop.
+                            if let Some((cols, rows)) = pty.session_size(&session_id) {
+                                if !send_text(
+                                    &mut ws,
+                                    json!({ "type": "size", "cols": cols, "rows": rows })
+                                        .to_string(),
+                                ) {
+                                    break 'conn;
                                 }
-                            });
-                            let _ = tx.send(reply.to_string());
-                        });
+                            }
+                            // Transcript backfill (chat history) + start tailing for appends.
+                            // Keyed by the session's CURRENT conversation, which a `/clear`
+                            // moves off the pinned id (see `Store::claude_conversation_id`).
+                            let store = app.state::<Arc<Store>>();
+                            let conversation = store.claude_conversation_id(&session_id);
+                            transcript = None;
+                            context_path = None;
+                            attached_claude = is_claude(&store, &session_id);
+                            let found = crate::pty::session_projects_dir(&store, &session_id)
+                                .and_then(|dir| crate::pty::transcript_path(&conversation, &dir));
+                            // No transcript yet (a chat opened the moment it was spawned): the
+                            // phone still gets an empty history, and the tail tick picks the
+                            // transcript up as soon as it appears.
+                            let lines = found.as_deref().map(read_lines).unwrap_or_default();
+                            let history = history_payload(&session_id, &lines);
+                            if !send_text(&mut ws, history.to_string()) {
+                                break 'conn;
+                            }
+                            if let Some(path) = found {
+                                transcript = Some((path.clone(), lines.len()));
+                                if attached_claude {
+                                    context_path = Some(path);
+                                }
+                            }
+                            tail_conversation = Some(conversation);
+                            next_resolve = Instant::now() + RESOLVE_EVERY;
+                            // Re-attach: release the subscription this socket already held.
+                            if let Some((old_sid, old_sub)) = crate::bridge_view::replace_attached(
+                                &mut attached,
+                                (session_id.clone(), sub_id, rx),
+                            ) {
+                                pty.unsubscribe(&old_sid, old_sub);
+                            }
+                            next_context = Instant::now();
+                        } else {
+                            // Never keep streaming the chat the phone just left into this one.
+                            if let Some((old_sid, old_sub)) = crate::bridge_view::clear_attachment(
+                                &mut attached,
+                                &mut transcript,
+                                &mut context_path,
+                            ) {
+                                pty.unsubscribe(&old_sid, old_sub);
+                            }
+                            tail_conversation = None;
+                            attached_claude = false;
+                            if !send_text(
+                                &mut ws,
+                                json!({ "type": "error", "message": "no such session" })
+                                    .to_string(),
+                            ) {
+                                break 'conn;
+                            }
+                        }
                     }
+                    Some(ClientMsg::Input { session_id, data }) => {
+                        let _ = pty.write(&session_id, &data);
+                    }
+                    Some(ClientMsg::Resize {
+                        session_id,
+                        cols,
+                        rows,
+                    }) => {
+                        let _ = pty.resize(&session_id, cols, rows);
+                    }
+                    Some(ClientMsg::Git {
+                        session_id,
+                        action,
+                        path,
+                    }) => {
+                        let reply = git_reply(&app, &session_id, &action, path.as_deref());
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::Kill { session_id }) => {
+                        pty.kill(&session_id);
+                        if !send_text(
+                            &mut ws,
+                            json!({ "type": "killed", "sessionId": session_id }).to_string(),
+                        ) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::Spawn {
+                        project_id,
+                        prompt,
+                        agent,
+                        worktree,
+                    }) => {
+                        // Budgeted per phone: its device id, or the peer IP for loopback.
+                        let key = device
+                            .as_ref()
+                            .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
+                        let reply = if take_spawn_slot(&ctrl.spawns, &key) {
+                            spawn_reply(&app, &project_id, &prompt, agent.as_deref(), worktree)
+                        } else {
+                            spawn_budget_error()
+                        };
+                        // Only Claude has a folder-trust prompt that stalls before any hook.
+                        if reply["type"] == "spawned"
+                            && spawn_agent(agent.as_deref()) == Some(crate::agent::AgentId::Claude)
+                        {
+                            if let Some(sid) = reply["sessionId"].as_str() {
+                                spawn_watch.watch(sid.to_string(), Instant::now());
+                            }
+                        }
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::Interrupt { session_id }) => {
+                        // Esc is Claude's interrupt key (spec §6 "Stop").
+                        let _ = pty.write(&session_id, "\x1b");
+                    }
+                    // Pairing again from a trusted socket: only loopback (the simulator) may,
+                    // since a parked wait would also park a remote device's revoke check.
+                    Some(ClientMsg::Pair {
+                        secret,
+                        request,
+                        device_name,
+                        nonce,
+                    }) => {
+                        if loopback {
+                            let _ = pair_flow(
+                                &ctrl,
+                                &app,
+                                &mut ws,
+                                peer,
+                                secret,
+                                request.unwrap_or(false),
+                                &device_name,
+                                &nonce,
+                            );
+                        } else {
+                            if !send_text(&mut ws, unauthorized().to_string()) {
+                                break 'conn;
+                            }
+                        }
+                    }
+                    // Probe the tailnet off this thread; the reply arrives via `macs_rx`. Only
+                    // a phone owned by this Mac's Tailscale user may see the owner's Macs; its
+                    // owner is looked up once per connection (loopback is the owner).
+                    Some(ClientMsg::Discover) => {
+                        if !discovering {
+                            discovering = true;
+                            let (tx, owner) = (macs_tx.clone(), peer_owner.clone());
+                            thread::spawn(move || {
+                                let reply = pairing::discover_macs(|self_user| {
+                                    if loopback {
+                                        Some(self_user)
+                                    } else {
+                                        *owner.get_or_init(|| {
+                                            tailscale::whois(peer).map(|w| w.user_id)
+                                        })
+                                    }
+                                });
+                                let _ = tx.send(reply.to_string());
+                            });
+                        }
+                    }
+                    // First answer wins: `resolve` is the check-and-set, so a phone that taps
+                    // after the desktop (or another phone) answered gets `ok: false`.
+                    Some(ClientMsg::Answer { ask_id, answers }) => {
+                        let asks = app.state::<Arc<Asks>>();
+                        let view = asks.get(&ask_id);
+                        let private = view.as_ref().is_some_and(|v| {
+                            crate::bridge_view::session_is_private(
+                                &app.state::<Arc<Store>>().list(),
+                                &v.session,
+                            )
+                        });
+                        let ok = phone_may_answer(view.as_ref(), private, &answers)
+                            && asks.resolve(
+                                &ask_id,
+                                crate::asks::AskOutcome::Answered {
+                                    answers,
+                                    by: crate::asks::By::Phone,
+                                },
+                            );
+                        let reply = crate::bridge_view::answer_result_frame(&ask_id, ok);
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    // Same rule for a permission: `resolve` is the check-and-set. A private
+                    // session's is refused like every private request, tagged with its
+                    // session, and the button still gets its `approveResult`.
+                    Some(ClientMsg::Approve { id, allow }) => {
+                        let broker = app.state::<Arc<Broker>>();
+                        let view = broker.get(&id);
+                        let private = view.as_ref().is_some_and(|v| {
+                            crate::bridge_view::session_is_private(
+                                &app.state::<Arc<Store>>().list(),
+                                &v.session,
+                            )
+                        });
+                        let frames = match view {
+                            Some(v) if private => approve_refusal(&v),
+                            view => {
+                                let decision = if allow {
+                                    crate::broker::Decision::Allow
+                                } else {
+                                    crate::broker::Decision::Deny
+                                };
+                                let ok = phone_may_approve(view.as_ref(), private)
+                                    && broker.resolve(&id, decision, crate::asks::By::Phone);
+                                vec![crate::bridge_view::approve_result_frame(&id, ok)]
+                            }
+                        };
+                        for frame in frames {
+                            if !send_text(&mut ws, frame.to_string()) {
+                                break 'conn;
+                            }
+                        }
+                    }
+                    // Already authenticated (or loopback): a repeat `auth` changes nothing.
+                    Some(ClientMsg::Auth { .. }) | None => {}
                 }
-                // Already authenticated (or loopback): a repeat `auth` changes nothing.
-                Some(ClientMsg::Auth { .. }) | None => {}
-            },
+            }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
             Err(tungstenite::Error::Io(e))
@@ -1297,10 +1865,61 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             Err(_) => break,
         }
 
-        // 2. Flush any buffered PTY output for the attached session.
+        // 1a. Keepalive, remote phones only: ping every PING_EVERY, and give up on a socket
+        //     that has read nothing for STALE_AFTER. Dropping it unregisters it, which hands
+        //     back any question only it was holding.
+        if let Some(conn) = device.as_ref() {
+            let now = Instant::now();
+            if conn_is_stale(conn.last_heard(), now) {
+                let _ = ws.close(None);
+                let _ = ws.flush();
+                break;
+            }
+            if ping_due(last_ping, now) {
+                last_ping = now;
+                if ws.send(Message::Ping(Vec::new())).is_err() {
+                    break;
+                }
+            }
+        }
+
+        // 1b. The attached session was made private while streaming: stop, and say so.
+        if attached.is_some() && Instant::now() >= next_private_check {
+            next_private_check = Instant::now() + PRIVATE_RECHECK_EVERY;
+            let projects = app.state::<Arc<Store>>().list();
+            let refusal = stop_streaming_if_private(
+                &mut attached,
+                &mut transcript,
+                &mut context_path,
+                &mut tail_conversation,
+                &mut attached_claude,
+                |s| crate::bridge_view::session_is_private(&projects, s),
+                |sid, sub| pty.unsubscribe(sid, sub),
+            );
+            if let Some(refusal) = refusal {
+                if ws.send(Message::Text(refusal.to_string())).is_err() {
+                    break;
+                }
+            }
+        }
+
+        // 1c. Pending questions and permissions: the whole list once trusted, then what changed, at most
+        //     every PUSH_EVERY. Every socket diffs on its own, so every phone collapses a
+        //     card whoever answered it.
+        if authed && (pushed.is_none() || Instant::now() >= next_push) {
+            next_push = Instant::now() + PUSH_EVERY;
+            if !push_pending(&app, &mut ws, &mut pushed) {
+                break;
+            }
+        }
+
+        // 2. Flush any buffered PTY output for the attached session -- to loopback only; a
+        //    remote phone's subscription is drained and dropped (see `streams_raw_output`).
+        let raw_output = streams_raw_output(device.is_some());
         if let Some((_, _, rx)) = attached.as_ref() {
             for _ in 0..DRAIN_PER_TICK {
                 match rx.try_recv() {
+                    Ok(_) if !raw_output => {}
                     Ok(frame) => {
                         if ws
                             .send(Message::Text(
@@ -1332,11 +1951,17 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
         };
         if let Some((sid, _, _)) = attached.as_ref() {
             for _ in 0..DRAIN_PER_TICK {
-                match bus_rx.try_recv() {
+                let next = bus_rx.try_recv();
+                if let Ok(ev) = next.as_ref() {
+                    if ev.event == "sessionstart" {
+                        spawn_watch.started(&ev.session);
+                    }
+                }
+                match next {
                     Ok(ev) if &ev.session == sid => {
                         if ws
                             .send(Message::Text(
-                                status_payload(&ev.event, &ev.body).to_string(),
+                                status_payload(sid, &ev.event, &ev.body).to_string(),
                             ))
                             .is_err()
                         {
@@ -1351,27 +1976,142 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             }
         } else {
             // Not attached: drain-and-discard so the bus buffer can't back up.
-            while bus_rx.try_recv().is_ok() {}
+            while let Ok(ev) = bus_rx.try_recv() {
+                if ev.event == "sessionstart" {
+                    spawn_watch.started(&ev.session);
+                }
+            }
         }
 
-        // 4. Tail the transcript for appended lines -> chat items.
-        if let Some((path, cursor)) = transcript.as_mut() {
-            let lines = read_lines(path);
-            if lines.len() > *cursor {
-                for line in &lines[*cursor..] {
-                    for item in crate::transcript::parse_line(line) {
-                        let _ = ws.send(Message::Text(
-                            json!({ "type": "chat", "item": item }).to_string(),
-                        ));
+        // 3b. A Claude session this phone spawned that has not started: it is on the Mac's
+        //     "trust this folder?" prompt, which the phone cannot answer. Say so, once.
+        for sid in spawn_watch.stalled(Instant::now()) {
+            if !send_text(&mut ws, trust_stall_frame(&sid).to_string()) {
+                break 'conn;
+            }
+        }
+
+        // 5. Context meter for the attached session: on attach, then every CONTEXT_EVERY.
+        if let (Some((sid, _, _)), Some(path)) = (attached.as_ref(), context_path.as_ref()) {
+            if Instant::now() >= next_context {
+                next_context = Instant::now() + CONTEXT_EVERY;
+                if let Some(u) = crate::context_window::for_transcript(path) {
+                    let frame = crate::bridge_view::context_frame(sid, &u);
+                    if !send_text(&mut ws, frame.to_string()) {
+                        break 'conn;
                     }
                 }
-                *cursor = lines.len();
+            }
+        }
+
+        // 4a. Follow the attached Claude session onto the transcript it is writing NOW: a
+        //     `/clear` moves it to a new conversation, and a chat opened the moment it was
+        //     spawned had none at attach. At most once per RESOLVE_EVERY, and the directory
+        //     scan only runs when the conversation id moved or there is no transcript yet.
+        if attached_claude && Instant::now() >= next_resolve {
+            next_resolve = Instant::now() + RESOLVE_EVERY;
+            if let Some((sid, _, _)) = attached.as_ref() {
+                let store = app.state::<Arc<Store>>();
+                let conversation = store.claude_conversation_id(sid);
+                if crate::bridge_view::needs_resolve(
+                    tail_conversation.as_deref(),
+                    transcript.is_some(),
+                    &conversation,
+                ) {
+                    let resolved = crate::pty::session_projects_dir(&store, sid)
+                        .and_then(|dir| crate::pty::transcript_path(&conversation, &dir));
+                    let current = transcript.as_ref().map(|(p, _)| p.as_path());
+                    if crate::bridge_view::should_switch_tail(current, resolved.as_deref()) {
+                        // Whatever the OLD conversation wrote since the last tail pass
+                        // goes out first, or it is lost with the switch.
+                        if let Some((old, cursor)) = transcript.as_mut() {
+                            for frame in crate::bridge_view::tail_frames(old, cursor, sid) {
+                                if !send_text(&mut ws, frame.to_string()) {
+                                    break 'conn;
+                                }
+                            }
+                        }
+                        if let Some(path) = resolved.clone() {
+                            let lines = read_lines(&path);
+                            let history = history_payload(sid, &lines);
+                            if !send_text(&mut ws, history.to_string()) {
+                                break 'conn;
+                            }
+                            transcript = Some((path.clone(), lines.len()));
+                            context_path = Some(path);
+                            next_context = Instant::now();
+                        }
+                    }
+                    // Settled only once found: until then, look again next tick.
+                    if resolved.is_some() {
+                        tail_conversation = Some(conversation);
+                    }
+                }
+            }
+        }
+
+        // 4b. Tail the transcript for appended lines -> chat items.
+        if let (Some((path, cursor)), Some((sid, _, _))) = (transcript.as_mut(), attached.as_ref())
+        {
+            for frame in crate::bridge_view::tail_frames(path, cursor, sid) {
+                if !send_text(&mut ws, frame.to_string()) {
+                    break 'conn;
+                }
             }
         }
     }
 
     unsubscribe_bus(&bus, &mut bus_sub);
     detach(&pty, &attached);
+}
+
+/// Send `pending` (first call) or the `pendingAdded` / `resolved` frames for what changed
+/// since this socket last pushed. A resolution older than the ring reads as `cancelled`.
+fn push_pending(
+    app: &AppHandle,
+    ws: &mut WebSocket<TcpStream>,
+    pushed: &mut Option<HashSet<String>>,
+) -> bool {
+    let asks = app.state::<Arc<Asks>>();
+    let broker = app.state::<Arc<Broker>>();
+    let views = asks.pending();
+    let perms = broker.pending();
+    let unchanged = pushed.as_ref().is_some_and(|p| {
+        p.len() == views.len() + perms.len()
+            && views.iter().all(|v| p.contains(&v.id))
+            && perms.iter().all(|v| p.contains(&v.id))
+    });
+    if unchanged {
+        return true;
+    }
+    // The store is read only when there is something to classify.
+    let projects = if views.is_empty() && perms.is_empty() {
+        Vec::new()
+    } else {
+        app.state::<Arc<Store>>().list()
+    };
+    let is_private = |sid: &str| crate::bridge_view::session_is_private(&projects, sid);
+    let mut items = crate::bridge_view::ask_push_items(&views, is_private);
+    items.extend(crate::bridge_view::permission_push_items(
+        &perms, is_private,
+    ));
+    // The ring is read only when something can have been resolved. Ask and permission ids
+    // never collide (`ask-N` / `perm-N`), so one combined ring names either.
+    let recent = if pushed.is_some() {
+        let mut r = asks.recent_resolutions();
+        r.extend(broker.recent_resolutions());
+        r
+    } else {
+        Vec::new()
+    };
+    let (frames, ids) = crate::bridge_view::push_frames(pushed.as_ref(), &items, &recent);
+    for frame in frames {
+        if ws.send(Message::Text(frame.to_string())).is_err() {
+            return false;
+        }
+    }
+    *pushed = Some(ids);
+    true
 }
 
 fn unsubscribe_bus(
@@ -1388,7 +2128,43 @@ fn unsubscribe_bus(
 struct LiveConn {
     ctrl: Arc<BridgeController>,
     device_id: String,
-    flag: Arc<AtomicBool>,
+    flag: Arc<LiveSlot>,
+}
+
+/// One authenticated remote socket as the controller sees it: whether it has been told to
+/// close, and when it last read anything from the phone.
+struct LiveSlot {
+    closed: AtomicBool,
+    heard: Mutex<Instant>,
+}
+
+impl LiveSlot {
+    fn new(now: Instant) -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            heard: Mutex::new(now),
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// The phone was heard from (any frame, a pong included) at `at`.
+    fn heard(&self, at: Instant) {
+        let mut h = lock(&self.heard);
+        if at > *h {
+            *h = at;
+        }
+    }
+
+    fn last_heard(&self) -> Instant {
+        *lock(&self.heard)
+    }
 }
 
 impl LiveConn {
@@ -1402,7 +2178,15 @@ impl LiveConn {
     }
 
     fn revoked(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        self.flag.is_closed()
+    }
+
+    fn heard(&self, at: Instant) {
+        self.flag.heard(at);
+    }
+
+    fn last_heard(&self) -> Instant {
+        self.flag.last_heard()
     }
 }
 
@@ -1410,6 +2194,16 @@ impl Drop for LiveConn {
     fn drop(&mut self) {
         self.ctrl.unregister_live(&self.device_id, &self.flag);
     }
+}
+
+/// Whether a session runs the Claude adapter (the only one with a transcript context meter).
+fn is_claude(store: &Store, session_id: &str) -> bool {
+    store
+        .list()
+        .iter()
+        .flat_map(|p| p.sessions.iter())
+        .find(|s| s.id == session_id)
+        .is_some_and(|s| s.agent == crate::agent::AgentId::Claude)
 }
 
 fn detach(
@@ -1424,6 +2218,29 @@ fn detach(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_gates_refuse_before_the_token_is_judged() {
+        // Rate-limited or switched off: unavailable, whatever the token is.
+        for verified in [true, false] {
+            assert_eq!(
+                auth_outcome(false, true, verified),
+                AuthOutcome::Unavailable
+            );
+            assert_eq!(
+                auth_outcome(true, false, verified),
+                AuthOutcome::Unavailable
+            );
+            assert_eq!(
+                auth_outcome(false, false, verified),
+                AuthOutcome::Unavailable
+            );
+        }
+        assert_eq!(auth_outcome(true, true, true), AuthOutcome::Accepted);
+        assert_eq!(auth_outcome(true, true, false), AuthOutcome::Unauthorized);
+        assert_eq!(unavailable()["message"], "unavailable");
+        assert_eq!(unauthorized()["message"], "unauthorized");
+    }
 
     fn sorted_keys(v: &serde_json::Value) -> Vec<String> {
         let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
@@ -1446,6 +2263,89 @@ mod tests {
         assert!(take_prompt_slot(&prompts, b), "another IP is unaffected");
         assert_eq!(PAIR_PROMPTS_MAX, 5);
         assert_eq!(PAIR_PROMPT_WINDOW, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn private_gate_covers_every_session_scoped_message() {
+        let scoped = [
+            r#"{"type":"attach","session_id":"s"}"#,
+            r#"{"type":"input","session_id":"s","data":"x"}"#,
+            r#"{"type":"resize","session_id":"s","cols":1,"rows":1}"#,
+            r#"{"type":"git","session_id":"s","action":"changes"}"#,
+            r#"{"type":"kill","session_id":"s"}"#,
+            r#"{"type":"interrupt","sessionId":"s"}"#,
+        ];
+        for raw in scoped {
+            let m = parse_client_msg(raw).unwrap();
+            assert_eq!(session_scope(&m), Some("s"), "{raw}");
+        }
+        for raw in [
+            r#"{"type":"list"}"#,
+            r#"{"type":"discover"}"#,
+            r#"{"type":"spawn","project_id":"p","prompt":"x"}"#,
+        ] {
+            assert_eq!(
+                session_scope(&parse_client_msg(raw).unwrap()),
+                None,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_agent_is_strict() {
+        use crate::agent::AgentId;
+        assert_eq!(spawn_agent(None), Some(AgentId::Claude));
+        assert_eq!(spawn_agent(Some("claude")), Some(AgentId::Claude));
+        assert_eq!(spawn_agent(Some("hermes")), Some(AgentId::Hermes));
+        // The lenient Deserialize would have made these Claude.
+        assert_eq!(spawn_agent(Some("gpt5-turbo")), None);
+        assert_eq!(spawn_agent(Some("")), None);
+        assert_eq!(spawn_agent(Some("Claude")), None);
+    }
+
+    #[test]
+    fn spawn_name_is_the_first_line_clipped() {
+        assert_eq!(
+            spawn_session_name("Fix the login bug\nmore detail"),
+            "Fix the login bug"
+        );
+        assert_eq!(
+            spawn_session_name("\n  \n  hello   there  \n"),
+            "hello there"
+        );
+        assert_eq!(spawn_session_name(""), "Mobile");
+        assert_eq!(spawn_session_name(" \n\t\n"), "Mobile");
+        let long = spawn_session_name(&"word ".repeat(30));
+        assert!(long.chars().count() <= SPAWN_NAME_MAX, "{long}");
+        assert!(long.ends_with('…'));
+        let exact = "é".repeat(SPAWN_NAME_MAX);
+        assert_eq!(
+            spawn_session_name(&exact),
+            exact,
+            "exactly the limit is kept whole"
+        );
+    }
+
+    #[test]
+    fn spawns_are_budgeted_per_phone() {
+        let spawns = Mutex::new(HashMap::new());
+        for i in 0..SPAWNS_MAX {
+            assert!(take_spawn_slot(&spawns, "dev-a"), "spawn {} allowed", i + 1);
+        }
+        assert!(
+            !take_spawn_slot(&spawns, "dev-a"),
+            "11th in the hour refused"
+        );
+        assert!(
+            take_spawn_slot(&spawns, "dev-b"),
+            "another phone is unaffected"
+        );
+        assert_eq!((SPAWNS_MAX, SPAWN_WINDOW), (10, Duration::from_secs(3600)));
+        assert_eq!(
+            spawn_budget_error(),
+            json!({ "type": "error", "message": "too many new chats — try again later" })
+        );
     }
 
     #[test]
@@ -1476,20 +2376,10 @@ mod tests {
     }
 
     #[test]
-    fn projects_message_marks_running_sessions() {
-        let projects = vec![serde_json::json!({
-            "id": "p1", "name": "Conduit", "path": "/repo",
-            "sessions": [ { "id": "s1", "name": "auth", "branch": "feat/x", "agent": "claude" } ]
-        })];
-        let running: std::collections::HashSet<String> = ["s1".to_string()].into_iter().collect();
-        let msg = projects_payload(&projects, &running);
-        assert_eq!(msg["type"], "projects");
-        assert_eq!(msg["projects"][0]["sessions"][0]["running"], true);
-    }
-
-    #[test]
     fn status_message_shape() {
-        let msg = status_payload("pretool", &serde_json::json!({ "tool_name": "Bash" }));
+        let msg = status_payload("s1", "pretool", &serde_json::json!({ "tool_name": "Bash" }));
+        assert_eq!(sorted_keys(&msg), ["body", "event", "sessionId", "type"]);
+        assert_eq!(msg["sessionId"], "s1");
         assert_eq!(msg["type"], "status");
         assert_eq!(msg["event"], "pretool");
         assert_eq!(msg["body"]["tool_name"], "Bash");
@@ -1502,8 +2392,9 @@ mod tests {
             serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"yo"}]}})
                 .to_string(),
         ];
-        let msg = history_payload(&lines);
+        let msg = history_payload("s1", &lines);
         assert_eq!(msg["type"], "history");
+        assert_eq!(msg["sessionId"], "s1");
         assert_eq!(msg["items"].as_array().unwrap().len(), 2);
         assert_eq!(msg["items"][0]["role"], "user");
     }
@@ -1779,39 +2670,101 @@ mod tests {
     }
 
     #[test]
-    fn origin_header_is_refused() {
-        let with = Request::builder()
-            .uri("/")
-            .header("Origin", "http://evil.example")
-            .body(())
-            .unwrap();
-        let without = Request::builder().uri("/").body(()).unwrap();
-        assert!(has_origin(&with));
-        assert!(!has_origin(&without));
+    fn foreign_origin_is_refused() {
+        let lo: SocketAddr = "127.0.0.1:8456".parse().unwrap();
+        let tn: SocketAddr = "100.64.0.1:8456".parse().unwrap();
+        let ok = |o: &str, at: SocketAddr| origin_allowed(Some(o.as_bytes()), at, "mac.t.ts.net");
+        // No Origin at all: the sidecar and plain clients.
+        assert!(origin_allowed(None, lo, ""));
+        // A browser page, including a DNS-rebinding one that targets our port.
+        assert!(!ok("http://evil.example", lo));
+        assert!(!ok("http://evil.example:8456", lo));
+        assert!(!ok("https://evil.example:8456", tn));
+        assert!(!ok("null", lo));
+        assert!(!ok("", lo));
+        // The wrong port, another address, a scheme other than http, or a path.
+        assert!(!ok("http://127.0.0.1:8457", lo));
+        assert!(!ok("http://127.0.0.1", lo));
+        assert!(!ok("http://100.64.0.1:8456", lo));
+        assert!(!ok("https://127.0.0.1:8456", lo));
+        assert!(!ok("http://127.0.0.1:8456/x", lo));
+        // localhost is never us (any local web page has it); our MagicDNS name only on the
+        // tailnet address.
+        assert!(!ok("http://localhost:8456", tn));
+        assert!(!ok("http://localhost:8456", lo));
+        assert!(!ok("http://mac.t.ts.net:8456", lo));
+        assert!(!ok("http://other.t.ts.net:8456", tn));
+        assert!(!origin_allowed(Some(b"http://:8456"), tn, ""));
+        assert!(!origin_allowed(Some(b"http://\xff:8456"), lo, ""));
+    }
 
-        // Real socket: a browser-shaped handshake to loopback gets 403, not a WebSocket.
+    #[test]
+    fn own_origin_is_accepted() {
+        // What iOS's WebSocket sends: the URL it dialled, which it cannot be told to drop.
+        let lo: SocketAddr = "127.0.0.1:8456".parse().unwrap();
+        let tn: SocketAddr = "100.64.0.1:8456".parse().unwrap();
+        let ok = |o: &str, at: SocketAddr| origin_allowed(Some(o.as_bytes()), at, "Mac.t.ts.net.");
+        assert!(ok("http://127.0.0.1:8456", lo));
+        assert!(ok("http://100.64.0.1:8456", tn));
+        assert!(ok("http://mac.t.ts.net:8456", tn));
+        assert!(ok("http://MAC.t.ts.net.:8456", tn));
+    }
+
+    /// Real socket handshake against `accept_ws`; `{port}` in an Origin is the listener's.
+    fn handshake_with_origins(origins: &[&str]) -> Result<(), StatusCode> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
-            accept_ws(s, false).is_some()
+            accept_ws(s, false, "").is_some()
         });
         let mut req =
             tungstenite::client::IntoClientRequest::into_client_request(format!("ws://{addr}/"))
                 .unwrap();
-        req.headers_mut()
-            .insert("Origin", "http://evil.example".parse().unwrap());
-        let stream = TcpStream::connect(addr).unwrap();
-        match tungstenite::client(req, stream) {
-            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(resp))) => {
-                assert_eq!(resp.status(), StatusCode::FORBIDDEN)
-            }
-            other => panic!("expected 403, got {:?}", other.map(|_| ())),
+        for o in origins {
+            let o = o.replace("{port}", &addr.port().to_string());
+            req.headers_mut().append("Origin", o.parse().unwrap());
         }
-        assert!(
-            !server.join().unwrap(),
-            "server must not complete the upgrade"
+        let stream = TcpStream::connect(addr).unwrap();
+        let out = match tungstenite::client(req, stream) {
+            Ok(_) => Ok(()),
+            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(resp))) => {
+                Err(resp.status())
+            }
+            Err(e) => panic!("unexpected handshake error: {e:?}"),
+        };
+        assert_eq!(
+            server.join().unwrap(),
+            out.is_ok(),
+            "server upgrade must match"
         );
+        out
+    }
+
+    #[test]
+    fn origin_header_is_refused() {
+        // Real socket: a browser-shaped handshake to loopback gets 403, not a WebSocket.
+        assert_eq!(
+            handshake_with_origins(&["http://evil.example:{port}"]),
+            Err(StatusCode::FORBIDDEN)
+        );
+        // Two Origins are refused even when both name us: nothing honest sends that.
+        assert_eq!(
+            handshake_with_origins(&["http://127.0.0.1:{port}", "http://127.0.0.1:{port}"]),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn ios_shaped_handshake_is_accepted() {
+        // The phone app in the Simulator dials ws://127.0.0.1:<port> and SocketRocket adds
+        // the matching Origin; the bridge must take it. `localhost` it does not.
+        assert_eq!(handshake_with_origins(&["http://127.0.0.1:{port}"]), Ok(()));
+        assert_eq!(
+            handshake_with_origins(&["http://localhost:{port}"]),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(handshake_with_origins(&[]), Ok(()));
     }
 
     #[test]
@@ -1846,7 +2799,7 @@ mod tests {
             // Per-read timeout is generous; only the overall deadline can end this.
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let t = std::time::Instant::now();
-            let ok = accept_ws_within(s, true, Duration::from_millis(400)).is_some();
+            let ok = accept_ws_within(s, true, "", Duration::from_millis(400)).is_some();
             (ok, t.elapsed())
         });
         let mut c = TcpStream::connect(addr).unwrap();
@@ -1868,7 +2821,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
-            let mut ws = accept_ws(s, true).expect("handshake");
+            let mut ws = accept_ws(s, true, "").expect("handshake");
             let small = ws.read().map(|m| m.into_text().unwrap_or_default());
             let big = ws.read();
             (small.ok(), big.is_err())
@@ -1963,16 +2916,13 @@ mod tests {
         let d1b = c.register_live("d1");
         let d2 = c.register_live("d2");
         c.disconnect_device("d1");
-        assert!(d1.load(Ordering::SeqCst));
-        assert!(
-            d1b.load(Ordering::SeqCst),
-            "every socket of the device closes"
-        );
-        assert!(!d2.load(Ordering::SeqCst), "other devices stay connected");
+        assert!(d1.is_closed());
+        assert!(d1b.is_closed(), "every socket of the device closes");
+        assert!(!d2.is_closed(), "other devices stay connected");
         // A connection that ends on its own deregisters; revoking later is a no-op.
         c.unregister_live("d2", &d2);
         c.disconnect_device("d2");
-        assert!(!d2.load(Ordering::SeqCst));
+        assert!(!d2.is_closed());
     }
 
     #[test]
@@ -1981,7 +2931,343 @@ mod tests {
         let a = c.register_live("d1");
         let b = c.register_live("d2");
         c.disconnect_all_devices();
-        assert!(a.load(Ordering::SeqCst) && b.load(Ordering::SeqCst));
+        assert!(a.is_closed() && b.is_closed());
+    }
+
+    fn wired_controller() -> (
+        BridgeController,
+        Arc<crate::asks::Asks>,
+        Arc<crate::asks::AskGate>,
+    ) {
+        let c = controller();
+        let asks = Arc::new(crate::asks::Asks::default());
+        let gate = Arc::new(crate::asks::AskGate::default());
+        c.wire_asks(asks.clone(), gate.clone());
+        (c, asks, gate)
+    }
+
+    #[test]
+    fn last_phone_leaving_hands_off() {
+        use crate::asks::AskOutcome;
+        let (c, asks, _gate) = wired_controller();
+        assert!(!c.has_remote_phone());
+        let a = c.register_live("d1");
+        let b = c.register_live("d2");
+        assert!(c.has_remote_phone());
+        let (held, rx_held) =
+            asks.register_held("s".into(), "t".into(), serde_json::json!([]), 1, true);
+        let (desk, rx_desk) =
+            asks.register_held("s".into(), "t".into(), serde_json::json!([]), 2, false);
+        c.unregister_live("d1", &a);
+        assert!(rx_held.try_recv().is_err(), "another phone still holds it");
+        c.unregister_live("d2", &b);
+        assert!(!c.has_remote_phone());
+        assert_eq!(rx_held.try_recv().unwrap(), AskOutcome::HandOff);
+        assert!(asks.get(&held).is_none());
+        assert!(
+            rx_desk.try_recv().is_err() && asks.get(&desk).is_some(),
+            "the desktop's own question is untouched"
+        );
+    }
+
+    #[test]
+    fn last_phone_leaving_keeps_asks_while_the_desktop_watches() {
+        let (c, asks, gate) = wired_controller();
+        gate.set(true);
+        let a = c.register_live("d1");
+        let (held, rx) = asks.register_held("s".into(), "t".into(), serde_json::json!([]), 1, true);
+        c.unregister_live("d1", &a);
+        assert!(rx.try_recv().is_err() && asks.get(&held).is_some());
+    }
+
+    #[test]
+    fn revoking_the_last_phone_hands_off_too() {
+        use crate::asks::AskOutcome;
+        let (c, asks, _gate) = wired_controller();
+        let _a = c.register_live("d1");
+        let (_, rx) = asks.register_held("s".into(), "t".into(), serde_json::json!([]), 1, true);
+        c.disconnect_device("d1");
+        assert_eq!(rx.try_recv().unwrap(), AskOutcome::HandOff);
+        let _b = c.register_live("d2");
+        let (_, rx2) = asks.register_held("s".into(), "t".into(), serde_json::json!([]), 1, true);
+        c.disconnect_all_devices();
+        assert_eq!(rx2.try_recv().unwrap(), AskOutcome::HandOff);
+    }
+
+    #[test]
+    fn answer_msg_parses_camel_case() {
+        let m = parse_client_msg(r#"{"type":"answer","askId":"ask-3","answers":{"Q?":"A"}}"#);
+        match m {
+            Some(ClientMsg::Answer { ask_id, answers }) => {
+                assert_eq!(ask_id, "ask-3");
+                assert_eq!(answers["Q?"], "A");
+            }
+            other => panic!("expected Answer, got {other:?}"),
+        }
+        assert!(parse_client_msg(r#"{"type":"answer","ask_id":"x","answers":{}}"#).is_none());
+        assert!(parse_client_msg(r#"{"type":"answer","askId":"x","answers":"A"}"#).is_none());
+    }
+
+    #[test]
+    fn a_session_made_private_while_attached_stops_streaming() {
+        let private = |s: &str| s == "secret";
+        assert_eq!(
+            attached_now_private(Some("secret"), private),
+            Some("secret")
+        );
+        assert_eq!(attached_now_private(Some("open"), private), None);
+        assert_eq!(attached_now_private(None, private), None);
+
+        // The whole step: unsubscribe the PTY stream, drop the tail, say why (tagged).
+        let (_tx, rx) = std::sync::mpsc::channel::<String>();
+        let mut attached = Some(("secret".to_string(), 7u64, rx));
+        let mut transcript = Some((PathBuf::from("/t/a.jsonl"), 3usize));
+        let mut context_path = Some(PathBuf::from("/t/a.jsonl"));
+        let mut tail_conversation = Some("conv".to_string());
+        let mut attached_claude = true;
+        let mut unsubscribed = Vec::new();
+        let refusal = stop_streaming_if_private(
+            &mut attached,
+            &mut transcript,
+            &mut context_path,
+            &mut tail_conversation,
+            &mut attached_claude,
+            private,
+            |sid, sub| unsubscribed.push((sid.to_string(), sub)),
+        );
+        assert_eq!(
+            refusal,
+            Some(json!({"type":"error","message":"private session","sessionId":"secret"}))
+        );
+        assert_eq!(unsubscribed, vec![("secret".to_string(), 7)]);
+        assert!(attached.is_none() && transcript.is_none() && context_path.is_none());
+        assert!(tail_conversation.is_none() && !attached_claude);
+
+        // A session that is still open is left streaming, untouched.
+        let (_tx, rx) = std::sync::mpsc::channel::<String>();
+        let mut attached = Some(("open".to_string(), 8u64, rx));
+        let mut transcript = Some((PathBuf::from("/t/b.jsonl"), 1usize));
+        let mut context_path = Some(PathBuf::from("/t/b.jsonl"));
+        let mut tail_conversation = Some("conv".to_string());
+        let mut attached_claude = true;
+        let refusal = stop_streaming_if_private(
+            &mut attached,
+            &mut transcript,
+            &mut context_path,
+            &mut tail_conversation,
+            &mut attached_claude,
+            private,
+            |_, _| panic!("nothing to unsubscribe"),
+        );
+        assert!(refusal.is_none());
+        assert!(attached.is_some() && transcript.is_some() && context_path.is_some());
+        assert!(tail_conversation.is_some() && attached_claude);
+    }
+
+    #[test]
+    fn a_silent_connection_is_pinged_then_dropped() {
+        let t0 = Instant::now();
+        assert!(!conn_is_stale(t0, t0));
+        assert!(!conn_is_stale(t0, t0 + Duration::from_secs(34)));
+        assert!(conn_is_stale(t0, t0 + Duration::from_secs(35)));
+        assert!(!ping_due(t0, t0 + Duration::from_secs(14)));
+        assert!(ping_due(t0, t0 + Duration::from_secs(15)));
+        // Two pings go unanswered before a connection is given up on.
+        assert!(STALE_AFTER > PING_EVERY * 2);
+    }
+
+    #[test]
+    fn a_peer_that_stops_reading_cannot_stall_the_loop() {
+        // A frozen phone stops reading but its kernel keeps the socket open (zero window),
+        // so an unbounded write blocks forever and the loop never reaches the staleness
+        // check. Measured in the Simulator: 70 s frozen, never dropped, question held.
+        assert!(WRITE_STALL < STALE_AFTER);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap(); // never reads
+        let (server, _) = listener.accept().unwrap();
+        bound_writes(&server, Duration::from_millis(300)).unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        let start = Instant::now();
+        let mut w = &server;
+        use std::io::Write;
+        let failed = loop {
+            if let Err(e) = w.write_all(&chunk) {
+                break e;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "write never gave up"
+            );
+        };
+        assert!(matches!(
+            failed.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
+    fn a_timed_out_send_ends_the_connection() {
+        use std::io::{Error as IoError, ErrorKind};
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::BrokenPipe,
+        ] {
+            assert!(
+                send_failure_is_fatal(&tungstenite::Error::Io(IoError::from(kind))),
+                "{kind:?} must end the connection"
+            );
+        }
+        assert!(send_failure_is_fatal(&tungstenite::Error::ConnectionClosed));
+        assert!(send_failure_is_fatal(&tungstenite::Error::AlreadyClosed));
+        // Refusing one oversized frame leaves the socket itself usable.
+        assert!(!send_failure_is_fatal(&tungstenite::Error::Capacity(
+            tungstenite::error::CapacityError::MessageTooLong {
+                size: 2,
+                max_size: 1
+            }
+        )));
+    }
+
+    #[test]
+    fn raw_output_goes_to_loopback_only() {
+        assert!(streams_raw_output(false), "loopback: sidecar + Simulator");
+        assert!(!streams_raw_output(true), "a remote phone never renders it");
+    }
+
+    #[test]
+    fn a_spawn_that_never_starts_is_reported_once() {
+        let t0 = Instant::now();
+        let mut w = SpawnWatch::default();
+        w.watch("s1".into(), t0);
+        w.watch("s2".into(), t0);
+        assert!(w
+            .stalled(t0 + TRUST_STALL - Duration::from_millis(1))
+            .is_empty());
+        w.started("s2");
+        assert_eq!(w.stalled(t0 + TRUST_STALL), vec!["s1".to_string()]);
+        assert!(w.stalled(t0 + TRUST_STALL * 3).is_empty(), "said once");
+        let f = trust_stall_frame("s1");
+        assert_eq!(f["type"], "error");
+        assert_eq!(f["sessionId"], "s1");
+        assert_eq!(
+            f["message"],
+            "Claude is waiting on your Mac \u{2014} open this folder there once to trust it"
+        );
+    }
+
+    #[test]
+    fn a_stale_phone_stops_holding_questions() {
+        let (c, _asks, _gate) = wired_controller();
+        let slot = c.register_live("d1");
+        let now = Instant::now();
+        assert!(c.has_remote_phone_at(now));
+        let later = now + STALE_AFTER;
+        assert!(
+            !c.has_remote_phone_at(later),
+            "a phone silent for STALE_AFTER no longer holds a question"
+        );
+        slot.heard(later);
+        assert!(c.has_remote_phone_at(later), "a frame from it counts again");
+        // Two sockets: one fresh one is enough.
+        let fresh = c.register_live("d2");
+        fresh.heard(later + STALE_AFTER);
+        assert!(c.has_remote_phone_at(later + STALE_AFTER));
+    }
+
+    #[test]
+    fn answer_refused_for_silo() {
+        let view = crate::asks::AskView {
+            id: "ask-1".into(),
+            session: "s".into(),
+            tool_use_id: "t".into(),
+            questions: serde_json::json!([{"question":"Q?","options":[{"label":"A"}]}]),
+            created_ms: 0,
+        };
+        let good: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Q?":"A"})).unwrap();
+        let bad: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"Other?":"A"})).unwrap();
+        assert!(phone_may_answer(Some(&view), false, &good));
+        assert!(
+            !phone_may_answer(Some(&view), true, &good),
+            "a private session is never answered from a phone"
+        );
+        assert!(!phone_may_answer(Some(&view), false, &bad), "validated");
+        assert!(!phone_may_answer(None, false, &good), "already resolved");
+    }
+
+    fn perm_view(id: &str) -> crate::broker::PermissionView {
+        crate::broker::PermissionView {
+            id: id.into(),
+            session: "s".into(),
+            tool_name: "Bash".into(),
+            summary: "ls".into(),
+            created_ms: 0,
+        }
+    }
+
+    #[test]
+    fn approve_refused_for_silo() {
+        let view = perm_view("perm-1");
+        assert!(phone_may_approve(Some(&view), false));
+        assert!(
+            !phone_may_approve(Some(&view), true),
+            "a private session's permission is never decided from a phone"
+        );
+        assert!(!phone_may_approve(None, false), "already resolved");
+        // The refusal names the session, so a phone in another chat can ignore it.
+        assert_eq!(
+            approve_refusal(&view),
+            vec![
+                serde_json::json!({ "type": "error", "message": "private session", "sessionId": "s" }),
+                serde_json::json!({ "type": "approveResult", "id": "perm-1", "ok": false }),
+            ]
+        );
+    }
+
+    #[test]
+    fn approve_msg_parses_camel_case() {
+        match parse_client_msg(r#"{"type":"approve","id":"perm-2","allow":true}"#) {
+            Some(ClientMsg::Approve { id, allow }) => {
+                assert_eq!(id, "perm-2");
+                assert!(allow);
+            }
+            other => panic!("expected Approve, got {other:?}"),
+        }
+        assert!(parse_client_msg(r#"{"type":"approve","id":"x"}"#).is_none());
+        assert!(parse_client_msg(r#"{"type":"approve","id":"x","allow":"yes"}"#).is_none());
+        // Not session-scoped by its fields: the handler checks the permission's own session.
+        let m = parse_client_msg(r#"{"type":"approve","id":"x","allow":false}"#).unwrap();
+        assert_eq!(session_scope(&m), None);
+    }
+
+    #[test]
+    fn last_phone_leaving_hands_off_permissions_too() {
+        use crate::asks::By;
+        use crate::broker::Decision;
+        let (c, _asks, gate) = wired_controller();
+        let broker = Arc::new(crate::broker::Broker::default());
+        c.wire_permissions(broker.clone());
+        let a = c.register_live("d1");
+        let (held, rx_held) =
+            broker.register_held("s".into(), "Bash".into(), serde_json::json!({}), 1, true);
+        let (desk, rx_desk) =
+            broker.register_held("s".into(), "Bash".into(), serde_json::json!({}), 2, false);
+        c.unregister_live("d1", &a);
+        assert_eq!(
+            rx_held.try_recv().unwrap(),
+            (Decision::FallThrough, By::Terminal)
+        );
+        assert!(broker.get(&held).is_none());
+        assert!(rx_desk.try_recv().is_err() && broker.get(&desk).is_some());
+        // While the desktop watches, its card can still answer: nothing is handed off.
+        gate.set(true);
+        let b = c.register_live("d2");
+        let (kept, rx_kept) =
+            broker.register_held("s".into(), "Bash".into(), serde_json::json!({}), 3, true);
+        c.unregister_live("d2", &b);
+        assert!(rx_kept.try_recv().is_err() && broker.get(&kept).is_some());
     }
 
     #[test]

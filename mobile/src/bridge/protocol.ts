@@ -6,23 +6,6 @@
 
 // ---- server → client ----
 
-export interface WireSession {
-  id: string;
-  name: string;
-  branch?: string | null;
-  agent: "claude" | "codex" | "gemini";
-  running: boolean;
-  useWorktree?: boolean;
-  worktreePath?: string | null;
-}
-
-export interface WireProject {
-  id: string;
-  name: string;
-  path: string;
-  sessions: WireSession[];
-}
-
 export interface WireQuestionOption {
   label: string;
   description: string;
@@ -49,8 +32,11 @@ export interface WireDiff {
   more: number;
 }
 
-/** A transcript-derived chat item (no id on the wire). Kinds mirror src-tauri/src/transcript_item_kinds.json. */
-export type WireChatItem =
+/** A transcript-derived chat item (no id on the wire). Kinds mirror src-tauri/src/transcript_item_kinds.json.
+ * `at` is the transcript line's ISO timestamp, omitted when the line had none. */
+export type WireChatItem = WireChatBody & { at?: string };
+
+type WireChatBody =
   | { kind: "bubble"; role: "user" | "assistant"; text: string }
   | {
       kind: "event";
@@ -87,22 +73,192 @@ export type WireChatItem =
   | { kind: "plan"; markdown: string }
   | { kind: "note"; tag: string; text: string };
 
+// ---- typed `projects` view (desktop bridge_view.rs) ----
+
+export type WireStatus = "idle" | "running" | "needsInput" | "done";
+
+/** The session's last chat bubble as plain text (<= 160 chars); null for silo / non-Claude / none. */
+export interface WireLastMessage {
+  role: "user" | "assistant";
+  text: string;
+  /** ISO time of the line; null when it had none */
+  at: string | null;
+}
+
+export type WireNeeds = { kind: "ask"; text: string | null } | { kind: "input"; text: null } | null;
+
+export interface WireViewSession {
+  id: string;
+  name: string;
+  /** lowercase desktop AgentId; unknown ids render as "?" */
+  agent: string;
+  branch: string | null;
+  model: string | null;
+  stopped: boolean;
+  running: boolean;
+  /** private / local-only: listed but never previewed or openable */
+  silo: boolean;
+  status: WireStatus;
+  activity: string | null;
+  /** unix ms */
+  updatedAt: number | null;
+  needs: WireNeeds;
+  lastMessage: WireLastMessage | null;
+}
+
+export interface WireViewProject {
+  id: string;
+  name: string;
+  profileId: string | null;
+  /** user-chosen colour only; the phone derives the accent otherwise */
+  color: string | null;
+  sessions: WireViewSession[];
+}
+
+export interface WireProfile {
+  id: string | null;
+  name: string;
+}
+
+export interface WireProjectsView {
+  profiles: WireProfile[];
+  activeProfileId: string | null;
+  projects: WireViewProject[];
+}
+
+export interface WireMac {
+  name: string;
+  dnsName: string;
+  ip: string;
+  port: number;
+  online: boolean;
+  conduitVersion: string;
+}
+
+// ---- questions + permissions waiting on a human (bridge_view.rs ask_push / permission_push) ----
+
+/** Who settled a pending item (asks.rs `By`). `cancelled` = the turn moved on: drop it silently. */
+export type WireBy = "phone" | "desktop" | "terminal" | "timeout" | "cancelled";
+
+/** A held AskUserQuestion. `kind` is absent from no shipped desktop, but an absent kind reads as "ask". */
+export interface WirePendingAsk {
+  kind?: "ask";
+  id: string;
+  sessionId: string;
+  /** joins the transcript's `question` item */
+  toolUseId: string;
+  /** Claude's `tool_input.questions`, verbatim */
+  questions: WireQuestion[];
+  createdMs: number;
+}
+
+/** A held PermissionRequest. No `toolUseId`: it is never joined to a transcript card. */
+export interface WirePendingPermission {
+  kind: "permission";
+  id: string;
+  sessionId: string;
+  toolName: string;
+  /** one line: the command, the file, or the tool name */
+  summary: string;
+  createdMs: number;
+}
+
+/** A silo'd / local-only session's item: exactly these keys, nothing about what it asks. */
+export interface WirePendingPrivate {
+  kind?: "ask" | "permission";
+  id: string;
+  sessionId: string;
+  private: true;
+}
+
+export type WirePendingItem = WirePendingAsk | WirePendingPermission | WirePendingPrivate;
+
+export type PairFailReason = "declined" | "expired" | "replaced" | "off" | "error";
+
+/** The only protocol version this build speaks. */
+export const PROTOCOL_VERSION = 1;
+
 export type ServerMsg =
-  | { type: "projects"; projects: WireProject[] }
+  | { type: "hello"; macName: string; conduitVersion: string; protocolVersion: number }
+  | { type: "authOk"; deviceId: string }
+  | { type: "error"; message: string; sessionId?: string }
+  | { type: "pairPending"; requestId: string }
+  | { type: "pairResult"; ok: true; token: string; deviceId: string }
+  | { type: "pairResult"; ok: false; reason: string }
+  | { type: "macs"; macs: WireMac[] }
+  | ({ type: "projects" } & WireProjectsView)
+  | { type: "context"; sessionId: string; used: number; window: number; fraction: number; model: string | null }
   | { type: "size"; cols: number; rows: number }
-  | { type: "history"; items: WireChatItem[] }
-  | { type: "chat"; item: WireChatItem }
-  | { type: "status"; event: string; body: unknown }
+  // `sessionId` names the session the frame is about; absent from desktops before it was added.
+  | { type: "history"; sessionId?: string; items: WireChatItem[] }
+  | { type: "chat"; sessionId?: string; item: WireChatItem }
+  | { type: "status"; sessionId?: string; event: string; body: unknown }
   | { type: "output"; data: string } // base64 PTY bytes — chat UI ignores
-  | { type: "error"; message: string };
+  | { type: "killed"; sessionId: string }
+  | { type: "gitresult"; action: string; [k: string]: unknown }
+  | { type: "spawned"; sessionId: string; name: string; projectId: string }
+  // Sent once after trust, then diffs every <= 250 ms (bridge_view.rs push_frames).
+  | { type: "pending"; asks: WirePendingItem[]; permissions: WirePendingItem[] }
+  | { type: "pendingAdded"; item: WirePendingItem }
+  | { type: "resolved"; id: string; by: WireBy }
+  // ok:false = already resolved elsewhere, a private session, or answers the Mac would not accept
+  | { type: "answerResult"; askId: string; ok: boolean }
+  | { type: "approveResult"; id: string; ok: boolean };
 
 // ---- client → server ----
+// Spellings are mixed ON PURPOSE (pinned by Rust tests): attach/input/resize/git/kill/spawn use
+// snake_case, pair uses camelCase deviceName, interrupt uses camelCase sessionId.
 
 export type ClientMsg =
+  | { type: "auth"; token: string }
+  | { type: "pair"; secret?: string; request?: true; deviceName: string; nonce: string }
+  | { type: "discover" }
   | { type: "list" }
   | { type: "attach"; session_id: string }
   | { type: "input"; session_id: string; data: string }
-  | { type: "resize"; session_id: string; cols: number; rows: number };
+  | { type: "resize"; session_id: string; cols: number; rows: number }
+  | { type: "git"; session_id: string; action: "changes" | "diff"; path?: string }
+  | { type: "kill"; session_id: string }
+  | { type: "spawn"; project_id: string; prompt: string; agent?: string; worktree?: boolean }
+  | { type: "interrupt"; sessionId: string }
+  | { type: "answer"; askId: string; answers: Record<string, string> }
+  | { type: "approve"; id: string; allow: boolean };
 
-/** Default dev endpoint: the desktop bridge on loopback (Simulator reaches this). */
-export const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:8456";
+export const authMsg = (token: string): ClientMsg => ({ type: "auth", token });
+
+export function pairMsg(
+  a: { secret: string; deviceName: string; nonce: string } | { request: true; deviceName: string; nonce: string },
+): ClientMsg {
+  return "secret" in a
+    ? { type: "pair", secret: a.secret, deviceName: a.deviceName, nonce: a.nonce }
+    : { type: "pair", request: true, deviceName: a.deviceName, nonce: a.nonce };
+}
+
+export const discoverMsg = (): ClientMsg => ({ type: "discover" });
+export const listMsg = (): ClientMsg => ({ type: "list" });
+export const attachMsg = (id: string): ClientMsg => ({ type: "attach", session_id: id });
+export const inputMsg = (id: string, data: string): ClientMsg => ({ type: "input", session_id: id, data });
+export const interruptMsg = (id: string): ClientMsg => ({ type: "interrupt", sessionId: id });
+/** Answer a held question: exact question text -> answer (multi-select already joined ", "). */
+export const answerMsg = (askId: string, answers: Record<string, string>): ClientMsg => ({ type: "answer", askId, answers });
+/** Allow or deny a held permission. */
+export const approveMsg = (id: string, allow: boolean): ClientMsg => ({ type: "approve", id, allow });
+/** Start a new session in a project with its first message; the Mac answers `spawned` or `error`. */
+export const spawnMsg = (projectId: string, prompt: string, agent: string): ClientMsg => ({
+  type: "spawn",
+  project_id: projectId,
+  prompt,
+  agent,
+});
+
+/** A chat message as PTY input: bracketed paste around the text, then a bare `\r`.
+ * Mirrors the desktop's `pty::paste_and_submit` (src-tauri/src/pty.rs) -- keep them in step.
+ * A plain `text + "\r"` works only for short lines: Claude Code reads a long burst as a
+ * PASTE, the `\r` lands inside it as one more newline, and the message sits unsent in the
+ * composer (seen in the Simulator with an 80-character prompt). The end marker makes the
+ * `\r` a keypress even when everything arrives in one read. ESC is dropped from the body
+ * so a `CSI 201~` inside it cannot close the paste early. */
+export function promptInput(text: string): string {
+  const body = text.split("\u001b").join("");
+  return `\u001b[200~${body}\u001b[201~\r`;
+}

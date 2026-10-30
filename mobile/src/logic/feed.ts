@@ -38,6 +38,25 @@ export function pendingApproval(items: ChatItem[]): ApprovalItem | null {
   );
 }
 
+/** Most items a chat keeps in memory. A long-running session's transcript can hold tens of
+ * thousands of lines; the phone keeps the newest and says where the rest are. */
+export const FEED_CAP = 2000;
+export const FEED_CAP_ID = "feed-cap";
+
+/**
+ * The newest `max` items of a feed (the "earlier messages" divider counts as one of them),
+ * led by that divider whenever anything was dropped. Returns the same array when under the
+ * cap, so a feed that did not overflow keeps its identity.
+ */
+export function capFeed(feed: ChatItem[], max: number = FEED_CAP): ChatItem[] {
+  if (feed.length <= max) return feed;
+  const rest = feed[0]?.id === FEED_CAP_ID ? feed.slice(1) : feed;
+  return [
+    { kind: "divider", id: FEED_CAP_ID, label: "Earlier messages are on your Mac", tone: "info" },
+    ...rest.slice(rest.length - (max - 1)),
+  ];
+}
+
 export type CallStatus = "running" | "ok" | "error" | "unknown";
 
 /** A tool call with its outcome folded in. */
@@ -100,6 +119,30 @@ export function groupFeed(items: ChatItem[]): FeedRow[] {
   });
   flush();
   return rows;
+}
+
+/** The tool a call kind names, for a line that no longer has a verb of its own. */
+const CALL_NOUN: Record<string, string> = {
+  read: "Read",
+  bash: "Bash",
+  edit: "Edit",
+  search: "Search",
+  web: "Web",
+  subagent: "Agent",
+};
+
+/** A refusal, whoever refused: Conduit's own deny (`broker::DENY_MESSAGE`), a terminal "No",
+ *  or a permission rule. */
+const DENIED = /\b(denied|rejected)\b|doesn't want to proceed/i;
+
+/** The verb a call line shows. The transcript fixes it when the tool is CALLED ("ran"), so a
+ *  call whose result is an error would still read "ran touch a.txt" beside its ✕ -- which
+ *  contradicts an honest "Denied". Once the result is an error the line says what happened.
+ *  Keep identical to `callVerb` in src/chatItems.ts (desktop). */
+export function callVerb(call: Call, verb: string): string {
+  if (call.status !== "error") return verb;
+  const noun = CALL_NOUN[call.event.event] ?? "tool";
+  return `${call.errorText && DENIED.test(call.errorText) ? "Denied" : "Failed"}: ${noun}`;
 }
 
 /** One-line digest of a folded run: buckets in descending count (stable on first seen). Matches desktop `groupLabel`. */

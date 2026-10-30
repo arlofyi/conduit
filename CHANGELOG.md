@@ -5,6 +5,26 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.48.0 — 2026-10-30
+
+- **Added — Conduit for iPhone.** The app connects to your Mac over Tailscale, remembers it, and finds your other Macs on the same tailnet. It opens on a WhatsApp-style list of every session: each in its project's colour, with its agent, status, last message and an unread count, anything waiting on you on top, filterable by what needs you, what is running or one project, and switchable by profile. Open a chat to read the conversation as it happens and reply; it shows whether the session is working, waiting on you or idle, its model and how full its context is, and stays put while you scroll back. A banner drops in when another session asks a question or needs your permission (and, if you turn it on, when one finishes). Private sessions are listed but never previewed, and the Mac refuses to open them on a phone.
+- **Added — Start a new chat from the phone.** "+" on the chat list picks a project and sends a first message to a new Claude session, named after that message. Other agents are listed but start on the Mac. A phone can start up to 10 new chats an hour.
+- **Added — Stop, Compact and Clear from the phone.** The "+" beside the message field stops the current turn for any agent, and runs Claude's `/compact` or `/clear` (Clear asks first). After a Clear the chat follows the session into its new conversation.
+- **Added — Session details on the phone.** Tap a chat's header for its project, agent, model, context use, branch and status.
+- **Added — Copy a message on the phone.** Long-press a message to copy its text.
+- **Changed — Session chat hides Claude Code's internal reminder lines.** The system reminders Claude Code adds to a conversation no longer appear as messages, on the desktop or the phone.
+- **Changed — The phone app looks and feels like Conduit.** Chats read like a messenger — times, grouped bubbles, formatted replies, a composer that grows and shrinks — with Conduit's agent marks, project colours and Liquid Glass bars.
+- **Added — Answer Claude from your phone.** When a session asks a question or needs permission to run a tool, your phone shows it straight away; tap an answer and every other screen clears it. Private sessions still only ask on your Mac.
+- **Added — Allow or deny tool permissions from Conduit.** When Claude asks to run a tool, Conduit shows the request beside its question cards with Allow and Deny, and the terminal's own prompt stays available. Like the question cards, it appears only while the Continuity view is turned on (Settings → General) and Conduit is in front or the Continuity view is open; otherwise the request goes straight to the terminal (or to your phone, if one is connected). The card is hidden while you are looking at that session's terminal, and says where the request was handled if the phone, another window or the terminal got there first.
+- **Fixed — A question or permission card no longer outlives its question.** When a session moves on while Conduit is holding one (you send a new message, the session ends, a tool finishes, or you press Esc or answer in the terminal), the card disappears within about a second instead of waiting ten minutes. A phone that goes to sleep, freezes or loses its connection stops holding questions within about half a minute, so the terminal can ask instead.
+- **Changed — The phone uses far less mobile data while a chat is open.** The Mac no longer streams the raw terminal output to the phone, which never showed it — about 70 MB per working hour on cellular.
+- **Added — A new chat that waits on your Mac says so.** If a chat started from the phone has not begun after 20 seconds — Claude is asking on the Mac whether to trust the folder — the chat shows "Trust this folder on your Mac to start" instead of looking busy forever.
+- **Fixed — A denied or failed tool no longer reads "ran …".** In session chat on the desktop and the phone, a tool call refused in the terminal, by Conduit or by a permission rule reads "Denied", and one that errored reads "Failed".
+- **Fixed — A phone answer the Mac could not accept no longer reads "Already answered".** The question card stays open and says "Couldn't send that answer — try a shorter one", so you can try again.
+- **Fixed — A permission card no longer vanishes when a different tool finishes.** Only the requested tool finishing (or the turn ending) clears it.
+- **Fixed — Tidier phone chat.** A private session's chat shows only its notice, with no typing indicator beneath it, and a question or permission card that appears while you are at the bottom of the chat is scrolled fully into view.
+- **Fixed — A phone whose connection stalls is dropped cleanly.** A message to the phone that cannot be delivered within 10 seconds now ends that connection instead of being retried on it.
+
 ## 0.47.0 — 2026-10-30
 
 - **Changed — Settings look and behave the same on every page.** Buttons, on/off switches, scope pickers, text fields and status badges now share one design across every Settings page, and on/off settings use switches instead of checkboxes. Inline actions such as "Add key" and "Remove" are real buttons rather than coloured text.

@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { useStore, findSession } from "../store";
 import { answerSummary, buildAnswers, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "../asks";
 import { blocksGlobalShortcut } from "../keyboardGuards";
+import { cardResolution } from "../permissionView";
+import { handedOff } from "../askHandoff";
 
 /** How long the done state stays up if `ask-resolved` never arrives to remove it. */
 const DONE_FALLBACK_MS = 4000;
@@ -68,6 +70,13 @@ export function AskCard({
     return () => clearInterval(t);
   }, [ticking]);
 
+  // Answered elsewhere (the phone, the terminal, another window): say where, instead of
+  // leaving an interactive card up until it vanishes, or claiming "Sent to …".
+  // A lost race (`gone`) keeps the winner's name once it is known: no flip back to the form.
+  const resolvedBy = useStore((s) => s.askResolvedBy[ask.id] ?? null);
+  const resolution = cardResolution(state, resolvedBy, "ask");
+  const remoteCopy = resolution?.view === "remote" ? resolution.copy : null;
+
   const q = ask.questions[page];
   const total = ask.questions.length;
   const last = page === total - 1;
@@ -75,7 +84,7 @@ export function AskCard({
   const otherIdx = q ? q.options.length : 0;
   const rowCount = otherIdx + 1;
   const chosen = q ? (picks[q.question] ?? []) : [];
-  const busy = state === "sending" || state === "done" || state === "gone";
+  const busy = state === "sending" || state === "done" || state === "gone" || !!remoteCopy;
 
   const submit = async (payload: Record<string, string>) => {
     if (inFlight.current) return;
@@ -98,9 +107,11 @@ export function AskCard({
   /** Give the question back to Claude's own menu, then take the user to that terminal —
    *  the arrow promises the jump. The overlay covers the terminals, so drop it too. */
   const handOffToTerminal = async () => {
+    handedOff.add(ask.id);
     try {
       await invoke("ask_handoff", { id: ask.id });
     } catch {
+      handedOff.delete(ask.id);
       setState("error");
       return;
     }
@@ -365,12 +376,20 @@ export function AskCard({
             <small>It's carrying on. This card closes in a moment.</small>
           </div>
         </div>
+      ) : remoteCopy ? (
+        <div className="ask-card-done" role="status">
+          <span className="ask-card-ck" aria-hidden />
+          <div>
+            {remoteCopy}
+            <small>{q.question}</small>
+          </div>
+        </div>
       ) : (
         <>
           <p className="ask-card-q">{q.question}</p>
           {meta}
-          {state === "gone" ? (
-            <div className="ask-card-note">Already answered in the terminal.</div>
+          {resolution?.view === "gone" ? (
+            <div className="ask-card-note">{resolution.copy}</div>
           ) : (
             <>
               <div className="ask-card-opts">{rows}</div>

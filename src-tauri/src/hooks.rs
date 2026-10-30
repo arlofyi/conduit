@@ -16,17 +16,19 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 use tiny_http::{Method, Request, Response, Server};
 
-use crate::broker::{Broker, Decision, Presence};
+use crate::broker::Broker;
 use crate::hookbus::{HookBus, HookEvent};
 
 /// The verb (and route) of the blocking `AskUserQuestion` hook. See `asks.rs`.
 pub const ASK_VERB: &str = "ask";
+
+/// The verb (and route) of the blocking `PermissionRequest` hook. See `broker.rs`.
+pub const PERMISSION_VERB: &str = "permission";
 
 /// Holds the port the listener actually bound to, so pty spawns can inject it.
 pub struct HookState {
@@ -59,7 +61,6 @@ pub fn start(
     state: Arc<HookState>,
     bus: Arc<HookBus>,
     broker: Arc<Broker>,
-    presence: Arc<Presence>,
     fleet: Arc<crate::fleet::FleetState>,
     store: Arc<crate::store::Store>,
     pty: Arc<crate::pty::PtyManager>,
@@ -199,14 +200,17 @@ pub fn start(
                 continue;
             }
 
-            // Approval broker: blocking, handled on its own thread so a pending
-            // approval never stalls the hook loop. The HTTP response IS the
-            // permission decision Claude reads from the hook's stdout.
-            if url.starts_with("/approve") {
+            // PermissionRequest: blocking, own thread, so a pending permission never
+            // stalls the hook loop. The HTTP response IS the decision Claude reads from
+            // the hook's stdout. See broker.rs.
+            if url.starts_with("/permission") {
+                let app = app.clone();
                 let broker = broker.clone();
-                let presence = presence.clone();
-                let bus = bus.clone();
-                thread::spawn(move || handle_approve(request, &url, &broker, &presence, &bus));
+                let gate = ask_gate.clone();
+                let store = store.clone();
+                thread::spawn(move || {
+                    handle_permission(request, &url, &app, &broker, &gate, &store)
+                });
                 continue;
             }
 
@@ -366,6 +370,17 @@ pub fn start(
             // was mid-turn (see `Session::agent_state`). No-op unless it changed.
             if let Some(state) = fleet.status_of(&session) {
                 store.set_session_agent_state(&session, Some(&state));
+            }
+
+            // The turn moved past any question or permission this session was holding:
+            // cancel them, so the blocked `/ask` / `/permission` answer `{}` and no
+            // surface keeps a dead card. For a permission this is also how a terminal
+            // "Yes" clears the card: the hook is left running, but PostToolUse follows.
+            if turn_moved_on(&event, &parsed) {
+                asks.cancel_session(&session);
+                broker.cancel_session_where(&session, |tool| {
+                    permission_moved_on(&event, &parsed, tool)
+                });
             }
 
             // Capture Command Code's own session id, once, so the next spawn can resume
@@ -572,61 +587,6 @@ fn ingest_high_stakes_verb(
     Ok(())
 }
 
-/// Blocking approval handler. With no phone attached to the session it returns no
-/// decision (Claude's normal flow runs — native desktop prompt unchanged). Otherwise
-/// it registers the request, surfaces it to the phone via the bus, and blocks until
-/// answered (or times out → deny with a reason).
-fn handle_approve(
-    mut request: Request,
-    url: &str,
-    broker: &Broker,
-    presence: &Presence,
-    bus: &HookBus,
-) {
-    let (session, _event) = parse_query(url);
-    let mut body = String::new();
-    let _ = request
-        .as_reader()
-        .take(1024 * 1024)
-        .read_to_string(&mut body);
-    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-
-    let Some(session) = session else {
-        let _ = request.respond(Response::from_string("{}"));
-        return;
-    };
-
-    // No phone watching → don't intercept; let Claude's normal flow run.
-    if !presence.is_attached(&session) {
-        let _ = request.respond(Response::from_string("{}"));
-        return;
-    }
-
-    let tool = parsed
-        .get("tool_name")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string();
-    let input = parsed.get("tool_input").cloned().unwrap_or(Value::Null);
-
-    let (id, rx) = broker.register(session.clone(), tool.clone(), input.clone());
-    forward_to_bus(
-        bus,
-        Some(session),
-        "approval_request".to_string(),
-        json!({ "request_id": id, "tool": tool, "input": input }),
-    );
-    let decision = rx.recv_timeout(APPROVAL_WAIT).ok();
-    if let Some(d) = &decision {
-        broker.resolve(&id, d.clone()); // ensure cleared (no-op if already gone)
-    } else {
-        broker.forget(&id);
-    }
-    let _ = request.respond(Response::from_string(
-        approve_response(decision.as_ref()).to_string(),
-    ));
-}
-
 #[derive(Debug, PartialEq)]
 enum AskDecision {
     /// Answer `{}` now: Claude shows its own menu.
@@ -635,24 +595,36 @@ enum AskDecision {
         session: String,
         tool_use_id: String,
         questions: Value,
+        /// Only a connected phone holds it (see `Asks::register_held`).
+        held_for_phone: bool,
     },
+}
+
+/// Who could show a card right now: the desktop gate (`set_ask_gate`) and whether an
+/// authenticated remote phone is connected (`BridgeController::has_remote_phone`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Holders {
+    desktop: bool,
+    phone: bool,
 }
 
 /// Every reason `/ask` declines to hold a question, in one pure place. `has_origin` is
 /// checked FIRST (a browser page must not raise cards), then the gate, then whether the
 /// session is one of ours -- the same settings file is read by a `claude` the user runs by
-/// hand in that checkout, which posts `session=unknown`.
+/// hand in that checkout, which posts `session=unknown`. A private (silo / local-only)
+/// session's question is held ONLY by the desktop: a phone never sees it, so a phone being
+/// connected is no reason to park it.
 fn ask_decision(
-    gate_open: bool,
+    holders: Holders,
     has_origin: bool,
     session: Option<&str>,
     body: &Value,
     known_session: impl Fn(&str) -> bool,
+    private_session: impl Fn(&str) -> bool,
 ) -> AskDecision {
-    if has_origin || !gate_open {
-        return AskDecision::Skip;
-    }
-    let Some(session) = session.filter(|s| known_session(s)) else {
+    let Some((session, held_for_phone)) =
+        holder_for(holders, has_origin, session, known_session, private_session)
+    else {
         return AskDecision::Skip;
     };
     let Some(questions) = body
@@ -669,11 +641,111 @@ fn ask_decision(
             .unwrap_or("")
             .to_string(),
         questions,
+        held_for_phone,
     }
 }
 
-/// Blocking `AskUserQuestion` handler (own thread, like `/approve`). The HTTP response is
-/// the hook's stdout. Every path answers -- `{}` unless the card answered in time.
+/// The gate both blocking routes share (`/ask` and `/permission`): `Some((session,
+/// held_for_phone))` if someone could show a card for this post, else None (answer `{}`).
+/// `has_origin` FIRST (a browser page must not raise cards), then whether anyone is
+/// watching, then whether the session is ours, then the silo rule: a private session is
+/// held only by the desktop, never because a phone is connected.
+fn holder_for(
+    holders: Holders,
+    has_origin: bool,
+    session: Option<&str>,
+    known_session: impl Fn(&str) -> bool,
+    private_session: impl Fn(&str) -> bool,
+) -> Option<(&str, bool)> {
+    if has_origin || !(holders.desktop || holders.phone) {
+        return None;
+    }
+    let session = session.filter(|s| known_session(s))?;
+    let phone_may_hold = holders.phone && !private_session(session);
+    if !holders.desktop && !phone_may_hold {
+        return None;
+    }
+    Some((session, !holders.desktop))
+}
+
+#[derive(Debug, PartialEq)]
+enum PermissionDecision {
+    /// Answer `{}` now: Claude's own dialog decides.
+    Skip,
+    Hold {
+        session: String,
+        tool: String,
+        input: Value,
+        held_for_phone: bool,
+    },
+}
+
+/// Tools whose PermissionRequest is never a permission card. `AskUserQuestion` fires the
+/// event too (measured): it is answered by `/ask`, and `allow` here would run it with no
+/// answers. `ExitPlanMode` is a plan to approve, which stays in Claude's own UI (the same
+/// pair `status_rules::awaits_user` names).
+const NOT_A_PERMISSION: [&str; 2] = ["AskUserQuestion", "ExitPlanMode"];
+
+/// Every reason `/permission` declines to hold a request, in one pure place: questions
+/// first, then the shared gate (`holder_for`), then a body with no tool name.
+fn permission_decision(
+    holders: Holders,
+    has_origin: bool,
+    session: Option<&str>,
+    body: &Value,
+    known_session: impl Fn(&str) -> bool,
+    private_session: impl Fn(&str) -> bool,
+) -> PermissionDecision {
+    let tool = body.get("tool_name").and_then(Value::as_str).unwrap_or("");
+    if tool.is_empty() || NOT_A_PERMISSION.contains(&tool) {
+        return PermissionDecision::Skip;
+    }
+    let Some((session, held_for_phone)) =
+        holder_for(holders, has_origin, session, known_session, private_session)
+    else {
+        return PermissionDecision::Skip;
+    };
+    PermissionDecision::Hold {
+        session: session.to_string(),
+        tool: tool.to_string(),
+        input: body.get("tool_input").cloned().unwrap_or(Value::Null),
+        held_for_phone,
+    }
+}
+
+/// Did this hook say the session's turn has moved past any question it was asking? Then
+/// a held question is dead (the user typed a new prompt, the session ended, the turn
+/// stopped, or another tool ran) and every surface must drop it. Esc is NOT among these:
+/// an interrupt fires no `Stop` -- it kills the hook, which `handle_ask` notices as its
+/// client hanging up (`hook_wait`). NOT `pretool`: the no-matcher
+/// `PreToolUse` row fires for `AskUserQuestion` itself, beside the blocking row. And not a
+/// SUBAGENT's tool finishing (`agent_id` set): a background subagent keeps working while
+/// the main turn waits on its question.
+fn turn_moved_on(event: &str, body: &Value) -> bool {
+    match event {
+        "stop" | "prompt" | "sessionend" => true,
+        "tooluse" => body
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty),
+        _ => false,
+    }
+}
+
+/// [`turn_moved_on`], narrowed for a pending PERMISSION whose tool is `permission_tool`: a
+/// finished tool cancels it only when it is that same tool (a terminal "Yes" -- the hook is
+/// left running, and its own `PostToolUse` is what clears the card). A sibling tool in the
+/// same batch finishing first says nothing about this tool's dialog, which is still up.
+fn permission_moved_on(event: &str, body: &Value, permission_tool: &str) -> bool {
+    turn_moved_on(event, body)
+        && (event != "tooluse"
+            || body.get("tool_name").and_then(Value::as_str) == Some(permission_tool))
+}
+
+/// Blocking `AskUserQuestion` handler (own thread, like `/permission`). The HTTP response is
+/// the hook's stdout. Every path answers -- `{}` unless the card answered in time -- and
+/// while it waits, the hook's client is probed (`hook_wait`), so a hook Claude Code has
+/// killed hands the question back to the terminal within about a second.
 fn handle_ask(
     mut request: Request,
     url: &str,
@@ -703,16 +775,25 @@ fn handle_ask(
             .iter()
             .any(|p| p.sessions.iter().any(|s| s.id == id))
     };
+    let bridge = app.try_state::<Arc<crate::bridge::BridgeController>>();
+    let phone = || bridge.as_ref().is_some_and(|b| b.has_remote_phone());
+    let holders = Holders {
+        desktop: gate.is_open(),
+        phone: phone(),
+    };
+    let private = |id: &str| crate::bridge_view::session_is_private(&store.list(), id);
     let AskDecision::Hold {
         session,
         tool_use_id,
         questions,
+        held_for_phone,
     } = ask_decision(
-        gate.is_open(),
+        holders,
         has_origin,
         session.as_deref(),
         &parsed,
         known,
+        private,
     )
     else {
         let _ = request.respond(Response::from_string("{}"));
@@ -723,57 +804,174 @@ fn handle_ask(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let (id, rx) = asks.register(session, tool_use_id, questions, now_ms);
+    let (id, rx) = asks.register_held(session, tool_use_id, questions, now_ms, held_for_phone);
+    // The last phone may have left between reading `holders` and registering, in which
+    // case its departure found nothing to hand off: re-check, or this waits 600 s unseen.
+    if held_for_phone && !gate.is_open() && !phone() {
+        asks.resolve(&id, crate::asks::AskOutcome::HandOff);
+    }
     if let Some(view) = asks.get(&id) {
         let _ = app.emit("ask-request", &view);
     }
-    let received = rx.recv_timeout(crate::asks::ASK_CEILING).ok();
+    // The writer carries interim probes while we wait (see `hook_wait`), so the final
+    // response is written by hand on it too.
+    let mut out = request.into_writer();
+    let waited = crate::hook_wait::wait_for_answer(&rx, &mut *out, crate::asks::ASK_CEILING);
+    let received = settle_wait(waited, asks, &id);
     // Forget FIRST, then drain once. `Asks::resolve` removes + sends under one lock, so a
     // resolve either completed before the forget (caught by try_recv) or finds nothing and
     // reports false to its card: the card is never told "answered" when we replied `{}`.
     asks.forget(&id);
     let outcome = crate::asks::pick_outcome(received, rx.try_recv().ok());
     let how = crate::asks::how(&outcome);
-    let _ = request.respond(Response::from_string(
-        crate::asks::ask_response(&input, outcome.as_ref()).to_string(),
-    ));
-    let _ = app.emit("ask-resolved", json!({ "id": id, "how": how }));
+    let by = crate::asks::by_of(&outcome);
+    let _ = crate::hook_wait::write_json_response(
+        &mut *out,
+        &crate::asks::ask_response(&input, outcome.as_ref()).to_string(),
+    );
+    drop(out);
+    let _ = app.emit("ask-resolved", ask_resolved_payload(&id, how, by));
 }
 
-/// How long the hook holds its request open waiting for a human.
-///
-/// Must stay comfortably inside Claude's own hook timeout (60s by default) -- past that
-/// Claude kills the hook and the answer arrives to nobody, so a longer wait is not a more
-/// patient feature, it is a broken one. The previous 300s could never have delivered a
-/// decision at all.
-const APPROVAL_WAIT: Duration = Duration::from_secs(45);
-
-/// The `PreToolUse` hook output Claude reads from the hook's stdout.
-///
-/// `None` means nobody answered in time, and the response is deliberately EMPTY: an empty
-/// object carries no `permissionDecision`, so Claude falls through to its own interactive
-/// prompt exactly as if Conduit were not involved.
-///
-/// This is FAIL-OPEN, and the direction matters. The obvious alternative -- deny on timeout
-/// -- looks like the safe default and is the opposite: it aborts a tool call that no human
-/// ever saw, on the grounds that nobody was watching. Silence means "ask the human directly",
-/// not "answer no on their behalf".
-fn approve_response(decision: Option<&Decision>) -> Value {
-    let Some(decision) = decision else {
-        return json!({});
-    };
-    let mut out = serde_json::Map::new();
-    out.insert("hookEventName".into(), json!("PreToolUse"));
-    match decision {
-        Decision::Allow => {
-            out.insert("permissionDecision".into(), json!("allow"));
-        }
-        Decision::Deny { reason } => {
-            out.insert("permissionDecision".into(), json!("deny"));
-            out.insert("permissionDecisionReason".into(), json!(reason));
+/// What a finished wait means for the ask. An answer or a timeout passes through. A hook
+/// whose curl hung up -- Claude Code killed it (Esc interrupts the turn and fires no
+/// `Stop`) -- can no longer deliver anything, so the question goes back to the terminal:
+/// every card drops, phones are told `by: terminal`, and a later answer is refused
+/// (`answerResult ok: false`). The hand-off's send lands in the holder's receiver, where
+/// its drain picks it up.
+fn settle_wait(
+    waited: crate::hook_wait::Waited<crate::asks::AskOutcome>,
+    asks: &crate::asks::Asks,
+    id: &str,
+) -> Option<crate::asks::AskOutcome> {
+    match waited {
+        crate::hook_wait::Waited::Got(outcome) => Some(outcome),
+        crate::hook_wait::Waited::NoAnswer => None,
+        crate::hook_wait::Waited::ClientGone => {
+            asks.resolve(id, crate::asks::AskOutcome::HandOff);
+            None
         }
     }
-    json!({ "hookSpecificOutput": Value::Object(out) })
+}
+
+/// The `ask-resolved` event: `{id, how, by}`. `how` is kept for the existing desktop
+/// listener; `by` names who resolved it.
+fn ask_resolved_payload(id: &str, how: &str, by: crate::asks::By) -> Value {
+    json!({ "id": id, "how": how, "by": by.as_str() })
+}
+
+/// Blocking `PermissionRequest` handler (own thread). Same shape as `handle_ask`: every
+/// path answers -- `{}` unless a card decided in time -- and the hook's client is probed
+/// while it waits (`hook_wait`), because a terminal "No" KILLS the hook and fires no
+/// `PostToolUse`/`Stop` (measured): the hang-up is the only sign, and without noticing it a
+/// phone would keep a dead card until the session's next prompt.
+fn handle_permission(
+    mut request: Request,
+    url: &str,
+    app: &AppHandle,
+    broker: &Broker,
+    gate: &crate::asks::AskGate,
+    store: &crate::store::Store,
+) {
+    let has_origin = request.headers().iter().any(|h| h.field.equiv("Origin"));
+    if has_origin {
+        let _ = request.respond(Response::from_string("{}"));
+        return;
+    }
+    let (session, _event) = parse_query(url);
+    let mut body = String::new();
+    let _ = request
+        .as_reader()
+        .take(1024 * 1024)
+        .read_to_string(&mut body);
+    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+
+    let known = |id: &str| store.has_session(id);
+    let bridge = app.try_state::<Arc<crate::bridge::BridgeController>>();
+    let phone = || bridge.as_ref().is_some_and(|b| b.has_remote_phone());
+    let holders = Holders {
+        desktop: gate.is_open(),
+        phone: phone(),
+    };
+    let private = |id: &str| crate::bridge_view::session_is_private(&store.list(), id);
+    let PermissionDecision::Hold {
+        session,
+        tool,
+        input,
+        held_for_phone,
+    } = permission_decision(
+        holders,
+        has_origin,
+        session.as_deref(),
+        &parsed,
+        known,
+        private,
+    )
+    else {
+        let _ = request.respond(Response::from_string("{}"));
+        return;
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let (id, rx) = broker.register_held(session, tool, input, now_ms, held_for_phone);
+    // Same race as `handle_ask`: the last phone may have left between the read and the
+    // register, finding nothing to hand off.
+    if held_for_phone && !gate.is_open() && !phone() {
+        broker.resolve(
+            &id,
+            crate::broker::Decision::FallThrough,
+            crate::asks::By::Terminal,
+        );
+    }
+    if let Some(view) = broker.get(&id) {
+        let _ = app.emit("permission-request", &view);
+    }
+    let mut out = request.into_writer();
+    let waited =
+        crate::hook_wait::wait_for_answer(&rx, &mut *out, crate::broker::PERMISSION_CEILING);
+    let received = settle_permission_wait(waited, broker, &id);
+    // Forget FIRST, then drain once (the asks.rs rule): a card is never told "decided"
+    // when the hook replied `{}`.
+    broker.forget(&id);
+    let outcome = received.or(rx.try_recv().ok());
+    let by = outcome.map_or(crate::asks::By::Timeout, |(_, by)| by);
+    let decision = outcome.map(|(d, _)| d);
+    let _ = crate::hook_wait::write_json_response(
+        &mut *out,
+        &crate::broker::permission_response(decision.as_ref()).to_string(),
+    );
+    drop(out);
+    let _ = app.emit("permission-resolved", permission_resolved_payload(&id, by));
+}
+
+/// What a finished permission wait means. A decision or a timeout passes through. A hook
+/// whose curl hung up (a terminal "No" or Esc killed it) can deliver nothing: the request
+/// goes back to the terminal, every card drops (`by: terminal`) and a later tap is refused.
+fn settle_permission_wait(
+    waited: crate::hook_wait::Waited<crate::broker::Resolution>,
+    broker: &Broker,
+    id: &str,
+) -> Option<crate::broker::Resolution> {
+    match waited {
+        crate::hook_wait::Waited::Got(r) => Some(r),
+        crate::hook_wait::Waited::NoAnswer => None,
+        crate::hook_wait::Waited::ClientGone => {
+            broker.resolve(
+                id,
+                crate::broker::Decision::FallThrough,
+                crate::asks::By::Terminal,
+            );
+            None
+        }
+    }
+}
+
+/// The `permission-resolved` event: `{id, by}`.
+fn permission_resolved_payload(id: &str, by: crate::asks::By) -> Value {
+    json!({ "id": id, "by": by.as_str() })
 }
 
 fn parse_query(url: &str) -> (Option<String>, String) {
@@ -982,6 +1180,8 @@ fn entries_for(rows: &[HookRow], port: u16) -> Vec<(&'static str, Vec<Value>)> {
         }
         let cmd = if r.verb == ASK_VERB {
             ask_command(port)
+        } else if r.verb == PERMISSION_VERB {
+            permission_command(port)
         } else {
             command(r.verb, port)
         };
@@ -1072,6 +1272,12 @@ pub fn ask_relay_path() -> std::path::PathBuf {
     crate::store::data_dir().join("conduit-ask.cmd")
 }
 
+/// Windows: the relay the blocking PermissionRequest hook calls (see `permission_command`).
+#[cfg(windows)]
+pub fn permission_relay_path() -> std::path::PathBuf {
+    crate::store::data_dir().join("conduit-permission.cmd")
+}
+
 /// `conduit-hook.cmd <event> <fallback port>`. A `claude` that Conduit did not launch has
 /// no CONDUIT_SESSION_ID, so it posts nothing at all rather than a sessionless event.
 /// `-o NUL` keeps the server's reply out of the hook's stdout: for UserPromptSubmit and
@@ -1084,13 +1290,19 @@ const HOOK_RELAY_CMD: &str = "@echo off\r\nsetlocal\r\nif not defined CONDUIT_SE
 #[cfg(windows)]
 const ASK_RELAY_CMD: &str = "@echo off\r\nsetlocal\r\nif not defined CONDUIT_SESSION_ID exit /b 0\r\nset \"CONDUIT_RELAY_PORT=%~1\"\r\nif defined CONDUIT_HOOK_PORT set \"CONDUIT_RELAY_PORT=%CONDUIT_HOOK_PORT%\"\r\ncurl.exe -s -f -m %~2 -X POST -H \"Content-Type: application/json\" --data-binary @- \"http://127.0.0.1:%CONDUIT_RELAY_PORT%/ask?session=%CONDUIT_SESSION_ID%\" 2>NUL\r\nexit /b 0\r\n";
 
-/// Write both Windows relays, skipping the write when the file already matches. Called
+/// `conduit-permission.cmd <fallback port> <max seconds>`: `ASK_RELAY_CMD` with the
+/// `/permission` route. Its stdout is the hook's decision, so curl writes it through.
+#[cfg(windows)]
+const PERMISSION_RELAY_CMD: &str = "@echo off\r\nsetlocal\r\nif not defined CONDUIT_SESSION_ID exit /b 0\r\nset \"CONDUIT_RELAY_PORT=%~1\"\r\nif defined CONDUIT_HOOK_PORT set \"CONDUIT_RELAY_PORT=%CONDUIT_HOOK_PORT%\"\r\ncurl.exe -s -f -m %~2 -X POST -H \"Content-Type: application/json\" --data-binary @- \"http://127.0.0.1:%CONDUIT_RELAY_PORT%/permission?session=%CONDUIT_SESSION_ID%\" 2>NUL\r\nexit /b 0\r\n";
+
+/// Write every Windows relay, skipping the write when the file already matches. Called
 /// before any hook settings that reference them are written, and once at startup.
 #[cfg(windows)]
 pub fn write_hook_relays() {
     for (path, body) in [
         (hook_relay_path(), HOOK_RELAY_CMD),
         (ask_relay_path(), ASK_RELAY_CMD),
+        (permission_relay_path(), PERMISSION_RELAY_CMD),
     ] {
         if fs::read(&path).ok().as_deref() == Some(body.as_bytes()) {
             continue;
@@ -1223,6 +1435,13 @@ pub fn claude_profile() -> HooksProfile {
                 event: "PreToolUse",
                 matcher: Some("AskUserQuestion"),
                 verb: ASK_VERB,
+            },
+            // No matcher: questions are skipped server-side (`NOT_A_PERMISSION`), which
+            // keeps the row generic and the rule in one testable place.
+            HookRow {
+                event: "PermissionRequest",
+                matcher: None,
+                verb: PERMISSION_VERB,
             },
             HookRow {
                 event: "PreCompact",
@@ -1516,6 +1735,26 @@ fn ask_command(port: u16) -> Value {
     json!({ "type": "command", "command": cmd, "timeout": crate::asks::ASK_HOOK_TIMEOUT_SECS })
 }
 
+/// The blocking `PermissionRequest` hook: `ask_command`'s shape on the `/permission` route
+/// with its own ceilings (`broker::PERMISSION_*`). Every failure prints nothing, which
+/// Claude reads as "no decision" -- its own dialog stays up.
+fn permission_command(port: u16) -> Value {
+    let max = crate::broker::PERMISSION_CURL_MAX_SECS;
+    #[cfg(windows)]
+    let cmd = format!("\"{}\" {port} {max}", relay_arg(&permission_relay_path()));
+    #[cfg(not(windows))]
+    let cmd = {
+        let url = format!(
+            "http://127.0.0.1:${{CONDUIT_HOOK_PORT:-{port}}}/permission?session=${{CONDUIT_SESSION_ID:-unknown}}"
+        );
+        format!(
+            "[ -n \"$CONDUIT_HOOK_ENDPOINT\" ] && [ -r \"$CONDUIT_HOOK_ENDPOINT\" ] && . \"$CONDUIT_HOOK_ENDPOINT\"; \
+             curl -s -f -m {max} -X POST -H \"Content-Type: application/json\" --data-binary @- \"{url}\" 2>/dev/null || true"
+        )
+    };
+    json!({ "type": "command", "command": cmd, "timeout": crate::broker::PERMISSION_HOOK_TIMEOUT_SECS })
+}
+
 /// Strip any prior Conduit entries (idempotent), then append ours.
 fn merged(existing: Option<&Value>, entries: Vec<Value>) -> Value {
     let mut array: Vec<Value> = existing
@@ -1541,15 +1780,19 @@ fn is_conduit_entry(entry: &Value) -> bool {
     // Every shipped form, on every platform: a settings file can carry entries a
     // different build wrote (a synced dotfile, the Codex PowerShell relay), and each must
     // still be recognized as ours so an install replaces it instead of stacking a copy.
-    const MARKERS: [&str; 8] = [
+    const MARKERS: [&str; 12] = [
         "conduit-hook.cmd\"",
         "conduit-ask.cmd\"",
+        "conduit-permission.cmd\"",
         "/hook?session=%CONDUIT_SESSION_ID%",
         "/ask?session=%CONDUIT_SESSION_ID%",
+        "/permission?session=%CONDUIT_SESSION_ID%",
         "/hook?session=${CONDUIT_SESSION_ID",
         "/ask?session=${CONDUIT_SESSION_ID",
+        "/permission?session=${CONDUIT_SESSION_ID",
         "/hook?session=$env:CONDUIT_SESSION_ID",
         "/ask?session=$env:CONDUIT_SESSION_ID",
+        "/permission?session=$env:CONDUIT_SESSION_ID",
     ];
 
     entry
@@ -1615,6 +1858,19 @@ mod tests {
         assert!(HOOK_RELAY_CMD.contains("if not defined CONDUIT_SESSION_ID exit /b 0"));
         assert!(HOOK_RELAY_CMD.ends_with("exit /b 0\r\n"));
         assert!(ASK_RELAY_CMD.ends_with("exit /b 0\r\n"));
+        // The permission row goes through its own relay, with the same guards.
+        let perm = entries_for(&claude_profile().rows, 8423)
+            .into_iter()
+            .find(|(event, _)| *event == "PermissionRequest")
+            .expect("a PermissionRequest row");
+        let cmd = perm.1[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(cmd.contains("conduit-permission.cmd\" 8423 "), "{cmd}");
+        assert!(PERMISSION_RELAY_CMD.contains("if not defined CONDUIT_SESSION_ID exit /b 0"));
+        assert!(PERMISSION_RELAY_CMD.contains("/permission?session=%CONDUIT_SESSION_ID%"));
+        assert!(PERMISSION_RELAY_CMD.ends_with("exit /b 0\r\n"));
     }
 
     #[test]
@@ -1623,6 +1879,11 @@ mod tests {
             "command": "\"C:/Users/x/AppData/Roaming/ConduitTauri/conduit-hook.cmd\" stop 8423"}]});
         let ask = json!({"hooks": [{"type": "command",
             "command": "\"C:/Users/x/AppData/Roaming/ConduitTauri/conduit-ask.cmd\" 8423 40"}]});
+        let perm = json!({"hooks": [{"type": "command",
+            "command": "\"C:/Users/x/AppData/Roaming/ConduitTauri/conduit-permission.cmd\" 8423 330"}]});
+        let posix_perm = json!({"hooks": [{"type": "command",
+            "command": "curl -s -f -m 330 \"http://127.0.0.1:${CONDUIT_HOOK_PORT:-8423}/permission?session=${CONDUIT_SESSION_ID:-unknown}\""}]});
+        assert!(is_conduit_entry(&perm) && is_conduit_entry(&posix_perm));
         let foreign = json!({"hooks": [{"type": "command", "command": "my-hook.cmd stop"}]});
         assert!(is_conduit_entry(&ours));
         assert!(is_conduit_entry(&ask));
@@ -2001,100 +2262,343 @@ mod tests {
         assert!(!is_conduit_entry(&foreign));
     }
 
+    const DESK: Holders = Holders {
+        desktop: true,
+        phone: false,
+    };
+    const NONE: Holders = Holders {
+        desktop: false,
+        phone: false,
+    };
+    const PHONE: Holders = Holders {
+        desktop: false,
+        phone: true,
+    };
+
+    fn ask_body() -> Value {
+        json!({"tool_name":"AskUserQuestion","tool_use_id":"tu",
+            "tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}})
+    }
+
     #[test]
     fn ask_decision_fails_open_on_every_refusal() {
         let known = |s: &str| s == "sess-1";
-        let body = json!({"tool_name":"AskUserQuestion","tool_use_id":"tu",
-            "tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}});
-        match ask_decision(true, false, Some("sess-1"), &body, known) {
+        let public = |_: &str| false;
+        let body = ask_body();
+        match ask_decision(DESK, false, Some("sess-1"), &body, known, public) {
             AskDecision::Hold {
                 session,
                 tool_use_id,
                 questions,
+                held_for_phone,
             } => {
                 assert_eq!(session, "sess-1");
                 assert_eq!(tool_use_id, "tu");
                 assert_eq!(questions, body["tool_input"]["questions"]);
+                assert!(!held_for_phone, "the desktop gate holds it");
             }
             other => panic!("expected Hold, got {other:?}"),
         }
         let no_id =
             json!({"tool_input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}});
-        match ask_decision(true, false, Some("sess-1"), &no_id, known) {
+        match ask_decision(DESK, false, Some("sess-1"), &no_id, known, public) {
             AskDecision::Hold { tool_use_id, .. } => assert_eq!(tool_use_id, ""),
             other => panic!("expected Hold, got {other:?}"),
         }
         assert_eq!(
-            ask_decision(true, true, Some("sess-1"), &body, known),
+            ask_decision(DESK, true, Some("sess-1"), &body, known, public),
             AskDecision::Skip,
             "Origin refused"
         );
         assert_eq!(
-            ask_decision(false, false, Some("sess-1"), &body, known),
+            ask_decision(NONE, false, Some("sess-1"), &body, known, public),
             AskDecision::Skip,
-            "gate closed"
+            "gate closed and no phone"
         );
         assert_eq!(
-            ask_decision(true, false, Some("unknown"), &body, known),
+            ask_decision(DESK, false, Some("unknown"), &body, known, public),
             AskDecision::Skip,
             "a claude outside Conduit reads the same settings file"
         );
         assert_eq!(
-            ask_decision(true, false, None, &body, known),
+            ask_decision(DESK, false, None, &body, known, public),
             AskDecision::Skip
         );
         let bad = json!({"tool_input":{"questions":[]}});
         assert_eq!(
-            ask_decision(true, false, Some("sess-1"), &bad, known),
+            ask_decision(DESK, false, Some("sess-1"), &bad, known, public),
             AskDecision::Skip
         );
     }
 
     #[test]
-    fn approve_response_allow_and_deny_shapes() {
-        let allow = approve_response(Some(&Decision::Allow));
-        assert_eq!(allow["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-        assert_eq!(allow["hookSpecificOutput"]["permissionDecision"], "allow");
-        let deny = approve_response(Some(&Decision::Deny {
-            reason: "nope".into(),
-        }));
-        assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny");
+    fn a_connected_phone_holds_a_question_the_desktop_cannot_see() {
+        let known = |s: &str| s == "sess-1";
+        match ask_decision(PHONE, false, Some("sess-1"), &ask_body(), known, |_| false) {
+            AskDecision::Hold { held_for_phone, .. } => assert!(held_for_phone),
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        // Both open: the desktop is a holder, so the phone leaving must not hand it off.
+        let both = Holders {
+            desktop: true,
+            phone: true,
+        };
+        match ask_decision(both, false, Some("sess-1"), &ask_body(), known, |_| false) {
+            AskDecision::Hold { held_for_phone, .. } => assert!(!held_for_phone),
+            other => panic!("expected Hold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_hook_that_hung_up_hands_its_question_to_the_terminal() {
+        use crate::asks::{AskOutcome, Asks, By};
+        use crate::hook_wait::Waited;
+        let asks = Asks::default();
+        let (id, rx) = asks.register_held("s".into(), "t".into(), json!([]), 1, true);
+        let received = settle_wait(Waited::ClientGone, &asks, &id);
+        assert!(received.is_none());
+        assert!(asks.get(&id).is_none(), "every card drops");
         assert_eq!(
-            deny["hookSpecificOutput"]["permissionDecisionReason"],
-            "nope"
+            asks.recent_resolutions().last(),
+            Some(&(id.clone(), By::Terminal)),
+            "phones are told the terminal has it"
         );
-    }
+        let late = AskOutcome::Answered {
+            answers: serde_json::Map::new(),
+            by: By::Phone,
+        };
+        assert!(!asks.resolve(&id, late), "a later phone answer is refused");
+        // What the holder then reports is the hand-off.
+        let outcome = crate::asks::pick_outcome(received, rx.try_recv().ok());
+        assert_eq!(outcome, Some(AskOutcome::HandOff));
 
-    #[test]
-    fn nobody_answering_falls_through_to_claudes_own_prompt() {
-        // FAIL-OPEN. An empty object carries no permissionDecision, so Claude asks the
-        // human itself. Denying here would abort a tool call no human ever saw, on the
-        // grounds that nobody was watching.
-        let none = approve_response(None);
-        assert_eq!(none, serde_json::json!({}));
-        assert!(none.get("hookSpecificOutput").is_none());
-    }
-
-    #[test]
-    fn the_wait_fits_inside_claudes_own_hook_timeout() {
-        // Claude kills a hook at 60s by default; a longer wait cannot deliver a decision at
-        // all, it just guarantees the hook is killed first. (The previous value was 300s.)
+        // An answer or a plain timeout passes through untouched.
+        let (id, _rx) = asks.register_held("s".into(), "t".into(), json!([]), 2, false);
+        assert_eq!(
+            settle_wait(Waited::Got(AskOutcome::HandOff), &asks, &id),
+            Some(AskOutcome::HandOff)
+        );
+        assert!(settle_wait(Waited::NoAnswer, &asks, &id).is_none());
         assert!(
-            APPROVAL_WAIT < Duration::from_secs(60),
-            "APPROVAL_WAIT must stay under Claude's hook timeout"
+            asks.get(&id).is_some(),
+            "only the holder's forget removes it"
         );
     }
 
     #[test]
-    fn a_timed_out_request_is_forgotten_rather_than_left_answerable() {
+    fn ask_resolved_names_who_resolved_it() {
+        let p = ask_resolved_payload("ask-1", "answered", crate::asks::By::Phone);
+        assert_eq!(
+            p,
+            json!({ "id": "ask-1", "how": "answered", "by": "phone" })
+        );
+    }
+
+    #[test]
+    fn silo_ask_not_held_for_phone() {
+        let known = |s: &str| s == "sess-1";
+        let private = |_: &str| true;
+        assert_eq!(
+            ask_decision(PHONE, false, Some("sess-1"), &ask_body(), known, private),
+            AskDecision::Skip,
+            "a phone never holds a private session's question"
+        );
+        match ask_decision(DESK, false, Some("sess-1"), &ask_body(), known, private) {
+            AskDecision::Hold { held_for_phone, .. } => assert!(!held_for_phone),
+            other => panic!("the desktop still holds it: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_moving_on_cancels_but_its_own_pretool_does_not() {
+        let none = json!({});
+        for e in ["stop", "prompt", "sessionend", "tooluse"] {
+            assert!(turn_moved_on(e, &none), "{e}");
+        }
+        // `pretool` fires for AskUserQuestion ITSELF, beside the blocking row.
+        for e in [
+            "pretool",
+            "notification",
+            "todos",
+            "precompact",
+            "sessionstart",
+        ] {
+            assert!(!turn_moved_on(e, &none), "{e}");
+        }
+        // A subagent's tool finishing says nothing about the main turn's question.
+        let sub = json!({"agent_id": "a1", "tool_name": "Read"});
+        assert!(!turn_moved_on("tooluse", &sub));
+        assert!(turn_moved_on("tooluse", &json!({"agent_id": ""})));
+    }
+
+    #[test]
+    fn a_finished_tool_cancels_only_its_own_permission() {
+        let bash_done = json!({"tool_name": "Bash"});
+        // A sibling tool in the same batch finishing says nothing about Bash's dialog.
+        assert!(!permission_moved_on("tooluse", &bash_done, "Write"));
+        // Bash itself finishing (a terminal "Yes") clears Bash's card.
+        assert!(permission_moved_on("tooluse", &bash_done, "Bash"));
+        // A tooluse with no tool name cannot be matched: keep the card.
+        assert!(!permission_moved_on("tooluse", &json!({}), "Bash"));
+        // Still never a subagent's tool, even one with the same name.
+        let sub = json!({"agent_id": "a1", "tool_name": "Bash"});
+        assert!(!permission_moved_on("tooluse", &sub, "Bash"));
+        // The turn-level events cancel every permission, whatever its tool.
+        for e in ["stop", "prompt", "sessionend"] {
+            assert!(permission_moved_on(e, &json!({}), "Bash"), "{e}");
+        }
+        assert!(!permission_moved_on("pretool", &bash_done, "Bash"));
+    }
+
+    fn perm_body(tool: &str) -> Value {
+        json!({"hook_event_name":"PermissionRequest","tool_name":tool,
+            "tool_input":{"command":"touch a.txt","description":"d"},
+            "permission_suggestions":[]})
+    }
+
+    #[test]
+    fn permission_decision_holds_like_a_question_and_fails_open_otherwise() {
+        let known = |s: &str| s == "sess-1";
+        let public = |_: &str| false;
+        let body = perm_body("Bash");
+        match permission_decision(DESK, false, Some("sess-1"), &body, known, public) {
+            PermissionDecision::Hold {
+                session,
+                tool,
+                input,
+                held_for_phone,
+            } => {
+                assert_eq!(session, "sess-1");
+                assert_eq!(tool, "Bash");
+                assert_eq!(input, body["tool_input"]);
+                assert!(!held_for_phone);
+            }
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        match permission_decision(PHONE, false, Some("sess-1"), &body, known, public) {
+            PermissionDecision::Hold { held_for_phone, .. } => assert!(held_for_phone),
+            other => panic!("expected Hold, got {other:?}"),
+        }
+        for (holders, origin, session, why) in [
+            (DESK, true, Some("sess-1"), "Origin refused"),
+            (NONE, false, Some("sess-1"), "gate closed and no phone"),
+            (DESK, false, Some("unknown"), "a claude outside Conduit"),
+            (DESK, false, None, "no session"),
+        ] {
+            assert_eq!(
+                permission_decision(holders, origin, session, &body, known, public),
+                PermissionDecision::Skip,
+                "{why}"
+            );
+        }
+        // No tool name: nothing to show.
+        assert_eq!(
+            permission_decision(DESK, false, Some("sess-1"), &json!({}), known, public),
+            PermissionDecision::Skip
+        );
+    }
+
+    #[test]
+    fn questions_are_never_permission_cards() {
+        // AskUserQuestion fires PermissionRequest too (measured, 2.1.312); `allow` would
+        // run it with no answers. `/ask` owns questions; plan approval stays in the TUI.
+        let known = |s: &str| s == "sess-1";
+        for tool in ["AskUserQuestion", "ExitPlanMode"] {
+            assert_eq!(
+                permission_decision(DESK, false, Some("sess-1"), &perm_body(tool), known, |_| {
+                    false
+                }),
+                PermissionDecision::Skip,
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn silo_permission_not_held_for_phone() {
+        let known = |s: &str| s == "sess-1";
+        let private = |_: &str| true;
+        assert_eq!(
+            permission_decision(
+                PHONE,
+                false,
+                Some("sess-1"),
+                &perm_body("Bash"),
+                known,
+                private
+            ),
+            PermissionDecision::Skip
+        );
+        match permission_decision(
+            DESK,
+            false,
+            Some("sess-1"),
+            &perm_body("Bash"),
+            known,
+            private,
+        ) {
+            PermissionDecision::Hold { held_for_phone, .. } => assert!(!held_for_phone),
+            other => panic!("the desktop still holds it: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_permission_hook_that_hung_up_goes_back_to_the_terminal() {
+        // A terminal "No" kills the hook (measured): the card must drop everywhere.
+        use crate::asks::By;
+        use crate::broker::{Broker, Decision};
+        use crate::hook_wait::Waited;
         let broker = Broker::default();
-        let (id, _rx) = broker.register("s1".into(), "Bash".into(), serde_json::json!({}));
-        assert_eq!(broker.pending_for("s1").len(), 1);
-        broker.forget(&id);
-        assert!(
-            broker.pending_for("s1").is_empty(),
-            "a hook that gave up waiting must not leave a question on screen"
+        let (id, rx) = broker.register_held("s".into(), "Bash".into(), json!({}), 1, true);
+        let received = settle_permission_wait(Waited::ClientGone, &broker, &id);
+        assert!(received.is_none());
+        assert!(broker.get(&id).is_none(), "every card drops");
+        assert_eq!(
+            broker.recent_resolutions().last(),
+            Some(&(id.clone(), By::Terminal))
         );
+        assert!(!broker.resolve(&id, Decision::Allow, By::Phone));
+        assert_eq!(
+            received.or(rx.try_recv().ok()),
+            Some((Decision::FallThrough, By::Terminal))
+        );
+        let (id, _rx) = broker.register_held("s".into(), "Bash".into(), json!({}), 2, false);
+        assert_eq!(
+            settle_permission_wait(Waited::Got((Decision::Allow, By::Phone)), &broker, &id),
+            Some((Decision::Allow, By::Phone))
+        );
+        assert!(settle_permission_wait(Waited::NoAnswer, &broker, &id).is_none());
+    }
+
+    #[test]
+    fn permission_resolved_names_who_resolved_it() {
+        assert_eq!(
+            permission_resolved_payload("perm-1", crate::asks::By::Phone),
+            json!({ "id": "perm-1", "by": "phone" })
+        );
+    }
+
+    #[test]
+    fn claude_profile_installs_a_blocking_permission_row() {
+        let rows = claude_profile().rows;
+        let perm: Vec<_> = rows.iter().filter(|r| r.verb == PERMISSION_VERB).collect();
+        assert_eq!(perm.len(), 1);
+        assert_eq!(perm[0].event, "PermissionRequest");
+        assert_eq!(perm[0].matcher, None, "questions are skipped server-side");
+        // Command Code has no such event.
+        assert!(command_code_profile()
+            .rows
+            .iter()
+            .all(|r| r.verb != PERMISSION_VERB));
+    }
+
+    #[test]
+    fn reinstall_does_not_duplicate_the_permission_entry() {
+        let dir = fresh_test_dir("perm-idempotent");
+        install(dir.to_str().unwrap(), 8423);
+        install(dir.to_str().unwrap(), 8424);
+        let v = read_settings(&dir);
+        assert_eq!(v["hooks"]["PermissionRequest"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -2107,14 +2611,44 @@ mod tests {
     }
 
     #[test]
-    fn only_the_ask_entry_carries_a_timeout_and_a_long_curl() {
+    fn only_the_blocking_entries_carry_a_timeout_and_a_long_curl() {
         let entries = entries_for(&claude_profile().rows, 8423);
         let mut asks = 0;
-        for (_event, list) in &entries {
+        let mut perms = 0;
+        for (event, list) in &entries {
             for e in list {
                 let h = &e["hooks"][0];
                 let cmd = h["command"].as_str().unwrap();
-                if e["matcher"] == "AskUserQuestion" {
+                if *event == "PermissionRequest" {
+                    perms += 1;
+                    assert_eq!(
+                        h["timeout"],
+                        json!(crate::broker::PERMISSION_HOOK_TIMEOUT_SECS)
+                    );
+                    #[cfg(not(windows))]
+                    {
+                        let m = crate::broker::PERMISSION_CURL_MAX_SECS;
+                        assert!(cmd.contains(&format!("-m {m} ")), "got {cmd}");
+                        assert!(cmd.contains("/permission?session=${CONDUIT_SESSION_ID:-unknown}"));
+                        assert!(cmd.contains(" -f "), "an HTTP error must print nothing");
+                        assert!(
+                            !cmd.contains(" >/dev/null"),
+                            "the response body IS the hook's stdout"
+                        );
+                        assert!(cmd.contains("CONDUIT_HOOK_ENDPOINT"));
+                    }
+                    #[cfg(windows)]
+                    {
+                        let m = crate::broker::PERMISSION_CURL_MAX_SECS;
+                        assert!(cmd.contains("conduit-permission.cmd\""), "got {cmd}");
+                        assert!(cmd.ends_with(&format!(" {m}")));
+                        assert!(PERMISSION_RELAY_CMD.contains("-m %~2 "));
+                        assert!(PERMISSION_RELAY_CMD
+                            .contains("/permission?session=%CONDUIT_SESSION_ID%"));
+                        assert!(PERMISSION_RELAY_CMD.contains(" -f "));
+                        assert!(!PERMISSION_RELAY_CMD.contains("-o NUL"));
+                    }
+                } else if e["matcher"] == "AskUserQuestion" {
                     asks += 1;
                     assert_eq!(h["timeout"], json!(crate::asks::ASK_HOOK_TIMEOUT_SECS));
                     #[cfg(not(windows))]
@@ -2153,6 +2687,7 @@ mod tests {
             }
         }
         assert_eq!(asks, 1);
+        assert_eq!(perms, 1);
     }
 
     #[test]
