@@ -12,6 +12,7 @@ import {
   REJECTED_ANSWER_TEXT,
   SETTLED_SHOW_MS,
   trailingEntries,
+  WATCHING_TEXT,
   type PendingEvent,
   type PendingState,
 } from "./pending";
@@ -279,5 +280,53 @@ describe("pending", () => {
     // a send for a private item is refused locally: it stays private, never "sending"
     const t = run([{ t: "sent", id: "ask-1", mine: { kind: "answer", summary: "x" } }], s);
     expect(cardView(t.entries["ask-1"]).mode).toBe("private");
+  });
+
+  it("an_absent_held_reads_as_held_for_an_older_mac", () => {
+    const a = fromWire(ask("ask-1", "tu1"));
+    const p = fromWire(perm("perm-1"));
+    expect(!a.private && a.held).toBe(true);
+    expect(!p.private && p.held).toBe(true);
+    expect(cardView({ item: a }).mode).toBe("live");
+  });
+
+  it("a_question_the_terminal_has_is_shown_in_full_without_buttons", () => {
+    const w = { ...ask("ask-1", "tu1"), held: false } as WirePendingItem;
+    const s = run([{ t: "snapshot", items: [fromWire(w)], now: 0 }]);
+    const e = s.entries["ask-1"];
+    const v = cardView(e);
+    expect(v).toEqual({ mode: "watching", item: e.item, text: WATCHING_TEXT });
+    expect(WATCHING_TEXT).toBe("Waiting for an answer in the terminal on your Mac");
+    // the full question travels with it
+    expect(v.item.kind === "ask" && !v.item.private && v.item.questions).toEqual([Q]);
+    // it joins the transcript card in place of the old read-only history card
+    expect(entryForToolUse(s, "s1", "tu1")).toBe(e);
+    // still needs you
+    expect(openBySession(s)).toEqual({ s1: e.item });
+    // nothing can be sent for it: no hook is waiting on an answer
+    const t = run([{ t: "sent", id: "ask-1", mine: { kind: "answer", summary: "x" } }], s);
+    expect(t.entries["ask-1"].sent).toBeUndefined();
+    expect(cardView(t.entries["ask-1"]).mode).toBe("watching");
+    const u = run([{ t: "unsent", id: "ask-1" }], s);
+    expect(cardView(u.entries["ask-1"]).mode).toBe("watching");
+  });
+
+  it("a_permission_the_terminal_has_is_shown_without_buttons_and_says_how_it_ended", () => {
+    const w = { ...perm("perm-1"), held: false } as WirePendingItem;
+    let s = run([{ t: "added", item: fromWire(w) }]);
+    expect(cardView(s.entries["perm-1"])).toMatchObject({ mode: "watching", text: WATCHING_TEXT });
+    expect(trailingEntries(s, "s1", new Set(), 0).map((e) => e.item.id)).toEqual(["perm-1"]);
+    // its own tool ran (PostToolUse): the terminal handled it
+    s = run([{ t: "resolved", id: "perm-1", by: "terminal", now: 5 }], s);
+    expect(cardView(s.entries["perm-1"])).toMatchObject({ mode: "done", tone: "info", text: "Handled in the terminal" });
+    // an observed question answered in the terminal is ANSWERED there, not "moved"
+    const q = { ...ask("ask-1", "tu1"), held: false } as WirePendingItem;
+    let a = run([{ t: "added", item: fromWire(q) }]);
+    a = run([{ t: "resolved", id: "ask-1", by: "terminal", now: 5 }], a);
+    expect(cardView(a.entries["ask-1"])).toMatchObject({ mode: "done", text: "Answered in the terminal" });
+    // a held one handed to the terminal still reads as moved: nobody answered it yet
+    let h = run([{ t: "added", item: fromWire(ask("ask-2", "tu2")) }]);
+    h = run([{ t: "resolved", id: "ask-2", by: "terminal", now: 5 }], h);
+    expect(cardView(h.entries["ask-2"])).toMatchObject({ mode: "done", text: "Moved to the terminal" });
   });
 });

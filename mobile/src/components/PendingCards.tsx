@@ -64,10 +64,10 @@ function liveCardStyle(p: Palette) {
 }
 
 /** How a card ended, or why it cannot be answered here: one line under (or instead of) it. */
-function OutcomeLine({ card }: { card: Extract<CardView, { mode: "done" | "private" }> }) {
+function OutcomeLine({ card }: { card: Extract<CardView, { mode: "done" | "private" | "watching" }> }) {
   const { palette: p } = useTheme();
-  const tone = card.mode === "private" ? "info" : card.tone;
-  const icon = card.mode === "private" ? "lock.fill" : tone === "ok" ? "checkmark.circle.fill" : tone === "bad" ? "xmark.circle.fill" : "info.circle";
+  const tone = card.mode === "done" ? card.tone : "info";
+  const icon = card.mode === "private" ? "lock.fill" : card.mode === "watching" ? "terminal" : tone === "ok" ? "checkmark.circle.fill" : tone === "bad" ? "xmark.circle.fill" : "info.circle";
   const color = tone === "ok" ? p.green : tone === "bad" ? p.red : p.textMid;
   return (
     <View accessible accessibilityRole="text" style={{ flexDirection: "row", alignItems: "flex-start", gap: 8 }}>
@@ -166,12 +166,14 @@ export function QuestionCard({ questions, card, onAnswer }: { questions: WireQue
     );
   }
   const qs = card && card.item.kind === "ask" && !card.item.private ? card.item.questions : questions;
+  // Still waiting on a human, just not on this phone: warm like a live card, no buttons.
+  const watching = card?.mode === "watching";
   return (
-    <View style={[cardStyle(p), { gap: 12 }]}>
+    <View style={[watching ? liveCardStyle(p) : cardStyle(p), { gap: 12 }]}>
       {qs.map((q, i) => (
         <StaticQuestion key={i} q={q} />
       ))}
-      {card && (card.mode === "done" || card.mode === "private") ? (
+      {card && (card.mode === "done" || card.mode === "private" || card.mode === "watching") ? (
         <View style={{ borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: p.border, paddingTop: 10 }}>
           <OutcomeLine card={card} />
         </View>
@@ -492,7 +494,7 @@ export function PermissionCard({ card, onApprove }: { card: CardView; onApprove:
         </>
       ) : card.mode === "sending" ? (
         <Sending />
-      ) : card.mode === "done" ? (
+      ) : card.mode === "done" || card.mode === "watching" ? (
         <OutcomeLine card={card} />
       ) : null}
     </View>

@@ -700,7 +700,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     (id: string, mine: Mine, frame: ClientMsg) => {
       const e = pendingRef.current.entries[id];
       const client = clientRef.current;
-      if (!e || e.sent || e.item.private || e.ok !== undefined || e.by !== undefined) return;
+      // Never for an item no hook is waiting on (`held: false`): the Mac's terminal has it.
+      if (!e || e.sent || e.item.private || !e.item.held || e.ok !== undefined || e.by !== undefined) return;
       // Marked sent only once the frame actually went out: a tap while the socket redials
       // (e.g. just back from the background) stays live and says so, instead of "Sending…"
       // forever.

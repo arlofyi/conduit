@@ -381,6 +381,7 @@ describe("needs preview from pending", () => {
     toolUseId: "tu1",
     questions: [{ question: "Ship it?", header: "", multiSelect: false, options: [] }],
     createdMs: 1,
+    held: true,
   };
   const perm = {
     kind: "permission" as const,
@@ -390,6 +391,7 @@ describe("needs preview from pending", () => {
     toolName: "Bash",
     summary: "touch a.txt",
     createdMs: 1,
+    held: true,
   };
 
   it("a pushed question or permission leads the row before the next poll", () => {

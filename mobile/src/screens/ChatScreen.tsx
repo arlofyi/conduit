@@ -180,7 +180,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   // after the list has settled, so a reader at the bottom is put back at offset 0 once it has
   // laid out -- never a reader scrolled up into history.
   const liveCards = useMemo(
-    () => data.flatMap((d) => (d.type !== "date" && d.card && (d.card.mode === "live" || d.card.mode === "sending") ? [d.card.item.id] : [])),
+    () => data.flatMap((d) => (d.type !== "date" && d.card && (d.card.mode === "live" || d.card.mode === "sending" || d.card.mode === "watching") ? [d.card.item.id] : [])),
     [data],
   );
   const seenLive = useRef<Set<string>>(new Set());

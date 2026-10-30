@@ -23,6 +23,8 @@ export type PendingAsk = {
   toolUseId: string;
   questions: WireQuestion[];
   createdMs: number;
+  /** a hook is waiting on it (a card may answer); false = the Mac's terminal has it */
+  held: boolean;
 };
 export type PendingPermission = {
   kind: "permission";
@@ -32,6 +34,7 @@ export type PendingPermission = {
   toolName: string;
   summary: string;
   createdMs: number;
+  held: boolean;
 };
 export type PendingPrivate = { kind: "ask" | "permission"; id: string; sessionId: string; private: true };
 export type PendingItem = PendingAsk | PendingPermission | PendingPrivate;
@@ -84,6 +87,7 @@ export function fromWire(w: WirePendingItem): PendingItem {
       toolName: p.toolName ?? "",
       summary: p.summary ?? "",
       createdMs: p.createdMs ?? 0,
+      held: p.held !== false,
     };
   }
   const a = w as Extract<WirePendingItem, { toolUseId: string }>;
@@ -95,8 +99,12 @@ export function fromWire(w: WirePendingItem): PendingItem {
     toolUseId: a.toolUseId ?? "",
     questions: Array.isArray(a.questions) ? a.questions : [],
     createdMs: a.createdMs ?? 0,
+    held: a.held !== false,
   };
 }
+
+/** Whether this phone may send anything for an item: only a HELD one (a hook is waiting). */
+const answerable = (item: PendingItem): boolean => !item.private && item.held;
 
 export type PendingEvent =
   | { t: "snapshot"; items: PendingItem[]; now: number }
@@ -170,9 +178,9 @@ export function pendingReducer(s: PendingState, ev: PendingEvent): PendingState 
       return prune(s.order, { ...s.entries, [ev.id]: { ...e, by: ev.by, settledAt: e.settledAt ?? ev.now } });
     }
     case "sent":
-      return patch(s, ev.id, (e) => (e.item.private || isSettled(e) ? e : { item: e.item, sent: ev.mine }));
+      return patch(s, ev.id, (e) => (!answerable(e.item) || isSettled(e) ? e : { item: e.item, sent: ev.mine }));
     case "unsent":
-      return patch(s, ev.id, (e) => (e.item.private || isSettled(e) || (e.sent && !e.rejected) || e.unsent ? e : { ...e, unsent: true }));
+      return patch(s, ev.id, (e) => (!answerable(e.item) || isSettled(e) || (e.sent && !e.rejected) || e.unsent ? e : { ...e, unsent: true }));
     case "result":
       return patch(s, ev.id, (e) => {
         // An answer refused while no `resolved` names a winner was refused for what it SAID
@@ -191,19 +199,24 @@ export type CardView =
   | { mode: "live"; item: PendingAsk | PendingPermission; notice?: string }
   | { mode: "sending"; item: PendingAsk | PendingPermission; mine: Mine }
   | { mode: "private"; item: PendingItem; text: string }
+  /** the Mac's terminal has it (no hook waiting): the full item, read-only */
+  | { mode: "watching"; item: PendingAsk | PendingPermission; text: string }
   | { mode: "done"; item: PendingItem; tone: "ok" | "bad" | "info"; text: string; detail?: string };
 
 export const UNSENT_TEXT = "Not connected — try again";
 export const REJECTED_ANSWER_TEXT = "Couldn't send that answer — try a shorter one";
+export const WATCHING_TEXT = "Waiting for an answer in the terminal on your Mac";
 
-function elsewhere(kind: PendingItem["kind"], by: By | undefined, late: boolean): string {
+function elsewhere(item: PendingItem, by: By | undefined, late: boolean): string {
+  const kind = item.kind;
   switch (by) {
     case "desktop":
       return late ? "Already answered on your Mac" : "Answered on your Mac";
     case "terminal":
-      // An ask resolved by the terminal is always a hand-off (Esc in the pane, the last phone
-      // left, another window) -- nobody answered it anywhere yet.
-      if (kind === "ask") return "Moved to the terminal";
+      // A HELD ask resolved by the terminal is always a hand-off (Esc in the pane, the last
+      // phone left, the card's link) -- nobody answered it anywhere yet. An OBSERVED ask only
+      // reads `terminal` when its own tool finished: it was answered there.
+      if (kind === "ask") return !item.private && !item.held ? "Answered in the terminal" : "Moved to the terminal";
       return late ? "Already handled in the terminal" : "Handled in the terminal";
     case "timeout":
       return "Moved to the terminal";
@@ -227,10 +240,11 @@ export function cardView(e: Entry): CardView {
       // ok:true means the answer reached Claude's hook, not that the tool was stopped.
       return mine.allow ? { mode: "done", item, tone: "ok", text: "Allowed" } : { mode: "done", item, tone: "bad", text: DENIED_TEXT };
     }
-    if (e.ok === false || e.by !== undefined) return { mode: "done", item, tone: "info", text: elsewhere(item.kind, e.by, true) };
+    if (e.ok === false || e.by !== undefined) return { mode: "done", item, tone: "info", text: elsewhere(item, e.by, true) };
     return { mode: "sending", item, mine };
   }
-  if (e.by !== undefined || e.ok !== undefined) return { mode: "done", item, tone: "info", text: elsewhere(item.kind, e.by, false) };
+  if (e.by !== undefined || e.ok !== undefined) return { mode: "done", item, tone: "info", text: elsewhere(item, e.by, false) };
+  if (!item.held) return { mode: "watching", item, text: WATCHING_TEXT };
   return e.unsent ? { mode: "live", item, notice: UNSENT_TEXT } : { mode: "live", item };
 }
 

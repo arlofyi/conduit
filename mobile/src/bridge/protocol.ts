@@ -150,6 +150,9 @@ export interface WirePendingAsk {
   /** Claude's `tool_input.questions`, verbatim */
   questions: WireQuestion[];
   createdMs: number;
+  /** false = no hook is waiting: the Mac's terminal has the menu, shown here read-only.
+   *  Absent (an older Mac) = true. */
+  held?: boolean;
 }
 
 /** A held PermissionRequest. No `toolUseId`: it is never joined to a transcript card. */
@@ -161,6 +164,8 @@ export interface WirePendingPermission {
   /** one line: the command, the file, or the tool name */
   summary: string;
   createdMs: number;
+  /** as WirePendingAsk.held */
+  held?: boolean;
 }
 
 /** A silo'd / local-only session's item: exactly these keys, nothing about what it asks. */

@@ -124,8 +124,9 @@ describe("banner from a pushed question or permission", () => {
     toolUseId: "tu1",
     questions: [{ question: "Ship it?", header: "", multiSelect: false, options: [] }],
     createdMs: 1,
+    held: true,
   };
-  const permItem = { kind: "permission" as const, id: "perm-1", sessionId: "a", private: false as const, toolName: "Bash", summary: "touch a.txt", createdMs: 1 };
+  const permItem = { kind: "permission" as const, id: "perm-1", sessionId: "a", private: false as const, toolName: "Bash", summary: "touch a.txt", createdMs: 1, held: true };
 
   it("banner_fires_on_pending_added_and_the_next_poll_does_not_repeat_it", () => {
     const signals = bannersFromView({}, view(idle), null, ALL_ON).signals;
