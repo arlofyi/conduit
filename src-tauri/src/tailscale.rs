@@ -239,9 +239,16 @@ pub fn cli_path() -> Option<PathBuf> {
     find_cli(|p| p.is_file(), std::env::var("PATH").ok().as_deref())
 }
 
+/// The Mac App Store / standalone `Tailscale.app` binary is both the GUI and the CLI, and
+/// it only acts as the CLI when it sees a terminal (`TERM`) or this variable. Conduit
+/// launched from the Dock has no `TERM`, so without it the binary tries to start the GUI
+/// and prints "The Tailscale GUI failed to start" instead of JSON. Harmless elsewhere.
+const CLI_ENV: (&str, &str) = ("TAILSCALE_BE_CLI", "1");
+
 fn run_cli_at(cli: &Path, args: &[&str]) -> Result<String, String> {
     let mut child = Command::new(cli)
         .args(args)
+        .env(CLI_ENV.0, CLI_ENV.1)
         .no_window()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -333,6 +340,27 @@ mod tests {
 
     const RUNNING: &str = r#"{"BackendState":"Running","Self":{"HostName":"Uzair’s MacBook Pro","DNSName":"uzairs-macbook-pro.tailc7b992.ts.net.","TailscaleIPs":["100.120.238.84","fd7a:115c:a1e0::5239:ee55"],"UserID":2963369091006053,"OS":"macOS","Online":true},"MagicDNSSuffix":"tailc7b992.ts.net","CurrentTailnet":{"Name":"uziiuzair.com","MagicDNSSuffix":"tailc7b992.ts.net","MagicDNSEnabled":true},"User":null,"Peer":null}"#;
     const STOPPED: &str = r#"{"BackendState":"Stopped","Self":{"HostName":"Uzair’s MacBook Pro","DNSName":"uzairs-macbook-pro.tailc7b992.ts.net.","TailscaleIPs":["100.120.238.84","fd7a:115c:a1e0::5239:ee55"],"UserID":2963369091006053,"OS":"macOS","Online":false},"MagicDNSSuffix":"tailc7b992.ts.net","CurrentTailnet":{"Name":"uziiuzair.com","MagicDNSSuffix":"tailc7b992.ts.net","MagicDNSEnabled":true},"User":null,"Peer":null}"#;
+
+    /// A stand-in for `Tailscale.app`'s binary: CLI only when told so, GUI text otherwise —
+    /// what a Conduit launched from the Dock (no `TERM`) used to get.
+    #[cfg(unix)]
+    #[test]
+    fn cli_is_run_in_cli_mode_without_a_terminal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("conduit-ts-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cli = dir.join("Tailscale");
+        std::fs::write(
+            &cli,
+            "#!/bin/sh\nif [ \"$TAILSCALE_BE_CLI\" = 1 ]; then echo '{\"BackendState\":\"Running\"}'; \
+             else echo 'The Tailscale GUI failed to start'; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = run_cli_at(&cli, &["status", "--json"]).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.trim_start().starts_with('{'), "{out}");
+    }
 
     #[test]
     fn running_status_parses() {

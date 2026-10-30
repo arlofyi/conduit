@@ -5,6 +5,9 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — Settings → Mobile reads Tailscale when Conduit is opened from the Dock.** It showed "Couldn't read Tailscale: unreadable status" because the Tailscale app's command-line tool started its window instead of answering; Conduit now asks it for the command-line answer.
+- **Fixed — The phone's Connect screen no longer overflows.** It starts from the top after switching between scanning and typing an address, and after returning to the app.
+
 ## 0.48.0 — 2026-10-30
 
 - **Added — Conduit for iPhone.** The app connects to your Mac over Tailscale, remembers it, and finds your other Macs on the same tailnet. It opens on a WhatsApp-style list of every session: each in its project's colour, with its agent, status, last message and an unread count, anything waiting on you on top, filterable by what needs you, what is running or one project, and switchable by profile. Open a chat to read the conversation as it happens and reply; it shows whether the session is working, waiting on you or idle, its model and how full its context is, and stays put while you scroll back. A banner drops in when another session asks a question or needs your permission (and, if you turn it on, when one finishes). Private sessions are listed but never previewed, and the Mac refuses to open them on a phone.
