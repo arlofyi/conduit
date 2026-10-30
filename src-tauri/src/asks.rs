@@ -318,6 +318,13 @@ pub fn supported_questions(input: &Value) -> Option<Value> {
     Some(Value::Array(qs.clone()))
 }
 
+/// Whether the desktop's automatic hand-off (its terminal came in front) must leave a
+/// question alone: a connected phone holds it, unless the session is private (a phone never
+/// holds those).
+pub fn auto_handoff_keeps(phone_connected: bool, private: bool) -> bool {
+    phone_connected && !private
+}
+
 /// Exactly the asked question texts as keys; each value a non-empty string within the cap.
 pub fn validate_answers(questions: &Value, answers: &Map<String, Value>) -> Result<(), String> {
     let asked: Vec<&str> = questions
@@ -395,6 +402,19 @@ pub fn ask_response(input: &Value, outcome: Option<&AskOutcome>) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn auto_handoff_leaves_a_phone_held_question() {
+        assert!(auto_handoff_keeps(true, false), "a phone holds it");
+        assert!(
+            !auto_handoff_keeps(false, false),
+            "no phone: hand off as before"
+        );
+        assert!(
+            !auto_handoff_keeps(true, true),
+            "a phone never holds a private session"
+        );
+    }
 
     fn one_q() -> Value {
         json!({"questions":[{"question":"Pick a fruit","header":"Fruit","multiSelect":false,

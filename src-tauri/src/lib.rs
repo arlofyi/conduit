@@ -1740,6 +1740,32 @@ fn ask_handoff(asks: State<Arc<asks::Asks>>, id: String) -> bool {
     asks.resolve(&id, asks::AskOutcome::HandOff)
 }
 
+/// The desktop's AUTOMATIC hand-off (the session's terminal came in front). Unlike the card's
+/// explicit "Answer in terminal", it must not take a question away from a connected phone:
+/// the user may be looking at the Mac's screen share or have walked away with the phone,
+/// and handing off made every phone-held question read-only text on the phone.
+/// `"handedOff"` | `"kept"` (a phone holds it; the desktop shows its card) | `"gone"`.
+#[tauri::command]
+fn ask_auto_handoff(
+    asks: State<Arc<asks::Asks>>,
+    bridge: State<Arc<bridge::BridgeController>>,
+    store: State<Arc<store::Store>>,
+    id: String,
+) -> &'static str {
+    let Some(view) = asks.get(&id) else {
+        return "gone";
+    };
+    let private = bridge_view::session_is_private(&store.list(), &view.session);
+    if asks::auto_handoff_keeps(bridge.has_remote_phone(), private) {
+        return "kept";
+    }
+    if asks.resolve(&id, asks::AskOutcome::HandOff) {
+        "handedOff"
+    } else {
+        "gone"
+    }
+}
+
 #[tauri::command]
 fn ask_pending(asks: State<Arc<asks::Asks>>) -> Vec<asks::AskView> {
     asks.pending()
@@ -3616,6 +3642,7 @@ pub fn run() {
             continuity_tables,
             ask_answer,
             ask_handoff,
+            ask_auto_handoff,
             ask_pending,
             set_ask_gate,
             permission_pending,

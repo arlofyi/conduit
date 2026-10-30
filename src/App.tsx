@@ -106,10 +106,15 @@ function admitAsk(a: PendingAsk) {
   if (handedOff.has(a.id) || a.id in s.asks) return;
   if (askShouldHandOff(a, handOffView(s))) {
     handedOff.add(a.id);
-    void invoke<boolean>("ask_handoff", { id: a.id }).catch(() => {
-      handedOff.delete(a.id);
-      useStore.getState().addAsk(a);
-    });
+    // "kept": a connected phone holds it, so the terminal shows no menu -- show the card.
+    void invoke<string>("ask_auto_handoff", { id: a.id })
+      .then((r) => {
+        if (r === "kept") useStore.getState().addAsk(a);
+      })
+      .catch(() => {
+        handedOff.delete(a.id);
+        useStore.getState().addAsk(a);
+      });
     return;
   }
   s.addAsk(a);
@@ -1053,7 +1058,8 @@ export default function App() {
         if (handedOff.has(a.id)) continue;
         if (askShouldHandOff(a, view)) {
           handedOff.add(a.id);
-          void invoke("ask_handoff", { id: a.id }).catch(() => handedOff.delete(a.id));
+          // A phone-held question is "kept" and its card simply stays.
+          void invoke("ask_auto_handoff", { id: a.id }).catch(() => handedOff.delete(a.id));
         }
       }
     });

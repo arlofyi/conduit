@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — Questions stay answerable on the phone while you look at that session on the Mac.** Conduit handed a question back to the terminal as soon as its session was on screen, even with a phone connected, so the phone only ever showed it as text. While a phone is connected, the question now stays with the phone and the Mac's question card.
+
 ## 0.48.1 — 2026-10-30
 
 - **Fixed — Settings → Mobile reads Tailscale when Conduit is opened from the Dock.** It showed "Couldn't read Tailscale: unreadable status" because the Tailscale app's command-line tool started its window instead of answering; Conduit now asks it for the command-line answer.
