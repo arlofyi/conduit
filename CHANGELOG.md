@@ -5,10 +5,9 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
-- **Changed — Questions and permissions are decided when Claude asks, and the phone always sees the full question.** Conduit now decides once, at the moment Claude asks, where a question or permission goes: a connected phone takes it, otherwise a card on the Mac takes it unless you're already looking at that session's terminal, where Claude's own menu answers it. Nothing moves it afterwards by itself. When the terminal has it, the phone still shows the whole question or the command being asked about, read-only, with "Waiting for an answer in the terminal on your Mac".
-
 ## 0.48.2 — 2026-10-30
 
+- **Changed — Questions and permissions are decided when Claude asks, and the phone always sees the full question.** Conduit now decides once, at the moment Claude asks, where a question or permission goes: a connected phone takes it, otherwise a card on the Mac takes it unless you're already looking at that session's terminal, where Claude's own menu answers it. Nothing moves it afterwards by itself. When the terminal has it, the phone still shows the whole question or the command being asked about, read-only, with "Waiting for an answer in the terminal on your Mac".
 - **Fixed — Questions stay answerable on the phone while you look at that session on the Mac.** Conduit handed a question back to the terminal as soon as its session was on screen, even with a phone connected, so the phone only ever showed it as text. While a phone is connected, the question now stays with the phone and the Mac's question card.
 
 ## 0.48.1 — 2026-10-30
