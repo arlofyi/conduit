@@ -376,13 +376,15 @@ fn phone_may_answer(
     private: bool,
     answers: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {
-    view.is_some_and(|v| !private && crate::asks::validate_answers(&v.questions, answers).is_ok())
+    view.is_some_and(|v| {
+        v.held && !private && crate::asks::validate_answers(&v.questions, answers).is_ok()
+    })
 }
 
-/// May a phone decide this permission? Only a still-pending one (None = already decided
-/// elsewhere), and never a private session's.
+/// May a phone decide this permission? Only a still-pending HELD one (None = already
+/// decided elsewhere; an observed one has no hook to tell), and never a private session's.
 fn phone_may_approve(view: Option<&PermissionView>, private: bool) -> bool {
-    view.is_some() && !private
+    view.is_some_and(|v| v.held) && !private
 }
 
 /// What a phone is sent when it tries to decide a private session's permission: the
@@ -1086,16 +1088,18 @@ impl BridgeController {
             .any(|slot| !conn_is_stale(slot.last_heard(), now))
     }
 
-    /// The last remote phone just left. Every ask or permission it alone was holding goes back to the
-    /// terminal now -- unless the desktop is watching, in which case its card still can.
+    /// The last remote phone just left. Every ask or permission it alone was holding goes back
+    /// to the terminal now -- unless a desktop card is the right place for it NOW (gate open,
+    /// and the user is not looking at that session's own terminal, where the menu belongs).
     /// Called with the `live` lock released.
     fn last_phone_left(&self) {
         if let Some((asks, gate)) = self.asks.get() {
-            if !gate.is_open() {
-                asks.hand_off_where(|_, held_for_phone| held_for_phone);
-                if let Some(broker) = self.permissions.get() {
-                    broker.hand_off_where(|_, held_for_phone| held_for_phone);
-                }
+            let to_terminal = |session: &str, held_for_phone: bool| {
+                held_for_phone && !gate.desktop_can_show(session)
+            };
+            asks.hand_off_where(|v, held_for_phone| to_terminal(&v.session, held_for_phone));
+            if let Some(broker) = self.permissions.get() {
+                broker.hand_off_where(|v, held_for_phone| to_terminal(&v.session, held_for_phone));
             }
         }
     }
@@ -1580,7 +1584,8 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         // state::<Store>() panics the connection thread on the first `list`.
                         let store = app.state::<Arc<Store>>();
                         let fleet = app.state::<Arc<crate::fleet::FleetState>>().snapshot();
-                        let asks = app.state::<Arc<crate::asks::Asks>>().pending();
+                        // Held or observed: either way the session is waiting on a human.
+                        let asks = app.state::<Arc<crate::asks::Asks>>().all();
                         let view = crate::bridge_view::projects_view(
                             &store.list(),
                             &store.list_profiles(),
@@ -2067,6 +2072,8 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
 
 /// Send `pending` (first call) or the `pendingAdded` / `resolved` frames for what changed
 /// since this socket last pushed. A resolution older than the ring reads as `cancelled`.
+/// Phones get every open item, HELD (a card may answer it) or OBSERVED (the terminal has
+/// it; shown read-only), each saying which (`held`).
 fn push_pending(
     app: &AppHandle,
     ws: &mut WebSocket<TcpStream>,
@@ -2074,8 +2081,14 @@ fn push_pending(
 ) -> bool {
     let asks = app.state::<Arc<Asks>>();
     let broker = app.state::<Arc<Broker>>();
-    let views = asks.pending();
-    let perms = broker.pending();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    asks.sweep_observed(now_ms);
+    broker.sweep_observed(now_ms);
+    let views = asks.all();
+    let perms = broker.all();
     let unchanged = pushed.as_ref().is_some_and(|p| {
         p.len() == views.len() + perms.len()
             && views.iter().all(|v| p.contains(&v.id))
@@ -2981,6 +2994,31 @@ mod tests {
     }
 
     #[test]
+    fn last_phone_leaving_hands_the_terminal_in_front_its_own_question() {
+        use crate::asks::AskOutcome;
+        let (c, asks, gate) = wired_controller();
+        gate.set(true);
+        gate.set_focused(Some("s".into()));
+        let a = c.register_live("d1");
+        // Held for the phone while the user looks at s's own terminal on the Mac.
+        let (mine, rx_mine) =
+            asks.register_held("s".into(), "t".into(), serde_json::json!([]), 1, true);
+        let (other, rx_other) =
+            asks.register_held("o".into(), "t".into(), serde_json::json!([]), 2, true);
+        c.unregister_live("d1", &a);
+        assert_eq!(
+            rx_mine.try_recv().unwrap(),
+            AskOutcome::HandOff,
+            "the terminal in front answers it with its own menu"
+        );
+        assert!(
+            rx_other.try_recv().is_err() && asks.get(&other).is_some(),
+            "another session's card stays on the desktop"
+        );
+        assert!(asks.get(&mine).is_none());
+    }
+
+    #[test]
     fn revoking_the_last_phone_hands_off_too() {
         use crate::asks::AskOutcome;
         let (c, asks, _gate) = wired_controller();
@@ -3183,6 +3221,7 @@ mod tests {
             tool_use_id: "t".into(),
             questions: serde_json::json!([{"question":"Q?","options":[{"label":"A"}]}]),
             created_ms: 0,
+            held: true,
         };
         let good: serde_json::Map<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({"Q?":"A"})).unwrap();
@@ -3195,6 +3234,14 @@ mod tests {
         );
         assert!(!phone_may_answer(Some(&view), false, &bad), "validated");
         assert!(!phone_may_answer(None, false, &good), "already resolved");
+        let observed = crate::asks::AskView {
+            held: false,
+            ..view.clone()
+        };
+        assert!(
+            !phone_may_answer(Some(&observed), false, &good),
+            "no hook is waiting on an observed question"
+        );
     }
 
     fn perm_view(id: &str) -> crate::broker::PermissionView {
@@ -3204,6 +3251,7 @@ mod tests {
             tool_name: "Bash".into(),
             summary: "ls".into(),
             created_ms: 0,
+            held: true,
         }
     }
 
@@ -3216,6 +3264,14 @@ mod tests {
             "a private session's permission is never decided from a phone"
         );
         assert!(!phone_may_approve(None, false), "already resolved");
+        let observed = crate::broker::PermissionView {
+            held: false,
+            ..view.clone()
+        };
+        assert!(
+            !phone_may_approve(Some(&observed), false),
+            "only a hook that is waiting can be allowed"
+        );
         // The refusal names the session, so a phone in another chat can ignore it.
         assert_eq!(
             approve_refusal(&view),

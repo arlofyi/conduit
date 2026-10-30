@@ -66,11 +66,17 @@ pub struct PermissionView {
     pub tool_name: String,
     pub summary: String,
     pub created_ms: u64,
+    /// A hook is blocked on this request. `false` = OBSERVED: the hook already answered
+    /// `{}` and Claude's own dialog decides; listed only so a phone can show it (see
+    /// `asks::AskView::held`). Never on the desktop's wire.
+    #[serde(skip)]
+    pub held: bool,
 }
 
 struct Pending {
     view: PermissionView,
-    tx: SyncSender<Resolution>,
+    /// The blocked hook's channel; `None` for an observed entry.
+    tx: Option<SyncSender<Resolution>>,
     /// Held ONLY because a remote phone was connected (see `asks::Pending`).
     held_for_phone: bool,
 }
@@ -94,15 +100,36 @@ impl Broker {
         created_ms: u64,
         held_for_phone: bool,
     ) -> (String, Receiver<Resolution>) {
+        let (tx, rx) = sync_channel(1);
+        let id = self.insert(session, tool, &input, created_ms, Some(tx), held_for_phone);
+        (id, rx)
+    }
+
+    /// Record a request nobody is holding: the hook answers `{}` at once and Claude's own
+    /// dialog decides, but phones are still shown what it would run (read-only). Cleared by
+    /// [`Broker::cancel_session_where`] or, failing that, [`Broker::sweep_observed`].
+    pub fn observe(&self, session: String, tool: String, input: Value, created_ms: u64) -> String {
+        self.insert(session, tool, &input, created_ms, None, false)
+    }
+
+    fn insert(
+        &self,
+        session: String,
+        tool: String,
+        input: &Value,
+        created_ms: u64,
+        tx: Option<SyncSender<Resolution>>,
+        held_for_phone: bool,
+    ) -> String {
         let n = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let id = format!("perm-{n}");
-        let (tx, rx) = sync_channel(1);
         let view = PermissionView {
             id: id.clone(),
             session,
-            summary: permission_summary(&tool, &input),
+            summary: permission_summary(&tool, input),
             tool_name: tool,
             created_ms,
+            held: tx.is_some(),
         };
         self.pending
             .lock()
@@ -115,7 +142,25 @@ impl Broker {
                     held_for_phone,
                 },
             );
-        (id, rx)
+        id
+    }
+
+    /// Drop every observed entry older than `asks::OBSERVED_TTL` at `now_ms`, as
+    /// `cancelled`. A held one is never touched: its own hook's ceiling ends it.
+    pub fn sweep_observed(&self, now_ms: u64) -> Vec<String> {
+        let ttl = crate::asks::OBSERVED_TTL.as_millis() as u64;
+        let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ids: Vec<String> = map
+            .iter()
+            .filter(|(_, p)| p.tx.is_none() && p.view.created_ms.saturating_add(ttl) <= now_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        for id in &ids {
+            map.remove(id);
+            self.record(id, By::Cancelled);
+        }
+        ids
     }
 
     /// Append to the ring. Called with the `pending` guard held (lock order: pending ->
@@ -131,67 +176,81 @@ impl Broker {
     /// First responder wins. `false` = already resolved (or never existed): nothing sent.
     /// The guard is held across remove + `try_send`, so the holder's forget + `try_recv`
     /// is a true check-and-set (see `asks::Asks::resolve`).
+    /// Only a HELD request resolves: an observed one has no hook waiting, so nothing may
+    /// claim to have allowed or denied it.
     pub fn resolve(&self, id: &str, decision: Decision, by: By) -> bool {
         let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        match map.remove(id) {
-            Some(p) => {
-                self.record(id, by);
-                let _ = p.tx.try_send((decision, by));
-                true
-            }
-            None => false,
+        if !map.get(id).is_some_and(|p| p.tx.is_some()) {
+            return false;
         }
+        let Some(Pending { tx: Some(tx), .. }) = map.remove(id) else {
+            return false;
+        };
+        self.record(id, by);
+        let _ = tx.try_send((decision, by));
+        true
     }
 
     /// The holder giving up (its ceiling ran out). Still present = nobody decided it, which
     /// is recorded as a timeout; after a resolve this is a no-op.
     pub fn forget(&self, id: &str) {
         let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if map.remove(id).is_some() {
+        if map.get(id).is_some_and(|p| p.tx.is_some()) {
+            map.remove(id);
             self.record(id, By::Timeout);
         }
     }
 
-    /// Fall through every pending request matching `pred(view, held_for_phone)`, as `by`.
-    /// One lock for the whole sweep.
+    /// Remove every request `pick(view, held_for_phone)` names, recording the `By` it
+    /// returns; a held one's hook is also told to fall through (`{}`). One lock for the
+    /// whole sweep.
     fn fall_through_where(
         &self,
-        pred: impl Fn(&PermissionView, bool) -> bool,
-        by: By,
+        pick: impl Fn(&PermissionView, bool) -> Option<By>,
     ) -> Vec<String> {
         let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        let ids: Vec<String> = map
+        let picked: Vec<(String, By)> = map
             .iter()
-            .filter(|(_, p)| pred(&p.view, p.held_for_phone))
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, p)| pick(&p.view, p.held_for_phone).map(|by| (id.clone(), by)))
             .collect();
-        for id in &ids {
+        for (id, by) in &picked {
             if let Some(p) = map.remove(id) {
-                self.record(id, by);
-                let _ = p.tx.try_send((Decision::FallThrough, by));
+                self.record(id, *by);
+                if let Some(tx) = p.tx {
+                    let _ = tx.try_send((Decision::FallThrough, *by));
+                }
             }
         }
-        ids
+        picked.into_iter().map(|(id, _)| id).collect()
     }
 
     /// The session's turn moved on (`hooks::permission_moved_on`): its open requests whose
     /// tool name passes `tool_matches` are dead -- all of them for a turn-level event, only
     /// the finished tool's own for a PostToolUse. After a terminal "Yes" this is what clears
-    /// the card: the hook is left running and its reply ignored, but `PostToolUse` follows.
+    /// a held card: the hook is left running and its reply ignored, but `PostToolUse`
+    /// follows. A held one is recorded `cancelled`; an observed one as `observed_by(view)`.
     pub fn cancel_session_where(
         &self,
         session: &str,
         tool_matches: impl Fn(&str) -> bool,
+        observed_by: impl Fn(&PermissionView) -> By,
     ) -> Vec<String> {
-        self.fall_through_where(
-            |v, _| v.session == session && tool_matches(&v.tool_name),
-            By::Cancelled,
-        )
+        self.fall_through_where(|v, _| {
+            (v.session == session && tool_matches(&v.tool_name)).then(|| {
+                if v.held {
+                    By::Cancelled
+                } else {
+                    observed_by(v)
+                }
+            })
+        })
     }
 
-    /// Hand back to the terminal every pending request matching `pred(view, held_for_phone)`.
+    /// Hand back to the terminal every HELD request matching `pred(view, held_for_phone)`.
     pub fn hand_off_where(&self, pred: impl Fn(&PermissionView, bool) -> bool) -> Vec<String> {
-        self.fall_through_where(pred, By::Terminal)
+        self.fall_through_where(|v, held_for_phone| {
+            (v.held && pred(v, held_for_phone)).then_some(By::Terminal)
+        })
     }
 
     /// The last [`RECENT_RESOLUTIONS`] resolutions, oldest first.
@@ -204,21 +263,34 @@ impl Broker {
             .collect()
     }
 
+    /// A HELD request (one a card may still decide); None once resolved, or if observed.
     pub fn get(&self, id: &str) -> Option<PermissionView> {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
+            .filter(|p| p.view.held)
             .map(|p| p.view.clone())
     }
 
-    /// Catch-up for a reload, a new window or a newly connected phone. Oldest first.
+    /// Catch-up for a reload or a new window: the HELD requests, oldest first. The desktop
+    /// never shows an observed one -- its terminal already has the dialog.
     pub fn pending(&self) -> Vec<PermissionView> {
+        self.listed(true)
+    }
+
+    /// Every open request, held or observed, oldest first: what phones are shown.
+    pub fn all(&self) -> Vec<PermissionView> {
+        self.listed(false)
+    }
+
+    fn listed(&self, held_only: bool) -> Vec<PermissionView> {
         let mut v: Vec<PermissionView> = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
+            .filter(|p| p.view.held || !held_only)
             .map(|p| p.view.clone())
             .collect();
         v.sort_by(|a, b| a.created_ms.cmp(&b.created_ms).then(a.id.cmp(&b.id)));
@@ -304,9 +376,14 @@ mod tests {
     fn a_finished_sibling_tool_leaves_the_permission_pending() {
         let b = Broker::default();
         let (bash, rx_bash) = reg(&b, "s1", 1); // tool "Bash"
-        assert!(b.cancel_session_where("s1", |t| t == "Read").is_empty());
+        assert!(b
+            .cancel_session_where("s1", |t| t == "Read", |_| By::Terminal)
+            .is_empty());
         assert!(rx_bash.try_recv().is_err() && b.get(&bash).is_some());
-        assert_eq!(b.cancel_session_where("s1", |t| t == "Bash"), vec![bash]);
+        assert_eq!(
+            b.cancel_session_where("s1", |t| t == "Bash", |_| By::Terminal),
+            vec![bash]
+        );
         assert_eq!(
             rx_bash.try_recv().unwrap(),
             (Decision::FallThrough, By::Cancelled)
@@ -319,7 +396,7 @@ mod tests {
         let (a, rx_a) = reg(&b, "s1", 1);
         let (other, rx_other) = reg(&b, "s2", 2);
         let (c, rx_c) = reg(&b, "s1", 3);
-        let mut gone = b.cancel_session_where("s1", |_| true);
+        let mut gone = b.cancel_session_where("s1", |_| true, |_| By::Terminal);
         gone.sort();
         let mut want = vec![a.clone(), c.clone()];
         want.sort();
@@ -335,6 +412,80 @@ mod tests {
         assert_eq!(b.pending().len(), 1);
         let ring = b.recent_resolutions();
         assert!(ring.contains(&(a, By::Cancelled)) && ring.contains(&(c, By::Cancelled)));
+    }
+
+    #[test]
+    fn an_observed_permission_is_listed_for_phones_but_never_decidable() {
+        let b = Broker::default();
+        let (held, _rx) = reg(&b, "s1", 1);
+        let seen = b.observe(
+            "s1".into(),
+            "Write".into(),
+            json!({ "file_path": "/a.txt", "content": "x" }),
+            2,
+        );
+        assert_eq!(
+            b.pending().into_iter().map(|v| v.id).collect::<Vec<_>>(),
+            vec![held.clone()],
+            "the desktop never gets a card for it"
+        );
+        assert!(b.get(&seen).is_none());
+        assert!(
+            !b.resolve(&seen, Decision::Allow, By::Phone),
+            "no hook is waiting: nothing may claim to allow it"
+        );
+        assert_eq!(b.hand_off_where(|_, _| true), vec![held]);
+        let all = b.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, seen);
+        assert!(!all[0].held);
+        assert_eq!(all[0].tool_name, "Write");
+        assert_eq!(all[0].summary, "/a.txt");
+        // The desktop payload never grows a `held` key.
+        let v = serde_json::to_value(&all[0]).unwrap();
+        assert!(v.get("held").is_none());
+    }
+
+    #[test]
+    fn turn_end_clears_observed_permissions_with_the_callers_verdict() {
+        let b = Broker::default();
+        let (held, rx) = reg(&b, "s1", 1); // Bash
+        let ran = b.observe("s1".into(), "Bash".into(), json!({}), 2);
+        let sibling = b.observe("s1".into(), "Write".into(), json!({}), 3);
+        // Bash finished: the held one is cancelled (its hook answers `{}`), the observed one
+        // is what the terminal let run.
+        let mut gone = b.cancel_session_where("s1", |t| t == "Bash", |_| By::Terminal);
+        gone.sort();
+        let mut want = vec![held.clone(), ran.clone()];
+        want.sort();
+        assert_eq!(gone, want);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            (Decision::FallThrough, By::Cancelled)
+        );
+        let ring = b.recent_resolutions();
+        assert!(ring.contains(&(held, By::Cancelled)));
+        assert!(ring.contains(&(ran, By::Terminal)));
+        assert_eq!(
+            b.cancel_session_where("s1", |_| true, |_| By::Cancelled),
+            vec![sibling.clone()]
+        );
+        assert!(b.recent_resolutions().contains(&(sibling, By::Cancelled)));
+    }
+
+    #[test]
+    fn observed_permissions_expire_after_ten_minutes() {
+        let b = Broker::default();
+        let ttl = crate::asks::OBSERVED_TTL.as_millis() as u64;
+        let (held, _rx) = reg(&b, "s1", 0);
+        let old = b.observe("s1".into(), "Bash".into(), json!({}), 0);
+        assert!(b.sweep_observed(ttl - 1).is_empty());
+        assert_eq!(b.sweep_observed(ttl), vec![old.clone()]);
+        assert!(b.recent_resolutions().contains(&(old, By::Cancelled)));
+        assert_eq!(
+            b.all().into_iter().map(|v| v.id).collect::<Vec<_>>(),
+            vec![held]
+        );
     }
 
     #[test]

@@ -376,11 +376,17 @@ pub fn start(
             // cancel them, so the blocked `/ask` / `/permission` answer `{}` and no
             // surface keeps a dead card. For a permission this is also how a terminal
             // "Yes" clears the card: the hook is left running, but PostToolUse follows.
+            // OBSERVED entries (no hook waiting, listed for phones) clear by the same rule;
+            // one cleared by its own tool finishing was answered in the terminal.
             if turn_moved_on(&event, &parsed) {
-                asks.cancel_session(&session);
-                broker.cancel_session_where(&session, |tool| {
-                    permission_moved_on(&event, &parsed, tool)
+                asks.cancel_session(&session, |v| {
+                    observed_clear_by(&event, &parsed, ASK_TOOL, &v.tool_use_id)
                 });
+                broker.cancel_session_where(
+                    &session,
+                    |tool| permission_moved_on(&event, &parsed, tool),
+                    |v| observed_clear_by(&event, &parsed, &v.tool_name, ""),
+                );
             }
 
             // Capture Command Code's own session id, once, so the next spawn can resume
@@ -589,31 +595,60 @@ fn ingest_high_stakes_verb(
 
 #[derive(Debug, PartialEq)]
 enum AskDecision {
-    /// Answer `{}` now: Claude shows its own menu.
+    /// Answer `{}` now, record nothing: not one of our sessions (or a shape no card shows).
     Skip,
+    /// Answer `{}` now -- Claude shows its own menu -- and record the question so phones
+    /// can show it read-only (`Asks::observe`).
+    Observe {
+        session: String,
+        tool_use_id: String,
+        questions: Value,
+    },
     Hold {
         session: String,
         tool_use_id: String,
         questions: Value,
-        /// Only a connected phone holds it (see `Asks::register_held`).
+        /// The desktop cannot show it, so only a connected phone is holding it (see
+        /// `Asks::register_held`).
         held_for_phone: bool,
     },
 }
 
-/// Who could show a card right now: the desktop gate (`set_ask_gate`) and whether an
-/// authenticated remote phone is connected (`BridgeController::has_remote_phone`).
+/// What the hook knows about who is watching, at the moment it fires: the desktop gate and
+/// the terminal the user is looking at (`set_ask_gate`), and whether an authenticated remote
+/// phone is connected (`BridgeController::has_remote_phone`).
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Holders {
-    desktop: bool,
+struct Holders<'a> {
+    gate_open: bool,
+    focused: Option<&'a str>,
     phone: bool,
 }
 
-/// Every reason `/ask` declines to hold a question, in one pure place. `has_origin` is
-/// checked FIRST (a browser page must not raise cards), then the gate, then whether the
-/// session is one of ours -- the same settings file is read by a `claude` the user runs by
-/// hand in that checkout, which posts `session=unknown`. A private (silo / local-only)
-/// session's question is held ONLY by the desktop: a phone never sees it, so a phone being
-/// connected is no reason to park it.
+/// The verdict [`holder_for`] reaches for one post.
+#[derive(Debug, PartialEq)]
+enum Holding<'a> {
+    /// Not ours (a browser `Origin`, an unknown or missing session): `{}`, nothing recorded.
+    Ignore,
+    /// Ours, but no card should take it: `{}` at once, recorded for phones.
+    Observe(&'a str),
+    /// Block for a card. `held_for_phone` = the desktop cannot show it, so the last phone
+    /// leaving hands it back.
+    Hold {
+        session: &'a str,
+        held_for_phone: bool,
+    },
+}
+
+/// The question `/ask` records, as the hook knows it: the tool's `tool_use_id`.
+fn ask_tool_use_id(body: &Value) -> String {
+    body.get("tool_use_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Every reason `/ask` holds, observes or ignores a question, in one pure place: the
+/// shared rule ([`holder_for`]), then whether the question has a shape a card can show.
 fn ask_decision(
     holders: Holders,
     has_origin: bool,
@@ -622,56 +657,116 @@ fn ask_decision(
     known_session: impl Fn(&str) -> bool,
     private_session: impl Fn(&str) -> bool,
 ) -> AskDecision {
-    let Some((session, held_for_phone)) =
-        holder_for(holders, has_origin, session, known_session, private_session)
-    else {
+    let holding = holder_for(holders, has_origin, session, known_session, private_session);
+    if holding == Holding::Ignore {
         return AskDecision::Skip;
-    };
+    }
     let Some(questions) = body
         .get("tool_input")
         .and_then(crate::asks::supported_questions)
     else {
         return AskDecision::Skip;
     };
-    AskDecision::Hold {
-        session: session.to_string(),
-        tool_use_id: body
-            .get("tool_use_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        questions,
-        held_for_phone,
+    let tool_use_id = ask_tool_use_id(body);
+    match holding {
+        Holding::Ignore => AskDecision::Skip,
+        Holding::Observe(session) => AskDecision::Observe {
+            session: session.to_string(),
+            tool_use_id,
+            questions,
+        },
+        Holding::Hold {
+            session,
+            held_for_phone,
+        } => AskDecision::Hold {
+            session: session.to_string(),
+            tool_use_id,
+            questions,
+            held_for_phone,
+        },
     }
 }
 
-/// The gate both blocking routes share (`/ask` and `/permission`): `Some((session,
-/// held_for_phone))` if someone could show a card for this post, else None (answer `{}`).
-/// `has_origin` FIRST (a browser page must not raise cards), then whether anyone is
-/// watching, then whether the session is ours, then the silo rule: a private session is
-/// held only by the desktop, never because a phone is connected.
-fn holder_for(
+/// THE decision, shared by `/ask` and `/permission`, made once, at hook time, from what the
+/// hook knows. Nothing on the desktop later hands a held item back by itself; only the
+/// card's own "Answer in terminal", the last phone leaving, a timeout or the hook hanging up
+/// do.
+///
+/// 1. `has_origin` (a browser page) or a session that is not ours: [`Holding::Ignore`].
+/// 2. A remote phone is connected and the session is not private: HOLD -- the phone shows
+///    the card whatever the Mac is showing. `held_for_phone` = the desktop cannot show it.
+/// 3. The desktop gate is open and the user is not looking at THIS session's terminal: HOLD
+///    for the desktop card.
+/// 4. Otherwise: [`Holding::Observe`] -- `{}` at once, so Claude's own menu takes it. That
+///    includes the user looking at this very terminal with no phone connected.
+fn holder_for<'a>(
     holders: Holders,
     has_origin: bool,
-    session: Option<&str>,
+    session: Option<&'a str>,
     known_session: impl Fn(&str) -> bool,
     private_session: impl Fn(&str) -> bool,
-) -> Option<(&str, bool)> {
-    if has_origin || !(holders.desktop || holders.phone) {
-        return None;
+) -> Holding<'a> {
+    if has_origin {
+        return Holding::Ignore;
     }
-    let session = session.filter(|s| known_session(s))?;
-    let phone_may_hold = holders.phone && !private_session(session);
-    if !holders.desktop && !phone_may_hold {
-        return None;
+    let Some(session) = session.filter(|s| known_session(s)) else {
+        return Holding::Ignore;
+    };
+    let desktop = crate::asks::desktop_can_show(holders.gate_open, holders.focused, session);
+    if holders.phone && !private_session(session) {
+        return Holding::Hold {
+            session,
+            held_for_phone: !desktop,
+        };
     }
-    Some((session, !holders.desktop))
+    if desktop {
+        return Holding::Hold {
+            session,
+            held_for_phone: false,
+        };
+    }
+    Holding::Observe(session)
 }
+
+/// Who cleared an OBSERVED entry when its session's turn moved on: `terminal` when the hook
+/// doing it is the entry's own tool finishing (`PostToolUse` -- the human answered or
+/// allowed it in the terminal and it ran), else `cancelled`. `tool_use_id` narrows the match
+/// when both sides carry one (questions); a permission has none, so its tool name decides.
+/// Deliberately simple: a terminal "No" fires no `PostToolUse`, so a denied permission
+/// clears as `cancelled` at the turn's end, never as something it was not.
+fn observed_clear_by(
+    event: &str,
+    body: &Value,
+    tool_name: &str,
+    tool_use_id: &str,
+) -> crate::asks::By {
+    let id = body
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let ran = event == "tooluse"
+        && body.get("tool_name").and_then(Value::as_str) == Some(tool_name)
+        && (tool_use_id.is_empty() || id.is_empty() || id == tool_use_id);
+    if ran {
+        crate::asks::By::Terminal
+    } else {
+        crate::asks::By::Cancelled
+    }
+}
+
+/// The tool `/ask` answers.
+const ASK_TOOL: &str = "AskUserQuestion";
 
 #[derive(Debug, PartialEq)]
 enum PermissionDecision {
-    /// Answer `{}` now: Claude's own dialog decides.
+    /// Answer `{}` now, record nothing.
     Skip,
+    /// Answer `{}` now -- Claude's own dialog decides -- and record it for phones.
+    Observe {
+        session: String,
+        tool: String,
+        input: Value,
+    },
     Hold {
         session: String,
         tool: String,
@@ -686,8 +781,9 @@ enum PermissionDecision {
 /// pair `status_rules::awaits_user` names).
 const NOT_A_PERMISSION: [&str; 2] = ["AskUserQuestion", "ExitPlanMode"];
 
-/// Every reason `/permission` declines to hold a request, in one pure place: questions
-/// first, then the shared gate (`holder_for`), then a body with no tool name.
+/// Every reason `/permission` holds, observes or ignores a request, in one pure place: a
+/// body with no tool name or a question first (`/ask` records those), then the shared rule
+/// ([`holder_for`]).
 fn permission_decision(
     holders: Holders,
     has_origin: bool,
@@ -700,16 +796,23 @@ fn permission_decision(
     if tool.is_empty() || NOT_A_PERMISSION.contains(&tool) {
         return PermissionDecision::Skip;
     }
-    let Some((session, held_for_phone)) =
-        holder_for(holders, has_origin, session, known_session, private_session)
-    else {
-        return PermissionDecision::Skip;
-    };
-    PermissionDecision::Hold {
-        session: session.to_string(),
-        tool: tool.to_string(),
-        input: body.get("tool_input").cloned().unwrap_or(Value::Null),
-        held_for_phone,
+    let input = || body.get("tool_input").cloned().unwrap_or(Value::Null);
+    match holder_for(holders, has_origin, session, known_session, private_session) {
+        Holding::Ignore => PermissionDecision::Skip,
+        Holding::Observe(session) => PermissionDecision::Observe {
+            session: session.to_string(),
+            tool: tool.to_string(),
+            input: input(),
+        },
+        Holding::Hold {
+            session,
+            held_for_phone,
+        } => PermissionDecision::Hold {
+            session: session.to_string(),
+            tool: tool.to_string(),
+            input: input(),
+            held_for_phone,
+        },
     }
 }
 
@@ -777,37 +880,55 @@ fn handle_ask(
     };
     let bridge = app.try_state::<Arc<crate::bridge::BridgeController>>();
     let phone = || bridge.as_ref().is_some_and(|b| b.has_remote_phone());
+    let focused = gate.focused();
     let holders = Holders {
-        desktop: gate.is_open(),
+        gate_open: gate.is_open(),
+        focused: focused.as_deref(),
         phone: phone(),
     };
     let private = |id: &str| crate::bridge_view::session_is_private(&store.list(), id);
-    let AskDecision::Hold {
-        session,
-        tool_use_id,
-        questions,
-        held_for_phone,
-    } = ask_decision(
+    let now_ms = now_millis();
+    let (session, tool_use_id, questions, held_for_phone) = match ask_decision(
         holders,
         has_origin,
         session.as_deref(),
         &parsed,
         known,
         private,
-    )
-    else {
-        let _ = request.respond(Response::from_string("{}"));
-        return;
+    ) {
+        AskDecision::Hold {
+            session,
+            tool_use_id,
+            questions,
+            held_for_phone,
+        } => (session, tool_use_id, questions, held_for_phone),
+        AskDecision::Observe {
+            session,
+            tool_use_id,
+            questions,
+        } => {
+            // Recorded (in memory, microseconds) and answered at once: never delays Claude.
+            asks.sweep_observed(now_ms);
+            asks.observe(session, tool_use_id, questions, now_ms);
+            let _ = request.respond(Response::from_string("{}"));
+            return;
+        }
+        AskDecision::Skip => {
+            let _ = request.respond(Response::from_string("{}"));
+            return;
+        }
     };
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let (id, rx) = asks.register_held(session, tool_use_id, questions, now_ms, held_for_phone);
+    let (id, rx) = asks.register_held(
+        session.clone(),
+        tool_use_id,
+        questions,
+        now_ms,
+        held_for_phone,
+    );
     // The last phone may have left between reading `holders` and registering, in which
     // case its departure found nothing to hand off: re-check, or this waits 600 s unseen.
-    if held_for_phone && !gate.is_open() && !phone() {
+    if held_for_phone && !gate.desktop_can_show(&session) && !phone() {
         asks.resolve(&id, crate::asks::AskOutcome::HandOff);
     }
     if let Some(view) = asks.get(&id) {
@@ -889,37 +1010,49 @@ fn handle_permission(
     let known = |id: &str| store.has_session(id);
     let bridge = app.try_state::<Arc<crate::bridge::BridgeController>>();
     let phone = || bridge.as_ref().is_some_and(|b| b.has_remote_phone());
+    let focused = gate.focused();
     let holders = Holders {
-        desktop: gate.is_open(),
+        gate_open: gate.is_open(),
+        focused: focused.as_deref(),
         phone: phone(),
     };
     let private = |id: &str| crate::bridge_view::session_is_private(&store.list(), id);
-    let PermissionDecision::Hold {
-        session,
-        tool,
-        input,
-        held_for_phone,
-    } = permission_decision(
+    let now_ms = now_millis();
+    let (session, tool, input, held_for_phone) = match permission_decision(
         holders,
         has_origin,
         session.as_deref(),
         &parsed,
         known,
         private,
-    )
-    else {
-        let _ = request.respond(Response::from_string("{}"));
-        return;
+    ) {
+        PermissionDecision::Hold {
+            session,
+            tool,
+            input,
+            held_for_phone,
+        } => (session, tool, input, held_for_phone),
+        PermissionDecision::Observe {
+            session,
+            tool,
+            input,
+        } => {
+            // Recorded and answered at once: Claude's own dialog is never delayed.
+            broker.sweep_observed(now_ms);
+            broker.observe(session, tool, input, now_ms);
+            let _ = request.respond(Response::from_string("{}"));
+            return;
+        }
+        PermissionDecision::Skip => {
+            let _ = request.respond(Response::from_string("{}"));
+            return;
+        }
     };
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let (id, rx) = broker.register_held(session, tool, input, now_ms, held_for_phone);
+    let (id, rx) = broker.register_held(session.clone(), tool, input, now_ms, held_for_phone);
     // Same race as `handle_ask`: the last phone may have left between the read and the
     // register, finding nothing to hand off.
-    if held_for_phone && !gate.is_open() && !phone() {
+    if held_for_phone && !gate.desktop_can_show(&session) && !phone() {
         broker.resolve(
             &id,
             crate::broker::Decision::FallThrough,
@@ -967,6 +1100,14 @@ fn settle_permission_wait(
             None
         }
     }
+}
+
+/// Wall-clock milliseconds: `createdMs`, and the observed-entry TTL.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The `permission-resolved` event: `{id, by}`.
@@ -2264,17 +2405,149 @@ mod tests {
     }
 
     const DESK: Holders = Holders {
-        desktop: true,
+        gate_open: true,
+        focused: None,
         phone: false,
     };
     const NONE: Holders = Holders {
-        desktop: false,
+        gate_open: false,
+        focused: None,
         phone: false,
     };
     const PHONE: Holders = Holders {
-        desktop: false,
+        gate_open: false,
+        focused: None,
         phone: true,
     };
+
+    /// The whole rule, row by row: phone x gate x focused x private. `Hold(true)` = held
+    /// for the phone (the desktop cannot show it), `Hold(false)` = the desktop card can,
+    /// `Observe` = `{}` at once and recorded for phones to read.
+    #[test]
+    fn holder_decision_table() {
+        #[derive(Debug, PartialEq)]
+        enum W {
+            Hold(bool),
+            Observe,
+        }
+        use W::*;
+        let this = Some("s");
+        let other = Some("o");
+        #[rustfmt::skip]
+        let rows: [(bool, bool, Option<&str>, bool, W); 24] = [
+            // phone, gate, focused, private => verdict
+            (false, false, None,  false, Observe),
+            (false, false, this,  false, Observe),
+            (false, false, other, false, Observe),
+            (false, false, None,  true,  Observe),
+            (false, false, this,  true,  Observe),
+            (false, false, other, true,  Observe),
+            (false, true,  None,  false, Hold(false)),
+            // Looking at this very terminal, no phone: Claude's own menu answers it.
+            (false, true,  this,  false, Observe),
+            (false, true,  other, false, Hold(false)),
+            (false, true,  None,  true,  Hold(false)),
+            (false, true,  this,  true,  Observe),
+            (false, true,  other, true,  Hold(false)),
+            // A connected phone holds every public question, whatever the Mac shows.
+            (true,  false, None,  false, Hold(true)),
+            (true,  false, this,  false, Hold(true)),
+            (true,  false, other, false, Hold(true)),
+            (true,  true,  None,  false, Hold(false)),
+            (true,  true,  this,  false, Hold(true)),
+            (true,  true,  other, false, Hold(false)),
+            // ...but never a private one: that is the desktop's or the terminal's.
+            (true,  false, None,  true,  Observe),
+            (true,  false, this,  true,  Observe),
+            (true,  false, other, true,  Observe),
+            (true,  true,  None,  true,  Hold(false)),
+            (true,  true,  this,  true,  Observe),
+            (true,  true,  other, true,  Hold(false)),
+        ];
+        for (phone, gate_open, focused, private, want) in rows {
+            let h = Holders {
+                gate_open,
+                focused,
+                phone,
+            };
+            let got = match holder_for(h, false, Some("s"), |_| true, |_| private) {
+                Holding::Hold {
+                    session,
+                    held_for_phone,
+                } => {
+                    assert_eq!(session, "s");
+                    Hold(held_for_phone)
+                }
+                Holding::Observe(session) => {
+                    assert_eq!(session, "s");
+                    Observe
+                }
+                Holding::Ignore => panic!("a known session is never ignored"),
+            };
+            assert_eq!(
+                got, want,
+                "phone={phone} gate={gate_open} focused={focused:?} private={private}"
+            );
+        }
+        // Not ours at all: neither held nor recorded.
+        let all = Holders {
+            gate_open: true,
+            focused: None,
+            phone: true,
+        };
+        assert_eq!(
+            holder_for(all, true, Some("s"), |_| true, |_| false),
+            Holding::Ignore,
+            "Origin"
+        );
+        assert_eq!(
+            holder_for(all, false, Some("x"), |s| s == "s", |_| false),
+            Holding::Ignore,
+            "a claude outside Conduit"
+        );
+        assert_eq!(
+            holder_for(all, false, None, |_| true, |_| false),
+            Holding::Ignore
+        );
+    }
+
+    #[test]
+    fn an_observed_item_cleared_by_its_own_tool_finishing_was_the_terminals() {
+        let ran = json!({"tool_name": "AskUserQuestion", "tool_use_id": "tu1"});
+        assert_eq!(
+            observed_clear_by("tooluse", &ran, "AskUserQuestion", "tu1"),
+            crate::asks::By::Terminal
+        );
+        // A different call of the same tool, or another tool: the turn moved on.
+        let twin = json!({"tool_name": "AskUserQuestion", "tool_use_id": "tu2"});
+        assert_eq!(
+            observed_clear_by("tooluse", &twin, "AskUserQuestion", "tu1"),
+            crate::asks::By::Cancelled
+        );
+        let read = json!({"tool_name": "Read", "tool_use_id": "tu1"});
+        assert_eq!(
+            observed_clear_by("tooluse", &read, "AskUserQuestion", "tu1"),
+            crate::asks::By::Cancelled
+        );
+        // A permission has no tool_use_id: the tool name is all there is to match.
+        let bash = json!({"tool_name": "Bash", "tool_use_id": "tu9"});
+        assert_eq!(
+            observed_clear_by("tooluse", &bash, "Bash", ""),
+            crate::asks::By::Terminal
+        );
+        // A body without an id cannot contradict a match on the name.
+        assert_eq!(
+            observed_clear_by("tooluse", &json!({"tool_name": "Bash"}), "Bash", "tu"),
+            crate::asks::By::Terminal
+        );
+        for e in ["stop", "prompt", "sessionend"] {
+            assert_eq!(
+                observed_clear_by(e, &bash, "Bash", ""),
+                crate::asks::By::Cancelled,
+                "{e}"
+            );
+        }
+    }
 
     fn ask_body() -> Value {
         json!({"tool_name":"AskUserQuestion","tool_use_id":"tu",
@@ -2311,9 +2584,14 @@ mod tests {
             AskDecision::Skip,
             "Origin refused"
         );
+        // Nobody to hold it for: answered `{}` at once, and recorded for phones to read.
         assert_eq!(
             ask_decision(NONE, false, Some("sess-1"), &body, known, public),
-            AskDecision::Skip,
+            AskDecision::Observe {
+                session: "sess-1".into(),
+                tool_use_id: "tu".into(),
+                questions: body["tool_input"]["questions"].clone(),
+            },
             "gate closed and no phone"
         );
         assert_eq!(
@@ -2341,7 +2619,8 @@ mod tests {
         }
         // Both open: the desktop is a holder, so the phone leaving must not hand it off.
         let both = Holders {
-            desktop: true,
+            gate_open: true,
+            focused: None,
             phone: true,
         };
         match ask_decision(both, false, Some("sess-1"), &ask_body(), known, |_| false) {
@@ -2399,9 +2678,11 @@ mod tests {
     fn silo_ask_not_held_for_phone() {
         let known = |s: &str| s == "sess-1";
         let private = |_: &str| true;
-        assert_eq!(
-            ask_decision(PHONE, false, Some("sess-1"), &ask_body(), known, private),
-            AskDecision::Skip,
+        assert!(
+            matches!(
+                ask_decision(PHONE, false, Some("sess-1"), &ask_body(), known, private),
+                AskDecision::Observe { .. }
+            ),
             "a phone never holds a private session's question"
         );
         match ask_decision(DESK, false, Some("sess-1"), &ask_body(), known, private) {
@@ -2480,9 +2761,17 @@ mod tests {
             PermissionDecision::Hold { held_for_phone, .. } => assert!(held_for_phone),
             other => panic!("expected Hold, got {other:?}"),
         }
+        assert_eq!(
+            permission_decision(NONE, false, Some("sess-1"), &body, known, public),
+            PermissionDecision::Observe {
+                session: "sess-1".into(),
+                tool: "Bash".into(),
+                input: body["tool_input"].clone(),
+            },
+            "gate closed and no phone: answered at once, recorded for phones"
+        );
         for (holders, origin, session, why) in [
             (DESK, true, Some("sess-1"), "Origin refused"),
-            (NONE, false, Some("sess-1"), "gate closed and no phone"),
             (DESK, false, Some("unknown"), "a claude outside Conduit"),
             (DESK, false, None, "no session"),
         ] {
@@ -2504,14 +2793,22 @@ mod tests {
         // AskUserQuestion fires PermissionRequest too (measured, 2.1.312); `allow` would
         // run it with no answers. `/ask` owns questions; plan approval stays in the TUI.
         let known = |s: &str| s == "sess-1";
-        for tool in ["AskUserQuestion", "ExitPlanMode"] {
-            assert_eq!(
-                permission_decision(DESK, false, Some("sess-1"), &perm_body(tool), known, |_| {
-                    false
-                }),
-                PermissionDecision::Skip,
-                "{tool}"
-            );
+        // Nor recorded as an observed permission: `/ask` records the question itself.
+        for holders in [DESK, NONE, PHONE] {
+            for tool in ["AskUserQuestion", "ExitPlanMode"] {
+                assert_eq!(
+                    permission_decision(
+                        holders,
+                        false,
+                        Some("sess-1"),
+                        &perm_body(tool),
+                        known,
+                        |_| false
+                    ),
+                    PermissionDecision::Skip,
+                    "{tool}"
+                );
+            }
         }
     }
 
@@ -2519,7 +2816,7 @@ mod tests {
     fn silo_permission_not_held_for_phone() {
         let known = |s: &str| s == "sess-1";
         let private = |_: &str| true;
-        assert_eq!(
+        assert!(matches!(
             permission_decision(
                 PHONE,
                 false,
@@ -2528,8 +2825,8 @@ mod tests {
                 known,
                 private
             ),
-            PermissionDecision::Skip
-        );
+            PermissionDecision::Observe { .. }
+        ));
         match permission_decision(
             DESK,
             false,

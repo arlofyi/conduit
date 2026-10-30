@@ -31,6 +31,11 @@ pub const MULTI_QUESTION_SUPPORTED: bool = true;
 /// bridge connection diffing every 250 ms to name who answered whatever left its list.
 pub const RECENT_RESOLUTIONS: usize = 64;
 
+/// How long an OBSERVED question or permission (one no hook is waiting on) is listed for
+/// phones before it is dropped as `cancelled`, if nothing in its session's turn cleared it
+/// first. Shared by `broker.rs`.
+pub const OBSERVED_TTL: Duration = Duration::from_secs(600);
+
 /// Who (or what) resolved a question. Carried on `ask-resolved` and the bridge's
 /// `resolved` frame, so every surface can say "Answered on your Mac" rather than just
 /// dropping the card.
@@ -77,14 +82,21 @@ pub struct AskView {
     pub tool_use_id: String,
     pub questions: Value,
     pub created_ms: u64,
+    /// A hook is blocked on this question (a card may answer it). `false` = OBSERVED: the
+    /// hook already answered `{}`, Claude's own menu is up, and the entry exists only so a
+    /// phone can show what the terminal is asking. Never on the desktop's wire.
+    #[serde(skip)]
+    pub held: bool,
 }
 
 struct Pending {
     view: AskView,
-    tx: SyncSender<AskOutcome>,
-    /// Held ONLY because a remote phone was connected (the desktop gate was closed). When
-    /// the last phone leaves, these are handed back to the terminal at once rather than
-    /// waiting out `ASK_CEILING` for a card nobody can see.
+    /// The blocked hook's channel; `None` for an observed entry (nobody to answer).
+    tx: Option<SyncSender<AskOutcome>>,
+    /// Held ONLY because a remote phone was connected (at hook time no desktop card was the
+    /// right place: gate closed, or the user was looking at this session's terminal). When
+    /// the last phone leaves, these go back to the terminal unless a desktop card is the
+    /// right place by then (`BridgeController::last_phone_left`).
     held_for_phone: bool,
 }
 
@@ -128,6 +140,7 @@ impl Asks {
             tool_use_id,
             questions,
             created_ms,
+            held: true,
         };
         self.pending
             .lock()
@@ -136,11 +149,63 @@ impl Asks {
                 id.clone(),
                 Pending {
                     view,
-                    tx,
+                    tx: Some(tx),
                     held_for_phone,
                 },
             );
         (id, rx)
+    }
+
+    /// Record a question nobody is holding: the hook answers `{}` at once and Claude's own
+    /// menu takes it, but phones are still shown the whole question (read-only). Cleared by
+    /// [`Asks::cancel_session`] or, failing that, [`Asks::sweep_observed`].
+    pub fn observe(
+        &self,
+        session: String,
+        tool_use_id: String,
+        questions: Value,
+        created_ms: u64,
+    ) -> String {
+        let n = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        let id = format!("ask-{n}");
+        let view = AskView {
+            id: id.clone(),
+            session,
+            tool_use_id,
+            questions,
+            created_ms,
+            held: false,
+        };
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                id.clone(),
+                Pending {
+                    view,
+                    tx: None,
+                    held_for_phone: false,
+                },
+            );
+        id
+    }
+
+    /// Drop every observed entry older than [`OBSERVED_TTL`] at `now_ms`, as `cancelled`.
+    /// A held one is never touched: its own hook's ceiling ends it.
+    pub fn sweep_observed(&self, now_ms: u64) -> Vec<String> {
+        let ttl = OBSERVED_TTL.as_millis() as u64;
+        let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ids: Vec<String> = map
+            .iter()
+            .filter(|(_, p)| p.tx.is_none() && p.view.created_ms.saturating_add(ttl) <= now_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        for id in &ids {
+            map.remove(id);
+            self.record(id, By::Cancelled);
+        }
+        ids
     }
 
     /// Append to the ring. Called with the `pending` guard held (lock order: pending ->
@@ -153,62 +218,89 @@ impl Asks {
         recent.push_back((id.to_string(), by));
     }
 
-    /// First responder wins: the entry is removed, so a second resolve finds nothing.
+    /// First responder wins: the entry is removed, so a second resolve finds nothing. Only
+    /// a HELD entry resolves: an observed one has no hook to answer, so nothing may claim
+    /// to have answered it.
     pub fn resolve(&self, id: &str, outcome: AskOutcome) -> bool {
         // Hold the guard across remove + try_send (never blocks on sync_channel(1)), so
         // `forget` + `try_recv` in the holder is a true check-and-set: a resolve either
         // completes before the forget (and is seen by try_recv) or finds nothing.
         let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        match map.remove(id) {
-            Some(p) => {
-                self.record(id, by_of(&Some(outcome.clone())));
-                let _ = p.tx.try_send(outcome);
-                true
-            }
-            None => false,
+        if !map.get(id).is_some_and(|p| p.tx.is_some()) {
+            return false;
         }
+        let Some(Pending { tx: Some(tx), .. }) = map.remove(id) else {
+            return false;
+        };
+        self.record(id, by_of(&Some(outcome.clone())));
+        let _ = tx.try_send(outcome);
+        true
     }
 
     /// The holder giving up (its `ASK_CEILING` ran out). An entry still present was
     /// resolved by nobody, so that is recorded as a timeout; after a resolve this is a no-op.
     pub fn forget(&self, id: &str) {
         let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if map.remove(id).is_some() {
+        if map.get(id).is_some_and(|p| p.tx.is_some()) {
+            map.remove(id);
             self.record(id, By::Timeout);
         }
     }
 
-    /// Resolve every pending ask whose `(view, held_for_phone)` matches with `outcome`.
-    /// One lock for the whole sweep, so nothing slips between the match and the resolve.
+    /// Remove every entry `pick(view, held_for_phone)` names, recording the `By` it
+    /// returns: a held one is also sent `outcome` (its hook answers), an observed one is
+    /// only recorded. One lock for the whole sweep, so nothing slips between match and
+    /// resolve.
     fn resolve_where(
         &self,
-        pred: impl Fn(&AskView, bool) -> bool,
+        pick: impl Fn(&AskView, bool) -> Option<By>,
         outcome: AskOutcome,
     ) -> Vec<String> {
         let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        let ids: Vec<String> = map
+        let picked: Vec<(String, By)> = map
             .iter()
-            .filter(|(_, p)| pred(&p.view, p.held_for_phone))
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, p)| pick(&p.view, p.held_for_phone).map(|by| (id.clone(), by)))
             .collect();
-        let by = by_of(&Some(outcome.clone()));
-        for id in &ids {
+        for (id, by) in &picked {
             if let Some(p) = map.remove(id) {
-                self.record(id, by);
-                let _ = p.tx.try_send(outcome.clone());
+                self.record(id, *by);
+                if let Some(tx) = p.tx {
+                    let _ = tx.try_send(outcome.clone());
+                }
             }
         }
-        ids
+        picked.into_iter().map(|(id, _)| id).collect()
     }
 
-    /// The session's turn moved on: every question it still has open is dead.
-    pub fn cancel_session(&self, session: &str) -> Vec<String> {
-        self.resolve_where(|v, _| v.session == session, AskOutcome::Cancelled)
+    /// The session's turn moved on: every question it still has open is dead. A held one
+    /// is cancelled (its hook answers `{}`); an observed one is recorded as
+    /// `observed_by(view)` -- `terminal` when the hook that cleared it says the question
+    /// itself ran (answered in the terminal), else `cancelled`.
+    pub fn cancel_session(
+        &self,
+        session: &str,
+        observed_by: impl Fn(&AskView) -> By,
+    ) -> Vec<String> {
+        self.resolve_where(
+            |v, _| {
+                (v.session == session).then(|| {
+                    if v.held {
+                        By::Cancelled
+                    } else {
+                        observed_by(v)
+                    }
+                })
+            },
+            AskOutcome::Cancelled,
+        )
     }
 
-    /// Hand back to the terminal every pending ask matching `pred(view, held_for_phone)`.
+    /// Hand back to the terminal every HELD ask matching `pred(view, held_for_phone)`.
     pub fn hand_off_where(&self, pred: impl Fn(&AskView, bool) -> bool) -> Vec<String> {
-        self.resolve_where(pred, AskOutcome::HandOff)
+        self.resolve_where(
+            |v, held_for_phone| (v.held && pred(v, held_for_phone)).then_some(By::Terminal),
+            AskOutcome::HandOff,
+        )
     }
 
     /// Whether a pending ask is held only for a phone; None once it has resolved.
@@ -243,42 +335,79 @@ impl Asks {
             .map(|(_, by)| *by)
     }
 
+    /// A HELD ask (one a card may still answer); None once resolved, or if it is observed.
     pub fn get(&self, id: &str) -> Option<AskView> {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
+            .filter(|p| p.view.held)
             .map(|p| p.view.clone())
     }
 
-    /// Catch-up for a reload or a newly opened window. Oldest first.
+    /// Catch-up for a reload or a newly opened window: the HELD asks, oldest first. The
+    /// desktop never shows an observed one -- its terminal already has the menu.
     pub fn pending(&self) -> Vec<AskView> {
+        self.listed(true)
+    }
+
+    /// Every open ask, held or observed, oldest first: what phones are shown.
+    pub fn all(&self) -> Vec<AskView> {
+        self.listed(false)
+    }
+
+    fn listed(&self, held_only: bool) -> Vec<AskView> {
         let mut v: Vec<AskView> = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
+            .filter(|p| p.view.held || !held_only)
             .map(|p| p.view.clone())
             .collect();
-        v.sort_by_key(|a| a.created_ms);
+        v.sort_by(|a, b| a.created_ms.cmp(&b.created_ms).then(a.id.cmp(&b.id)));
         v
     }
 }
 
-/// Whether `/ask` may hold questions at all. Set by the frontend (`set_ask_gate`): open
-/// only while the Continuity view is open or a Conduit window has focus, so a question
-/// nobody can see is never parked. Closed by default — before the frontend says anything,
-/// behaviour is exactly today's.
+/// What the desktop tells `/ask` and `/permission` (`set_ask_gate`): whether a card could
+/// be seen at all (open only while the Continuity view is enabled and either open or a
+/// Conduit window has focus), and which session's terminal the user is looking at (only
+/// while a Conduit window is focused). Closed and unfocused by default -- before the
+/// frontend says anything, the desktop holds nothing.
 #[derive(Default)]
-pub struct AskGate(AtomicBool);
+pub struct AskGate {
+    open: AtomicBool,
+    focused: Mutex<Option<String>>,
+}
 
 impl AskGate {
     pub fn is_open(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.open.load(Ordering::SeqCst)
     }
     pub fn set(&self, open: bool) {
-        self.0.store(open, Ordering::SeqCst);
+        self.open.store(open, Ordering::SeqCst);
     }
+    pub fn set_focused(&self, session: Option<String>) {
+        *self.focused.lock().unwrap_or_else(|e| e.into_inner()) = session;
+    }
+    pub fn focused(&self) -> Option<String> {
+        self.focused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    /// [`desktop_can_show`] for the gate as it is now.
+    pub fn desktop_can_show(&self, session: &str) -> bool {
+        desktop_can_show(self.is_open(), self.focused().as_deref(), session)
+    }
+}
+
+/// Whether a desktop CARD is the right place for `session`'s question or permission: the
+/// gate is open and the user is not looking at that session's own terminal, where Claude's
+/// own menu is already in front of them.
+pub fn desktop_can_show(gate_open: bool, focused: Option<&str>, session: &str) -> bool {
+    gate_open && focused != Some(session)
 }
 
 /// The `questions` array if this tool input is a shape the card can answer, else None
@@ -316,13 +445,6 @@ pub fn supported_questions(input: &Value) -> Option<Value> {
         }
     }
     Some(Value::Array(qs.clone()))
-}
-
-/// Whether the desktop's automatic hand-off (its terminal came in front) must leave a
-/// question alone: a connected phone holds it, unless the session is private (a phone never
-/// holds those).
-pub fn auto_handoff_keeps(phone_connected: bool, private: bool) -> bool {
-    phone_connected && !private
 }
 
 /// Exactly the asked question texts as keys; each value a non-empty string within the cap.
@@ -404,15 +526,102 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn auto_handoff_leaves_a_phone_held_question() {
-        assert!(auto_handoff_keeps(true, false), "a phone holds it");
+    fn the_desktop_can_show_a_card_unless_its_terminal_is_in_front() {
         assert!(
-            !auto_handoff_keeps(false, false),
-            "no phone: hand off as before"
+            desktop_can_show(true, None, "s"),
+            "gate open, nothing focused"
         );
         assert!(
-            !auto_handoff_keeps(true, true),
-            "a phone never holds a private session"
+            desktop_can_show(true, Some("other"), "s"),
+            "looking elsewhere"
+        );
+        assert!(
+            !desktop_can_show(true, Some("s"), "s"),
+            "looking at this very terminal: its own menu answers it"
+        );
+        assert!(!desktop_can_show(false, None, "s"), "gate closed");
+        assert!(!desktop_can_show(false, Some("other"), "s"));
+        let g = AskGate::default();
+        assert!(!g.desktop_can_show("s"));
+        g.set(true);
+        g.set_focused(Some("s".into()));
+        assert!(!g.desktop_can_show("s"));
+        assert!(g.desktop_can_show("t"));
+        g.set_focused(None);
+        assert!(g.desktop_can_show("s"));
+    }
+
+    #[test]
+    fn an_observed_question_is_listed_for_phones_but_never_answerable() {
+        let asks = Asks::default();
+        let (held, _rx) = asks.register_held("s".into(), "t1".into(), json!([]), 1, false);
+        let seen = asks.observe("s".into(), "t2".into(), one_q()["questions"].clone(), 2);
+        // The desktop's catch-up and every resolve path see only what a hook is waiting on.
+        assert_eq!(
+            asks.pending().into_iter().map(|v| v.id).collect::<Vec<_>>(),
+            vec![held.clone()]
+        );
+        assert!(asks.get(&seen).is_none(), "nothing to answer");
+        assert!(
+            !asks.resolve(&seen, answered(By::Phone)),
+            "nobody is waiting"
+        );
+        assert_eq!(asks.hand_off_where(|_, _| true), vec![held.clone()]);
+        // Phones get the full list, each item saying whether a hook is waiting on it.
+        let all = asks.all();
+        assert_eq!(all.len(), 1, "the held one was handed off");
+        assert_eq!(all[0].id, seen);
+        assert!(!all[0].held);
+        assert_eq!(all[0].questions, one_q()["questions"]);
+        assert_eq!(all[0].tool_use_id, "t2");
+        assert_eq!(asks.resolution_of(&seen), None, "still open");
+    }
+
+    #[test]
+    fn turn_end_clears_observed_questions_with_the_callers_verdict() {
+        let asks = Asks::default();
+        let (held, rh) = asks.register_held("s".into(), "t0".into(), json!([]), 1, true);
+        let ran = asks.observe("s".into(), "t1".into(), json!([]), 2);
+        let other = asks.observe("s".into(), "t2".into(), json!([]), 3);
+        let elsewhere = asks.observe("s2".into(), "t3".into(), json!([]), 4);
+        let mut gone = asks.cancel_session("s", |v| {
+            if v.tool_use_id == "t1" {
+                By::Terminal
+            } else {
+                By::Cancelled
+            }
+        });
+        gone.sort();
+        let mut want = vec![held.clone(), ran.clone(), other.clone()];
+        want.sort();
+        assert_eq!(gone, want);
+        // A held one is always cancelled: its hook answers `{}`.
+        assert_eq!(rh.try_recv().unwrap(), AskOutcome::Cancelled);
+        assert_eq!(asks.resolution_of(&held), Some(By::Cancelled));
+        assert_eq!(asks.resolution_of(&ran), Some(By::Terminal));
+        assert_eq!(asks.resolution_of(&other), Some(By::Cancelled));
+        assert_eq!(
+            asks.all().into_iter().map(|v| v.id).collect::<Vec<_>>(),
+            vec![elsewhere]
+        );
+    }
+
+    #[test]
+    fn observed_questions_expire_after_ten_minutes() {
+        let asks = Asks::default();
+        let ttl = OBSERVED_TTL.as_millis() as u64;
+        assert_eq!(ttl, 600_000);
+        let (held, _rx) = asks.register_held("s".into(), "t".into(), json!([]), 1_000, true);
+        let old = asks.observe("s".into(), "t1".into(), json!([]), 1_000);
+        let young = asks.observe("s".into(), "t2".into(), json!([]), 5_000);
+        assert!(asks.sweep_observed(1_000 + ttl - 1).is_empty(), "not yet");
+        assert_eq!(asks.sweep_observed(1_000 + ttl), vec![old.clone()]);
+        assert_eq!(asks.resolution_of(&old), Some(By::Cancelled));
+        let ids: Vec<String> = asks.all().into_iter().map(|v| v.id).collect();
+        assert_eq!(
+            ids,
+            vec![held, young],
+            "a held one is its own hook's to end"
         );
     }
 
@@ -507,7 +716,7 @@ mod tests {
         let (a, ra) = asks.register("s1".into(), "t1".into(), json!([]), 1);
         let (b, rb) = asks.register("s1".into(), "t2".into(), json!([]), 2);
         let (c, rc) = asks.register("s2".into(), "t3".into(), json!([]), 3);
-        let mut gone = asks.cancel_session("s1");
+        let mut gone = asks.cancel_session("s1", |_| By::Terminal);
         gone.sort();
         let mut want = vec![a.clone(), b.clone()];
         want.sort();
@@ -519,7 +728,7 @@ mod tests {
         assert_eq!(asks.pending().len(), 1);
         assert_eq!(asks.pending()[0].id, c);
         assert!(
-            asks.cancel_session("s1").is_empty(),
+            asks.cancel_session("s1", |_| By::Cancelled).is_empty(),
             "nothing left to cancel"
         );
         // A cancelled ask answers the hook `{}`: Claude shows (or has moved past) its menu.

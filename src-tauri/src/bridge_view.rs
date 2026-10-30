@@ -393,6 +393,8 @@ pub fn ask_push(view: &AskView, private: bool) -> Value {
         "toolUseId": view.tool_use_id,
         "questions": view.questions,
         "createdMs": view.created_ms,
+        // false = the terminal has it (no hook waiting): shown in full, read-only.
+        "held": view.held,
     })
 }
 
@@ -420,6 +422,7 @@ pub fn permission_push(view: &PermissionView, private: bool) -> Value {
         "toolName": view.tool_name,
         "summary": view.summary,
         "createdMs": view.created_ms,
+        "held": view.held,
     })
 }
 
@@ -871,6 +874,7 @@ mod tests {
             tool_use_id: "t".into(),
             questions: json!([{ "question": long }, { "question": "second" }]),
             created_ms: 1,
+            held: true,
         }];
         let v = view(&[p], &fleet, &asks);
         let s = &v["projects"][0]["sessions"];
@@ -911,6 +915,7 @@ mod tests {
             tool_use_id: "t".into(),
             questions: json!([{ "question": "Delete payroll?" }]),
             created_ms: 1,
+            held: true,
         }];
         let v = view(&[project("p", vec![a, b])], &fleet, &asks);
         for i in 0..2 {
@@ -965,7 +970,54 @@ mod tests {
             tool_use_id: "tu".into(),
             questions: json!([{"question":"Q?","options":[{"label":"A"}]}]),
             created_ms: 7,
+            held: true,
         }
+    }
+
+    #[test]
+    fn every_open_item_says_whether_a_hook_is_waiting_on_it() {
+        let held = ask_push(&ask("ask-1", "s1"), false);
+        assert_eq!(held["held"], true);
+        let observed = ask_push(
+            &AskView {
+                held: false,
+                ..ask("ask-2", "s1")
+            },
+            false,
+        );
+        assert_eq!(observed["held"], false);
+        // The full question, so the phone can show what the terminal is asking.
+        assert_eq!(observed["questions"][0]["question"], "Q?");
+        assert_eq!(observed["toolUseId"], "tu");
+        // Private: still exactly the four keys, held or not.
+        let private = ask_push(
+            &AskView {
+                held: false,
+                ..ask("ask-3", "s1")
+            },
+            true,
+        );
+        assert_eq!(
+            private,
+            json!({ "kind": "ask", "id": "ask-3", "sessionId": "s1", "private": true })
+        );
+        let perm = crate::broker::PermissionView {
+            id: "perm-1".into(),
+            session: "s1".into(),
+            tool_name: "Bash".into(),
+            summary: "ls".into(),
+            created_ms: 9,
+            held: false,
+        };
+        assert_eq!(
+            permission_push(&perm, false),
+            json!({ "kind": "permission", "id": "perm-1", "sessionId": "s1",
+                "toolName": "Bash", "summary": "ls", "createdMs": 9, "held": false })
+        );
+        assert_eq!(
+            permission_push(&perm, true),
+            json!({ "kind": "permission", "id": "perm-1", "sessionId": "s1", "private": true })
+        );
     }
 
     fn item(id: &str) -> PushItem {
@@ -982,6 +1034,7 @@ mod tests {
             keys(&open),
             [
                 "createdMs",
+                "held",
                 "id",
                 "kind",
                 "questions",
@@ -1032,12 +1085,13 @@ mod tests {
             tool_name: "Bash".into(),
             summary: "touch a.txt".into(),
             created_ms: 9,
+            held: true,
         };
         let open = permission_push(&view, false);
         assert_eq!(
             open,
             json!({ "kind": "permission", "id": "perm-1", "sessionId": "s1",
-                "toolName": "Bash", "summary": "touch a.txt", "createdMs": 9 })
+                "toolName": "Bash", "summary": "touch a.txt", "createdMs": 9, "held": true })
         );
         // Private: that it exists, nothing of what it would run.
         let private = permission_push(&view, true);
