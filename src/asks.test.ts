@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { answerSummary, askGateOpen, askResolvedPlan, askResolvedToast, askShouldHandOff, buildAnswers, permissionsToShow, sessionsAwaitingAnswer, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "./asks";
+import { answerSummary, askGateOpen, askResolvedPlan, askResolvedToast, buildAnswers, focusedTerminal, permissionsToShow, terminalInFront, sessionsAwaitingAnswer, splitRecommended, waitingClock, type AskQuestion, type PendingAsk } from "./asks";
 import { MULTISELECT_JOIN } from "./askProtocol";
 import { resolvedCopy } from "./permissionView";
 
@@ -17,15 +17,18 @@ describe("ask gate", () => {
   });
 });
 
-describe("hand-off", () => {
-  it("hands off when the user is looking at that session's terminal", () => {
-    expect(askShouldHandOff(ask, { selectedSessionId: "s1", continuityVisible: false, windowFocused: true })).toBe(true);
+describe("the terminal in front", () => {
+  it("is the selected session's, only while a window is focused and the graph is not covering it", () => {
+    expect(focusedTerminal({ selectedSessionId: "s1", continuityVisible: false, windowFocused: true })).toBe("s1");
+    expect(focusedTerminal({ selectedSessionId: "s1", continuityVisible: true, windowFocused: true })).toBe(null);
+    expect(focusedTerminal({ selectedSessionId: "s1", continuityVisible: false, windowFocused: false })).toBe(null);
+    expect(focusedTerminal({ selectedSessionId: null, continuityVisible: false, windowFocused: true })).toBe(null);
   });
-  it("keeps the card while the graph is the visible surface, another session is selected, or the window is unfocused", () => {
-    expect(askShouldHandOff(ask, { selectedSessionId: "s1", continuityVisible: true, windowFocused: true })).toBe(false);
-    expect(askShouldHandOff(ask, { selectedSessionId: "s2", continuityVisible: false, windowFocused: true })).toBe(false);
-    expect(askShouldHandOff(ask, { selectedSessionId: "s1", continuityVisible: false, windowFocused: false })).toBe(false);
-    expect(askShouldHandOff(ask, { selectedSessionId: null, continuityVisible: false, windowFocused: true })).toBe(false);
+  it("names the item whose session that is", () => {
+    expect(terminalInFront(ask, { selectedSessionId: "s1", continuityVisible: false, windowFocused: true })).toBe(true);
+    expect(terminalInFront(ask, { selectedSessionId: "s1", continuityVisible: true, windowFocused: true })).toBe(false);
+    expect(terminalInFront(ask, { selectedSessionId: "s2", continuityVisible: false, windowFocused: true })).toBe(false);
+    expect(terminalInFront(ask, { selectedSessionId: "s1", continuityVisible: false, windowFocused: false })).toBe(false);
   });
 });
 

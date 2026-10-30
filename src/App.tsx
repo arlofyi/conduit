@@ -17,7 +17,7 @@ import {
 } from "./store";
 import { type AgentId } from "./agents";
 import { applyCliOpenPayload, inThisWindow, type CliOpenPayload } from "./cliOpen";
-import { askGateOpen, askResolvedPlan, askShouldHandOff, type PendingAsk } from "./asks";
+import { askGateOpen, askResolvedPlan, focusedTerminal, terminalInFront, type PendingAsk } from "./asks";
 import { parseBy, resolutionHold, type PendingPermission } from "./permissionView";
 import { handedOff, handOffView } from "./askHandoff";
 import { effectiveCenterMode } from "./centerViews";
@@ -98,25 +98,13 @@ function runEditorAction(id: string): void {
 }
 
 
-/** An incoming ask (live or catch-up). One for the terminal the user is already watching
- *  goes straight back to it and never becomes a card: adding it first would flash a docked
- *  card for a frame and then toast about moving it. If the hand-off fails, show the card. */
+/** An incoming ask (live or catch-up). Every one Rust sends is HELD -- the hook decided,
+ *  when Claude asked, that a card should take it (hooks.rs `holder_for`), so its terminal
+ *  shows no menu meanwhile and the card is always drawn. A question for the terminal the
+ *  user was already looking at never gets here: the hook answered it `{}` at once. */
 function admitAsk(a: PendingAsk) {
   const s = useStore.getState();
   if (handedOff.has(a.id) || a.id in s.asks) return;
-  if (askShouldHandOff(a, handOffView(s))) {
-    handedOff.add(a.id);
-    // "kept": a connected phone holds it, so the terminal shows no menu -- show the card.
-    void invoke<string>("ask_auto_handoff", { id: a.id })
-      .then((r) => {
-        if (r === "kept") useStore.getState().addAsk(a);
-      })
-      .catch(() => {
-        handedOff.delete(a.id);
-        useStore.getState().addAsk(a);
-      });
-    return;
-  }
   s.addAsk(a);
 }
 
@@ -985,7 +973,7 @@ export default function App() {
           // A card hidden behind its own terminal (the dock's hand-off rule) was never seen:
           // drop it now, or looking away during the hold would surface a stale card.
           const held = s.permissions[payload.id];
-          if (resolutionHold(by, !!held && !askShouldHandOff(held, handOffView(s)))) {
+          if (resolutionHold(by, !!held && !terminalInFront(held, handOffView(s)))) {
             s.notePermissionResolved(payload.id, by!);
             setTimeout(() => useStore.getState().removePermission(payload.id), PERMISSION_DONE_HOLD_MS);
           } else s.removePermission(payload.id);
@@ -1045,25 +1033,12 @@ export default function App() {
       windowFocused: s.windowFocused,
     }),
   );
+  // ...and which session's terminal is in front of the user. The hook reads both when
+  // Claude asks and decides then; nothing already held is moved when they change.
+  const focused = useStore((s) => focusedTerminal(handOffView(s)));
   useEffect(() => {
-    void invoke("set_ask_gate", { open: askGate }).catch(() => {});
-  }, [askGate]);
-
-  // Hand a question back once its session's own terminal is in front of the user. Each id
-  // is invoked once; it is forgotten when its `ask-resolved` arrives.
-  useEffect(() => {
-    return useStore.subscribe((s) => {
-      const view = handOffView(s);
-      for (const a of Object.values(s.asks)) {
-        if (handedOff.has(a.id)) continue;
-        if (askShouldHandOff(a, view)) {
-          handedOff.add(a.id);
-          // A phone-held question is "kept" and its card simply stays.
-          void invoke("ask_auto_handoff", { id: a.id }).catch(() => handedOff.delete(a.id));
-        }
-      }
-    });
-  }, []);
+    void invoke("set_ask_gate", { open: askGate, focused }).catch(() => {});
+  }, [askGate, focused]);
 
   // Returning to the app clears "needs you" on whatever session you're viewing.
   useEffect(() => {

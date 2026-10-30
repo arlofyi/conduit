@@ -13,20 +13,28 @@ export function askGateOpen(i: { enabled: boolean; viewOpen: boolean; windowFocu
   return i.enabled && (i.viewOpen || i.windowFocused);
 }
 
-/** Hand back once the user is looking at that session's own terminal — the menu is about
- *  to be useful there, and a card elsewhere would be a second copy of the same question. */
+/** Where the user is looking (see askHandoff.ts `handOffView`). */
 export type HandOffView = { selectedSessionId: string | null; continuityVisible: boolean; windowFocused: boolean };
 
-export function askShouldHandOff(ask: Pick<PendingAsk, "session">, v: HandOffView): boolean {
-  return v.windowFocused && !v.continuityVisible && v.selectedSessionId === ask.session;
+/** The session whose terminal is in front of the user: the selected one, while a Conduit
+ *  window is focused and the Continuity graph is not covering it; else null. Sent to Rust
+ *  with the gate (`set_ask_gate`), where the hook decides — once, when Claude asks —
+ *  whether that session's question needs a card at all (hooks.rs `holder_for`). */
+export function focusedTerminal(v: HandOffView): string | null {
+  return v.windowFocused && !v.continuityVisible ? v.selectedSessionId : null;
+}
+
+export function terminalInFront(item: { session: string }, v: HandOffView): boolean {
+  return focusedTerminal(v) === item.session;
 }
 
 /** The permission cards worth drawing. Claude's own dialog is already up in every
- *  session's terminal, so a permission for the terminal in front of the user is HIDDEN
- *  (same rule as an ask's hand-off) — never resolved: it comes back when the user looks
- *  away, and the terminal stays the one place to answer it meanwhile. */
+ *  session's terminal, so a permission for the terminal in front of the user is HIDDEN —
+ *  never resolved: it comes back when the user looks away, and the terminal stays the one
+ *  place to answer it meanwhile. (A question is never hidden: while a hook holds it the
+ *  terminal shows no menu, so the card is the only way to answer it on the Mac.) */
 export function permissionsToShow<P extends { session: string }>(list: P[], v: HandOffView): P[] {
-  return list.filter((p) => !askShouldHandOff(p, v));
+  return list.filter((p) => !terminalInFront(p, v));
 }
 
 /** Sessions with at least one ask still unanswered. An ask in `answered` is only holding
@@ -37,9 +45,9 @@ export function sessionsAwaitingAnswer(asks: Iterable<PendingAsk>, answered: Rec
   return out;
 }
 
-/** Whether an `ask-resolved` deserves a toast. A hand-off (automatic, or the card's own
- *  link) is the user already looking at the terminal, and an answer has its own done state;
- *  only a card the user could see running into the ceiling needs telling where it went. */
+/** Whether an `ask-resolved` deserves a toast. A hand-off (the card's own link, Esc in the
+ *  terminal, the last phone leaving) and an answer each have their own done state; only a
+ *  card the user could see running into the ceiling needs telling where it went. */
 export function askResolvedToast(how: string, cardWasShown: boolean): boolean {
   return how === "timeout" && cardWasShown;
 }
