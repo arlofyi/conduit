@@ -10,6 +10,7 @@ import {
   type LocalProviderStatus,
 } from "../store";
 import { agentMeta, type AgentId } from "../agents";
+import { Button, Switch, Segmented, Notice } from "./ui";
 
 /**
  * One agent's endpoint, edited in one place.
@@ -220,41 +221,45 @@ export function EndpointEditor({
     await loadModels(false);
   };
 
-  const chipRow = (defs: PresetDef[]) => (
-    <div className="mp-chips">
-      {defs.map((p) => {
+  const chipRow = (defs: PresetDef[], groupLabel: string) => (
+    <Segmented
+      value={endpoint.preset || ""}
+      onChange={(val) => {
+        const p = defs.find((d) => d.preset === val);
+        if (p) {
+          // Changing the endpoint invalidates the model: an id served by Ollama is not
+          // an id OpenRouter serves. Clearing it is what stops a stale model silently
+          // pinning a route the new endpoint cannot honour.
+          save({ preset: p.preset, baseUrl: p.baseUrl || endpoint.baseUrl, model: "" });
+          setModels([]);
+          setFilter("");
+          setNote(null);
+        }
+      }}
+      label={groupLabel}
+      options={defs.map((p) => {
         const live = statuses?.find((s) => s.preset === p.preset)?.running;
         const detail = statuses?.find((s) => s.preset === p.preset)?.detail;
-        return (
-          <button
-            key={p.preset}
-            className={`mp-chip${endpoint.preset === p.preset ? " active" : ""}`}
-            title={detail || p.baseUrl || undefined}
-            onClick={() => {
-              // Changing the endpoint invalidates the model: an id served by Ollama is not
-              // an id OpenRouter serves. Clearing it is what stops a stale model silently
-              // pinning a route the new endpoint cannot honour.
-              save({ preset: p.preset, baseUrl: p.baseUrl || endpoint.baseUrl, model: "" });
-              setModels([]);
-              setFilter("");
-              setNote(null);
-            }}
-          >
-            {live ? <span className="mp-dot" /> : null}
-            {p.label}
-          </button>
-        );
+        return {
+          value: p.preset,
+          label: (
+            <>
+              {live ? <span className="mp-dot" /> : null}
+              {p.label}
+            </>
+          ),
+          title: detail || p.baseUrl || undefined,
+        };
       })}
-    </div>
+    />
   );
 
   return (
     <div className="mp-section">
-      <label className="mp-row mp-toggle">
-        <input
-          type="checkbox"
+      <label className="ui-switch-label">
+        <Switch
           checked={endpoint.enabled}
-          onChange={(e) => save({ enabled: e.target.checked })}
+          onChange={(on) => save({ enabled: on })}
         />
         <span>Route {meta.label} at a chosen endpoint</span>
       </label>
@@ -270,7 +275,7 @@ export function EndpointEditor({
               On this machine
               <span className="ep-group-sub">nothing leaves your computer</span>
             </div>
-            {chipRow(LOCAL_PRESET_DEFS)}
+            {chipRow(LOCAL_PRESET_DEFS, "Local providers")}
           </div>
 
           <div className="ep-group">
@@ -278,7 +283,7 @@ export function EndpointEditor({
               Cloud
               <span className="ep-group-sub">prompts are sent to a provider</span>
             </div>
-            {chipRow(REMOTE_PRESET_DEFS)}
+            {chipRow(REMOTE_PRESET_DEFS, "Remote providers")}
           </div>
 
           {endpoint.preset ? (
@@ -313,13 +318,14 @@ export function EndpointEditor({
                     if (e.key === "Enter") void saveKey();
                   }}
                 />
-                <button
-                  className="mp-btn"
+                <Button
+                  variant="primary"
+                  size="sm"
                   onClick={() => void saveKey()}
                   disabled={!keyDraft.trim() || busy}
                 >
                   {busy ? "Checking…" : "Save & load"}
-                </button>
+                </Button>
               </label>
               <p className="mp-note ep-keyhint">
                 {keyHeld ? "Key stored. " : ""}
@@ -378,11 +384,10 @@ export function EndpointEditor({
             </div>
           ) : null}
 
-          <label className="mp-row mp-toggle">
-            <input
-              type="checkbox"
+          <label className="ui-switch-label">
+            <Switch
               checked={endpoint.pinLocal}
-              onChange={(e) => save({ pinLocal: e.target.checked })}
+              onChange={(on) => save({ pinLocal: on })}
             />
             <span>
               Use only this endpoint
@@ -395,8 +400,9 @@ export function EndpointEditor({
           </label>
 
           <div className="mp-actions">
-            <button
-              className="mp-btn"
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={async () => {
                 setBusy(true);
                 try {
@@ -409,31 +415,31 @@ export function EndpointEditor({
               disabled={busy}
             >
               {busy ? "Scanning…" : "Re-scan"}
-            </button>
+            </Button>
             {needsKey && !keyHeld ? (
               <span className="mp-note">Enter a key above to list models.</span>
             ) : null}
           </div>
 
           {!providerReady(endpoint) ? (
-            <p className="mp-warn">
+            <Notice tone="error">
               Incomplete — a base URL and a model are both needed before this endpoint is used.
-            </p>
+            </Notice>
           ) : null}
 
           {/* The silo rule is the one place this editor must be blunt: "use only this
               endpoint" is satisfied by a cloud aggregator, which defeats a local-only
               session entirely — so the backend drops the routing rather than honour it. */}
           {sessionLocalOnly && !allowedForLocalOnly(endpoint) ? (
-            <p className="mp-warn">
+            <Notice tone="error">
               This session is marked local-only, but {def?.label ?? "this endpoint"} is not local
               inference. Under private mode its routing is dropped and the session runs on{" "}
               {meta.label}'s own configuration.
-            </p>
+            </Notice>
           ) : null}
 
           {note ? (
-            <p className={note.kind === "warn" ? "mp-warn" : "mp-note"}>{note.text}</p>
+            <Notice tone={note.kind === "warn" ? "warn" : "info"}>{note.text}</Notice>
           ) : null}
         </>
       )}

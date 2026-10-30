@@ -5,6 +5,8 @@ import type { McpServer } from "../agents";
 import { Dropdown } from "./Dropdown";
 import { agentMeta, type AgentId } from "../agents";
 import { AgentGlyph } from "./AgentGlyph";
+import { PlusIcon } from "./Icons";
+import { Button, ButtonRow, Notice, SettingsSection } from "./ui";
 
 /**
  * MCP server registry matrix.
@@ -239,81 +241,84 @@ export function McpMatrix() {
 
       {/* Add-server form */}
       {!formOpen ? (
-        <button className="mcp-add-btn" onClick={() => setFormOpen(true)}>
-          + Add server
-        </button>
+        <Button variant="secondary" onClick={() => setFormOpen(true)}>
+          <PlusIcon size={11} />
+          Add server
+        </Button>
       ) : (
-        <div className="mcp-form">
-          <div className="mcp-form-field">
-            <label className="mcp-form-label">Name</label>
-            <input
-              className="dialog-input mcp-form-input"
-              value={fname}
-              onChange={(e) => { setFname(e.target.value); setFerr(null); }}
-              placeholder="context7"
-              autoFocus
-            />
-          </div>
-          <div className="mcp-form-field">
-            <label className="mcp-form-label">Transport</label>
-            <Dropdown
-              className="dd-dialog"
-              value={ftransport}
-              options={[
-                { value: "stdio", label: "stdio" },
-                { value: "http", label: "http" },
-              ]}
-              onChange={(v) => setFtransport(v as "stdio" | "http")}
-            />
-          </div>
-          {ftransport === "stdio" ? (
-            <>
-              <div className="mcp-form-field">
-                <label className="mcp-form-label">Command</label>
-                <input
-                  className="dialog-input mcp-form-input mcp-mono"
-                  value={fcmd}
-                  onChange={(e) => { setFcmd(e.target.value); setFerr(null); }}
-                  placeholder="npx"
-                />
-              </div>
-              <div className="mcp-form-field">
-                <label className="mcp-form-label">Args</label>
-                <input
-                  className="dialog-input mcp-form-input mcp-mono"
-                  value={fargs}
-                  onChange={(e) => setFargs(e.target.value)}
-                  placeholder="-y @upstash/context7-mcp"
-                />
-              </div>
-            </>
-          ) : (
+        <SettingsSection title="Add MCP server" flush>
+          <div className="mcp-form">
             <div className="mcp-form-field">
-              <label className="mcp-form-label">URL</label>
+              <label className="mcp-form-label">Name</label>
               <input
-                className="dialog-input mcp-form-input mcp-mono"
-                value={furl}
-                onChange={(e) => { setFurl(e.target.value); setFerr(null); }}
-                placeholder="https://example.com/mcp"
+                className="ui-input"
+                value={fname}
+                onChange={(e) => { setFname(e.target.value); setFerr(null); }}
+                placeholder="context7"
+                autoFocus
               />
             </div>
-          )}
-          <div className="mcp-form-field">
-            <label className="mcp-form-label">Env vars</label>
-            <textarea
-              className="dialog-input mcp-form-textarea"
-              value={fenv}
-              onChange={(e) => setFenv(e.target.value)}
-              placeholder={"KEY=value\nANOTHER=value"}
-              rows={2}
-            />
+            <div className="mcp-form-field">
+              <label className="mcp-form-label">Transport</label>
+              <Dropdown
+                className="dd-dialog"
+                value={ftransport}
+                options={[
+                  { value: "stdio", label: "stdio" },
+                  { value: "http", label: "http" },
+                ]}
+                onChange={(v) => setFtransport(v as "stdio" | "http")}
+              />
+            </div>
+            {ftransport === "stdio" ? (
+              <>
+                <div className="mcp-form-field">
+                  <label className="mcp-form-label">Command</label>
+                  <input
+                    className="ui-input mono"
+                    value={fcmd}
+                    onChange={(e) => { setFcmd(e.target.value); setFerr(null); }}
+                    placeholder="npx"
+                  />
+                </div>
+                <div className="mcp-form-field">
+                  <label className="mcp-form-label">Args</label>
+                  <input
+                    className="ui-input mono"
+                    value={fargs}
+                    onChange={(e) => setFargs(e.target.value)}
+                    placeholder="-y @upstash/context7-mcp"
+                  />
+                </div>
+              </>
+            ) : (
+              <div className="mcp-form-field">
+                <label className="mcp-form-label">URL</label>
+                <input
+                  className="ui-input mono"
+                  value={furl}
+                  onChange={(e) => { setFurl(e.target.value); setFerr(null); }}
+                  placeholder="https://example.com/mcp"
+                />
+              </div>
+            )}
+            <div className="mcp-form-field">
+              <label className="mcp-form-label">Env vars</label>
+              <textarea
+                className="ui-textarea"
+                value={fenv}
+                onChange={(e) => setFenv(e.target.value)}
+                placeholder={"KEY=value\nANOTHER=value"}
+                rows={2}
+              />
+            </div>
+            {ferr && <Notice tone="error">{ferr}</Notice>}
+            <ButtonRow align="end">
+              <Button variant="ghost" onClick={() => { resetForm(); setFormOpen(false); }}>Cancel</Button>
+              <Button variant="primary" onClick={handleSubmit}>Add</Button>
+            </ButtonRow>
           </div>
-          {ferr && <div className="mcp-form-error">{ferr}</div>}
-          <div className="mcp-form-actions">
-            <button onClick={() => { resetForm(); setFormOpen(false); }}>Cancel</button>
-            <button className="primary" onClick={handleSubmit}>Add</button>
-          </div>
-        </div>
+        </SettingsSection>
       )}
     </div>
   );

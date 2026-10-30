@@ -79,8 +79,7 @@ textarea,
 .chat-empty,
 .settings-intro,
 .setting-status,
-.setting-detail-inner,
-.dialog-hint {
+.setting-detail-inner {
   -webkit-user-select: text;
   user-select: text;
 }
@@ -2834,8 +2833,7 @@ button {
 .dialog-input:focus {
   border-color: var(--accent);
 }
-.dialog-toggle,
-.telemetry-toggle {
+.dialog-toggle {
   display: flex;
   /* Top-align: these labels routinely run several lines, and a box centered against a
      paragraph looks adrift. The 1px nudge sits the 15px box on the first text line. */
@@ -2845,8 +2843,7 @@ button {
   color: var(--text-mid);
   cursor: pointer;
 }
-.dialog-toggle input[type="checkbox"],
-.telemetry-toggle input[type="checkbox"] {
+.dialog-toggle input[type="checkbox"] {
   margin-top: 1px;
 }
 .dialog-toggle.disabled {
@@ -2856,23 +2853,7 @@ button {
 /* Inline follow-on inside a toggle's label: why it is unavailable, or that we are
    still finding out. Dimmer than the label so it reads as a footnote, not a second
    instruction. */
-.dialog-hint {
-  color: var(--text-dim, var(--text-mid));
-  font-style: normal;
-  opacity: 0.75;
-  /* Explicit size: outside a dialog (e.g. Settings → Terminal) this inherits the body
-     size and dwarfs the 12px control it explains. */
-  display: block;
-  font-size: 11.5px;
-  line-height: 1.55;
-}
-.dialog-hint code {
-  font-family: var(--mono-font);
-  font-size: 11px;
-  padding: 0 3px;
-  border-radius: 3px;
-  background: var(--hover);
-}
+
 .dialog-actions {
   display: flex;
   justify-content: flex-end;
@@ -3063,7 +3044,7 @@ button {
   display: inline-flex; align-items: center; gap: 6px; margin-top: 4px;
   font-size: 11px; color: var(--text-mid); cursor: pointer; user-select: none;
 }
-.agy-track-toggle input { cursor: pointer; }
+.agy-track-toggle label { cursor: pointer; }
 
 /* ---- Unified multi-account usage bar (replaces the per-agent panels) ---- */
 .usage-panel {
@@ -3261,16 +3242,7 @@ button {
   flex-direction: column;
   gap: 16px;
 }
-.usage-prefs-section {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.usage-prefs-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-bright);
-}
+
 .usage-prefs-checks {
   display: flex;
   flex-direction: column;
@@ -3570,23 +3542,31 @@ button {
 }
 .setting-row.disabled .setting-row-label {
   opacity: 0.5;
-  cursor: not-allowed;
 }
 .setting-row-head {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 12px;
+  min-height: 26px;
 }
 .setting-row-label {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
   flex: 1;
+}
+.setting-row-trailing {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+label.setting-row-title {
   cursor: pointer;
 }
-.setting-row-label:not(label) {
-  cursor: default;
+.setting-row.disabled label.setting-row-title {
+  cursor: not-allowed;
 }
 .setting-row-title {
   font-size: 12.5px;
@@ -3625,13 +3605,8 @@ button {
   outline: 1px solid var(--accent);
   outline-offset: 1px;
 }
-/* Status + detail + control share the title's left edge (checkbox 15px + 8px gap),
-   so everything under a title reads as one column. */
-.setting-status,
-.setting-control,
-.setting-detail {
-  padding-left: 23px;
-}
+/* Status + detail + control share the title's left edge (the switch sits at the row's
+   right end), so everything under a title reads as one column. */
 .setting-status {
   font-size: 11.5px;
   color: var(--text-mid);
@@ -3680,18 +3655,7 @@ button {
   background: var(--hover);
 }
 /* Same affordance as "Choose…" above — one button style, not a third. */
-.cli-shim-action > button {
-  font-size: 12px;
-  padding: 4px 12px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--sidebar-bg);
-  color: var(--text-bright);
-  cursor: pointer;
-}
-.cli-shim-action > button:hover {
-  border-color: var(--accent);
-}
+
 @media (prefers-reduced-motion: reduce) {
   .setting-detail,
   .setting-detail-inner,
@@ -3725,55 +3689,14 @@ button {
   border: 1px solid color-mix(in srgb, #e0a63a 45%, transparent);
   background: color-mix(in srgb, #e0a63a 12%, transparent);
 }
-.trust-scan {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-}
-.trust-scan-input {
-  width: 100%;
-  box-sizing: border-box;
-  resize: vertical;
-  font-family: var(--font-mono, monospace);
-  font-size: 11px;
-  padding: 8px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg-elevated, var(--bg));
-  color: var(--text-bright);
-}
+
 .trust-scan-actions {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 /* The Scan action was a bare text node — give it real button affordance. */
-.trust-scan-actions > button {
-  font-size: 12px;
-  color: var(--text-bright);
-  background: var(--sidebar-bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 4px 12px;
-  cursor: pointer;
-}
-.trust-scan-actions > button:hover:not(:disabled) {
-  border-color: var(--accent);
-}
-.trust-scan-actions > button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.trust-scan-clean {
-  font-size: 11px;
-  color: var(--text-mid);
-}
-.trust-scan-hit {
-  font-size: 11px;
-  color: #f2b8b8;
-}
+
 .trust-scan-list {
   margin: 0;
   padding-left: 18px;
@@ -3870,28 +3793,7 @@ button {
   flex-direction: column;
   gap: 10px;
 }
-.route-scope {
-  display: inline-flex;
-  gap: 6px;
-}
-.route-scope-btn {
-  font-size: 11px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text-mid);
-  cursor: pointer;
-}
-.route-scope-btn.on {
-  border-color: var(--accent);
-  color: var(--text-bright);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-}
-.route-scope-btn:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
+
 .route-task {
   display: flex;
   flex-direction: column;
@@ -3911,13 +3813,7 @@ button {
 /* Where the chain in force came from. Deliberately always shown, not only when
    overridden: "which of the three scopes am I looking at" is the question this page
    exists to answer. */
-.route-origin {
-  font-size: 10px;
-  color: var(--text-mid);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 1px 7px;
-}
+
 .route-hint {
   font-size: 10px;
   color: var(--text-mid);
@@ -3957,23 +3853,6 @@ button {
   color: var(--text-bright);
   border-color: var(--accent);
 }
-.route-reset {
-  margin-left: auto;
-}
-.route-add {
-  align-self: flex-start;
-  font-size: 11px;
-  color: var(--text-mid);
-  background: transparent;
-  border: 1px dashed var(--border);
-  border-radius: 5px;
-  padding: 3px 9px;
-  cursor: pointer;
-}
-.route-add:hover {
-  color: var(--text-bright);
-  border-color: var(--accent);
-}
 
 /* ---- Settings > Command Code ---- */
 .cc-panel {
@@ -3981,13 +3860,7 @@ button {
   flex-direction: column;
   gap: 12px;
 }
-.cc-section {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-}
+
 .cc-field {
   display: flex;
   flex-direction: column;
@@ -3997,34 +3870,10 @@ button {
   font-size: 11px;
   color: var(--text-mid);
 }
-.cc-toggle {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  font-size: 11px;
-  color: var(--text-mid);
-  line-height: 1.5;
-}
-.cc-toggle input {
-  margin-top: 2px;
-  flex: 0 0 auto;
-}
-.cc-note {
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text-mid);
-}
-.cc-note code {
-  font-family: var(--mono-font);
-  font-size: 10px;
-}
+
 /* Errors and unreachable-CLI notices: same shape as a note, tinted so it reads as a
    problem without becoming an alarm — none of these states break the panel. */
-.cc-warn {
-  color: var(--text-bright);
-  border-left: 2px solid var(--commandcode);
-  padding-left: 8px;
-}
+
 .oc-section {
   display: flex;
   flex-direction: column;
@@ -4181,10 +4030,7 @@ button {
   flex-direction: column;
   gap: 12px;
 }
-.account-actions {
-  display: flex;
-  gap: 8px;
-}
+
 .account-remove {
   flex-shrink: 0;
   font-size: 11px;
@@ -4199,10 +4045,7 @@ button {
   color: var(--text-bright);
   border-color: var(--text-mid);
 }
-.account-error {
-  font-size: 12px;
-  color: #e06c75;
-}
+
 .account-candidates {
   display: flex;
   flex-direction: column;
@@ -4230,34 +4073,7 @@ button {
   color: var(--text-mid);
   cursor: pointer;
 }
-.account-defaults {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
-}
-.account-defaults-title {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-dim);
-}
-.account-defaults-hint {
-  font-size: 11px;
-  color: var(--text-dim);
-  margin: -2px 0 2px;
-}
-.account-default-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-.account-default-label {
-  font-size: 12px;
-  color: var(--text-mid);
-}
+
 /* Dropdown (.dd) sizing variants per site. The old .account-select /
    .mcp-form-select / .oc-model-select native selects are gone — every dropdown
    is the custom .dd component now. */
@@ -4336,11 +4152,9 @@ input[type="checkbox"]:checked::after {
   transform: translate(-50%, -50%) rotate(45deg);
 }
 /* agy quota toggle keeps its brand color on the same custom box. */
-.agy-track-toggle input[type="checkbox"]:checked {
+/* agy keeps its brand colour on its own switch. */
+.agy-track-toggle .ui-switch.on {
   background: var(--agy);
-  border-color: var(--agy);
-}
-.agy-track-toggle input[type="checkbox"]:hover {
   border-color: var(--agy);
 }
 
@@ -4508,35 +4322,6 @@ input[type="number"]:focus {
   text-overflow: ellipsis;
 }
 
-.agent-tag {
-  font-size: 9.5px;
-  color: var(--accent);
-  letter-spacing: 0.04em;
-  padding: 2px 6px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-
-.agent-stat {
-  font-size: 10px;
-  padding: 2px 7px;
-  border-radius: 4px;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-
-.agent-stat.ok {
-  color: var(--green);
-  background: color-mix(in srgb, var(--green) 12%, transparent);
-}
-
-.agent-stat.no {
-  color: var(--text-dim);
-  background: var(--selection-bg);
-}
-
 .agent-rescan {
   margin-top: 6px;
   align-self: flex-start;
@@ -4560,24 +4345,7 @@ input[type="number"]:focus {
 }
 
 /* ---- One-click agent install (Feature 5) ---- */
-.agent-install-btn {
-  font-size: 10px;
-  padding: 3px 10px;
-  border-radius: 4px;
-  white-space: nowrap;
-  flex-shrink: 0;
-  color: var(--accent);
-  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-}
-.agent-install-btn:hover:not(:disabled) {
-  color: var(--text-bright);
-  background: color-mix(in srgb, var(--accent) 20%, transparent);
-}
-.agent-install-btn:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
+
 .agent-install-note {
   font-size: 10.5px;
   color: var(--green);
@@ -4860,21 +4628,6 @@ input[type="number"]:focus {
 }
 
 /* "Add server" trigger button */
-.mcp-add-btn {
-  align-self: flex-start;
-  font-size: 12px;
-  color: var(--accent);
-  padding: 5px 10px;
-  border-radius: 6px;
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  transition: background 0.1s, border-color 0.1s;
-}
-
-.mcp-add-btn:hover {
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
-  border-color: var(--accent);
-}
 
 /* Add-server form */
 .mcp-form {
@@ -4901,64 +4654,7 @@ input[type="number"]:focus {
   text-align: right;
 }
 
-.mcp-form-input {
-  flex: 1;
-  min-width: 0;
-  font-size: 12px;
-  padding: 5px 8px;
-}
-
 /* Unified hover/focus + monospace code fields for the add-server form. */
-.mcp-form-input:hover,
-.mcp-form-textarea:hover {
-  border-color: var(--text-dim);
-}
-.mcp-form-input.mcp-mono {
-  font-family: var(--mono-font);
-  font-size: 11.5px;
-}
-
-.mcp-form-textarea {
-  flex: 1;
-  min-width: 0;
-  font-family: var(--mono-font);
-  font-size: 11.5px;
-  padding: 5px 8px;
-  resize: vertical;
-  min-height: 44px;
-  line-height: 1.4;
-  -webkit-user-select: text;
-  user-select: text;
-}
-
-.mcp-form-error {
-  font-size: 11px;
-  color: var(--red);
-  padding: 2px 70px; /* indent past label */
-}
-
-.mcp-form-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  padding-top: 2px;
-}
-
-.mcp-form-actions button {
-  font-size: 12px;
-  color: var(--text-bright);
-  padding: 5px 12px;
-  border-radius: 5px;
-}
-
-.mcp-form-actions button:hover {
-  background: var(--selection-bg);
-}
-
-.mcp-form-actions button.primary {
-  background: var(--accent);
-  color: var(--sidebar-bg);
-}
 
 /* "Skip" affordance inside the onboarding MCP step */
 .mcp-skip-link {
@@ -5314,19 +5010,7 @@ input[type="number"]:focus {
   align-items: center;
   gap: 10px;
 }
-.about-check-btn {
-  font-size: 12px;
-  padding: 4px 10px;
-  border-radius: 6px;
-  cursor: pointer;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text-bright);
-}
-.about-check-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
+
 .about-update-status {
   font-size: 12px;
   color: var(--text-mid);
@@ -5533,7 +5217,6 @@ input[type="number"]:focus {
 
 /* ---- Plugins ---- */
 .plugins-panel { display: flex; flex-direction: column; gap: 14px; font-family: var(--ui-font); }
-.plugins-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* Buttons in the panel share the app's settings-button look (cf. .mcp-form-actions button). */
 .plugins-panel button,
@@ -5932,26 +5615,8 @@ button.hq-note:hover { color: var(--hq-ink-2); border-color: var(--hq-line-2); }
 .hq-list { margin-bottom: 6px; }
 .root-chat-row .name { flex: 1; }
 .root-chat-running { color: var(--accent); flex: none; }
-.workspace-root-input { display: flex; gap: 8px; }
-.workspace-root-input input {
-  flex: 1; background: color-mix(in srgb, var(--border) 40%, transparent);
-  color: var(--text-bright); border: 1px solid var(--border); border-radius: 6px;
-  padding: 6px 10px; font-size: 12px; font-family: var(--mono-font);
-}
-/* "Choose…" was a bare text node — give it the same button affordance as Scan. */
-.workspace-root-input > button {
-  font-size: 12px;
-  color: var(--text-bright);
-  background: var(--sidebar-bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 4px 12px;
-  cursor: pointer;
-}
-.workspace-root-input > button:hover {
-  border-color: var(--accent);
-}
 
+/* "Choose…" was a bare text node — give it the same button affordance as Scan. */
 
 /* HQ row glyph — the chat counterpart of a session row's agent mark. */
 .root-chat-glyph { color: var(--text-mid); flex: none; }
@@ -6064,10 +5729,7 @@ button.hq-note:hover { color: var(--hq-ink-2); border-color: var(--hq-line-2); }
 .mp-input:focus {
   border-color: var(--accent);
 }
-.mp-toggle {
-  font-size: 11px;
-  color: var(--text-mid);
-}
+
 .mp-chips {
   display: flex;
   flex-wrap: wrap;
@@ -6461,13 +6123,7 @@ button.hq-note:hover { color: var(--hq-ink-2); border-color: var(--hq-line-2); }
   flex-direction: column;
   gap: 8px;
 }
-.ep-pool-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--text-mid);
-}
+
 .ep-rows {
   list-style: none;
   margin: 0;
@@ -6955,7 +6611,7 @@ button.hq-note:hover { color: var(--hq-ink-2); border-color: var(--hq-line-2); }
 .mobile-device-name { font-size: 13px; color: var(--text-bright); }
 .mobile-device-meta, .mobile-empty, .mobile-port { font-size: 11.5px; color: var(--text-mid); }
 .mobile-port { margin-top: 12px; }
-.mobile-error { font-size: 12px; color: var(--red); margin-top: 6px; }
+
 .header-badge {
   min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; margin-left: 2px;
   background: var(--amber); color: var(--panel-bg); font-size: 10.5px; font-weight: 700; line-height: 16px; text-align: center;
@@ -6984,19 +6640,334 @@ button.hq-note:hover { color: var(--hq-ink-2); border-color: var(--hq-line-2); }
   font-size: 12px;
   color: var(--text-mid);
 }
-.setting-number {
-  width: 64px;
-  padding: 2px 6px;
-  font: inherit;
-  color: var(--text-bright);
-  background: var(--bg-input, var(--hover));
-  border: 1px solid var(--border);
-  border-radius: 4px;
-}
-.setting-number:disabled {
-  opacity: 0.5;
-}
+
 .setting-note {
   font-size: 11.5px;
   color: var(--text-mid);
 }
+
+/* ══ Settings vocabulary (src/components/ui.tsx) ═══════════════════════════════
+   One button, one switch, one segmented picker, one badge, one input, one section
+   surface. Sized to match .dd-trigger (12px / 26px tall / 6px radius) so a row holding a
+   Dropdown, a number and a button lines up on one baseline. Everything derives from the
+   theme tokens, so all three themes get it for free. */
+.ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 120ms ease-out, border-color 120ms ease-out, color 120ms ease-out;
+}
+.ui-btn-sm { height: 26px; padding: 0 10px; }
+.ui-btn-md { height: 30px; padding: 0 14px; font-size: 12.5px; }
+.ui-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: 1px;
+}
+.ui-btn:disabled { opacity: 0.45; cursor: default; }
+
+.ui-btn-secondary {
+  color: var(--text-bright);
+  background: var(--sidebar-bg);
+  border-color: var(--border);
+}
+.ui-btn-secondary:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--sidebar-bg));
+}
+.ui-btn-primary {
+  color: var(--panel-bg);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 500;
+}
+.ui-btn-primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--accent) 88%, var(--text-bright));
+}
+.ui-btn-ghost {
+  color: var(--text-mid);
+  background: transparent;
+}
+.ui-btn-ghost:not(:disabled):hover {
+  color: var(--text-bright);
+  background: var(--selection-bg);
+}
+.ui-btn-danger {
+  color: var(--red);
+  background: transparent;
+}
+.ui-btn-danger:not(:disabled):hover {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  border-color: color-mix(in srgb, var(--red) 35%, transparent);
+}
+.ui-btn-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-btn-row-end { justify-content: flex-end; }
+.ui-btn-row-start { justify-content: flex-start; }
+
+/* Switch: 28x16 track, thumb slides 12px. The track is the panel colour off, accent on —
+   the same fill rule the checkbox uses, so on/off reads identically across controls. */
+.ui-switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 28px;
+  height: 16px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--text-dim) 35%, var(--sidebar-bg));
+  cursor: pointer;
+  transition: background 160ms ease-out, border-color 160ms ease-out;
+}
+.ui-switch-thumb {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-bright);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ui-switch.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.ui-switch.on .ui-switch-thumb {
+  transform: translateX(12px);
+  background: var(--panel-bg);
+}
+.ui-switch:not(:disabled):hover { border-color: color-mix(in srgb, var(--accent) 70%, var(--border)); }
+.ui-switch:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: 2px;
+}
+.ui-switch:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Segmented: one track, the chosen segment raised inside it. */
+.ui-seg {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  max-width: 100%;
+  overflow-x: auto;
+}
+.ui-seg-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: inherit;
+  font-size: 12px;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 5px;
+  color: var(--text-mid);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms ease-out, color 120ms ease-out;
+}
+.ui-seg-item:not(:disabled):not(.on):hover { color: var(--text-bright); background: var(--hover); }
+.ui-seg-item.on {
+  color: var(--text-bright);
+  background: var(--selection-bg);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+.ui-seg-item:disabled { opacity: 0.4; cursor: default; }
+.ui-seg-item:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent); outline-offset: -1px; }
+
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  height: 17px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 1;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  color: var(--text-mid);
+}
+.ui-badge-muted { color: var(--text-dim); border-color: color-mix(in srgb, var(--border) 70%, transparent); }
+.ui-badge-accent {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.ui-badge-good { color: var(--green); border-color: color-mix(in srgb, var(--green) 40%, transparent); }
+.ui-badge-warn { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
+.ui-badge-bad { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+
+/* Inputs. `.ui-input` is the text/number field; `.ui-textarea` the multi-line one. */
+.ui-input,
+.ui-textarea {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-bright);
+  background: var(--sidebar-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  min-width: 0;
+  transition: border-color 120ms ease-out;
+  -webkit-user-select: text;
+  user-select: text;
+}
+.ui-input { height: 26px; padding: 0 8px; }
+.ui-input[type="number"] { width: 84px; font-variant-numeric: tabular-nums; }
+.ui-input.mono,
+.ui-textarea { font-family: var(--mono-font); }
+.ui-textarea { width: 100%; padding: 8px 10px; line-height: 1.5; resize: vertical; font-size: 11.5px; }
+.ui-input::placeholder,
+.ui-textarea::placeholder { color: var(--text-dim); }
+.ui-input:hover:not(:disabled),
+.ui-textarea:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.ui-input:focus,
+.ui-textarea:focus { outline: none; border-color: var(--accent); }
+.ui-input:disabled,
+.ui-textarea:disabled { opacity: 0.5; }
+
+/* Section: heading + one line of scope + a grouped surface of rows. */
+.ui-section { display: flex; flex-direction: column; gap: 6px; }
+.ui-section + .ui-section { margin-top: 14px; }
+.ui-section-head { display: flex; align-items: center; gap: 8px; min-height: 22px; }
+.ui-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-bright);
+  flex: 1;
+  min-width: 0;
+}
+.ui-section-actions { display: flex; align-items: center; gap: 6px; }
+.ui-section-desc {
+  font-size: 11.5px;
+  color: var(--text-mid);
+  line-height: 1.5;
+  max-width: 68ch;
+  -webkit-user-select: text;
+  user-select: text;
+}
+.ui-section-body {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--sidebar-bg) 55%, transparent);
+  padding: 2px;
+}
+.ui-section-body > .setting-row { border-radius: 6px; }
+.ui-section-body > .setting-row + .setting-row {
+  box-shadow: 0 -1px 0 0 color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.ui-notice {
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--text-mid);
+  -webkit-user-select: text;
+  user-select: text;
+}
+.ui-notice-warn { color: var(--text-bright); border-color: color-mix(in srgb, var(--amber) 45%, var(--border)); background: color-mix(in srgb, var(--amber) 8%, transparent); }
+.ui-notice-error { color: var(--text-bright); border-color: color-mix(in srgb, var(--red) 50%, var(--border)); background: color-mix(in srgb, var(--red) 9%, transparent); }
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-btn, .ui-switch, .ui-switch-thumb, .ui-seg-item, .ui-input, .ui-textarea { transition: none; }
+}
+
+/* ---- Settings > Orchestration ---- */
+.orch-panel { display: flex; flex-direction: column; gap: 12px; }
+.orch-scope { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.orch-scope-hint { font-size: 11.5px; color: var(--text-mid); }
+.orch-value {
+  font-size: 12px;
+  color: var(--text-mid);
+  font-variant-numeric: tabular-nums;
+}
+.orch-disclosure {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 22px;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.orch-disclosure .ui-section-title { flex: 0 1 auto; }
+.orch-disclosure-caret { color: var(--text-dim); transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1); }
+.orch-disclosure.open .orch-disclosure-caret { transform: rotate(90deg); }
+.orch-disclosure:hover .orch-disclosure-caret,
+.orch-disclosure:hover .ui-section-title { color: var(--text-bright); }
+.orch-disclosure:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent); outline-offset: 2px; border-radius: 4px; }
+.orch-planned {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 4px;
+  padding-left: 14px;
+  border-left: 1px solid var(--border);
+}
+.orch-planned .ui-section + .ui-section { margin-top: 0; }
+.orch-planned .ui-section-title { font-weight: 500; color: var(--text-mid); }
+.orch-planned .setting-row { padding-block: 6px; }
+.orch-file-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.orch-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--sidebar-bg) 55%, transparent);
+}
+.orch-diff-head { font-size: 11.5px; font-weight: 600; color: var(--text-bright); }
+.orch-diff-empty { font-size: 11.5px; color: var(--text-mid); }
+.orch-diff-list { list-style: none; display: flex; flex-direction: column; max-height: 220px; overflow-y: auto; }
+.orch-diff-row {
+  display: grid;
+  grid-template-columns: minmax(60px, 0.6fr) minmax(0, 1.4fr) auto;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 2px;
+  font-size: 11.5px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+}
+.orch-diff-row:first-child { border-top: none; }
+.orch-diff-scope { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.orch-diff-label { color: var(--text-bright); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.orch-diff-values { display: inline-flex; gap: 6px; font-variant-numeric: tabular-nums; color: var(--text-dim); }
+.orch-diff-values s { color: var(--text-dim); }
+.orch-diff-values strong { color: var(--accent); font-weight: 500; }
+.orch-footnote {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-mid);
+}
+@media (prefers-reduced-motion: reduce) { .orch-disclosure-caret { transition: none; } }
+
+/* Settings: a text field with a button beside it (workspace root). */
+.setting-field { display: flex; align-items: center; gap: 8px; }
+.setting-field .ui-input { flex: 1; }
+.agent-list-foot { display: flex; justify-content: flex-start; margin-top: 4px; }
+.usage-prefs-value { font-size: 12px; color: var(--text-mid); font-variant-numeric: tabular-nums; }
+/* A Switch with its label beside it, outside a SettingRow. */
+.ui-switch-label { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 12px; color: var(--text-bright); cursor: pointer; }

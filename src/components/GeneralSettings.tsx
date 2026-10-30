@@ -1,8 +1,8 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { useStore } from "../store";
-import { InfoIcon } from "./Icons";
+import { Button, ButtonRow, SettingRow } from "./ui";
 
 /** Mirrors `cli_shim::ShimStatus` (serde camelCase). */
 type ShimStatus = {
@@ -13,76 +13,6 @@ type ShimStatus = {
   /** Installed by an older Conduit; the shim lacks this version's flags. */
   outdated: boolean;
 };
-
-/**
- * One settings row: a short scannable title on the control line, the full explanation
- * behind the (i) disclosure. `status` renders ALWAYS-visible follow-on lines (a restart
- * note, a missing dependency, an install path) — state the user must see without
- * clicking; the detail copy is background reading. `control` replaces the checkbox for
- * non-toggle rows (workspace root, CLI shim) and renders full-width under the title.
- *
- * The (i) button lives OUTSIDE the <label> on purpose: inside it, expanding the
- * explanation would also flip the checkbox.
- */
-export function SettingRow({
-  id,
-  title,
-  detail,
-  status,
-  checked,
-  disabled,
-  onChange,
-  control,
-}: {
-  id: string;
-  title: ReactNode;
-  detail: ReactNode;
-  status?: ReactNode;
-  checked?: boolean;
-  disabled?: boolean;
-  onChange?: (on: boolean) => void;
-  control?: ReactNode;
-}) {
-  const [openInfo, setOpenInfo] = useState(false);
-  const detailId = `setting-detail-${id}`;
-  return (
-    <div className={"setting-row" + (disabled ? " disabled" : "")}>
-      <div className="setting-row-head">
-        {onChange ? (
-          <label className="setting-row-label">
-            <input
-              type="checkbox"
-              checked={checked}
-              disabled={disabled}
-              onChange={(e) => onChange(e.target.checked)}
-            />
-            <span className="setting-row-title">{title}</span>
-          </label>
-        ) : (
-          <span className="setting-row-label">
-            <span className="setting-row-title">{title}</span>
-          </span>
-        )}
-        <button
-          type="button"
-          className={"setting-info" + (openInfo ? " on" : "")}
-          title={openInfo ? "Hide explanation" : "What does this do?"}
-          aria-label={openInfo ? "Hide explanation" : "Show explanation"}
-          aria-expanded={openInfo}
-          aria-controls={detailId}
-          onClick={() => setOpenInfo((v) => !v)}
-        >
-          <InfoIcon size={13} />
-        </button>
-      </div>
-      {status && <div className="setting-status">{status}</div>}
-      {control && <div className="setting-control">{control}</div>}
-      <div id={detailId} className="setting-detail" data-open={openInfo || undefined}>
-        <div className="setting-detail-inner">{detail}</div>
-      </div>
-    </div>
-  );
-}
 
 /** Settings → General: startup / session behavior toggles. */
 export function GeneralSettings() {
@@ -245,15 +175,16 @@ export function GeneralSettings() {
         title="Workspace root"
         detail="The folder HQ root chats read from — where your projects live. Leave empty for your home directory. Root chats can read anything under it but never modify files."
         control={
-          <div className="workspace-root-input">
+          <div className="setting-field">
             <input
               type="text"
+              className="ui-input mono"
               value={workspaceRoot}
               placeholder="~ (home directory)"
               spellCheck={false}
               onChange={(e) => setWorkspaceRoot(e.target.value)}
             />
-            <button
+            <Button
               onClick={async () => {
                 const dir = await open({
                   directory: true,
@@ -264,7 +195,7 @@ export function GeneralSettings() {
               }}
             >
               Choose…
-            </button>
+            </Button>
           </div>
         }
       />
@@ -297,22 +228,21 @@ export function GeneralSettings() {
           ) : undefined
         }
         control={
-          <div className="cli-shim-action">
+          <ButtonRow align="start">
             {shim?.outdated && (
-              <>
-                <button onClick={() => void runShim("install_cli_shim")}>
-                  Update command line tool
-                </button>{" "}
-              </>
+              <Button variant="primary" onClick={() => void runShim("install_cli_shim")}>
+                Update command line tool
+              </Button>
             )}
-            <button
+            <Button
+              variant={shim?.installed ? "danger" : "secondary"}
               onClick={() =>
                 void runShim(shim?.installed ? "remove_cli_shim" : "install_cli_shim")
               }
             >
               {shim?.installed ? "Remove" : "Install"}
-            </button>
-          </div>
+            </Button>
+          </ButtonRow>
         }
       />
     </div>

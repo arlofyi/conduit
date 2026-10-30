@@ -8,7 +8,7 @@ import {
   type LaunchRestore,
 } from "../sessionLifecycle";
 import { Dropdown } from "./Dropdown";
-import { SettingRow } from "./GeneralSettings";
+import { Button, SettingRow } from "./ui";
 
 const isWindows = /win/i.test(navigator.platform || navigator.userAgent);
 
@@ -78,7 +78,7 @@ export function SessionSettings() {
             after{" "}
             <input
               type="number"
-              className="setting-number"
+              className="ui-input"
               min={MIN_AUTO_STOP_MINUTES}
               max={MAX_AUTO_STOP_MINUTES}
               value={minutesText}
@@ -128,9 +128,9 @@ export function SessionSettings() {
           title="Remove stray NUL files"
           control={
             <div className="setting-inline">
-              <button disabled={nulBusy} onClick={() => void cleanNul()}>
+              <Button disabled={nulBusy} onClick={() => void cleanNul()}>
                 {nulBusy ? "Cleaning…" : "Clean up project folders"}
-              </button>
+              </Button>
               {nulResult && <span className="setting-note"> {nulResult}</span>}
             </div>
           }

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useStore } from "../store";
 import { AGENTS, type AgentId } from "../agents";
 import { AgentGlyph } from "./AgentGlyph";
+import { Badge, Button, Switch } from "./ui";
 
 /** Detection rows: glyph · name · binary/path · status · "default" radio.
  *  A not-found agent with a known installer gets a one-click "Install" button.
@@ -76,14 +77,14 @@ export function AgentList({ allowNoDefault = false }: { allowNoDefault?: boolean
                 <div className="agent-install-note">Installed — open a session to sign in.</div>
               )}
               {a.id === "antigravity" && ok && (
-                <label className="agy-track-toggle" title="Installs a status-line hook in agy's settings.json so Conduit can show your Antigravity quota. Uses agy's own extension surface — no third-party API access.">
-                  <input
-                    type="checkbox"
+                <div className="agy-track-toggle" title="Installs a status-line hook in agy's settings.json so Conduit can show your Antigravity quota. Uses agy's own extension surface — no third-party API access.">
+                  <Switch
+                    id="agy-track"
                     checked={agyTracking}
-                    onChange={(e) => void toggleAgyTracking(e.target.checked)}
+                    onChange={(on) => void toggleAgyTracking(on)}
                   />
-                  <span>Show usage in Conduit</span>
-                </label>
+                  <label htmlFor="agy-track">Show usage in Conduit</label>
+                </div>
               )}
               {a.id === "antigravity" && agyTrackErr && (
                 <div className="agent-install-err">{agyTrackErr}</div>
@@ -91,28 +92,29 @@ export function AgentList({ allowNoDefault = false }: { allowNoDefault?: boolean
             </div>
             {ok ? (
               defaultAgent === a.id ? (
-                <span className="agent-tag">default</span>
+                <Badge tone="accent">Default</Badge>
               ) : (
-                <span className="agent-stat ok">ready</span>
+                <Badge tone="good">Ready</Badge>
               )
             ) : d?.installCommand ? (
-              <button
-                className="agent-install-btn"
+              <Button
                 disabled={busy}
                 title={`Runs: ${d.installCommand}`}
                 onClick={() => void doInstall(a.id)}
               >
                 {busy ? "Installing…" : "Install"}
-              </button>
+              </Button>
             ) : (
-              <span className="agent-stat no">not installed</span>
+              <Badge tone="muted">Not installed</Badge>
             )}
           </div>
         );
       })}
-      <button className="agent-rescan" onClick={() => void loadAgents()}>
-        Re-scan PATH
-      </button>
+      <div className="agent-list-foot">
+        <Button variant="ghost" onClick={() => void loadAgents()}>
+          Re-scan PATH
+        </Button>
+      </div>
       {allowNoDefault && (
         <div className="agent-list-note">
           You can also pick an agent per session in the New Session dialog.

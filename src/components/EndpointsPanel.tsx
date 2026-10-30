@@ -2,7 +2,9 @@ import { useEffect, useState } from "react";
 import { AGENTS, agentMeta, type AgentId } from "../agents";
 import { useStore, EMPTY_PROVIDER, type EndpointView } from "../store";
 import { AgentGlyph } from "./AgentGlyph";
+import { PlusIcon } from "./Icons";
 import { EndpointEditor, presetMeta } from "./EndpointEditor";
+import { Button, Segmented, SettingsSection } from "./ui";
 
 /**
  * Settings → Model endpoints. The global, per-agent half of the same setting the Model tab
@@ -29,18 +31,20 @@ export function EndpointsPanel() {
 
   return (
     <div className="ep-panel">
-      <div className="mp-chips">
-        {agents.map((a) => (
-          <button
-            key={a.id}
-            className={`mp-chip${open === a.id ? " active" : ""}`}
-            onClick={() => setOpen(a.id)}
-          >
-            <AgentGlyph id={a.id} size={12} />
-            {a.label}
-          </button>
-        ))}
-      </div>
+      <Segmented
+        value={open}
+        onChange={setOpen}
+        label="Choose an agent"
+        options={agents.map((a) => ({
+          value: a.id,
+          label: (
+            <>
+              <AgentGlyph id={a.id} size={12} />
+              {a.label}
+            </>
+          ),
+        }))}
+      />
       <EndpointPool agent={open} />
       <EndpointEditor agent={open} />
     </div>
@@ -104,20 +108,23 @@ function EndpointPool({ agent }: { agent: AgentId }) {
 
   return (
     <div className="ep-pool">
-      <div className="ep-pool-head">
-        <span>Endpoints for {meta.label}</span>
-        <button
-          className="mp-btn"
-          onClick={() => {
-            // A blank active endpoint is what puts the editor below into "configure a new
-            // one" mode. It is not added to the pool until it has a URL — an unaddressable
-            // row would render a provider nothing can switch to.
-            void setProviderSettings(agent, EMPTY_PROVIDER);
-          }}
-        >
-          + Add endpoint
-        </button>
-      </div>
+      <SettingsSection
+        title={`Endpoints for ${meta.label}`}
+        actions={
+          <Button
+            onClick={() => {
+              // A blank active endpoint is what puts the editor below into "configure a new
+              // one" mode. It is not added to the pool until it has a URL — an unaddressable
+              // row would render a provider nothing can switch to.
+              void setProviderSettings(agent, EMPTY_PROVIDER);
+            }}
+          >
+            <PlusIcon size={11} />
+            Add endpoint
+          </Button>
+        }
+        flush
+      >
 
       {rows.length === 0 ? (
         <p className="mp-note">
@@ -147,18 +154,23 @@ function EndpointPool({ agent }: { agent: AgentId }) {
                   ) : null}
                 </button>
                 <span className="ep-row-actions">
-                  <button
-                    className="mp-link"
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     onClick={() => {
                       setKeyFor(open ? null : r.settings.baseUrl);
                       setKeyDraft("");
                     }}
                   >
                     {r.hasKey ? "Replace key" : "Add key"}
-                  </button>
-                  <button className="mp-link danger" onClick={() => remove(r)}>
+                  </Button>
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    onClick={() => remove(r)}
+                  >
                     Remove
-                  </button>
+                  </Button>
                 </span>
                 {open ? (
                   <div className="ep-row-key">
@@ -174,19 +186,20 @@ function EndpointPool({ agent }: { agent: AgentId }) {
                         if (e.key === "Escape") setKeyFor(null);
                       }}
                     />
-                    <button className="mp-btn" onClick={() => void saveKey(r)}>
+                    <Button variant="primary" size="sm" onClick={() => void saveKey(r)}>
                       Save
-                    </button>
+                    </Button>
                     {r.hasKey ? (
-                      <button
-                        className="mp-link danger"
+                      <Button
+                        variant="ghost"
+                        size="sm"
                         onClick={async () => {
                           await setEndpointKey(agent, r.settings.baseUrl, "");
                           setKeyFor(null);
                         }}
                       >
                         Clear
-                      </button>
+                      </Button>
                     ) : null}
                     {/* Said on every key field, because "held in memory" is the part that
                         explains why it must be entered again after a restart. */}
@@ -207,6 +220,7 @@ function EndpointPool({ agent }: { agent: AgentId }) {
           the session.
         </p>
       ) : null}
+      </SettingsSection>
     </div>
   );
 }
