@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.48.0 — 2026-10-30
+
 - **Added — Conduit for iPhone.** The app connects to your Mac over Tailscale, remembers it, and finds your other Macs on the same tailnet. It opens on a WhatsApp-style list of every session: each in its project's colour, with its agent, status, last message and an unread count, anything waiting on you on top, filterable by what needs you, what is running or one project, and switchable by profile. Open a chat to read the conversation as it happens and reply; it shows whether the session is working, waiting on you or idle, its model and how full its context is, and stays put while you scroll back. A banner drops in when another session asks a question or needs your permission (and, if you turn it on, when one finishes). Private sessions are listed but never previewed, and the Mac refuses to open them on a phone.
 - **Added — Start a new chat from the phone.** "+" on the chat list picks a project and sends a first message to a new Claude session, named after that message. Other agents are listed but start on the Mac. A phone can start up to 10 new chats an hour.
 - **Added — Stop, Compact and Clear from the phone.** The "+" beside the message field stops the current turn for any agent, and runs Claude's `/compact` or `/clear` (Clear asks first). After a Clear the chat follows the session into its new conversation.
