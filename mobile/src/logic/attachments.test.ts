@@ -1,4 +1,4 @@
-import { canSendWith, composeMessage, decodedBytes, formatBytes, MAX_UPLOAD_BYTES, nameFor, tooLarge, type Attachment } from "./attachments";
+import { canSendWith, chunkBase64, composeMessage, decodedBytes, formatBytes, MAX_UPLOAD_BYTES, nameFor, tooLarge, type Attachment } from "./attachments";
 
 const ready = (path: string): Attachment => ({ id: path, name: path, kind: "image", uri: "", state: "ready", path });
 const uploading: Attachment = { id: "u", name: "u", kind: "image", uri: "", state: "uploading" };
@@ -29,6 +29,17 @@ describe("canSendWith", () => {
     expect(canSendWith("", [ready("p")])).toBe(true);
     expect(canSendWith("hi", [ready("p"), uploading])).toBe(false);
     expect(canSendWith("", [failed])).toBe(false);
+  });
+});
+
+describe("chunkBase64", () => {
+  it("splits on 4-character boundaries and keeps every byte", () => {
+    const b64 = "QUJD".repeat(10) + "QQ==";
+    const parts = chunkBase64(b64, 10);
+    expect(parts.every((p, i) => i === parts.length - 1 || p.length % 4 === 0)).toBe(true);
+    expect(parts.join("")).toBe(b64);
+    expect(chunkBase64("")).toEqual([""]);
+    expect(chunkBase64("QUJD", 1024)).toEqual(["QUJD"]);
   });
 });
 

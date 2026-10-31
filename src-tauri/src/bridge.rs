@@ -129,15 +129,19 @@ pub enum ClientMsg {
         id: String,
         allow: bool,
     },
-    /// A file for a session (photo, camera shot, document): `data` is the base64 body.
-    /// Written into the session's `.conduit-uploads/` and acked with `uploadResult`
-    /// carrying the same `requestId` (see `uploads.rs`).
+    /// A file for a session (photo, camera shot, document), as numbered base64 chunks:
+    /// each non-final chunk is acked with `uploadProgress`, the last with `uploadResult`
+    /// (see `uploads.rs`). No `seq` = the whole file in one frame.
     #[serde(rename_all = "camelCase")]
     Upload {
         session_id: String,
         request_id: String,
         name: String,
         data: String,
+        #[serde(default)]
+        seq: Option<u32>,
+        #[serde(default)]
+        done: Option<bool>,
     },
     /// Stop or delete sessions picked on the phone (long-press / multi-select). The desktop
     /// runs its OWN stop/delete for each (`mobile-session-action` event), so a phone action
@@ -259,12 +263,16 @@ impl std::fmt::Debug for ClientMsg {
                 request_id,
                 name,
                 data,
+                seq,
+                done,
             } => f
                 .debug_struct("Upload")
                 .field("session_id", session_id)
                 .field("request_id", request_id)
                 .field("name", name)
                 .field("data", &data.len())
+                .field("seq", seq)
+                .field("done", done)
                 .finish(),
         }
     }
@@ -420,8 +428,11 @@ fn trust_stall_frame(session_id: &str) -> serde_json::Value {
     })
 }
 
+/// A WIRE constant, not copy: phones match it exactly (`frames.ts TRUST_STALL`), so its
+/// wording stays as shipped even though the phone now says "computer" -- the phone shows its
+/// own text for it, and a reworded string would silently break every older phone.
 const TRUST_STALL_MESSAGE: &str =
-    "Claude is waiting on your computer \u{2014} open this folder there once to trust it";
+    "Claude is waiting on your Mac \u{2014} open this folder there once to trust it";
 
 /// May a phone's `answer` resolve this ask? Only a still-pending ask (None = someone else
 /// already answered), never a private session's, and only a valid set of answers.
@@ -516,22 +527,44 @@ const UPLOADS_MAX: usize = 30;
 const UPLOAD_WINDOW: Duration = Duration::from_secs(600);
 
 /// The `uploadResult` frame for one `upload`: the path for the message, or why not.
-fn upload_reply(
-    session_dir: Option<String>,
+/// Take one `upload` chunk and answer it: `uploadProgress` while more is coming,
+/// `uploadResult` once the file is written (or refused). `allowed` is the rate limit's
+/// verdict, consulted only on a file's first chunk; `dir_of` resolves the session directory.
+#[allow(clippy::too_many_arguments)]
+fn upload_step(
+    assembler: &mut crate::uploads::Assembler,
+    dir_of: impl Fn(&str) -> Option<String>,
     request_id: &str,
+    session_id: &str,
     name: &str,
     data: &str,
-    allowed: bool,
+    seq: u32,
+    done: bool,
+    allowed: impl FnOnce() -> bool,
 ) -> serde_json::Value {
-    let result = match (session_dir, allowed) {
-        (_, false) => {
-            Err("Too many files sent in the last few minutes. Try again shortly.".to_string())
+    if seq == 0 && !allowed() {
+        return upload_reply(
+            request_id,
+            Err("Too many files sent in the last few minutes. Try again shortly.".to_string()),
+        );
+    }
+    let result = match assembler.push(request_id, session_id, name, seq, done, data) {
+        Ok(None) => {
+            return json!({ "type": "uploadProgress", "requestId": request_id, "seq": seq });
         }
-        (None, _) => Err("That session no longer exists.".to_string()),
-        (Some(dir), true) => {
-            crate::uploads::save(std::path::Path::new(&dir), name, data).map_err(|e| e.to_string())
-        }
+        Ok(Some(file)) => match dir_of(&file.session_id) {
+            None => Err("That session no longer exists.".to_string()),
+            Some(dir) => {
+                crate::uploads::save_bytes(std::path::Path::new(&dir), &file.name, &file.bytes)
+                    .map_err(|e| e.to_string())
+            }
+        },
+        Err(e) => Err(e.to_string()),
     };
+    upload_reply(request_id, result)
+}
+
+fn upload_reply(request_id: &str, result: Result<String, String>) -> serde_json::Value {
     match result {
         Ok(path) => {
             json!({ "type": "uploadResult", "requestId": request_id, "ok": true, "path": path })
@@ -1531,6 +1564,8 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
 
     // (session_id, subscription id, frame receiver) once attached.
     let mut attached: Option<(String, u64, std::sync::mpsc::Receiver<String>)> = None;
+    // Half-received phone uploads on this socket (chunked; see uploads.rs).
+    let mut uploads = crate::uploads::Assembler::default();
     // (transcript path, lines already sent) — set on attach, advanced while tailing.
     let mut transcript: Option<(PathBuf, usize)> = None;
     // Transcript of the attached session when it is a Claude one (the only agent with a
@@ -1974,18 +2009,31 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         request_id,
                         name,
                         data,
+                        seq,
+                        done,
                     }) => {
                         let key = device
                             .as_ref()
                             .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
-                        let allowed = crate::fleet::rate_limited(
-                            &ctrl.uploads,
-                            &key,
-                            UPLOADS_MAX,
-                            UPLOAD_WINDOW,
+                        let store = app.state::<Arc<Store>>();
+                        let reply = upload_step(
+                            &mut uploads,
+                            |sid| store.session_dir(sid),
+                            &request_id,
+                            &session_id,
+                            &name,
+                            &data,
+                            seq.unwrap_or(0),
+                            done.unwrap_or(seq.is_none()),
+                            || {
+                                crate::fleet::rate_limited(
+                                    &ctrl.uploads,
+                                    &key,
+                                    UPLOADS_MAX,
+                                    UPLOAD_WINDOW,
+                                )
+                            },
                         );
-                        let dir = app.state::<Arc<Store>>().session_dir(&session_id);
-                        let reply = upload_reply(dir, &request_id, &name, &data, allowed);
                         if !send_text(&mut ws, reply.to_string()) {
                             break 'conn;
                         }
@@ -2517,31 +2565,49 @@ mod tests {
     }
 
     #[test]
-    fn upload_reply_answers_every_request_by_its_id() {
-        let ok = upload_reply(None, "r1", "a.png", "aGk=", true);
-        assert_eq!(ok["requestId"], "r1");
-        assert_eq!(ok["ok"], false, "an unknown session cannot take a file");
-        let limited = upload_reply(Some("/nowhere".into()), "r2", "a.png", "aGk=", false);
+    fn upload_steps_answer_every_chunk_by_its_request() {
+        let mut a = crate::uploads::Assembler::default();
+        let none = |_: &str| None;
+        // An unknown session cannot take a file.
+        let r = upload_step(&mut a, none, "r1", "s", "a.png", "aGk=", 0, true, || true);
         assert_eq!(
-            (limited["requestId"].as_str(), limited["ok"].as_bool()),
-            (Some("r2"), Some(false))
+            (r["type"].as_str(), r["ok"].as_bool()),
+            (Some("uploadResult"), Some(false))
         );
+        assert_eq!(r["requestId"], "r1");
+        // The rate limit is asked on a file's first chunk only, and refuses it.
+        let r = upload_step(&mut a, none, "r2", "s", "a.png", "aGk=", 0, true, || false);
+        assert_eq!(r["ok"], false);
         let root = std::env::temp_dir().join(format!("conduit-upr-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let good = upload_reply(
-            Some(root.to_string_lossy().into_owned()),
-            "r3",
-            "a.png",
-            "aGk=",
-            true,
+        let dir = root.to_string_lossy().into_owned();
+        let here = |_: &str| Some(dir.clone());
+        let r = upload_step(&mut a, here, "r3", "s", "a.png", "aGk=", 0, false, || true);
+        assert_eq!(
+            (r["type"].as_str(), r["seq"].as_u64()),
+            (Some("uploadProgress"), Some(0))
         );
-        assert_eq!(good["ok"], true);
-        assert!(good["path"]
-            .as_str()
-            .unwrap()
-            .starts_with(".conduit-uploads/"));
+        let r = upload_step(&mut a, here, "r3", "s", "a.png", "aGk=", 1, true, || {
+            panic!("the limit is not consulted mid-file")
+        });
+        assert_eq!(r["ok"], true, "{r}");
+        let path = r["path"].as_str().unwrap();
+        assert!(path.starts_with(".conduit-uploads/"));
+        assert_eq!(std::fs::read(root.join(path)).unwrap(), b"hihi");
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!((UPLOADS_MAX, UPLOAD_WINDOW), (30, Duration::from_secs(600)));
+        // The first phone build sent whole files with no seq/done: still accepted.
+        let m = parse_client_msg(
+            r#"{"type":"upload","sessionId":"s","requestId":"r","name":"a.png","data":"aGk="}"#,
+        );
+        assert!(matches!(
+            m,
+            Some(ClientMsg::Upload {
+                seq: None,
+                done: None,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3404,7 +3470,7 @@ mod tests {
         assert_eq!(f["sessionId"], "s1");
         assert_eq!(
             f["message"],
-            "Claude is waiting on your computer \u{2014} open this folder there once to trust it"
+            "Claude is waiting on your Mac \u{2014} open this folder there once to trust it"
         );
     }
 

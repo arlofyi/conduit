@@ -12,6 +12,11 @@
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 /** Files per message: enough for a set of screenshots, few enough to stay a message. */
 export const MAX_ATTACHMENTS = 6;
+/** Base64 characters per `upload` frame (a multiple of 4, so each chunk decodes alone).
+ * Must not exceed the desktop's `uploads::CHUNK_MAX_B64`. Each chunk is acked before the
+ * next is sent: the desktop drops a phone it has not heard from in 35 s, and Android's
+ * WebSocket closes once 16 MiB is queued, so one big frame failed on a slow uplink. */
+export const UPLOAD_CHUNK = 512 * 1024;
 /** Photos are re-encoded to this longest edge before upload. */
 export const PHOTO_MAX_EDGE = 2048;
 
@@ -26,6 +31,14 @@ export type Attachment = {
   path?: string;
   error?: string;
 };
+
+/** Split a base64 body into upload chunks (always at least one). */
+export function chunkBase64(b64: string, size = UPLOAD_CHUNK): string[] {
+  const step = Math.max(4, size - (size % 4));
+  const out: string[] = [];
+  for (let i = 0; i < b64.length; i += step) out.push(b64.slice(i, i + step));
+  return out.length ? out : [""];
+}
 
 /** Decoded size of a base64 body, without decoding it. */
 export function decodedBytes(b64: string): number {

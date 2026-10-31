@@ -209,11 +209,9 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     (f: Picked) => {
       const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const base: Attachment = { id, name: f.name, kind: f.kind, uri: f.uri, state: "uploading" };
-      if (tooLarge(f.data)) {
-        setAttachments((l) => [
-          ...l,
-          { ...base, state: "failed", error: `${formatBytes(decodedBytes(f.data))} is over the 10 MB limit for one file.` },
-        ]);
+      const big = f.tooBig ?? (tooLarge(f.data) ? decodedBytes(f.data) : 0);
+      if (big > 0) {
+        setAttachments((l) => [...l, { ...base, state: "failed", error: `${formatBytes(big)} is over the 10 MB limit for one file.` }]);
         return;
       }
       setAttachments((l) => [...l, base]);

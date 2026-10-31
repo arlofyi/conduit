@@ -35,6 +35,7 @@ import { appendWire, mapHistory, mapProjectsView, sameView, statusPatch, type Li
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
 import { answerMsg, approveMsg, discoverMsg, pairMsg, sessionActionMsg, spawnMsg, uploadMsg, type ClientMsg, type WireMac } from "./protocol";
 import type { ActionResult, SessionAction } from "../logic/selection";
+import { chunkBase64 } from "../logic/attachments";
 
 /** Simulator/dev build: also try loopback, and offer "This computer (simulator)". */
 export const IS_SIMULATOR_OR_DEV = __DEV__;
@@ -108,8 +109,10 @@ const SPAWN_TIMEOUT_MS = 12_000;
 let localSeq = 0;
 
 export type UploadOutcome = { ok: true; path: string } | { ok: false; error: string };
+type UploadStep = { kind: "progress" } | { kind: "result"; outcome: UploadOutcome };
 /** A 10 MB file over a slow cellular link still finishes well inside this. */
-const UPLOAD_TIMEOUT_MS = 90_000;
+/** Per chunk: a 512 KiB chunk takes ~4 s at 1 Mbit/s. */
+const CHUNK_TIMEOUT_MS = 30_000;
 const ACTION_TIMEOUT_MS = 15_000;
 
 export interface LiveValue {
@@ -214,8 +217,10 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const viewRef = useRef<ProjectsView | null>(null);
   /** Session actions waiting for their `sessionActionResult`, by requestId. */
   const actionsRef = useRef(new Map<string, (r: ActionResult) => void>());
-  /** Uploads waiting for their `uploadResult`, by requestId. */
-  const uploadsRef = useRef(new Map<string, { sessionId: string; done: (o: UploadOutcome) => void }>());
+  /** The chunk each upload is waiting on an answer for, by requestId. */
+  const uploadsRef = useRef(new Map<string, { sessionId: string; step: (s: UploadStep) => void }>());
+  /** Uploads run one file at a time, in pick order (see `uploads.rs` on why). */
+  const uploadQueue = useRef<Promise<unknown>>(Promise.resolve());
   /** the session your computer is streaming to this socket; outlives `attachedRef` after the chat closes */
   const streamingRef = useRef<string | null>(null);
   /** last frame from the Mac; copied into `lastSeen` only when the link drops (a state per frame
@@ -360,10 +365,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               const stall = trustStallNotice(m.message, m.sessionId, attachedRef.current, genId("n"));
               if (m.message === PRIVATE_SESSION && m.sessionId) {
                 // A private session takes no files: fail its uploads now, not at the timeout.
-                for (const [id, w] of uploadsRef.current) {
+                for (const w of [...uploadsRef.current.values()]) {
                   if (w.sessionId !== m.sessionId) continue;
-                  uploadsRef.current.delete(id);
-                  w.done({ ok: false, error: "This session is private: it can't take files from the phone." });
+                  w.step({ kind: "result", outcome: { ok: false, error: "This session is private: it can't take files from the phone." } });
                 }
               }
               if (m.message === PRIVATE_SESSION) {
@@ -413,14 +417,14 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
             case "answerResult":
               dispatchPending({ t: "result", id: m.askId, ok: m.ok, now: Date.now() });
               break;
-            case "uploadResult": {
-              const waiter = uploadsRef.current.get(m.requestId);
-              if (waiter) {
-                uploadsRef.current.delete(m.requestId);
-                waiter.done(m.ok ? { ok: true, path: m.path } : { ok: false, error: m.error });
-              }
+            case "uploadProgress":
+              uploadsRef.current.get(m.requestId)?.step({ kind: "progress" });
               break;
-            }
+            case "uploadResult":
+              uploadsRef.current
+                .get(m.requestId)
+                ?.step({ kind: "result", outcome: m.ok ? { ok: true, path: m.path } : { ok: false, error: m.error } });
+              break;
             case "sessionActionResult": {
               const waiter = actionsRef.current.get(m.requestId);
               if (waiter) {
@@ -761,30 +765,46 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     [sendFor],
   );
 
+  /** Wait for the answer to one chunk; `cancel` if the chunk never went out. */
+  const awaitStep = useCallback((requestId: string, sessionId: string) => {
+    let cancel = () => {};
+    const promise = new Promise<UploadStep>((resolve) => {
+      const finish = (st: UploadStep) => {
+        clearTimeout(timer);
+        uploadsRef.current.delete(requestId);
+        resolve(st);
+      };
+      // A link that drops mid-upload never answers; say so instead of spinning forever.
+      const timer = setTimeout(
+        () => finish({ kind: "result", outcome: { ok: false, error: "Your computer didn't answer. Check the connection and try again." } }),
+        CHUNK_TIMEOUT_MS,
+      );
+      uploadsRef.current.set(requestId, { sessionId, step: finish });
+      cancel = () => finish({ kind: "result", outcome: { ok: false, error: "Not connected to your computer." } });
+    });
+    return { promise, cancel };
+  }, []);
+
   const upload = useCallback(
-    (sessionId: string, name: string, data: string): Promise<UploadOutcome> =>
-      new Promise<UploadOutcome>((resolve) => {
-        const client = clientRef.current;
+    (sessionId: string, name: string, data: string): Promise<UploadOutcome> => {
+      const run = async (): Promise<UploadOutcome> => {
         const requestId = genId("up");
-        let settled = false;
-        // A link that drops mid-upload never answers; say so instead of spinning forever.
-        const timer = setTimeout(() => {
-          uploadsRef.current.delete(requestId);
-          done({ ok: false, error: "Your computer didn't answer. Check the connection and try again." });
-        }, UPLOAD_TIMEOUT_MS);
-        function done(o: UploadOutcome) {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve(o);
+        const chunks = chunkBase64(data);
+        for (let seq = 0; seq < chunks.length; seq++) {
+          const done = seq === chunks.length - 1;
+          const wait = awaitStep(requestId, sessionId);
+          if (!clientRef.current?.send(uploadMsg(sessionId, requestId, name, chunks[seq], seq, done))) wait.cancel();
+          const st = await wait.promise;
+          // A result mid-file is a refusal (private, too big, busy): stop there.
+          if (st.kind === "result") return st.outcome;
         }
-        uploadsRef.current.set(requestId, { sessionId, done });
-        if (!client?.send(uploadMsg(sessionId, requestId, name, data))) {
-          uploadsRef.current.delete(requestId);
-          done({ ok: false, error: "Not connected to your computer." });
-        }
-      }),
-    [],
+        return { ok: false, error: "Your computer didn't confirm the file." };
+      };
+      const next = uploadQueue.current.then(run, run);
+      uploadQueue.current = next.catch(() => undefined);
+      return next;
+    },
+    [awaitStep],
   );
 
   const sessionAction = useCallback(

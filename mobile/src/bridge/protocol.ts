@@ -205,6 +205,8 @@ export type ServerMsg =
   | { type: "answerResult"; askId: string; ok: boolean }
   | { type: "approveResult"; id: string; ok: boolean }
   /** the answer to one `upload`: the file's path for the message, or why not */
+  /** a non-final upload chunk arrived; send the next */
+  | { type: "uploadProgress"; requestId: string; seq: number }
   | { type: "uploadResult"; requestId: string; ok: true; path: string }
   | { type: "uploadResult"; requestId: string; ok: false; error: string }
   /** the answer to one `sessionaction`: what was done, and what was refused and why */
@@ -228,7 +230,7 @@ export type ClientMsg =
   | { type: "interrupt"; sessionId: string }
   | { type: "answer"; askId: string; answers: Record<string, string> }
   | { type: "approve"; id: string; allow: boolean }
-  | { type: "upload"; sessionId: string; requestId: string; name: string; data: string }
+  | { type: "upload"; sessionId: string; requestId: string; name: string; data: string; seq: number; done: boolean }
   | { type: "sessionaction"; requestId: string; action: "stop" | "delete"; sessionIds: string[] };
 
 export const authMsg = (token: string): ClientMsg => ({ type: "auth", token });
@@ -250,13 +252,16 @@ export const interruptMsg = (id: string): ClientMsg => ({ type: "interrupt", ses
 export const answerMsg = (askId: string, answers: Record<string, string>): ClientMsg => ({ type: "answer", askId, answers });
 /** Allow or deny a held permission. */
 export const approveMsg = (id: string, allow: boolean): ClientMsg => ({ type: "approve", id, allow });
-/** Send one file (base64 body) into a session's `.conduit-uploads/`; answered by `uploadResult`. */
-export const uploadMsg = (sessionId: string, requestId: string, name: string, data: string): ClientMsg => ({
+/** One chunk of a file for a session's `.conduit-uploads/`: answered by `uploadProgress`, or
+ * `uploadResult` for the last chunk (or a refusal at any chunk). */
+export const uploadMsg = (sessionId: string, requestId: string, name: string, data: string, seq: number, done: boolean): ClientMsg => ({
   type: "upload",
   sessionId,
   requestId,
   name,
   data,
+  seq,
+  done,
 });
 /** Stop or delete sessions picked on the Chats list; answered by `sessionActionResult`. */
 export const sessionActionMsg = (requestId: string, action: "stop" | "delete", sessionIds: string[]): ClientMsg => ({

@@ -125,22 +125,28 @@ fn bubble(text: &str) -> Value {
 /// A message that arrives as a bracketed paste (every message sent from the phone, and the
 /// desktop's own `paste_and_submit`) is recorded as
 /// `\n\n<pasted_content id="…">\n…\n</pasted_content id="…">`. Shown raw, the bubble opened
-/// with two blank lines and both tags (seen on Claude Code 2.1.316). Only a tag alone on its
-/// line is removed, so a message that merely MENTIONS the tag keeps it.
+/// with two blank lines and both tags (seen on Claude Code 2.1.316). The wrapper is the first
+/// and last NON-BLANK lines and nothing else is touched: a message with no wrapper keeps its
+/// indentation and blank lines, and a paste that itself contains a tag line (an XML file,
+/// this source) keeps it.
 fn unwrap_paste(text: &str) -> String {
-    let is_tag = |l: &str| {
+    let is_tag = |l: &str, open: &str| {
         let l = l.trim();
-        (l.starts_with("<pasted_content") || l.starts_with("</pasted_content")) && l.ends_with('>')
+        l.starts_with(open) && l.ends_with('>')
     };
-    if !text.lines().any(is_tag) {
-        return text.trim().to_string();
+    let lines: Vec<&str> = text.lines().collect();
+    let first = lines.iter().position(|l| !l.trim().is_empty());
+    let last = lines.iter().rposition(|l| !l.trim().is_empty());
+    match (first, last) {
+        (Some(f), Some(l))
+            if f < l
+                && is_tag(lines[f], "<pasted_content")
+                && is_tag(lines[l], "</pasted_content") =>
+        {
+            lines[f + 1..l].join("\n").trim_matches('\n').to_string()
+        }
+        _ => text.to_string(),
     }
-    text.lines()
-        .filter(|l| !is_tag(l))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
 }
 
 /// Rules 5-7: caveat preamble (dropped), slash/bash commands, command output.
@@ -529,7 +535,12 @@ mod tests {
             unwrap_paste(raw),
             "The connection is made.\n\nAlso, the keyboard."
         );
-        assert_eq!(unwrap_paste("  plain  \n"), "plain");
+        // No wrapper: untouched, indentation included.
+        assert_eq!(unwrap_paste("    let x = 1;\n"), "    let x = 1;\n");
+        // A tag line INSIDE the paste is the user's content.
+        let nested =
+            "<pasted_content id=\"a\">\n<pasted_content id=\"x\">\nbody\n</pasted_content id=\"a\">";
+        assert_eq!(unwrap_paste(nested), "<pasted_content id=\"x\">\nbody");
         // A mention inside a sentence is the user's words, not the wrapper.
         assert_eq!(
             unwrap_paste("why does <pasted_content> appear?"),

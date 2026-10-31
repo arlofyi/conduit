@@ -10,9 +10,11 @@ import * as DocumentPicker from "expo-document-picker";
 import { File } from "expo-file-system";
 import { ImageManipulator, SaveFormat } from "expo-image-manipulator";
 import * as ImagePicker from "expo-image-picker";
-import { MAX_ATTACHMENTS, nameFor, PHOTO_MAX_EDGE } from "../logic/attachments";
+import { MAX_ATTACHMENTS, MAX_UPLOAD_BYTES, nameFor, PHOTO_MAX_EDGE } from "../logic/attachments";
 
-export type Picked = { name: string; kind: "image" | "file"; uri: string; data: string };
+/** `data` is the base64 body; empty with `tooBig` set when the file was never read
+ * (over the limit: reading a 300 MB video into JS memory would crash the app first). */
+export type Picked = { name: string; kind: "image" | "file"; uri: string; data: string; tooBig?: number };
 
 async function shrink(asset: ImagePicker.ImagePickerAsset, n: number): Promise<Picked> {
   const { width, height } = asset;
@@ -51,11 +53,15 @@ export async function pickFiles(room: number): Promise<Picked[]> {
   const r = await DocumentPicker.getDocumentAsync({ multiple: room > 1, copyToCacheDirectory: true });
   if (r.canceled) return [];
   return Promise.all(
-    r.assets.slice(0, room).map(async (a, i) => ({
-      name: nameFor(a.name, "file", i + 1, false),
-      kind: (a.mimeType?.startsWith("image/") ? "image" : "file") as Picked["kind"],
-      uri: a.uri,
-      data: await new File(a.uri).base64(),
-    })),
+    r.assets.slice(0, room).map(async (a, i) => {
+      const base = {
+        name: nameFor(a.name, "file", i + 1, false),
+        kind: (a.mimeType?.startsWith("image/") ? "image" : "file") as Picked["kind"],
+        uri: a.uri,
+      };
+      const size = a.size ?? new File(a.uri).size;
+      if (size > MAX_UPLOAD_BYTES) return { ...base, data: "", tooBig: size };
+      return { ...base, data: await new File(a.uri).base64() };
+    }),
   );
 }
