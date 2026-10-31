@@ -404,7 +404,9 @@ export function ChatScreen({ route, navigation }: ChatProps) {
           {refused ? null : (
             <Composer
               name={header.name}
-              bottomInset={keyboardUp ? 0 : insets.bottom}
+              // Android's nav bar is a hard edge with no home-indicator margin of its own, so
+              // the composer gets a little air above it (seen on the vivo: flush on the bar).
+              bottomInset={keyboardUp ? 0 : insets.bottom + (Platform.OS === "android" ? 8 : 0)}
               onSend={send}
               attachments={attachments}
               onAttach={onAttach}
