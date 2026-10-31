@@ -8,7 +8,7 @@ import {
   type ConnState,
   type Effect,
 } from "./connection";
-import { attachMsg, inputMsg, interruptMsg, listMsg, promptInput, type ClientMsg, type ServerMsg } from "./protocol";
+import { attachMsg, inputMsg, interruptMsg, listMsg, pasteInput, promptInput, submitDelayMs, type ClientMsg, type ServerMsg } from "./protocol";
 
 export interface BridgeOptions {
   /** ws:// URLs tried in order, advancing on every reconnect */
@@ -160,8 +160,16 @@ export class BridgeClient {
     this.send(interruptMsg(sessionId));
   }
 
-  /** Send a prompt: the text as a bracketed paste, then Enter, into the live PTY. */
+  /** Send a prompt: the text as a bracketed paste, then Enter, into the live PTY. With
+   * attachments the Enter follows after `submitDelayMs` (see there). */
   prompt(sessionId: string, text: string) {
+    const delay = submitDelayMs(text);
+    if (delay > 0) {
+      if (this.send(inputMsg(sessionId, pasteInput(text)))) {
+        setTimeout(() => this.send(inputMsg(sessionId, "\r")), delay);
+      }
+      return;
+    }
     this.send(inputMsg(sessionId, promptInput(text)));
   }
 

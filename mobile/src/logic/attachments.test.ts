@@ -70,3 +70,12 @@ describe("nameFor", () => {
     expect(nameFor("/storage/x/report.pdf", "file", 1, false)).toBe("report.pdf");
   });
 });
+
+describe("submitting a message with files", () => {
+  it("holds the Enter only when the message names uploads", () => {
+    const { submitDelayMs, promptInput, pasteInput } = require("../bridge/protocol");
+    expect(submitDelayMs("plain text")).toBe(0);
+    expect(submitDelayMs("@.conduit-uploads/a.jpg @.conduit-uploads/b.jpg Hello?")).toBe(1800);
+    expect(promptInput("hi")).toBe(`${pasteInput("hi")}\r`);
+  });
+});

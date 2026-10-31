@@ -286,6 +286,23 @@ export const spawnMsg = (projectId: string, prompt: string, agent: string): Clie
  * `\r` a keypress even when everything arrives in one read. ESC is dropped from the body
  * so a `CSI 201~` inside it cannot close the paste early. */
 export function promptInput(text: string): string {
+  return `${pasteInput(text)}\r`;
+}
+
+/** The bracketed paste alone, for a prompt whose Enter must come later (`submitDelayMs`). */
+export function pasteInput(text: string): string {
   const body = text.split("\u001b").join("");
-  return `\u001b[200~${body}\u001b[201~\r`;
+  return `\u001b[200~${body}\u001b[201~`;
+}
+
+/**
+ * How long to hold the Enter after the paste, or 0 to send both in one frame. A paste that
+ * names uploaded files makes Claude Code turn each `@path` into an attachment as it arrives,
+ * and an Enter in the same burst lands while it is still doing that and is dropped: the
+ * message sat in Claude's composer as a draft (seen: one image went through, two did not).
+ * Plain text keeps the single frame it has always used.
+ */
+export function submitDelayMs(text: string): number {
+  const files = text.split("@.conduit-uploads/").length - 1;
+  return files === 0 ? 0 : 1200 + 300 * files;
 }
