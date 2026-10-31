@@ -111,6 +111,11 @@ let localSeq = 0;
 export type UploadOutcome = { ok: true; path: string } | { ok: false; error: string };
 type UploadStep = { kind: "progress" } | { kind: "result"; outcome: UploadOutcome };
 /** A 10 MB file over a slow cellular link still finishes well inside this. */
+const NOT_CONNECTED = "Not connected to your computer.";
+/** The desktop's refusal for a chunk that does not continue a file it holds (uploads.rs). */
+const OUT_OF_ORDER = "The file arrived out of order. Try again.";
+/** How long an upload waits for the link to come back after a picker or camera returns. */
+const RECONNECT_WAIT_MS = 20_000;
 /** Per chunk: a 512 KiB chunk takes ~4 s at 1 Mbit/s. */
 const CHUNK_TIMEOUT_MS = 30_000;
 const ACTION_TIMEOUT_MS = 15_000;
@@ -205,6 +210,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [macs, setMacs] = useState<SavedMac[]>([]);
   const [currentMac, setCurrentMac] = useState<SavedMac | null>(null);
   const [conn, setConn] = useState<ConnState>(initialConn);
+  /** The live connection state, for async work that must wait for a reconnect. */
+  const connRef = useRef(conn);
+  connRef.current = conn;
   const [hello, setHello] = useState<HelloInfo | null>(null);
   const [notice, setNotice] = useState<ConnError | null>(null);
   const [discovered, setDiscovered] = useState<WireMac[] | null>(null);
@@ -780,14 +788,28 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
         CHUNK_TIMEOUT_MS,
       );
       uploadsRef.current.set(requestId, { sessionId, step: finish });
-      cancel = () => finish({ kind: "result", outcome: { ok: false, error: "Not connected to your computer." } });
+      cancel = () => finish({ kind: "result", outcome: { ok: false, error: NOT_CONNECTED } });
     });
     return { promise, cancel };
   }, []);
 
   const upload = useCallback(
     (sessionId: string, name: string, data: string): Promise<UploadOutcome> => {
-      const run = async (): Promise<UploadOutcome> => {
+      // Picking a photo or taking one sends the app to the background, and a backgrounded app
+      // closes its socket; the upload starts the moment the picker returns, usually before the
+      // reconnect. So wait for the link (measured on a vivo X200 Pro: every pick after the
+      // first failed with "Not connected"). The desktop keeps half-received files PER
+      // CONNECTION, so a link that drops mid-file restarts that file, once.
+      const waitReady = async (): Promise<boolean> => {
+        const until = Date.now() + RECONNECT_WAIT_MS;
+        while (Date.now() < until) {
+          if (connRef.current.phase === "ready" && clientRef.current) return true;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        return false;
+      };
+      const attempt = async (): Promise<UploadOutcome & { lost?: boolean }> => {
+        if (!(await waitReady())) return { ok: false, error: "Not connected to your computer.", lost: true };
         const requestId = genId("up");
         const chunks = chunkBase64(data);
         for (let seq = 0; seq < chunks.length; seq++) {
@@ -795,10 +817,17 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           const wait = awaitStep(requestId, sessionId);
           if (!clientRef.current?.send(uploadMsg(sessionId, requestId, name, chunks[seq], seq, done))) wait.cancel();
           const st = await wait.promise;
-          // A result mid-file is a refusal (private, too big, busy): stop there.
-          if (st.kind === "result") return st.outcome;
+          if (st.kind === "result") {
+            const lost = !st.outcome.ok && (st.outcome.error === NOT_CONNECTED || st.outcome.error === OUT_OF_ORDER);
+            return lost ? { ...st.outcome, lost } : st.outcome;
+          }
         }
         return { ok: false, error: "Your computer didn't confirm the file." };
+      };
+      const run = async (): Promise<UploadOutcome> => {
+        const first = await attempt();
+        const r = first.lost ? await attempt() : first;
+        return r.ok ? { ok: true, path: r.path } : { ok: false, error: r.error };
       };
       const next = uploadQueue.current.then(run, run);
       uploadQueue.current = next.catch(() => undefined);
