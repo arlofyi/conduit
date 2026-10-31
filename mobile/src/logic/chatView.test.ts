@@ -24,3 +24,16 @@ describe("outputPreview", () => {
     expect(outputPreview("one", false)).toEqual({ text: "one", hidden: 0 });
   });
 });
+
+describe("hasBlocks", () => {
+  it("spots lists, tables, fences and headings, not prose", () => {
+    const { hasBlocks } = require("./chatView");
+    expect(hasBlocks("Found the cause:\n\n- one\n- two")).toBe(true);
+    expect(hasBlocks("1. first\n2. second")).toBe(true);
+    expect(hasBlocks("| a | b |\n|---|---|")).toBe(true);
+    expect(hasBlocks("```ts\nx\n```")).toBe(true);
+    expect(hasBlocks("## Title")).toBe(true);
+    expect(hasBlocks("Done. The fix is in - see above.")).toBe(false);
+    expect(hasBlocks("Costs 5 - 3 = 2")).toBe(false);
+  });
+});

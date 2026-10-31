@@ -8,6 +8,7 @@
  * accent hairline, ink text — not a slab of salmon; the agent's reply is markdown prose on
  * the warm selection tier. Long-press copies the text (plain words, not asterisks).
  */
+import { hasBlocks } from "../logic/chatView";
 import * as Clipboard from "expo-clipboard";
 import React, { useEffect, useRef } from "react";
 import { Animated, Easing, Pressable, Text, View } from "react-native";
@@ -84,7 +85,11 @@ export function ChatBubble({
     <Animated.View
       style={{
         alignSelf: me ? "flex-end" : "flex-start",
-        maxWidth: me ? "82%" : "90%",
+        // A reply with a list, table, code block or heading takes the full width rather than
+        // shrinking to fit: markdown's list rows are flex rows, and in a shrink-to-fit bubble
+        // Android measured the bubble from its first line, so the list spilled out below it
+        // over the next rows (seen on a vivo X200 Pro).
+        ...(me || !hasBlocks(text) ? { maxWidth: me ? "82%" : "90%" } : { width: "90%" }),
         marginTop: first ? 8 : 2,
         marginLeft: me ? 0 : TAIL_W,
         marginRight: me ? TAIL_W : 0,

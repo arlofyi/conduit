@@ -115,7 +115,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   // Inverted list: newest first, so offset 0 is the bottom of the conversation. Each row carries
   // its own animateIn, so renderItem never changes and a memoised row re-renders only when ITS
   // content does.
-  // A question the Mac is holding joins its transcript card by tool_use id and makes it live;
+  // A question your computer is holding joins its transcript card by tool_use id and makes it live;
   // permissions (and questions whose transcript card has not landed yet) sit at the end.
   // `pendingNow` moves only when a settled standalone card's linger ends.
   const [pendingNow, setPendingNow] = useState(() => Date.now());
@@ -291,11 +291,17 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   // X200 Pro, Android 16), floating the composer over an empty band.
   const [keyboardUp, setKeyboardUp] = useState(false);
   const [androidKeyboard, setAndroidKeyboard] = useState(0);
+  const insetsRef = useRef(insets);
+  insetsRef.current = insets;
   useEffect(() => {
     const ios = Platform.OS === "ios";
     const show = Keyboard.addListener(ios ? "keyboardWillShow" : "keyboardDidShow", (e) => {
       setKeyboardUp(true);
-      if (!ios) setAndroidKeyboard(e.endCoordinates.height);
+      // React Native reports the IME inset MINUS the navigation bar (ReactRootView:
+      // ime.bottom - systemBars.bottom), but this screen runs under the nav bar
+      // (edge-to-edge), so the composer must clear both. Without the nav bar's share it sat
+      // one nav-bar height too low, behind the keys (measured on the vivo, 3-button nav).
+      if (!ios) setAndroidKeyboard(e.endCoordinates.height + insetsRef.current.bottom);
     });
     const hide = Keyboard.addListener(ios ? "keyboardWillHide" : "keyboardDidHide", () => {
       setKeyboardUp(false);
@@ -365,7 +371,14 @@ export function ChatScreen({ route, navigation }: ChatProps) {
           </View>
         ) : null}
 
-        <View style={{ position: "absolute", left: 0, right: 0, bottom: 0 }}>
+        {/* iOS: the conversation scrolls under the composer's glass. Android has no glass, so
+            the bar is solid: otherwise text shows through beside and below the controls. */}
+        <View
+          style={[
+            { position: "absolute", left: 0, right: 0, bottom: 0 },
+            Platform.OS === "android" && { backgroundColor: p.panelBg, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: p.border },
+          ]}
+        >
           {!pinned && (
             <View style={{ position: "absolute", right: 12, top: -52, alignItems: "center" }}>
               <GlassCircle symbol="chevron.down" label={unseen > 0 ? `Jump to latest, ${unseen} new` : "Jump to latest"} onPress={jumpToLatest} size={40} />

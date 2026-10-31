@@ -117,7 +117,30 @@ fn only_system_reminders(text: &str) -> bool {
 }
 
 fn bubble(text: &str) -> Value {
-    json!({ "kind": "bubble", "role": "user", "text": text })
+    json!({ "kind": "bubble", "role": "user", "text": unwrap_paste(text) })
+}
+
+/// What the human typed, without the wrapper Claude Code puts around a paste.
+///
+/// A message that arrives as a bracketed paste (every message sent from the phone, and the
+/// desktop's own `paste_and_submit`) is recorded as
+/// `\n\n<pasted_content id="…">\n…\n</pasted_content id="…">`. Shown raw, the bubble opened
+/// with two blank lines and both tags (seen on Claude Code 2.1.316). Only a tag alone on its
+/// line is removed, so a message that merely MENTIONS the tag keeps it.
+fn unwrap_paste(text: &str) -> String {
+    let is_tag = |l: &str| {
+        let l = l.trim();
+        (l.starts_with("<pasted_content") || l.starts_with("</pasted_content")) && l.ends_with('>')
+    };
+    if !text.lines().any(is_tag) {
+        return text.trim().to_string();
+    }
+    text.lines()
+        .filter(|l| !is_tag(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// Rules 5-7: caveat preamble (dropped), slash/bash commands, command output.
@@ -499,6 +522,21 @@ pub fn parse_system(v: &Value) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pasted_message_shows_as_typed() {
+        let raw = "\n\n<pasted_content id=\"f7e5\">\nThe connection is made.\n\nAlso, the keyboard.\n</pasted_content id=\"f7e5\">";
+        assert_eq!(
+            unwrap_paste(raw),
+            "The connection is made.\n\nAlso, the keyboard."
+        );
+        assert_eq!(unwrap_paste("  plain  \n"), "plain");
+        // A mention inside a sentence is the user's words, not the wrapper.
+        assert_eq!(
+            unwrap_paste("why does <pasted_content> appear?"),
+            "why does <pasted_content> appear?"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 
