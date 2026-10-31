@@ -9,8 +9,9 @@ import {
 } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { StatusBar } from "expo-status-bar";
-import React, { useMemo } from "react";
-import { LogBox, View } from "react-native";
+import { unstable_getMaterialSymbolSourceAsync } from "expo-symbols";
+import React, { useEffect, useMemo, useState } from "react";
+import { LogBox, Platform, View, type ImageSourcePropType } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { LiveProvider, useLive } from "./src/bridge/LiveProvider";
@@ -30,6 +31,28 @@ import { ListSelectionProvider, useListSelection } from "./src/data/ListSelectio
 import { needsCount, resolveProfile } from "./src/logic/chatList";
 import { openBySession } from "./src/logic/pending";
 import { ThemeProvider, useTheme } from "./src/theme/ThemeContext";
+import { ANDROID_SYMBOLS, type AppSymbol } from "./src/components/androidSymbols";
+
+/**
+ * A native tab icon. iOS names an SF Symbol; Android's native tab bar takes only an image,
+ * so the Material equivalent is rendered to one once (white, tinted by the bar). Until it
+ * resolves the tab shows its label alone.
+ */
+function useTabIcon(sf: AppSymbol) {
+  const [android, setAndroid] = useState<ImageSourcePropType | null>(null);
+  useEffect(() => {
+    if (Platform.OS !== "android") return;
+    let live = true;
+    unstable_getMaterialSymbolSourceAsync(ANDROID_SYMBOLS[sf], 96, "#ffffff")
+      .then((src) => live && setAndroid(src))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [sf]);
+  if (Platform.OS !== "android") return { type: "sfSymbol" as const, name: sf };
+  return android ? { type: "image" as const, source: android } : undefined;
+}
 
 // React Native's own dev-only noise: a native-driven animation (the glyph pulse, a bubble's
 // arrival) reports its final value back with no JS listener attached. Nothing is wrong, and in
@@ -62,6 +85,8 @@ function Tabs() {
   // Pushed items count too: the poll never marks a held permission as needing you.
   const openPending = useMemo(() => openBySession(pending), [pending]);
   const needs = needsCount(view, profile, openPending);
+  const chatsIcon = useTabIcon("bubble.left.and.bubble.right");
+  const settingsIcon = useTabIcon("gearshape");
   return (
     <Tab.Navigator
       screenOptions={{
@@ -76,11 +101,11 @@ function Tabs() {
         name="Chats"
         component={ChatsScreen}
         options={{
-          tabBarIcon: { type: "sfSymbol", name: "bubble.left.and.bubble.right" },
+          tabBarIcon: chatsIcon,
           tabBarBadge: needs > 0 ? needs : undefined,
         }}
       />
-      <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: { type: "sfSymbol", name: "gearshape" } }} />
+      <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: settingsIcon }} />
     </Tab.Navigator>
   );
 }

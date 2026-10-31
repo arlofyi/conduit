@@ -119,8 +119,10 @@ export function ChatBubble({
           <View>
             <Text selectable style={{ color: p.textBright, fontSize: TYPE.callout, lineHeight: 21 }}>
               {text}
-              {/* reserves the time's room on the last line, WhatsApp's trick */}
-              {time ? <Text style={{ ...timeStyle, color: "transparent" }}>{`   ${time}`}</Text> : null}
+              {/* reserves the time's room on the last line, WhatsApp's trick. Blank figure
+                  spaces, not the time in a transparent colour: Android ignores `transparent` on
+                  a span inside selectable text and drew the time twice. */}
+              {time ? <Text style={timeStyle}>{" ".repeat(time.length + 4)}</Text> : null}
             </Text>
             {time ? <Text style={[timeStyle, { position: "absolute", right: 0, bottom: -1 }]}>{time}</Text> : null}
           </View>
