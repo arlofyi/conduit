@@ -5,6 +5,15 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — Windows: a `%` in a session's first message no longer garbles it.** A short
+  task such as "raise coverage to 80%" reached the agent as "80^", and two `%` signs
+  swallowed everything between them. `^` is no longer doubled either.
+- **Fixed — Windows: the `conduit` command accepts accented and other non-English
+  characters.** A `--name` or a folder such as `Café` was refused with "Conduit rejected
+  the request". Reinstall the command from Settings to pick this up.
+- **Fixed — Windows: the `conduit` command opens folders with `)` or `&` in their name.**
+  `conduit "D:\app (v2)"` failed with "\app was unexpected at this time."
+
 ## 0.48.1 — 2026-10-30
 
 - **Fixed — Settings → Mobile reads Tailscale when Conduit is opened from the Dock.** It showed "Couldn't read Tailscale: unreadable status" because the Tailscale app's command-line tool started its window instead of answering; Conduit now asks it for the command-line answer.

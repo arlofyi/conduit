@@ -509,3 +509,62 @@ fn a_400_from_the_app_exits_2_without_a_cold_start() {
     assert!(started.elapsed() < Duration::from_secs(5), "not quick");
     silent(&rx);
 }
+
+/// Windows: a `)` or `&` in the path used to close the shim's `( ... )` block early, so
+/// `conduit "D:\app (v2)"` failed with "\app was unexpected at this time." even when the
+/// directory existed.
+#[cfg(windows)]
+#[test]
+fn a_path_with_parentheses_and_an_ampersand_opens() {
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("app (v2) & co");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let out = f.run(&[project.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(recv(&rx).path.ends_with("app (v2) & co"));
+
+    let missing = f.home.join("gone (v2) & co");
+    let out = f.run(&[missing.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("not a directory"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    silent(&rx);
+}
+
+/// Windows: under a legacy console codepage (437 here, the US default) cmd.exe hands the
+/// shim its arguments, and writes its body, in that codepage, so a non-ASCII name or path
+/// was not UTF-8 and was refused as a 400. The shim now reports the codepage and Conduit
+/// decodes with it.
+#[cfg(windows)]
+#[test]
+fn a_non_ascii_name_and_path_survive_an_oem_console_codepage() {
+    use std::os::windows::process::CommandExt;
+    let f = fixture();
+    let (port, rx) = serve(f.token.clone());
+    f.publish_port(port);
+    let project = f.home.join("Café projekt");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let c = f.command();
+    let shim = c.get_program().to_owned();
+    let mut cmd = Command::new("cmd.exe");
+    // The shim runs under a cmd.exe that switches the codepage first, with the fixture's
+    // hermetic environment carried across.
+    cmd.envs(c.get_envs().filter_map(|(k, v)| v.map(|v| (k, v))));
+    cmd.arg("/C").raw_arg(format!(
+        "\"chcp 437 >nul & \"{}\" \"{}\" --agent claude --name \"Crème brûlée\"\"",
+        shim.to_string_lossy(),
+        project.display()
+    ));
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let got = recv(&rx);
+    assert!(got.path.ends_with("Café projekt"), "got {}", got.path);
+    assert_eq!(got.name.as_deref(), Some("Crème brûlée"));
+}
