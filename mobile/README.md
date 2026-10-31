@@ -1,4 +1,4 @@
-# Conduit for iPhone
+# Conduit mobile (iPhone and Android)
 
 A React Native (Expo) app for the Conduit mobile companion: a **per-agent chat UI
 with inline status actions**, instead of mirroring the desktop terminal. See the
@@ -75,6 +75,24 @@ on the same Wi-Fi for that, separately from the Tailscale link to the bridge.
 First native build runs prebuild + `pod install` + compile (minutes); rebuilds are fast.
 Don't run two Metro instances at once; they fight over port 8081.
 
+**Android** (development or release build; needs JDK 17 and the Android SDK, `ANDROID_HOME`
+set). Turn on Developer options and USB debugging on the phone (some vendors, e.g. vivo, also
+need "Install via USB"), plug in and allow the computer:
+```bash
+npx expo prebuild --platform android --clean   # regenerates android/ (gitignored)
+npx expo run:android --device                  # debug build, JS from Metro
+# or a standalone release APK (JS bundled, no Metro needed), for one phone's ABI:
+cd android && ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+Android has no SF Symbols: every icon goes through `src/components/androidSymbols.ts`, whose
+keys are the only type `Icon` accepts, so an icon with no Material equivalent fails `tsc`.
+The bridge is plain `ws://` inside the Tailscale tunnel, so release builds set
+`usesCleartextTraffic` (via `expo-build-properties`).
+
+On Windows, the computer's firewall must let the phone in: allow Conduit inbound on TCP
+8455-8474 from `100.64.0.0/10` on the Private profile (Tailscale's network is Private).
+
 ## First-time pairing (a real phone)
 
 1. Install Tailscale on the iPhone and sign in to the same tailnet as the Mac.
@@ -85,6 +103,16 @@ Don't run two Metro instances at once; they fight over port 8081.
 4. The Mac shows a prompt with a 4-digit code. Check it matches the phone and approve.
 5. The phone remembers the Mac. Other Macs on the same tailnet that run Conduit appear on the
    Connect screen once one Mac is paired, and can ask to pair the same way.
+
+## Attachments and session actions
+
+- **"+" attaches** a photo, a camera shot or any file. Each uploads when picked (one
+  `upload` frame; photos re-encoded to 2048 px JPEG first) into the session's
+  `.conduit-uploads/` on the computer, and the message names it as `@<path>`. Up to 6 per
+  message, 10 MB each. Steering (compact, clear) is the header's tune button.
+- **Long-press a chat** to select it, tap others, then Stop or Delete. One `sessionaction`
+  frame; the desktop runs its own stop/delete per session and skips private ones. A delete
+  keeps the history and any worktree on the computer.
 
 ## Checks
 
