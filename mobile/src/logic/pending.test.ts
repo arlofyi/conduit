@@ -67,7 +67,7 @@ describe("pending", () => {
     expect(run([{ t: "added", item: fromWire(perm("perm-1")) }], s)).toBe(s);
     // resolved elsewhere: kept, settled, and says where
     s = run([{ t: "resolved", id: "ask-1", by: "desktop", now: 5 }], s);
-    expect(cardView(s.entries["ask-1"])).toMatchObject({ mode: "done", text: "Answered on your Mac" });
+    expect(cardView(s.entries["ask-1"])).toMatchObject({ mode: "done", text: "Answered on your computer" });
     expect(openBySession(s)).toEqual({ s1: expect.objectContaining({ id: "perm-1" }) });
     // cancelled: dropped silently
     s = run([{ t: "resolved", id: "perm-1", by: "cancelled", now: 6 }], s);
@@ -176,7 +176,7 @@ describe("pending", () => {
       ],
       s,
     );
-    expect(cardView(t.entries["ask-1"])).toMatchObject({ mode: "done", tone: "info", text: "Already answered on your Mac" });
+    expect(cardView(t.entries["ask-1"])).toMatchObject({ mode: "done", tone: "info", text: "Already answered on your computer" });
     // ok:false with no resolved frame (it fell out of the ring): still honest
     t = run([{ t: "sent", id: "perm-1", mine: { kind: "approve", allow: false } }, { t: "result", id: "perm-1", ok: false, now: 5 }], s);
     expect(cardView(t.entries["perm-1"])).toMatchObject({ mode: "done", text: "Already answered" });
@@ -275,7 +275,7 @@ describe("pending", () => {
     for (const id of ["ask-1", "perm-1"]) {
       expect(cardView(s.entries[id])).toEqual({ mode: "private", item: s.entries[id].item, text: PRIVATE_ANSWER_TEXT });
     }
-    expect(PRIVATE_ANSWER_TEXT).toBe("Private session — answer it on your Mac");
+    expect(PRIVATE_ANSWER_TEXT).toBe("Private session — answer it on your computer");
     // a send for a private item is refused locally: it stays private, never "sending"
     const t = run([{ t: "sent", id: "ask-1", mine: { kind: "answer", summary: "x" } }], s);
     expect(cardView(t.entries["ask-1"]).mode).toBe("private");

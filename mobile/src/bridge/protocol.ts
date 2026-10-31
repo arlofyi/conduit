@@ -203,7 +203,14 @@ export type ServerMsg =
   | { type: "resolved"; id: string; by: WireBy }
   // ok:false = already resolved elsewhere, a private session, or answers the Mac would not accept
   | { type: "answerResult"; askId: string; ok: boolean }
-  | { type: "approveResult"; id: string; ok: boolean };
+  | { type: "approveResult"; id: string; ok: boolean }
+  /** the answer to one `upload`: the file's path for the message, or why not */
+  /** a non-final upload chunk arrived; send the next */
+  | { type: "uploadProgress"; requestId: string; seq: number }
+  | { type: "uploadResult"; requestId: string; ok: true; path: string }
+  | { type: "uploadResult"; requestId: string; ok: false; error: string }
+  /** the answer to one `sessionaction`: what was done, and what was refused and why */
+  | { type: "sessionActionResult"; requestId: string; action: "stop" | "delete"; done: string[]; skipped: { id: string; reason: string }[] };
 
 // ---- client → server ----
 // Spellings are mixed ON PURPOSE (pinned by Rust tests): attach/input/resize/git/kill/spawn use
@@ -222,7 +229,9 @@ export type ClientMsg =
   | { type: "spawn"; project_id: string; prompt: string; agent?: string; worktree?: boolean }
   | { type: "interrupt"; sessionId: string }
   | { type: "answer"; askId: string; answers: Record<string, string> }
-  | { type: "approve"; id: string; allow: boolean };
+  | { type: "approve"; id: string; allow: boolean }
+  | { type: "upload"; sessionId: string; requestId: string; name: string; data: string; seq: number; done: boolean }
+  | { type: "sessionaction"; requestId: string; action: "stop" | "delete"; sessionIds: string[] };
 
 export const authMsg = (token: string): ClientMsg => ({ type: "auth", token });
 
@@ -243,6 +252,24 @@ export const interruptMsg = (id: string): ClientMsg => ({ type: "interrupt", ses
 export const answerMsg = (askId: string, answers: Record<string, string>): ClientMsg => ({ type: "answer", askId, answers });
 /** Allow or deny a held permission. */
 export const approveMsg = (id: string, allow: boolean): ClientMsg => ({ type: "approve", id, allow });
+/** One chunk of a file for a session's `.conduit-uploads/`: answered by `uploadProgress`, or
+ * `uploadResult` for the last chunk (or a refusal at any chunk). */
+export const uploadMsg = (sessionId: string, requestId: string, name: string, data: string, seq: number, done: boolean): ClientMsg => ({
+  type: "upload",
+  sessionId,
+  requestId,
+  name,
+  data,
+  seq,
+  done,
+});
+/** Stop or delete sessions picked on the Chats list; answered by `sessionActionResult`. */
+export const sessionActionMsg = (requestId: string, action: "stop" | "delete", sessionIds: string[]): ClientMsg => ({
+  type: "sessionaction",
+  requestId,
+  action,
+  sessionIds,
+});
 /** Start a new session in a project with its first message; the Mac answers `spawned` or `error`. */
 export const spawnMsg = (projectId: string, prompt: string, agent: string): ClientMsg => ({
   type: "spawn",
@@ -259,6 +286,23 @@ export const spawnMsg = (projectId: string, prompt: string, agent: string): Clie
  * `\r` a keypress even when everything arrives in one read. ESC is dropped from the body
  * so a `CSI 201~` inside it cannot close the paste early. */
 export function promptInput(text: string): string {
+  return `${pasteInput(text)}\r`;
+}
+
+/** The bracketed paste alone, for a prompt whose Enter must come later (`submitDelayMs`). */
+export function pasteInput(text: string): string {
   const body = text.split("\u001b").join("");
-  return `\u001b[200~${body}\u001b[201~\r`;
+  return `\u001b[200~${body}\u001b[201~`;
+}
+
+/**
+ * How long to hold the Enter after the paste, or 0 to send both in one frame. A paste that
+ * names uploaded files makes Claude Code turn each `@path` into an attachment as it arrives,
+ * and an Enter in the same burst lands while it is still doing that and is dropped: the
+ * message sat in Claude's composer as a draft (seen: one image went through, two did not).
+ * Plain text keeps the single frame it has always used.
+ */
+export function submitDelayMs(text: string): number {
+  const files = text.split("@.conduit-uploads/").length - 1;
+  return files === 0 ? 0 : 1200 + 300 * files;
 }

@@ -24,3 +24,8 @@ export function outputPreview(text: string, open: boolean): { text: string; hidd
     hidden: lines.length - OUTPUT_PREVIEW_LINES,
   };
 }
+
+/** Markdown blocks that lay out as flex rows or fixed grids (see the bubble's width rule). */
+export function hasBlocks(md: string): boolean {
+  return /^\s*([-*+]|\d+[.)])\s|^\s*\|.*\||^\s*```|^\s*#{1,6}\s/m.test(md);
+}

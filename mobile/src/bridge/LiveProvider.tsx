@@ -33,15 +33,17 @@ import { BridgeClient } from "./BridgeClient";
 import { initialConn, lifecycleAction, type ConnError, type ConnState } from "./connection";
 import { appendWire, mapHistory, mapProjectsView, sameView, statusPatch, type LivePatch } from "./live";
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
-import { answerMsg, approveMsg, discoverMsg, pairMsg, spawnMsg, type ClientMsg, type WireMac } from "./protocol";
+import { answerMsg, approveMsg, discoverMsg, pairMsg, sessionActionMsg, spawnMsg, uploadMsg, type ClientMsg, type WireMac } from "./protocol";
+import type { ActionResult, SessionAction } from "../logic/selection";
+import { chunkBase64 } from "../logic/attachments";
 
-/** Simulator/dev build: also try loopback, and offer "This Mac (simulator)". */
+/** Simulator/dev build: also try loopback, and offer "This computer (simulator)". */
 export const IS_SIMULATOR_OR_DEV = __DEV__;
 
 /**
  * The Mac answers `list` with its whole projects view and pushes nothing in between, so the
  * Chats list asks again on this cadence while connected. The view is built from in-memory
- * state on the Mac (no git, no disk), so this is cheap on both ends.
+ * state on your computer (no git, no disk), so this is cheap on both ends.
  */
 export const LIST_POLL_MS = 10_000;
 
@@ -106,6 +108,18 @@ const SPAWN_TIMEOUT_MS = 12_000;
 
 let localSeq = 0;
 
+export type UploadOutcome = { ok: true; path: string } | { ok: false; error: string };
+type UploadStep = { kind: "progress" } | { kind: "result"; outcome: UploadOutcome };
+/** A 10 MB file over a slow cellular link still finishes well inside this. */
+const NOT_CONNECTED = "Not connected to your computer.";
+/** The desktop's refusal for a chunk that does not continue a file it holds (uploads.rs). */
+const OUT_OF_ORDER = "The file arrived out of order. Try again.";
+/** How long an upload waits for the link to come back after a picker or camera returns. */
+const RECONNECT_WAIT_MS = 20_000;
+/** Per chunk: a 512 KiB chunk takes ~4 s at 1 Mbit/s. */
+const CHUNK_TIMEOUT_MS = 30_000;
+const ACTION_TIMEOUT_MS = 15_000;
+
 export interface LiveValue {
   /** false until the Keychain Mac list has been read; render nothing route-deciding before */
   loaded: boolean;
@@ -154,7 +168,7 @@ export interface LiveValue {
   detach: (sessionId?: string) => void;
   /** send a prompt to a session (text + Enter) */
   prompt: (sessionId: string, text: string) => void;
-  /** Stop the session's current turn (Esc on the Mac) and mark it in the open feed */
+  /** Stop the session's current turn (Esc on your computer) and mark it in the open feed */
   interrupt: (sessionId: string) => void;
   /** send prepared frames (quick actions) */
   sendFrames: (frames: ClientMsg[]) => void;
@@ -168,6 +182,10 @@ export interface LiveValue {
   answer: (askId: string, answers: Record<string, string>, summary: string) => void;
   /** allow or deny a held permission */
   approve: (id: string, allow: boolean) => void;
+  /** send one file into a session's `.conduit-uploads/`; resolves with its path or why not */
+  upload: (sessionId: string, name: string, data: string) => Promise<UploadOutcome>;
+  /** stop or delete sessions on the computer (the Chats list's selection) */
+  sessionAction: (action: SessionAction, sessionIds: string[]) => Promise<ActionResult>;
   /** the in-app banner on screen, if any */
   banner: Banner | null;
   dismissBanner: () => void;
@@ -192,6 +210,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [macs, setMacs] = useState<SavedMac[]>([]);
   const [currentMac, setCurrentMac] = useState<SavedMac | null>(null);
   const [conn, setConn] = useState<ConnState>(initialConn);
+  /** The live connection state, for async work that must wait for a reconnect. */
+  const connRef = useRef(conn);
+  connRef.current = conn;
   const [hello, setHello] = useState<HelloInfo | null>(null);
   const [notice, setNotice] = useState<ConnError | null>(null);
   const [discovered, setDiscovered] = useState<WireMac[] | null>(null);
@@ -202,7 +223,13 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [lastSeen, setLastSeen] = useState<number | null>(null);
   /** the last view, for diffing the next one into unread counts */
   const viewRef = useRef<ProjectsView | null>(null);
-  /** the session the Mac is streaming to this socket; outlives `attachedRef` after the chat closes */
+  /** Session actions waiting for their `sessionActionResult`, by requestId. */
+  const actionsRef = useRef(new Map<string, (r: ActionResult) => void>());
+  /** The chunk each upload is waiting on an answer for, by requestId. */
+  const uploadsRef = useRef(new Map<string, { sessionId: string; step: (s: UploadStep) => void }>());
+  /** Uploads run one file at a time, in pick order (see `uploads.rs` on why). */
+  const uploadQueue = useRef<Promise<unknown>>(Promise.resolve());
+  /** the session your computer is streaming to this socket; outlives `attachedRef` after the chat closes */
   const streamingRef = useRef<string | null>(null);
   /** last frame from the Mac; copied into `lastSeen` only when the link drops (a state per frame
    * would re-render every consumer on each streamed chunk) */
@@ -342,8 +369,15 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               }
               break;
             case "error": {
-              // A chat this phone started, stuck on the Mac's folder-trust prompt (null otherwise).
+              // A chat this phone started, stuck on your computer's folder-trust prompt (null otherwise).
               const stall = trustStallNotice(m.message, m.sessionId, attachedRef.current, genId("n"));
+              if (m.message === PRIVATE_SESSION && m.sessionId) {
+                // A private session takes no files: fail its uploads now, not at the timeout.
+                for (const w of [...uploadsRef.current.values()]) {
+                  if (w.sessionId !== m.sessionId) continue;
+                  w.step({ kind: "result", outcome: { ok: false, error: "This session is private: it can't take files from the phone." } });
+                }
+              }
               if (m.message === PRIVATE_SESSION) {
                 // The Mac refused the chat that is open (at attach, or because it was made
                 // private while streaming): say so instead of an empty feed. A refusal for a
@@ -391,6 +425,24 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
             case "answerResult":
               dispatchPending({ t: "result", id: m.askId, ok: m.ok, now: Date.now() });
               break;
+            case "uploadProgress":
+              uploadsRef.current.get(m.requestId)?.step({ kind: "progress" });
+              break;
+            case "uploadResult":
+              uploadsRef.current
+                .get(m.requestId)
+                ?.step({ kind: "result", outcome: m.ok ? { ok: true, path: m.path } : { ok: false, error: m.error } });
+              break;
+            case "sessionActionResult": {
+              const waiter = actionsRef.current.get(m.requestId);
+              if (waiter) {
+                actionsRef.current.delete(m.requestId);
+                waiter({ ok: true, done: m.done, skipped: m.skipped });
+              }
+              // The list changes now; do not leave deleted rows up until the next poll.
+              clientRef.current?.list();
+              break;
+            }
             case "approveResult":
               dispatchPending({ t: "result", id: m.id, ok: m.ok, now: Date.now() });
               break;
@@ -554,7 +606,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           },
           onEffect: (e) => {
             // A token the Mac issued is always kept, even if the attempt was abandoned:
-            // dropping it would leave a paired device on the Mac this phone cannot use.
+            // dropping it would leave a paired device on your computer this phone cannot use.
             if (e.k !== "saveToken") return;
             const mac: SavedMac = {
               deviceId: e.deviceId,
@@ -575,7 +627,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                 return;
               }
               client.close();
-              // The token is persisted: finish selecting this Mac even if the user left Pair
+              // The token is persisted: finish selecting this computer even if the user left Pair
               // meanwhile (pairGen only guards the Pair screen's own state).
               if (pairClientRef.current === client) pairClientRef.current = null;
               await refreshMacs();
@@ -721,6 +773,90 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     [sendFor],
   );
 
+  /** Wait for the answer to one chunk; `cancel` if the chunk never went out. */
+  const awaitStep = useCallback((requestId: string, sessionId: string) => {
+    let cancel = () => {};
+    const promise = new Promise<UploadStep>((resolve) => {
+      const finish = (st: UploadStep) => {
+        clearTimeout(timer);
+        uploadsRef.current.delete(requestId);
+        resolve(st);
+      };
+      // A link that drops mid-upload never answers; say so instead of spinning forever.
+      const timer = setTimeout(
+        () => finish({ kind: "result", outcome: { ok: false, error: "Your computer didn't answer. Check the connection and try again." } }),
+        CHUNK_TIMEOUT_MS,
+      );
+      uploadsRef.current.set(requestId, { sessionId, step: finish });
+      cancel = () => finish({ kind: "result", outcome: { ok: false, error: NOT_CONNECTED } });
+    });
+    return { promise, cancel };
+  }, []);
+
+  const upload = useCallback(
+    (sessionId: string, name: string, data: string): Promise<UploadOutcome> => {
+      // Picking a photo or taking one sends the app to the background, and a backgrounded app
+      // closes its socket; the upload starts the moment the picker returns, usually before the
+      // reconnect. So wait for the link (measured on a vivo X200 Pro: every pick after the
+      // first failed with "Not connected"). The desktop keeps half-received files PER
+      // CONNECTION, so a link that drops mid-file restarts that file, once.
+      const waitReady = async (): Promise<boolean> => {
+        const until = Date.now() + RECONNECT_WAIT_MS;
+        while (Date.now() < until) {
+          if (connRef.current.phase === "ready" && clientRef.current) return true;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        return false;
+      };
+      const attempt = async (): Promise<UploadOutcome & { lost?: boolean }> => {
+        if (!(await waitReady())) return { ok: false, error: "Not connected to your computer.", lost: true };
+        const requestId = genId("up");
+        const chunks = chunkBase64(data);
+        for (let seq = 0; seq < chunks.length; seq++) {
+          const done = seq === chunks.length - 1;
+          const wait = awaitStep(requestId, sessionId);
+          if (!clientRef.current?.send(uploadMsg(sessionId, requestId, name, chunks[seq], seq, done))) wait.cancel();
+          const st = await wait.promise;
+          if (st.kind === "result") {
+            const lost = !st.outcome.ok && (st.outcome.error === NOT_CONNECTED || st.outcome.error === OUT_OF_ORDER);
+            return lost ? { ...st.outcome, lost } : st.outcome;
+          }
+        }
+        return { ok: false, error: "Your computer didn't confirm the file." };
+      };
+      const run = async (): Promise<UploadOutcome> => {
+        const first = await attempt();
+        const r = first.lost ? await attempt() : first;
+        return r.ok ? { ok: true, path: r.path } : { ok: false, error: r.error };
+      };
+      const next = uploadQueue.current.then(run, run);
+      uploadQueue.current = next.catch(() => undefined);
+      return next;
+    },
+    [awaitStep],
+  );
+
+  const sessionAction = useCallback(
+    (action: SessionAction, sessionIds: string[]): Promise<ActionResult> =>
+      new Promise<ActionResult>((resolve) => {
+        const requestId = genId("act");
+        const timer = setTimeout(() => {
+          if (!actionsRef.current.delete(requestId)) return;
+          resolve({ ok: false, error: "Your computer didn't answer. Pull to refresh to see what changed." });
+        }, ACTION_TIMEOUT_MS);
+        actionsRef.current.set(requestId, (r) => {
+          clearTimeout(timer);
+          resolve(r);
+        });
+        if (!clientRef.current?.send(sessionActionMsg(requestId, action, sessionIds))) {
+          actionsRef.current.delete(requestId);
+          clearTimeout(timer);
+          resolve({ ok: false, error: "Not connected to your computer." });
+        }
+      }),
+    [],
+  );
+
   const prompt = useCallback((sessionId: string, text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -739,7 +875,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     if (!trimmed || spawnPending.current) return;
     const client = clientRef.current;
     if (!client) {
-      setSpawnState({ phase: "failed", message: "Not connected to your Mac." });
+      setSpawnState({ phase: "failed", message: "Not connected to your computer." });
       return;
     }
     spawnPending.current = true;
@@ -760,7 +896,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       clientRef.current?.list();
       setSpawnState({
         phase: "failed",
-        message: "Your Mac hasn't answered yet. Check Chats before starting another — it may have started.",
+        message: "Your computer hasn't answered yet. Check Chats before starting another — it may have started.",
       });
     }, SPAWN_TIMEOUT_MS);
     return () => clearTimeout(t);
@@ -812,6 +948,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       pending,
       answer,
       approve,
+      upload,
+      sessionAction,
       banner,
       dismissBanner,
     }),
@@ -819,6 +957,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       pending,
       answer,
       approve,
+      upload,
+      sessionAction,
       sendFrames,
       spawn,
       spawnState,

@@ -234,7 +234,7 @@ describe("previewFor", () => {
 
   it("silo_needs_preview_points_to_the_mac", () => {
     const s = sess({ id: "a", silo: true, status: "needsInput", needs: { kind: "input", text: null } });
-    expect(previewFor(s)).toEqual({ tone: "private", prefix: null, text: "Private session — open it on your Mac" });
+    expect(previewFor(s)).toEqual({ tone: "private", prefix: null, text: "Private session — open it on your computer" });
     // still a needs row (counted in Needs you), dimmed and not openable
     const v: WireProjectsView = { ...VIEW, projects: [proj("p", null, [s])] };
     const row = buildRows(v, { profileId: null, filter: "needs", unread: {}, now: NOW })[0];
@@ -400,7 +400,7 @@ describe("needs preview from pending", () => {
     expect(previewFor(s, { ...perm, toolName: "WebFetch", summary: "WebFetch" })).toEqual({ tone: "needs", prefix: null, text: "Allow WebFetch?" });
     // private: never its text
     expect(previewFor(sess({ id: "x", silo: true }), { kind: "ask", id: "a", sessionId: "x", private: true }).text).toBe(
-      "Private session — open it on your Mac",
+      "Private session — open it on your computer",
     );
     // and the row sorts and filters as needing you
     const rows = buildRows(VIEW, { profileId: null, filter: "needs", unread: {}, now: NOW, pending: { "run-new": perm } });

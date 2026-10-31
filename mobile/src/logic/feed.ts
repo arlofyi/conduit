@@ -52,7 +52,7 @@ export function capFeed(feed: ChatItem[], max: number = FEED_CAP): ChatItem[] {
   if (feed.length <= max) return feed;
   const rest = feed[0]?.id === FEED_CAP_ID ? feed.slice(1) : feed;
   return [
-    { kind: "divider", id: FEED_CAP_ID, label: "Earlier messages are on your Mac", tone: "info" },
+    { kind: "divider", id: FEED_CAP_ID, label: "Earlier messages are on your computer", tone: "info" },
     ...rest.slice(rest.length - (max - 1)),
   ];
 }

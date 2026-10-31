@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Alert,
   Animated,
   AppState,
   Easing,
@@ -21,7 +22,9 @@ import type { WireDiff } from "../bridge/protocol";
 import { AgentAvatar, useReduceMotion } from "../components/AgentAvatar";
 import { AssistantMarkdown } from "../components/AssistantMarkdown";
 import { ChatBubble } from "../components/ChatBubble";
-import { Composer } from "../components/Composer";
+import { Composer, type AttachSource } from "../components/Composer";
+import { pickFiles, pickPhotos, takePhoto, type Picked } from "../data/pickAttachments";
+import { composeMessage, formatBytes, decodedBytes, MAX_ATTACHMENTS, tooLarge, type Attachment } from "../logic/attachments";
 import { GlassCircle, GlassSurface, Icon, MaterialBar } from "../components/Glass";
 import { cardStyle, QuestionCard, Tag, TrailingCard, type OnAnswer, type OnApprove } from "../components/PendingCards";
 import type {
@@ -58,7 +61,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   const { palette: p } = useTheme();
   const h = hq(p);
   const insets = useSafeAreaInsets();
-  const { sessionLive, context, view, attach, detach, prompt, pending, answer, approve } = useLive();
+  const { sessionLive, context, view, attach, detach, prompt, pending, answer, approve, upload } = useLive();
   const list = useRef<FlatList<DisplayRow>>(null);
 
   // Attach to this session's live stream (transcript history + tail + status) while the screen
@@ -112,7 +115,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   // Inverted list: newest first, so offset 0 is the bottom of the conversation. Each row carries
   // its own animateIn, so renderItem never changes and a memoised row re-renders only when ITS
   // content does.
-  // A question the Mac is holding joins its transcript card by tool_use id and makes it live;
+  // A question your computer is holding joins its transcript card by tool_use id and makes it live;
   // permissions (and questions whose transcript card has not landed yet) sit at the end.
   // `pendingNow` moves only when a settled standalone card's linger ends.
   const [pendingNow, setPendingNow] = useState(() => Date.now());
@@ -197,7 +200,50 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     setUnseen(0);
   };
 
-  const send = (text: string) => {
+  // Files for the next message. Each uploads the moment it is picked, so Send is instant.
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const patchAttachment = useCallback((id: string, patch: Partial<Attachment>) => {
+    setAttachments((list) => list.map((a) => (a.id === id ? { ...a, ...patch } : a)));
+  }, []);
+  const startUpload = useCallback(
+    (f: Picked) => {
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const base: Attachment = { id, name: f.name, kind: f.kind, uri: f.uri, state: "uploading" };
+      const big = f.tooBig ?? (tooLarge(f.data) ? decodedBytes(f.data) : 0);
+      if (big > 0) {
+        setAttachments((l) => [...l, { ...base, state: "failed", error: `${formatBytes(big)} is over the 10 MB limit for one file.` }]);
+        return;
+      }
+      setAttachments((l) => [...l, base]);
+      upload(sessionId, f.name, f.data).then((r) =>
+        patchAttachment(id, r.ok ? { state: "ready", path: r.path } : { state: "failed", error: r.error }),
+      );
+    },
+    [sessionId, upload, patchAttachment],
+  );
+  const onAttach = useCallback(
+    async (source: AttachSource) => {
+      const room = MAX_ATTACHMENTS - attachments.length;
+      if (room <= 0) {
+        Alert.alert("That's the most for one message", `Send these ${MAX_ATTACHMENTS} first.`);
+        return;
+      }
+      try {
+        const picked =
+          source === "photos" ? await pickPhotos(room) : source === "camera" ? [await takePhoto()].filter((x): x is Picked => !!x) : await pickFiles(room);
+        picked.forEach(startUpload);
+      } catch (e) {
+        Alert.alert("Couldn't attach that", e instanceof Error ? e.message : String(e));
+      }
+    },
+    [attachments.length, startUpload],
+  );
+  const removeAttachment = useCallback((id: string) => setAttachments((l) => l.filter((a) => a.id !== id)), []);
+
+  const send = (typed: string) => {
+    const text = composeMessage(typed, attachments);
+    if (!text.trim()) return;
+    setAttachments([]);
     prompt(sessionId, text); // bracketed paste + Enter into the live PTY; the echo comes back as a chat frame
     sentRef.current = true;
     pinnedRef.current = true;
@@ -236,10 +282,29 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   const notice = refused ? PRIVATE_SESSION_TEXT : session && !chatOnPhone(agent) && feed.length === 0 ? NO_PHONE_CHAT_TEXT : null;
 
   // With the keyboard up there is no home indicator to clear, so the composer sits on the keys.
+  // Android fires no keyboardWill* events, only keyboardDid*. It also gets the keyboard's
+  // height applied by hand (`androidKeyboard`), not by KeyboardAvoidingView: the app is
+  // edge-to-edge (forced from Android 15), the window no longer resizes for the keyboard, and
+  // KAV's Android arm left its padding behind after the keyboard closed (measured on a vivo
+  // X200 Pro, Android 16), floating the composer over an empty band.
   const [keyboardUp, setKeyboardUp] = useState(false);
+  const [androidKeyboard, setAndroidKeyboard] = useState(0);
+  const insetsRef = useRef(insets);
+  insetsRef.current = insets;
   useEffect(() => {
-    const show = Keyboard.addListener("keyboardWillShow", () => setKeyboardUp(true));
-    const hide = Keyboard.addListener("keyboardWillHide", () => setKeyboardUp(false));
+    const ios = Platform.OS === "ios";
+    const show = Keyboard.addListener(ios ? "keyboardWillShow" : "keyboardDidShow", (e) => {
+      setKeyboardUp(true);
+      // React Native reports the IME inset MINUS the navigation bar (ReactRootView:
+      // ime.bottom - systemBars.bottom), but this screen runs under the nav bar
+      // (edge-to-edge), so the composer must clear both. Without the nav bar's share it sat
+      // one nav-bar height too low, behind the keys (measured on the vivo, 3-button nav).
+      if (!ios) setAndroidKeyboard(e.endCoordinates.height + insetsRef.current.bottom);
+    });
+    const hide = Keyboard.addListener(ios ? "keyboardWillHide" : "keyboardDidHide", () => {
+      setKeyboardUp(false);
+      if (!ios) setAndroidKeyboard(0);
+    });
     return () => {
       show.remove();
       hide.remove();
@@ -263,7 +328,11 @@ export function ChatScreen({ route, navigation }: ChatProps) {
 
   return (
     <View style={{ flex: 1, backgroundColor: p.panelBg }}>
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <KeyboardAvoidingView
+        style={{ flex: 1, paddingBottom: androidKeyboard }}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        enabled={Platform.OS === "ios"}
+      >
         {/* KAV pads itself; this inner view shrinks with it, so the absolute composer rides the keyboard */}
         <View style={{ flex: 1 }}>
         {/* the conversation scrolls under both floating bars */}
@@ -300,7 +369,14 @@ export function ChatScreen({ route, navigation }: ChatProps) {
           </View>
         ) : null}
 
-        <View style={{ position: "absolute", left: 0, right: 0, bottom: 0 }}>
+        {/* iOS: the conversation scrolls under the composer's glass. Android has no glass, so
+            the bar is solid: otherwise text shows through beside and below the controls. */}
+        <View
+          style={[
+            { position: "absolute", left: 0, right: 0, bottom: 0 },
+            Platform.OS === "android" && { backgroundColor: p.panelBg, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: p.border },
+          ]}
+        >
           {!pinned && (
             <View style={{ position: "absolute", right: 12, top: -52, alignItems: "center" }}>
               <GlassCircle symbol="chevron.down" label={unseen > 0 ? `Jump to latest, ${unseen} new` : "Jump to latest"} onPress={jumpToLatest} size={40} />
@@ -328,9 +404,13 @@ export function ChatScreen({ route, navigation }: ChatProps) {
           {refused ? null : (
             <Composer
               name={header.name}
-              bottomInset={keyboardUp ? 0 : insets.bottom}
+              // Android's nav bar is a hard edge with no home-indicator margin of its own, so
+              // the composer gets a little air above it (seen on the vivo: flush on the bar).
+              bottomInset={keyboardUp ? 0 : insets.bottom + (Platform.OS === "android" ? 8 : 0)}
               onSend={send}
-              onActions={() => navigation.navigate("QuickActions", { sessionId, running, agent })}
+              attachments={attachments}
+              onAttach={onAttach}
+              onRemoveAttachment={removeAttachment}
               onHeight={setComposerH}
             />
           )}
@@ -363,6 +443,15 @@ export function ChatScreen({ route, navigation }: ChatProps) {
               </Text>
             </View>
           </Pressable>
+          {!header.canStop && (
+            <GlassCircle
+              symbol="slider.horizontal.3"
+              label="Steer: compact or clear the conversation"
+              onPress={() => navigation.navigate("QuickActions", { sessionId, running, agent })}
+              size={38}
+              symbolSize={17}
+            />
+          )}
           {header.canStop && (
             <Pressable
               onPress={() => navigation.navigate("QuickActions", { sessionId, running: true, agent })}

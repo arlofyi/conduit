@@ -68,7 +68,7 @@ export const SETTLED_SHOW_MS = 4000;
 /** Settled entries remembered, so joined question cards keep their outcome. */
 export const SETTLED_KEEP = 64;
 
-export const PRIVATE_ANSWER_TEXT = "Private session — answer it on your Mac";
+export const PRIVATE_ANSWER_TEXT = "Private session — answer it on your computer";
 export const DENIED_TEXT = "Denied — if you'd already allowed it in the terminal, it keeps running.";
 
 export function fromWire(w: WirePendingItem): PendingItem {
@@ -199,7 +199,7 @@ export const REJECTED_ANSWER_TEXT = "Couldn't send that answer — try a shorter
 function elsewhere(kind: PendingItem["kind"], by: By | undefined, late: boolean): string {
   switch (by) {
     case "desktop":
-      return late ? "Already answered on your Mac" : "Answered on your Mac";
+      return late ? "Already answered on your computer" : "Answered on your computer";
     case "terminal":
       // An ask resolved by the terminal is always a hand-off (Esc in the pane, the last phone
       // left, another window) -- nobody answered it anywhere yet.

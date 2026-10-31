@@ -14,7 +14,7 @@ describe("capFeed", () => {
   it("keeps the newest items behind one divider", () => {
     const out = capFeed(items(12), 5);
     expect(out).toHaveLength(5);
-    expect(out[0]).toMatchObject({ kind: "divider", id: FEED_CAP_ID, label: "Earlier messages are on your Mac" });
+    expect(out[0]).toMatchObject({ kind: "divider", id: FEED_CAP_ID, label: "Earlier messages are on your computer" });
     expect(out.slice(1).map((i) => i.id)).toEqual(["b8", "b9", "b10", "b11"]);
   });
 

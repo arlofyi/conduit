@@ -717,6 +717,22 @@ plus install/remove/status), and one listener in `App.tsx`.
   A dev build launched from a terminal inside the installed Conduit inherits that app's
   `CONDUIT_HOOK_*` env; `build_script` now exports `CONDUIT_HOOK_ENDPOINT` so its sessions'
   hooks still reach the dev build, not the installed one.
+- **The phone app runs on Android too.** Icons go through `androidSymbols.ts` (SF Symbol ->
+  Material Symbol); its keys are the only type `Icon`/`GlassCircle`/`SheetRow` accept, so an
+  icon with no Android equivalent fails `tsc` instead of rendering blank. The chat applies
+  the keyboard height BY HAND on Android (edge-to-edge: the window no longer resizes, and
+  RN reports the IME inset minus the nav bar, so add the bottom safe-area inset). Copy says
+  "your computer", never "your Mac" -- the desktop runs on Windows and Linux too.
+- **Uploads** (`uploads.rs`, `upload` -> `uploadResult`): the file is written into the
+  SESSION's own directory under `.conduit-uploads/` (self-ignoring `.gitignore`, pruned
+  after 7 days) because inside it the agent reads with no permission prompt; the phone then
+  sends `@.conduit-uploads/<file>`, which Claude resolves as an attachment. The stored name
+  is built by Conduit, never joined from the phone's string. Session-scoped, so a private
+  session is refused by the same gate as `input`.
+- **Session actions** (`sessionaction` stop|delete -> `mobile-session-action` event): the
+  desktop's MAIN window runs its own `stopSession`/`removeSession`, so a phone action and a
+  sidebar click end in the same state, and a broadcast never runs a delete twice. A phone
+  delete keeps the worktree -- the desktop asks before removing one; a remote tap cannot.
 
 ## Where the IDE integration lives
 

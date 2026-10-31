@@ -2,7 +2,7 @@
  * The small native sheets (iOS form sheets, fitted to their content, grabber visible, swipe
  * to dismiss): the Chats "…" menu, the composer's quick actions, and session details.
  */
-import { type SFSymbol } from "expo-symbols";
+import { type AppSymbol } from "../components/androidSymbols";
 import React from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -58,7 +58,7 @@ export function SheetRow({
   disabled = false,
   first = false,
 }: {
-  symbol?: SFSymbol;
+  symbol?: AppSymbol;
   title: string;
   detail?: string;
   trailing?: string;
@@ -171,7 +171,7 @@ export function ChatsMenuScreen({ navigation }: ChatsMenuProps) {
         </>
       )}
       <Group>
-        <SheetRow first symbol="laptopcomputer" title="Switch Mac…" tone="accent" onPress={() => {
+        <SheetRow first symbol="laptopcomputer" title="Switch computer…" tone="accent" onPress={() => {
             navigation.goBack();
             navigation.navigate("Connect");
           }}
@@ -235,7 +235,7 @@ export function SessionInfoScreen({ navigation, route }: SessionInfoProps) {
   const model = modelLabel(context?.model ?? session?.model ?? null);
   const pct = context ? Math.round(Math.min(1, Math.max(0, context.fraction)) * 100) : null;
   const state = session && isNeeds(session) ? "Needs you" : sessionLive.status === "running" || session?.status === "running" ? "Working" : session?.stopped ? "Stopped" : "Idle";
-  const rows: { symbol: SFSymbol; title: string; value: string; mono?: boolean }[] = [
+  const rows: { symbol: AppSymbol; title: string; value: string; mono?: boolean }[] = [
     { symbol: "folder", title: "Project", value: project?.name ?? "—" },
     { symbol: "cpu", title: "Agent", value: agent.label },
     { symbol: "sparkles", title: "Model", value: model ?? "—" },

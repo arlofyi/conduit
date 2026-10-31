@@ -112,7 +112,7 @@ export function previewFor(s: WireViewSession, pending?: PendingItem): Preview {
     return {
       tone: "private",
       prefix: null,
-      text: isNeeds(s) || pending ? "Private session — open it on your Mac" : "Private session",
+      text: isNeeds(s) || pending ? "Private session — open it on your computer" : "Private session",
     };
   }
   // A pushed question/permission is fresher than the last poll: it leads the row at once.
@@ -276,7 +276,7 @@ export function resolveProfile(view: WireProjectsView, sel: ProfileSel): Profile
   return view.profiles.some((p) => p.id === sel) ? sel : null;
 }
 
-/** "Profile: <name>" label; an unknown id (profile deleted on the Mac) reads as Default. */
+/** "Profile: <name>" label; an unknown id (profile deleted on your computer) reads as Default. */
 export function profileName(view: WireProjectsView, profileId: ProfileSel): string {
   if (profileId === ALL_PROFILES) return "All profiles";
   return view.profiles.find((p) => p.id === profileId)?.name ?? "Default";

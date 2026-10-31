@@ -857,6 +857,26 @@ export default function App() {
     };
   }, []);
 
+  // A phone stopped or deleted sessions (long-press / multi-select on the Chats list). The
+  // desktop runs its OWN actions so a phone tap and a sidebar click end in the same state.
+  // Only the main window acts -- the event is a broadcast and a delete must run once; other
+  // windows converge through `store-saved`. A phone delete keeps the session's worktree: the
+  // desktop asks before removing one (it may hold uncommitted work), a remote tap cannot.
+  useEffect(() => {
+    const un = listen<{ action: "stop" | "delete"; projectId: string; sessionId: string }>(
+      "mobile-session-action",
+      ({ payload }) => {
+        const st = useStore.getState();
+        if (!st.windowProfile.isMain) return;
+        if (payload.action === "stop") void st.stopSession(payload.projectId, payload.sessionId);
+        else void st.removeSession(payload.projectId, payload.sessionId);
+      },
+    );
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
+
   // Conductor fleet events emitted by the in-app MCP server.
   useEffect(() => {
     const unSpawn = listen<{ projectId: string; session: Session; task?: string }>(

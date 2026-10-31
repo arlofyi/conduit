@@ -117,7 +117,36 @@ fn only_system_reminders(text: &str) -> bool {
 }
 
 fn bubble(text: &str) -> Value {
-    json!({ "kind": "bubble", "role": "user", "text": text })
+    json!({ "kind": "bubble", "role": "user", "text": unwrap_paste(text) })
+}
+
+/// What the human typed, without the wrapper Claude Code puts around a paste.
+///
+/// A message that arrives as a bracketed paste (every message sent from the phone, and the
+/// desktop's own `paste_and_submit`) is recorded as
+/// `\n\n<pasted_content id="…">\n…\n</pasted_content id="…">`. Shown raw, the bubble opened
+/// with two blank lines and both tags (seen on Claude Code 2.1.316). The wrapper is the first
+/// and last NON-BLANK lines and nothing else is touched: a message with no wrapper keeps its
+/// indentation and blank lines, and a paste that itself contains a tag line (an XML file,
+/// this source) keeps it.
+fn unwrap_paste(text: &str) -> String {
+    let is_tag = |l: &str, open: &str| {
+        let l = l.trim();
+        l.starts_with(open) && l.ends_with('>')
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let first = lines.iter().position(|l| !l.trim().is_empty());
+    let last = lines.iter().rposition(|l| !l.trim().is_empty());
+    match (first, last) {
+        (Some(f), Some(l))
+            if f < l
+                && is_tag(lines[f], "<pasted_content")
+                && is_tag(lines[l], "</pasted_content") =>
+        {
+            lines[f + 1..l].join("\n").trim_matches('\n').to_string()
+        }
+        _ => text.to_string(),
+    }
 }
 
 /// Rules 5-7: caveat preamble (dropped), slash/bash commands, command output.
@@ -499,6 +528,26 @@ pub fn parse_system(v: &Value) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pasted_message_shows_as_typed() {
+        let raw = "\n\n<pasted_content id=\"f7e5\">\nThe connection is made.\n\nAlso, the keyboard.\n</pasted_content id=\"f7e5\">";
+        assert_eq!(
+            unwrap_paste(raw),
+            "The connection is made.\n\nAlso, the keyboard."
+        );
+        // No wrapper: untouched, indentation included.
+        assert_eq!(unwrap_paste("    let x = 1;\n"), "    let x = 1;\n");
+        // A tag line INSIDE the paste is the user's content.
+        let nested =
+            "<pasted_content id=\"a\">\n<pasted_content id=\"x\">\nbody\n</pasted_content id=\"a\">";
+        assert_eq!(unwrap_paste(nested), "<pasted_content id=\"x\">\nbody");
+        // A mention inside a sentence is the user's words, not the wrapper.
+        assert_eq!(
+            unwrap_paste("why does <pasted_content> appear?"),
+            "why does <pasted_content> appear?"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

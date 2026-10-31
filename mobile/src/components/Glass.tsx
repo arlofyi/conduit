@@ -12,11 +12,12 @@
  */
 import { BlurView } from "expo-blur";
 import { GlassView, isGlassEffectAPIAvailable, isLiquidGlassAvailable } from "expo-glass-effect";
-import { SymbolView, type SFSymbol } from "expo-symbols";
+import { SymbolView } from "expo-symbols";
 import React from "react";
 import { Platform, Pressable, StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH } from "../theme/type";
+import { androidSymbolFor, type AppSymbol } from "./androidSymbols";
 
 let glassOk: boolean | null = null;
 /** Checked once: both the compile-time availability and the runtime API (some iOS 26 betas lack it). */
@@ -101,18 +102,22 @@ export function MaterialBar({ style, children }: { style?: StyleProp<ViewStyle>;
   return <View style={[{ backgroundColor: p.sidebarBg }, style]}>{children}</View>;
 }
 
-/** An SF Symbol, tinted. */
+/** An SF Symbol on iOS, its Material Symbol on Android (see androidSymbols.ts), tinted. */
 export function Icon({
   name,
   size = 20,
   color,
   weight = "regular",
 }: {
-  name: SFSymbol;
+  name: AppSymbol;
   size?: number;
   color: string;
   weight?: "ultraLight" | "thin" | "light" | "regular" | "medium" | "semibold" | "bold";
 }) {
+  if (Platform.OS === "android") {
+    // Regular weight only: each Material weight is its own ~1 MB font in the bundle.
+    return <SymbolView name={{ android: androidSymbolFor(name) }} size={size} tintColor={color} style={{ width: size, height: size }} />;
+  }
   return <SymbolView name={name} size={size} tintColor={color} weight={weight} resizeMode="scaleAspectFit" style={{ width: size, height: size }} />;
 }
 
@@ -126,7 +131,7 @@ export function GlassCircle({
   disabled = false,
   symbolSize = 18,
 }: {
-  symbol: SFSymbol;
+  symbol: AppSymbol;
   onPress: () => void;
   label: string;
   size?: number;

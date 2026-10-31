@@ -42,9 +42,9 @@ export function PairScreen({ navigation }: PairProps) {
     <View style={{ flex: 1, backgroundColor: p.panelBg }}>
       <ScreenHeader title={pairing.macName} onBack={() => navigation.goBack()} />
       <View style={{ paddingHorizontal: 20, paddingBottom: insets.bottom + 24, flex: 1 }}>
-        <BigTitle>Approve on your Mac</BigTitle>
+        <BigTitle>Approve on your computer</BigTitle>
         <Para>
-          Your Mac is showing a pairing request. Check the code matches, then click Allow there. You only do this
+          Your computer is showing a pairing request. Check the code matches, then click Allow there. You only do this
           once per phone.
         </Para>
 
@@ -83,7 +83,7 @@ export function PairScreen({ navigation }: PairProps) {
           <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, marginTop: 28 }}>
             <ActivityIndicator color={p.textDim} />
             <Text style={{ color: p.textMid }}>
-              {pairing.phase === "connecting" ? `Reaching ${pairing.macName}…` : "Waiting for your Mac…"}
+              {pairing.phase === "connecting" ? `Reaching ${pairing.macName}…` : "Waiting for your computer…"}
             </Text>
           </View>
         )}

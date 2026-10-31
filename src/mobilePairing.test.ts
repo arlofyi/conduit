@@ -9,7 +9,7 @@ describe("tailscaleRow", () => {
     });
   });
   it("stopped and needsLogin offer open", () => {
-    expect(tailscaleRow({ state: "stopped" })).toEqual({ label: "Tailscale is off on this Mac", action: "open" });
+    expect(tailscaleRow({ state: "stopped" })).toEqual({ label: "Tailscale is off on this computer", action: "open" });
     expect(tailscaleRow({ state: "needsLogin" })).toEqual({ label: "Sign in to Tailscale", action: "open" });
   });
   it("running shows tailnet and name, no action", () => {
@@ -23,7 +23,7 @@ describe("tailscaleRow", () => {
       userId: 1,
     };
     expect(tailscaleRow(s)).toEqual({
-      label: "Connected · me.ts.net · this Mac is mac.me.ts.net",
+      label: "Connected · me.ts.net · this computer is mac.me.ts.net",
       action: null,
     });
   });

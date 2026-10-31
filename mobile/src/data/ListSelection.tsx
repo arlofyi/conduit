@@ -8,7 +8,7 @@ import { useLive } from "../bridge/LiveProvider";
 import type { ChatFilter, ProfileSel } from "../logic/chatList";
 
 interface ListSelection {
-  /** undefined = "not chosen yet on this Mac": follow the Mac's active profile */
+  /** undefined = "not chosen yet on this computer": follow the Mac's active profile */
   profileSel: ProfileSel | undefined;
   setProfileSel: (p: ProfileSel) => void;
   filter: ChatFilter;
