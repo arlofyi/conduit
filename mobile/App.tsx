@@ -123,11 +123,18 @@ const SHEET = {
   contentStyle: { backgroundColor: "transparent" },
 };
 
+/** iOS draws its own glass behind a transparent sheet; Android has none, so a transparent
+ * sheet showed the chat straight through its header (seen on a vivo X200 Pro). */
+function sheetOptions(bg: string) {
+  return Platform.OS === "android" ? { ...SHEET, contentStyle: { backgroundColor: bg } } : SHEET;
+}
+
 function Inner() {
   const { palette } = useTheme();
   const { loaded: prefsLoaded } = usePrefs();
   const { loaded, currentMac } = useLive();
   const base = palette.appearance === "dark" ? DarkTheme : DefaultTheme;
+  const sheet = useMemo(() => sheetOptions(palette.sidebarBg), [palette.sidebarBg]);
   const navTheme: Theme = {
     ...base,
     colors: {
@@ -162,10 +169,10 @@ function Inner() {
             <Stack.Screen name="Chat" component={ChatScreen} />
             <Stack.Screen name="Connect" component={ConnectScreen} />
             <Stack.Screen name="Pair" component={PairScreen} />
-            <Stack.Screen name="NewChat" component={NewChatScreen} options={SHEET} />
-            <Stack.Screen name="ChatsMenu" component={ChatsMenuScreen} options={SHEET} />
-            <Stack.Screen name="QuickActions" component={QuickActionsScreen} options={SHEET} />
-            <Stack.Screen name="SessionInfo" component={SessionInfoScreen} options={SHEET} />
+            <Stack.Screen name="NewChat" component={NewChatScreen} options={sheet} />
+            <Stack.Screen name="ChatsMenu" component={ChatsMenuScreen} options={sheet} />
+            <Stack.Screen name="QuickActions" component={QuickActionsScreen} options={sheet} />
+            <Stack.Screen name="SessionInfo" component={SessionInfoScreen} options={sheet} />
           </Stack.Group>
         ) : (
           <Stack.Group navigationKey="no-mac">
