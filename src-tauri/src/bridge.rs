@@ -9,7 +9,7 @@
 //!   address re-binds within one tick and a stale address is never left bound.
 //! - Never `0.0.0.0` / `::`. Peers outside loopback and the tailnet ranges are dropped
 //!   before the handshake, and a handshake whose `Origin` is not this listener itself is
-//!   refused with 403 (a web page on the Mac must never reach the bridge; the iOS app's
+//!   refused with 403 (a web page on your computer must never reach the bridge; the iOS app's
 //!   socket always sends its own dialled origin, see [`origin_allowed`]).
 //!
 //! Every peer is greeted with `hello`. A non-loopback peer must then `auth` with its
@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{AppHandle, Manager};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -98,7 +98,7 @@ pub enum ClientMsg {
     Auth {
         token: String,
     },
-    /// Pair with this Mac, either with the QR's one-time `secret` or by asking
+    /// Pair with this computer, either with the QR's one-time `secret` or by asking
     /// (`request: true`). Allowed pre-auth; handled by the pairing seam.
     #[serde(rename_all = "camelCase")]
     Pair {
@@ -139,7 +139,28 @@ pub enum ClientMsg {
         name: String,
         data: String,
     },
+    /// Stop or delete sessions picked on the phone (long-press / multi-select). The desktop
+    /// runs its OWN stop/delete for each (`mobile-session-action` event), so a phone action
+    /// and a click in the sidebar end in the same state. Acked with `sessionActionResult`.
+    #[serde(rename_all = "camelCase")]
+    SessionAction {
+        request_id: String,
+        action: SessionActionKind,
+        session_ids: Vec<String>,
+    },
 }
+
+/// What a phone may do to a whole session. Deliberately not "start": opening a chat already
+/// wakes it.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionActionKind {
+    Stop,
+    Delete,
+}
+
+/// Most sessions one `sessionAction` may name: a whole list, never an unbounded batch.
+const SESSION_ACTION_MAX: usize = 50;
 
 /// Manual `Debug`: `Auth.token`, `Pair.secret` and `Pair.nonce` are plaintext secrets and
 /// must never reach a log through a stray `{:?}`.
@@ -222,6 +243,16 @@ impl std::fmt::Debug for ClientMsg {
                 .field("id", id)
                 .field("allow", allow)
                 .finish(),
+            Self::SessionAction {
+                request_id,
+                action,
+                session_ids,
+            } => f
+                .debug_struct("SessionAction")
+                .field("request_id", request_id)
+                .field("action", action)
+                .field("session_ids", session_ids)
+                .finish(),
             // The body is megabytes of base64; its length is what a log needs.
             Self::Upload {
                 session_id,
@@ -260,7 +291,7 @@ const PREAUTH_MAX_BYTES: usize = 4 * 1024;
 /// Failed `auth` attempts allowed per peer IP in [`AUTH_FAILURE_WINDOW`].
 const AUTH_FAILURES_MAX: usize = 5;
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
-/// Pair prompts raised on the Mac per peer IP in [`PAIR_PROMPT_WINDOW`], whatever their
+/// Pair prompts raised on your computer per peer IP in [`PAIR_PROMPT_WINDOW`], whatever their
 /// outcome -- a hang-up or a self-replacement still put a prompt in front of the human, so
 /// counting only failures would let a peer wear down the confirm-on-the-Mac safeguard.
 const PAIR_PROMPTS_MAX: usize = 5;
@@ -350,7 +381,7 @@ fn streams_raw_output(remote_device: bool) -> bool {
 }
 
 /// How long a phone-spawned Claude session may go without its `sessionstart` hook before the
-/// phone is told it is waiting on the Mac. Claude asks "do you trust this folder?" before it
+/// phone is told it is waiting on your computer. Claude asks "do you trust this folder?" before it
 /// runs any hook, and the phone cannot answer that prompt.
 const TRUST_STALL: Duration = Duration::from_secs(20);
 
@@ -390,7 +421,7 @@ fn trust_stall_frame(session_id: &str) -> serde_json::Value {
 }
 
 const TRUST_STALL_MESSAGE: &str =
-    "Claude is waiting on your Mac \u{2014} open this folder there once to trust it";
+    "Claude is waiting on your computer \u{2014} open this folder there once to trust it";
 
 /// May a phone's `answer` resolve this ask? Only a still-pending ask (None = someone else
 /// already answered), never a private session's, and only a valid set of answers.
@@ -509,6 +540,35 @@ fn upload_reply(
             json!({ "type": "uploadResult", "requestId": request_id, "ok": false, "error": error })
         }
     }
+}
+
+/// Which of `ids` a phone may act on, and why each other one is refused. Pure: `owner`
+/// answers a session's project (None = unknown), `private` its privacy.
+fn plan_session_action(
+    ids: &[String],
+    owner: impl Fn(&str) -> Option<String>,
+    private: impl Fn(&str) -> bool,
+) -> (Vec<(String, String)>, Vec<serde_json::Value>) {
+    let mut go = Vec::new();
+    let mut skipped = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (i, id) in ids.iter().enumerate() {
+        if i >= SESSION_ACTION_MAX {
+            skipped.push(json!({ "id": id, "reason": "too many at once" }));
+            continue;
+        }
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        match owner(id) {
+            None => skipped.push(json!({ "id": id, "reason": "no longer exists" })),
+            Some(_) if private(id) => {
+                skipped.push(json!({ "id": id, "reason": "private session" }))
+            }
+            Some(project) => go.push((project, id.clone())),
+        }
+    }
+    (go, skipped)
 }
 
 fn take_spawn_slot(spawns: &Mutex<HashMap<String, VecDeque<Instant>>>, key: &str) -> bool {
@@ -651,7 +711,7 @@ fn unauthorized() -> serde_json::Value {
     json!({ "type": "error", "message": "unauthorized" })
 }
 
-/// Reply to an `auth` this Mac will not even check right now (peer rate-limited, or
+/// Reply to an `auth` this computer will not even check right now (peer rate-limited, or
 /// mobile access off). Decided BEFORE the token is looked at, so it says nothing about
 /// the token -- and it tells the phone not to forget a Mac that never judged its token.
 fn unavailable() -> serde_json::Value {
@@ -699,7 +759,7 @@ fn auth_ok_payload(device_id: &str) -> serde_json::Value {
 /// client) is fine. The phone app DOES send one -- iOS's WebSocket (SocketRocket) always
 /// sets it to the URL it dialled, `http://<host>:<port>`, and JS cannot remove it -- so an
 /// Origin naming THIS listener is accepted too: the literal IP the socket arrived on
-/// (`127.0.0.1` on loopback), or this Mac's own MagicDNS name on the tailnet address, each
+/// (`127.0.0.1` on loopback), or this computer's own MagicDNS name on the tailnet address, each
 /// with the bridge's own port. A browser only sends such an Origin for a page served from
 /// that exact host and port, which is the bridge itself, and it serves no pages.
 ///
@@ -726,7 +786,7 @@ fn origin_allowed(origin: Option<&[u8]>, local: SocketAddr, own_dns: &str) -> bo
     if let Ok(ip) = host.parse::<IpAddr>() {
         return ip == local.ip();
     }
-    // `localhost` is NOT this listener: it is any process's origin on the Mac, and the phone
+    // `localhost` is NOT this listener: it is any process's origin on your computer, and the phone
     // never dials it (the Simulator uses the literal 127.0.0.1).
     if local.ip().is_loopback() {
         return false;
@@ -798,7 +858,7 @@ pub fn pick_port(persisted: Option<u16>, is_free: impl Fn(u16) -> bool) -> Optio
         .find(|p| is_free(*p))
 }
 
-/// The name a phone shows for this Mac: Tailscale's own name for it when running (what
+/// The name a phone shows for this computer: Tailscale's own name for it when running (what
 /// the user sees in the tailnet), else the system's, else "Conduit".
 fn mac_name_from(ts: &TailscaleState, system: Option<String>) -> String {
     if let TailscaleState::Running { self_name, .. } = ts {
@@ -1834,7 +1894,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         }
                     }
                     // Probe the tailnet off this thread; the reply arrives via `macs_rx`. Only
-                    // a phone owned by this Mac's Tailscale user may see the owner's Macs; its
+                    // a phone owned by this computer's Tailscale user may see the owner's Macs; its
                     // owner is looked up once per connection (loopback is the owner).
                     Some(ClientMsg::Discover) => {
                         if !discovering {
@@ -1926,6 +1986,42 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         );
                         let dir = app.state::<Arc<Store>>().session_dir(&session_id);
                         let reply = upload_reply(dir, &request_id, &name, &data, allowed);
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::SessionAction {
+                        request_id,
+                        action,
+                        session_ids,
+                    }) => {
+                        use tauri::Emitter;
+                        let store = app.state::<Arc<Store>>();
+                        let projects = store.list();
+                        let (go, skipped) = plan_session_action(
+                            &session_ids,
+                            |id| {
+                                projects
+                                    .iter()
+                                    .find(|p| p.sessions.iter().any(|s| s.id == id))
+                                    .map(|p| p.id.clone())
+                            },
+                            |id| crate::bridge_view::session_is_private(&projects, id),
+                        );
+                        for (project_id, session_id) in &go {
+                            let _ = app.emit(
+                                "mobile-session-action",
+                                json!({ "action": action, "projectId": project_id, "sessionId": session_id }),
+                            );
+                        }
+                        let done: Vec<&String> = go.iter().map(|(_, id)| id).collect();
+                        let reply = json!({
+                            "type": "sessionActionResult",
+                            "requestId": request_id,
+                            "action": action,
+                            "done": done,
+                            "skipped": skipped,
+                        });
                         if !send_text(&mut ws, reply.to_string()) {
                             break 'conn;
                         }
@@ -2062,7 +2158,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             }
         }
 
-        // 3b. A Claude session this phone spawned that has not started: it is on the Mac's
+        // 3b. A Claude session this phone spawned that has not started: it is on your computer's
         //     "trust this folder?" prompt, which the phone cannot answer. Say so, once.
         for sid in spawn_watch.stalled(Instant::now()) {
             if !send_text(&mut ws, trust_stall_frame(&sid).to_string()) {
@@ -2372,6 +2468,41 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn session_action_parses_and_plans() {
+        let m = parse_client_msg(
+            r#"{"type":"sessionaction","requestId":"r","action":"delete","sessionIds":["a","b"]}"#,
+        );
+        assert!(
+            matches!(m, Some(ClientMsg::SessionAction { action: SessionActionKind::Delete, ref session_ids, .. }) if session_ids.len() == 2),
+            "{m:?}"
+        );
+        // An unknown action is refused at parse time, never guessed.
+        assert!(parse_client_msg(
+            r#"{"type":"sessionaction","requestId":"r","action":"wipe","sessionIds":["a"]}"#
+        )
+        .is_none());
+        let ids: Vec<String> = ["a", "gone", "secret", "a"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (go, skipped) = plan_session_action(
+            &ids,
+            |id| (id != "gone").then(|| "p".to_string()),
+            |id| id == "secret",
+        );
+        assert_eq!(
+            go,
+            vec![("p".to_string(), "a".to_string())],
+            "deduped, private and unknown dropped"
+        );
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[1]["reason"], "private session");
+        let many: Vec<String> = (0..SESSION_ACTION_MAX + 3).map(|i| i.to_string()).collect();
+        let (go, skipped) = plan_session_action(&many, |_| Some("p".into()), |_| false);
+        assert_eq!((go.len(), skipped.len()), (SESSION_ACTION_MAX, 3));
     }
 
     #[test]
@@ -3273,7 +3404,7 @@ mod tests {
         assert_eq!(f["sessionId"], "s1");
         assert_eq!(
             f["message"],
-            "Claude is waiting on your Mac \u{2014} open this folder there once to trust it"
+            "Claude is waiting on your computer \u{2014} open this folder there once to trust it"
         );
     }
 

@@ -171,7 +171,7 @@ export function ChatsMenuScreen({ navigation }: ChatsMenuProps) {
         </>
       )}
       <Group>
-        <SheetRow first symbol="laptopcomputer" title="Switch Mac…" tone="accent" onPress={() => {
+        <SheetRow first symbol="laptopcomputer" title="Switch computer…" tone="accent" onPress={() => {
             navigation.goBack();
             navigation.navigate("Connect");
           }}

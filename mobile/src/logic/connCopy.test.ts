@@ -11,9 +11,9 @@ describe("qrErrorText", () => {
 
 describe("pairFailText", () => {
   it("maps_every_desktop_reason", () => {
-    expect(pairFailText("declined")).toBe("Declined on the Mac");
+    expect(pairFailText("declined")).toBe("Declined on your computer");
     expect(pairFailText("expired")).toBe("No answer in 2 minutes");
-    expect(pairFailText("off")).toBe("Mobile access is off on that Mac");
+    expect(pairFailText("off")).toBe("Mobile access is off on that computer");
     expect(pairFailText("replaced")).toBe("Another request replaced this one");
     expect(pairFailText("error")).toBe("Couldn't pair");
     expect(pairFailText("whatever")).toBe("Couldn't pair");

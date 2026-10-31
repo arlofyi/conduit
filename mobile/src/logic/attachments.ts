@@ -22,7 +22,7 @@ export type Attachment = {
   /** local URI, for an image thumbnail */
   uri: string;
   state: "uploading" | "ready" | "failed";
-  /** relative path on the Mac once uploaded */
+  /** relative path on your computer once uploaded */
   path?: string;
   error?: string;
 };

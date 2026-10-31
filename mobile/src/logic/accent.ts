@@ -36,7 +36,7 @@ export function projectAccent(projectId: string): string {
   return PROJECT_PALETTE[projectHue(projectId) % PROJECT_PALETTE.length];
 }
 
-/** The chosen colour when the user picked one on the Mac, else the derived accent. */
+/** The chosen colour when the user picked one on your computer, else the derived accent. */
 export function accentFor(project: { id: string; color: string | null }): string {
   return project.color ? project.color : projectAccent(project.id);
 }

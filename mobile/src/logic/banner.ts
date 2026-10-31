@@ -41,7 +41,7 @@ export interface Banner {
 
 export const BANNER_MS = 5000;
 
-export const PRIVATE_NEEDS_TEXT = "Private session — open it on your Mac";
+export const PRIVATE_NEEDS_TEXT = "Private session — open it on your computer";
 
 export function signalOf(s: WireViewSession): Signal {
   const needs = s.needs?.kind === "ask" ? "question" : isNeeds(s) ? "permission" : null;
@@ -149,7 +149,7 @@ export function bannerFromPending(
   const kind: "question" | "permission" = item.kind === "ask" ? "question" : "permission";
   const updated = { ...signals, [item.sessionId]: { needs: prev.needs ?? kind, status: "needsInput" as const } };
   // Keyed by the ITEM, not the session's needs flag: `pendingAdded` fires once per new id, so a
-  // second question in a session that already needed you (the first answered on the Mac before
+  // second question in a session that already needed you (the first answered on your computer before
   // any poll cleared the flag) is still announced.
   if (item.sessionId === openId || !allowed(kind, prefs)) return { signals: updated, banner: null };
   for (const p of view.projects) {

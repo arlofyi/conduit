@@ -26,7 +26,7 @@ export const QUICK_ACTIONS: readonly QuickAction[] = [
   {
     id: "stop",
     title: "Stop",
-    detail: "Interrupt the current turn (Esc on the Mac)",
+    detail: "Interrupt the current turn (Esc on your computer)",
     symbol: "stop.circle",
     destructive: true,
     runningOnly: true,
@@ -51,7 +51,7 @@ export const QUICK_ACTIONS: readonly QuickAction[] = [
     claudeOnly: true,
     confirm: {
       title: "Clear this conversation?",
-      message: "The session starts over with an empty context. The old conversation stays on your Mac.",
+      message: "The session starts over with an empty context. The old conversation stays on your computer.",
       action: "Clear",
     },
   },

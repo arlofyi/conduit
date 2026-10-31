@@ -25,14 +25,14 @@ export function SettingsScreen({ navigation }: SettingsProps) {
   const route = !currentMac
     ? "—"
     : isLoopbackMac(currentMac)
-      ? "This Mac (simulator)"
+      ? "This computer (simulator)"
       : `Tailscale · ${currentMac.dnsName || currentMac.ip}`;
 
   const confirmForget = () => {
     if (!currentMac) return;
     Alert.alert(
       `Forget ${currentMac.macName}?`,
-      "This phone will need to pair again to reach it. To also remove the phone on the Mac, use Settings → Mobile there.",
+      "This phone will need to pair again to reach it. To also remove the phone on your computer, use Settings → Mobile there.",
       [
         { text: "Cancel", style: "cancel" },
         { text: "Forget", style: "destructive", onPress: () => forget() },
@@ -64,7 +64,7 @@ export function SettingsScreen({ navigation }: SettingsProps) {
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 32 }}>
         <SectionLabel>Connection</SectionLabel>
         <Card>
-          <Row first title="Mac" value={macName} />
+          <Row first title="Computer" value={macName} />
           <Row title="Address" value={address ? hostPort(address) : "—"} />
           <Row title="Route" value={route} />
           <Row
@@ -85,8 +85,8 @@ export function SettingsScreen({ navigation }: SettingsProps) {
               </View>
             }
           />
-          <Row title="Switch Mac…" tone="accent" onPress={() => navigation.navigate("Connect")} />
-          <Row title="Forget this Mac" tone="danger" onPress={confirmForget} disabled={!currentMac} />
+          <Row title="Switch computer…" tone="accent" onPress={() => navigation.navigate("Connect")} />
+          <Row title="Forget this computer" tone="danger" onPress={confirmForget} disabled={!currentMac} />
         </Card>
 
         <SectionLabel>Notify me when</SectionLabel>

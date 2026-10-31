@@ -55,16 +55,16 @@ describe("spawn errors", () => {
   });
 });
 
-describe("a new chat waiting on the Mac's folder-trust prompt", () => {
+describe("a new chat waiting on your computer's folder-trust prompt", () => {
   it("matches bridge.rs TRUST_STALL_MESSAGE exactly", () => {
-    expect(TRUST_STALL).toBe("Claude is waiting on your Mac \u2014 open this folder there once to trust it");
+    expect(TRUST_STALL).toBe("Claude is waiting on your computer \u2014 open this folder there once to trust it");
   });
   it("becomes a notice in the chat it names, and only there", () => {
     expect(trustStallNotice(TRUST_STALL, "s1", "s1", "n-1")).toEqual({
       kind: "notice",
       id: "n-1",
       tone: "info",
-      text: "Trust this folder on your Mac to start",
+      text: "Trust this folder on your computer to start",
       detail: TRUST_STALL,
     });
     expect(trustStallNotice(TRUST_STALL, "s1", "other", "n-1")).toBeNull();
@@ -75,5 +75,13 @@ describe("a new chat waiting on the Mac's folder-trust prompt", () => {
   });
   it("is never mistaken for a spawn failure", () => {
     expect(isSpawnError(TRUST_STALL)).toBe(false);
+  });
+});
+
+describe("trust stall from an older desktop", () => {
+  it("is still recognised in its old wording", () => {
+    const { trustStallNotice, TRUST_STALL_LINE } = require("./frames");
+    const n = trustStallNotice("Claude is waiting on your Mac — open this folder there once to trust it", "s1", "s1", "n1");
+    expect(n?.text).toBe(TRUST_STALL_LINE);
   });
 });

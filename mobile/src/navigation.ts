@@ -17,7 +17,7 @@ export type RootStackParamList = {
   Pair: undefined;
   /** "+" on Chats: start a session */
   NewChat: undefined;
-  /** "…" on Chats: profile + Switch Mac */
+  /** "…" on Chats: profile + Switch computer */
   ChatsMenu: undefined;
   /** "+" in the composer */
   QuickActions: { sessionId: string; running: boolean; agent: string };

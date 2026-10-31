@@ -86,7 +86,7 @@ export function MobilePanel() {
         id="mobile-access"
         title="Mobile access"
         detail="Lets paired phones on your tailnet read and drive your sessions. Off by default; turning it off disconnects every phone and cancels pairing."
-        status={!running && !cfg?.enabled ? "Needs Tailscale connected on this Mac." : undefined}
+        status={!running && !cfg?.enabled ? "Needs Tailscale connected on this computer." : undefined}
         checked={!!cfg?.enabled}
         disabled={!cfg || (!running && !cfg.enabled)}
         onChange={setEnabled}
@@ -142,7 +142,7 @@ function PairCard({ now, running }: { now: number; running: boolean }) {
       .catch((e) => setErr(String(e)));
   };
 
-  // Kill the QR secret on the Mac whenever the card stops showing it.
+  // Kill the QR secret on your computer whenever the card stops showing it.
   const secretRef = useRef<string | null>(null);
   const cancelOnMac = () => {
     if (secretRef.current) invoke("pair_cancel", { secret: secretRef.current }).catch(() => {});

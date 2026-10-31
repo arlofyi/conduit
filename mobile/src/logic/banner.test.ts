@@ -104,7 +104,7 @@ describe("banners", () => {
     const siloNeeds = sess({ id: "s", name: "secret", silo: true, status: "needsInput", needs: { kind: "input", text: null } });
     const b = run([view(siloIdle), view(siloNeeds)], null);
     expect(b).toHaveLength(1);
-    expect(b[0]).toMatchObject({ openable: false, text: "Private session — open it on your Mac" });
+    expect(b[0]).toMatchObject({ openable: false, text: "Private session — open it on your computer" });
   });
 
   it("needs outranks finished when one poll carries both", () => {
@@ -146,7 +146,7 @@ describe("banner from a pushed question or permission", () => {
     expect(bannerFromPending(signals, view(idle), permItem, null, { ...ALL_ON, notifyPermission: false }).banner).toBeNull();
     expect(bannerFromPending(signals, view(idle), askItem, "a", ALL_ON).banner).toBeNull();
     // a NEW question in a session already needing you still banners: it is keyed by the item,
-    // not by the session's needs flag (the first was answered on the Mac before any poll)
+    // not by the session's needs flag (the first was answered on your computer before any poll)
     const needing = bannersFromView({}, view(asks), null, ALL_ON).signals;
     const second = bannerFromPending(needing, view(asks), { ...askItem, id: "ask-2" }, null, ALL_ON);
     expect(second.banner).toMatchObject({ sessionId: "a", kind: "question", text: "Asks: Ship it?" });
@@ -156,6 +156,6 @@ describe("banner from a pushed question or permission", () => {
     const siloIdle = sess({ id: "s", name: "secret", silo: true });
     const sig = bannersFromView({}, view(siloIdle), null, ALL_ON).signals;
     const b = bannerFromPending(sig, view(siloIdle), { kind: "ask", id: "ask-2", sessionId: "s", private: true }, null, ALL_ON).banner;
-    expect(b).toMatchObject({ openable: false, text: "Private session — open it on your Mac" });
+    expect(b).toMatchObject({ openable: false, text: "Private session — open it on your computer" });
   });
 });

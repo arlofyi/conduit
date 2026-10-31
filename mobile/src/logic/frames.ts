@@ -10,7 +10,7 @@ import type { NoticeItem } from "../data/types";
 export const PRIVATE_SESSION = "private session";
 
 /** What the chat shows when the Mac refuses a private session. */
-export const PRIVATE_SESSION_TEXT = "Private session — open it on your Mac";
+export const PRIVATE_SESSION_TEXT = "Private session — open it on your computer";
 
 /** Should a session-scoped frame reach the open chat? Untagged frames (older Macs) always do. */
 export function acceptsFrame(frameSessionId: unknown, open: string | null): boolean {
@@ -48,7 +48,9 @@ export function isSpawnError(message: string): boolean {
 /** The Mac's word that a chat this phone started has not begun: Claude is on its "trust this
  * folder?" prompt, which only the Mac can answer (bridge.rs `TRUST_STALL_MESSAGE`). Sent once,
  * tagged with the new session, about 20 s after the spawn if no `sessionstart` hook came. */
-export const TRUST_STALL = "Claude is waiting on your Mac — open this folder there once to trust it";
+export const TRUST_STALL = "Claude is waiting on your computer — open this folder there once to trust it";
+/** The same message from a desktop older than the wording change ("your Mac"). */
+const TRUST_STALL_OLD = "Claude is waiting on your Mac — open this folder there once to trust it";
 
 /** The notice that error becomes in the chat it names, or null when it is not that error or
  * is about a chat other than the open one. */
@@ -58,25 +60,25 @@ export function trustStallNotice(
   open: string | null,
   id: string,
 ): NoticeItem | null {
-  if (message !== TRUST_STALL || typeof frameSessionId !== "string" || frameSessionId !== open) return null;
+  if ((message !== TRUST_STALL && message !== TRUST_STALL_OLD) || typeof frameSessionId !== "string" || frameSessionId !== open) return null;
   // A notice is one line with its `detail` folded behind a chevron, so the line itself must say
   // what to do; the Mac's full sentence is the detail.
   return { kind: "notice", id, tone: "info", text: TRUST_STALL_LINE, detail: TRUST_STALL };
 }
 
 /** The notice line for a stalled new chat (fits one line at the default text size). */
-export const TRUST_STALL_LINE = "Trust this folder on your Mac to start";
+export const TRUST_STALL_LINE = "Trust this folder on your computer to start";
 
 /** The sheet's sentence for a spawn error. */
 export function spawnErrorText(message: string): string {
   switch (message) {
     case "unknown agent":
-      return "Your Mac doesn't know that agent.";
+      return "Your computer doesn't know that agent.";
     case "unknown project":
-      return "That project is no longer on your Mac.";
+      return "That project is no longer on your computer.";
     case "too many new chats — try again later":
       return "Too many new chats from this phone — try again later.";
     default:
-      return "Your Mac couldn't start the chat.";
+      return "Your computer couldn't start the chat.";
   }
 }

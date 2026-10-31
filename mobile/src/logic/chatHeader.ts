@@ -76,7 +76,7 @@ function find(
 ): { project: WireViewProject; session: WireViewSession } | null {
   if (!view) return null;
   // The route's project first; session ids are unique, so any project listing it will do
-  // (a session moved between projects on the Mac is still found).
+  // (a session moved between projects on your computer is still found).
   const ordered = [...view.projects].sort((x, y) => Number(y.id === projectId) - Number(x.id === projectId));
   for (const project of ordered) {
     const session = project.sessions.find((s) => s.id === sessionId);

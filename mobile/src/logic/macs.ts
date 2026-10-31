@@ -37,9 +37,9 @@ export function parseManualAddress(
 ): { ok: true; endpoint: PairEndpoint } | { ok: false; error: string } {
   const host = hostIn.trim().replace(/\.$/, "");
   const portText = portIn.trim();
-  if (!/^\d+$/.test(portText)) return { ok: false, error: "Enter the port shown on your Mac (8455–8474)." };
+  if (!/^\d+$/.test(portText)) return { ok: false, error: "Enter the port shown on your computer (8455–8474)." };
   const port = Number(portText);
-  if (port < 8455 || port > 8474) return { ok: false, error: "Enter the port shown on your Mac (8455–8474)." };
+  if (port < 8455 || port > 8474) return { ok: false, error: "Enter the port shown on your computer (8455–8474)." };
   const v4 = IPV4.exec(host);
   if (v4) {
     if (v4.slice(1).some((x) => Number(x) > 255)) return { ok: false, error: "That isn't a valid address." };

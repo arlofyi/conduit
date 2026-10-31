@@ -23,11 +23,11 @@ export function tailscaleRow(s: TailscaleState): { label: string; action: "insta
     case "notInstalled":
       return { label: "Tailscale is not installed", action: "install" };
     case "stopped":
-      return { label: "Tailscale is off on this Mac", action: "open" };
+      return { label: "Tailscale is off on this computer", action: "open" };
     case "needsLogin":
       return { label: "Sign in to Tailscale", action: "open" };
     case "running":
-      return { label: `Connected · ${s.tailnet} · this Mac is ${s.dnsName}`, action: null };
+      return { label: `Connected · ${s.tailnet} · this computer is ${s.dnsName}`, action: null };
     case "unknown":
       return { label: `Couldn't read Tailscale: ${s.reason}`, action: "open" };
   }

@@ -33,15 +33,16 @@ import { BridgeClient } from "./BridgeClient";
 import { initialConn, lifecycleAction, type ConnError, type ConnState } from "./connection";
 import { appendWire, mapHistory, mapProjectsView, sameView, statusPatch, type LivePatch } from "./live";
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
-import { answerMsg, approveMsg, discoverMsg, pairMsg, spawnMsg, uploadMsg, type ClientMsg, type WireMac } from "./protocol";
+import { answerMsg, approveMsg, discoverMsg, pairMsg, sessionActionMsg, spawnMsg, uploadMsg, type ClientMsg, type WireMac } from "./protocol";
+import type { ActionResult, SessionAction } from "../logic/selection";
 
-/** Simulator/dev build: also try loopback, and offer "This Mac (simulator)". */
+/** Simulator/dev build: also try loopback, and offer "This computer (simulator)". */
 export const IS_SIMULATOR_OR_DEV = __DEV__;
 
 /**
  * The Mac answers `list` with its whole projects view and pushes nothing in between, so the
  * Chats list asks again on this cadence while connected. The view is built from in-memory
- * state on the Mac (no git, no disk), so this is cheap on both ends.
+ * state on your computer (no git, no disk), so this is cheap on both ends.
  */
 export const LIST_POLL_MS = 10_000;
 
@@ -109,6 +110,7 @@ let localSeq = 0;
 export type UploadOutcome = { ok: true; path: string } | { ok: false; error: string };
 /** A 10 MB file over a slow cellular link still finishes well inside this. */
 const UPLOAD_TIMEOUT_MS = 90_000;
+const ACTION_TIMEOUT_MS = 15_000;
 
 export interface LiveValue {
   /** false until the Keychain Mac list has been read; render nothing route-deciding before */
@@ -158,7 +160,7 @@ export interface LiveValue {
   detach: (sessionId?: string) => void;
   /** send a prompt to a session (text + Enter) */
   prompt: (sessionId: string, text: string) => void;
-  /** Stop the session's current turn (Esc on the Mac) and mark it in the open feed */
+  /** Stop the session's current turn (Esc on your computer) and mark it in the open feed */
   interrupt: (sessionId: string) => void;
   /** send prepared frames (quick actions) */
   sendFrames: (frames: ClientMsg[]) => void;
@@ -174,6 +176,8 @@ export interface LiveValue {
   approve: (id: string, allow: boolean) => void;
   /** send one file into a session's `.conduit-uploads/`; resolves with its path or why not */
   upload: (sessionId: string, name: string, data: string) => Promise<UploadOutcome>;
+  /** stop or delete sessions on the computer (the Chats list's selection) */
+  sessionAction: (action: SessionAction, sessionIds: string[]) => Promise<ActionResult>;
   /** the in-app banner on screen, if any */
   banner: Banner | null;
   dismissBanner: () => void;
@@ -208,9 +212,11 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [lastSeen, setLastSeen] = useState<number | null>(null);
   /** the last view, for diffing the next one into unread counts */
   const viewRef = useRef<ProjectsView | null>(null);
+  /** Session actions waiting for their `sessionActionResult`, by requestId. */
+  const actionsRef = useRef(new Map<string, (r: ActionResult) => void>());
   /** Uploads waiting for their `uploadResult`, by requestId. */
   const uploadsRef = useRef(new Map<string, { sessionId: string; done: (o: UploadOutcome) => void }>());
-  /** the session the Mac is streaming to this socket; outlives `attachedRef` after the chat closes */
+  /** the session your computer is streaming to this socket; outlives `attachedRef` after the chat closes */
   const streamingRef = useRef<string | null>(null);
   /** last frame from the Mac; copied into `lastSeen` only when the link drops (a state per frame
    * would re-render every consumer on each streamed chunk) */
@@ -350,7 +356,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               }
               break;
             case "error": {
-              // A chat this phone started, stuck on the Mac's folder-trust prompt (null otherwise).
+              // A chat this phone started, stuck on your computer's folder-trust prompt (null otherwise).
               const stall = trustStallNotice(m.message, m.sessionId, attachedRef.current, genId("n"));
               if (m.message === PRIVATE_SESSION && m.sessionId) {
                 // A private session takes no files: fail its uploads now, not at the timeout.
@@ -413,6 +419,16 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                 uploadsRef.current.delete(m.requestId);
                 waiter.done(m.ok ? { ok: true, path: m.path } : { ok: false, error: m.error });
               }
+              break;
+            }
+            case "sessionActionResult": {
+              const waiter = actionsRef.current.get(m.requestId);
+              if (waiter) {
+                actionsRef.current.delete(m.requestId);
+                waiter({ ok: true, done: m.done, skipped: m.skipped });
+              }
+              // The list changes now; do not leave deleted rows up until the next poll.
+              clientRef.current?.list();
               break;
             }
             case "approveResult":
@@ -578,7 +594,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           },
           onEffect: (e) => {
             // A token the Mac issued is always kept, even if the attempt was abandoned:
-            // dropping it would leave a paired device on the Mac this phone cannot use.
+            // dropping it would leave a paired device on your computer this phone cannot use.
             if (e.k !== "saveToken") return;
             const mac: SavedMac = {
               deviceId: e.deviceId,
@@ -599,7 +615,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                 return;
               }
               client.close();
-              // The token is persisted: finish selecting this Mac even if the user left Pair
+              // The token is persisted: finish selecting this computer even if the user left Pair
               // meanwhile (pairGen only guards the Pair screen's own state).
               if (pairClientRef.current === client) pairClientRef.current = null;
               await refreshMacs();
@@ -771,6 +787,27 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     [],
   );
 
+  const sessionAction = useCallback(
+    (action: SessionAction, sessionIds: string[]): Promise<ActionResult> =>
+      new Promise<ActionResult>((resolve) => {
+        const requestId = genId("act");
+        const timer = setTimeout(() => {
+          if (!actionsRef.current.delete(requestId)) return;
+          resolve({ ok: false, error: "Your computer didn't answer. Pull to refresh to see what changed." });
+        }, ACTION_TIMEOUT_MS);
+        actionsRef.current.set(requestId, (r) => {
+          clearTimeout(timer);
+          resolve(r);
+        });
+        if (!clientRef.current?.send(sessionActionMsg(requestId, action, sessionIds))) {
+          actionsRef.current.delete(requestId);
+          clearTimeout(timer);
+          resolve({ ok: false, error: "Not connected to your computer." });
+        }
+      }),
+    [],
+  );
+
   const prompt = useCallback((sessionId: string, text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -789,7 +826,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     if (!trimmed || spawnPending.current) return;
     const client = clientRef.current;
     if (!client) {
-      setSpawnState({ phase: "failed", message: "Not connected to your Mac." });
+      setSpawnState({ phase: "failed", message: "Not connected to your computer." });
       return;
     }
     spawnPending.current = true;
@@ -810,7 +847,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       clientRef.current?.list();
       setSpawnState({
         phase: "failed",
-        message: "Your Mac hasn't answered yet. Check Chats before starting another — it may have started.",
+        message: "Your computer hasn't answered yet. Check Chats before starting another — it may have started.",
       });
     }, SPAWN_TIMEOUT_MS);
     return () => clearTimeout(t);
@@ -863,6 +900,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       answer,
       approve,
       upload,
+      sessionAction,
       banner,
       dismissBanner,
     }),
@@ -871,6 +909,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       answer,
       approve,
       upload,
+      sessionAction,
       sendFrames,
       spawn,
       spawnState,

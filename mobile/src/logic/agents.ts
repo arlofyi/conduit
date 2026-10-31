@@ -35,7 +35,7 @@ export function agentInfo(id: string): AgentInfo {
 /**
  * Agents whose conversation the phone can show and steer. Only Claude: the bridge reads the
  * chat from Claude's transcript, and Compact/Clear are Claude Code slash commands. Other
- * agents' sessions can still be messaged and stopped, and are started on the Mac.
+ * agents' sessions can still be messaged and stopped, and are started on your computer.
  */
 export const PHONE_CHAT_AGENTS: readonly string[] = ["claude"];
 

@@ -5,7 +5,7 @@
  *
  * Agents: only Claude can be started here, because only Claude's conversation reaches the
  * phone (the bridge reads its transcript). The other adapters are listed, disabled, as
- * "Opens on your Mac only". The Mac budgets spawns per phone (10 an hour).
+ * "Opens on your computer only". The Mac budgets spawns per phone (10 an hour).
  *
  * Start is disabled while a spawn is pending, and a timed-out spawn is never retried by
  * itself: the Mac may have started it, and a second press is the reader's call.
@@ -34,7 +34,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
     projects.some((x) => x.id === filter) ? filter : (projects[0]?.id ?? null),
   );
   // Claude first and the only one selectable: it is the agent whose chat the phone can show.
-  // The others are listed so the reader knows they exist, and start on the Mac.
+  // The others are listed so the reader knows they exist, and start on your computer.
   const agents = useMemo(() => {
     const used = new Set(projects.flatMap((x) => x.sessions.map((s) => s.agent)));
     const rank = (id: string) => (chatOnPhone(id) ? 2 : used.has(id) ? 1 : 0);
@@ -106,7 +106,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
               onPress={() => usable && setAgent(a.id)}
               disabled={!usable}
               accessibilityRole="button"
-              accessibilityLabel={usable ? a.label : `${a.label}, opens on your Mac only`}
+              accessibilityLabel={usable ? a.label : `${a.label}, opens on your computer only`}
               accessibilityState={{ selected: on, disabled: !usable }}
               style={{
                 opacity: usable ? 1 : 0.5,
@@ -137,7 +137,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
               </Text>
               {usable ? null : (
                 <Text maxFontSizeMultiplier={1.4} style={{ fontSize: 10, color: p.textDim, textAlign: "center", marginTop: -3 }} numberOfLines={2}>
-                  Opens on your Mac only
+                  Opens on your computer only
                 </Text>
               )}
             </Pressable>

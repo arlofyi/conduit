@@ -75,10 +75,10 @@ export function ConnectScreen({ navigation }: ConnectProps) {
         automaticallyAdjustKeyboardInsets
         keyboardShouldPersistTaps="handled"
       >
-        <BigTitle>Connect to your Mac</BigTitle>
+        <BigTitle>Connect to your computer</BigTitle>
         <Para>
-          Conduit reaches your Mac through Tailscale, so it works from anywhere, not only on your home Wi-Fi. Turn
-          Tailscale on on this phone, signed in to the same tailnet as your Mac.
+          Conduit reaches your computer through Tailscale, so it works from anywhere, not only on your home Wi-Fi. Turn
+          Tailscale on on this phone, signed in to the same tailnet as your computer.
         </Para>
 
         {notice ? <Notice text={connErrorText(notice)} /> : null}
@@ -127,18 +127,18 @@ export function ConnectScreen({ navigation }: ConnectProps) {
               }}
             />
             <Text style={{ color: p.textDim, fontSize: TYPE.footnote, textAlign: "center", marginTop: 2 }}>
-              On your Mac: Conduit → Settings → Mobile → Pair a phone
+              On your computer: Conduit → Settings → Mobile → Pair a phone
             </Text>
           </View>
         )}
 
         {ready ? (
           <>
-            <SectionLabel>Macs on your tailnet</SectionLabel>
+            <SectionLabel>Computers on your tailnet</SectionLabel>
             {discovered === null ? (
               <ActivityIndicator color={p.textDim} style={{ alignSelf: "flex-start" }} />
             ) : tailnetMacs.length === 0 ? (
-              <Para style={{ color: p.textDim }}>No other Macs running Conduit on your tailnet.</Para>
+              <Para style={{ color: p.textDim }}>No other computers running Conduit on your tailnet.</Para>
             ) : (
               <Card>
                 {tailnetMacs.map((m, i) => (
@@ -180,7 +180,7 @@ export function ConnectScreen({ navigation }: ConnectProps) {
                   key={m.deviceId}
                   first={i === 0}
                   title={m.macName}
-                  subtitle={isLoopbackMac(m) ? `This Mac (simulator) · port ${m.port}` : m.dnsName || m.ip}
+                  subtitle={isLoopbackMac(m) ? `This computer (simulator) · port ${m.port}` : m.dnsName || m.ip}
                   onPress={() => {
                     clearNotice();
                     selectMac(m.deviceId);
@@ -220,7 +220,7 @@ function Scanner({ onCode, onCancel }: { onCode: (text: string) => void; onCance
   } else if (!permission.granted) {
     body = permission.canAskAgain ? (
       <View style={{ gap: 12, padding: 16 }}>
-        <Para>Conduit needs the camera to scan the pairing code shown on your Mac.</Para>
+        <Para>Conduit needs the camera to scan the pairing code shown on your computer.</Para>
         <Button label="Allow camera" onPress={() => requestPermission()} />
       </View>
     ) : (
@@ -341,8 +341,8 @@ function LoopbackSection() {
 
   return (
     <>
-      <SectionLabel>This Mac (simulator)</SectionLabel>
-      <Button label="Find Conduit on this Mac" kind="secondary" busy={busy} onPress={scan} />
+      <SectionLabel>This computer (simulator)</SectionLabel>
+      <Button label="Find Conduit on this computer" kind="secondary" busy={busy} onPress={scan} />
       {failed ? <Notice text={failed} /> : null}
       {found && found.length === 0 ? (
         <Para style={{ color: p.textDim, marginTop: 10 }}>Nothing answered on 127.0.0.1:8455–8474.</Para>

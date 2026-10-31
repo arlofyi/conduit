@@ -16,7 +16,18 @@ All notable changes to Conduit are documented here. This project uses
   connection to your computer all work there now: every icon used to render blank, the
   keyboard covered the message box, and the app was not allowed the plain connection
   Tailscale carries (Tailscale encrypts it).
-- **Fixed — Your own messages on the phone no longer show their time twice.**
+- **Added — Select sessions on the phone to stop or delete them.** Long-press a chat to
+  start selecting, tap others to add them, then Stop or Delete from the top bar (Select all
+  is there too). Deleting asks first and keeps the conversation history and any worktree
+  folder on your computer; private sessions are never selectable.
+- **Changed — The phone app says "your computer", not "your Mac".** Conduit runs on
+  Windows and Linux too, and so did every message that told you to open something on your
+  Mac. Settings → Mobile on the desktop says the same.
+- **Fixed — Your own messages on the phone no longer show their time twice, or the
+  `<pasted_content>` tags and blank lines Claude Code wraps around them.** The desktop's
+  chat view shows them cleanly too.
+- **Fixed — Android: the keyboard no longer covers the message box,** and the conversation
+  no longer shows through around it. Replies with lists or tables stay inside their bubble.
 - **Fixed — Windows: a `%` in a session's first message no longer garbles it.** A short
   task such as "raise coverage to 80%" reached the agent as "80^", and two `%` signs
   swallowed everything between them. `^` is no longer doubled either.
@@ -25,6 +36,10 @@ All notable changes to Conduit are documented here. This project uses
   the request". Reinstall the command from Settings to pick this up.
 - **Fixed — Windows: the `conduit` command opens folders with `)` or `&` in their name.**
   `conduit "D:\app (v2)"` failed with "\app was unexpected at this time."
+- **Fixed — Opening Conduit twice no longer starts a hidden second copy.** Launching it again
+  (for example, right after an installer finished and opened it too) now brings the window
+  that is already open to the front instead of running a second, windowless Conduit beside
+  it that shared and could overwrite your projects and sessions.
 
 ## 0.48.1 — 2026-10-30
 

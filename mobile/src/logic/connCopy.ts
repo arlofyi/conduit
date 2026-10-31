@@ -7,11 +7,11 @@ import type { ConnError, ConnState } from "../bridge/connection";
 export function pairFailText(reason: string): string {
   switch (reason) {
     case "declined":
-      return "Declined on the Mac";
+      return "Declined on your computer";
     case "expired":
       return "No answer in 2 minutes";
     case "off":
-      return "Mobile access is off on that Mac";
+      return "Mobile access is off on that computer";
     case "replaced":
       return "Another request replaced this one";
     default:
@@ -20,7 +20,7 @@ export function pairFailText(reason: string): string {
 }
 
 /** One sentence for a connection error. `macName` fills in when the error lacks one. */
-export function connErrorText(e: ConnError, macName = "your Mac"): string {
+export function connErrorText(e: ConnError, macName = "your computer"): string {
   switch (e.kind) {
     case "revoked":
       return `${e.macName || macName} removed this phone. Pair again to reconnect.`;
@@ -46,7 +46,7 @@ export function qrErrorText(reason: "notConduit" | "version" | "invalid"): strin
     case "version":
       return "That code is from a newer Conduit. Update the app.";
     case "invalid":
-      return "That pairing code can't be used. Show a new one on your Mac.";
+      return "That pairing code can't be used. Show a new one on your computer.";
   }
 }
 
