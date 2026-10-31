@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -439,6 +440,50 @@ pub struct RootChat {
     /// Same semantics as `Project::profile_id`: the profile this chat is visible under.
     #[serde(default)]
     pub profile_id: Option<String>,
+    /// Which projects this chat is about (`ChatScope`). None = every project, which is
+    /// what every chat made before scopes existed means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ChatScope>,
+    /// A phone has driven this chat. Sticky: such a chat never reads a private session,
+    /// whatever private mode says, because the phone link refuses private sessions
+    /// everywhere else and a chat must not become the way around that.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub phone: bool,
+}
+
+/// The projects a root chat may see and act on: the union of whole profiles and single
+/// projects. `all_profiles` is everything. An empty scope sees nothing.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatScope {
+    #[serde(default)]
+    pub all_profiles: bool,
+    /// Profile ids; `null` is the Default profile.
+    #[serde(default)]
+    pub profiles: Vec<Option<String>>,
+    /// Project ids added one by one.
+    #[serde(default)]
+    pub projects: Vec<String>,
+}
+
+/// Is `project` inside `scope`? `known` = the profile ids that exist: a project pointing at
+/// a deleted profile counts as Default, the same normalization `sessions_for_profile` uses.
+pub fn project_in_scope(
+    scope: Option<&ChatScope>,
+    project: &Project,
+    known: &HashSet<String>,
+) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    if scope.all_profiles || scope.projects.contains(&project.id) {
+        return true;
+    }
+    let profile = project.profile_id.clone().filter(|id| known.contains(id));
+    scope
+        .profiles
+        .iter()
+        .any(|p| p.clone().filter(|id| known.contains(id)) == profile)
 }
 
 /// A registered agent account: a profile dir that holds its own credentials (a `.claude`
@@ -631,6 +676,9 @@ pub struct Store {
     /// Callback fired after every successful persisted store write. Used to emit broadcast
     /// events to all windows (e.g., `store-saved`). Never persisted, only set at startup.
     on_save: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Bumped after every successful persisted write: a cheap "did anything change" the
+    /// mobile bridge polls to push a fresh project list (a phone delete, a desktop rename).
+    saves: AtomicU64,
 }
 
 /// A read-only view of the project that owns a given Conductor, plus its sessions.
@@ -925,11 +973,17 @@ impl Store {
             provider_keys: Mutex::new(HashMap::new()),
             save_path,
             on_save: OnceLock::new(),
+            saves: AtomicU64::new(0),
         }
     }
 
     pub fn set_on_save(&self, f: Box<dyn Fn() + Send + Sync>) {
         let _ = self.on_save.set(f);
+    }
+
+    /// How many successful persisted writes this run has made (see `saves`).
+    pub fn save_generation(&self) -> u64 {
+        self.saves.load(Ordering::SeqCst)
     }
 
     fn save(&self, projects: &[Project]) -> bool {
@@ -1058,6 +1112,7 @@ impl Store {
             }
         }
         if success {
+            self.saves.fetch_add(1, Ordering::SeqCst);
             if let Some(f) = self.on_save.get() {
                 f();
             }
@@ -1161,6 +1216,16 @@ impl Store {
     }
 
     pub fn add_root_chat(&self, profile_id: Option<String>) -> RootChat {
+        self.add_root_chat_with(profile_id, None, false)
+    }
+
+    /// A new chat with a scope, and whether a phone created it (see `RootChat::phone`).
+    pub fn add_root_chat_with(
+        &self,
+        profile_id: Option<String>,
+        scope: Option<ChatScope>,
+        phone: bool,
+    ) -> RootChat {
         let account_id = self
             .default_accounts
             .lock()
@@ -1177,6 +1242,8 @@ impl Store {
                 .unwrap_or(0),
             // Stamped from the caller's argument, not the global -- see `add_project`.
             profile_id,
+            scope,
+            phone,
         };
         self.root_chats
             .lock()
@@ -1219,6 +1286,45 @@ impl Store {
             self.save(&projects);
         }
         removed
+    }
+
+    /// Change a chat's scope (None = every project). False if there is no such chat.
+    pub fn set_root_chat_scope(&self, id: &str, scope: Option<ChatScope>) -> bool {
+        self.update_root_chat(id, |c| c.scope = scope)
+    }
+
+    /// Mark a chat as driven from a phone (sticky; see `RootChat::phone`).
+    pub fn mark_root_chat_phone(&self, id: &str) {
+        self.update_root_chat(id, |c| c.phone = true);
+    }
+
+    fn update_root_chat(&self, id: &str, f: impl FnOnce(&mut RootChat)) -> bool {
+        let changed = {
+            let mut chats = self.root_chats.lock().unwrap_or_else(|e| e.into_inner());
+            match chats.iter_mut().find(|c| c.id == id) {
+                Some(c) => {
+                    let before = format!("{:?}{}", c.scope, c.phone);
+                    f(c);
+                    Some(before != format!("{:?}{}", c.scope, c.phone))
+                }
+                None => None,
+            }
+        };
+        if changed == Some(true) {
+            let projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+            self.save(&projects);
+        }
+        changed.is_some()
+    }
+
+    /// The projects a chat may see: everything for an unscoped (or unknown) chat.
+    pub fn projects_for_chat(&self, chat_id: &str) -> Vec<Project> {
+        let scope = self.root_chat(chat_id).and_then(|c| c.scope);
+        let known: HashSet<String> = self.list_profiles().into_iter().map(|p| p.id).collect();
+        self.list()
+            .into_iter()
+            .filter(|p| project_in_scope(scope.as_ref(), p, &known))
+            .collect()
     }
 
     pub fn root_chat(&self, id: &str) -> Option<RootChat> {
@@ -2702,6 +2808,7 @@ mod tests {
                 provider_keys: Mutex::new(HashMap::new()),
                 save_path: dir.join("state.json"),
                 on_save: OnceLock::new(),
+                saves: AtomicU64::new(0),
             }
         }
     }
@@ -4470,6 +4577,54 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_scope_selects_profiles_and_single_projects() {
+        let known: HashSet<String> = ["work".to_string()].into_iter().collect();
+        let mk = |id: &str, profile: Option<&str>| Project {
+            id: id.into(),
+            profile_id: profile.map(String::from),
+            ..serde_json::from_value(serde_json::json!({"id": id, "name": id, "path": "/x"}))
+                .unwrap()
+        };
+        let work = mk("w", Some("work"));
+        let home = mk("h", None);
+        let stranded = mk("s", Some("deleted-profile"));
+        assert!(project_in_scope(None, &home, &known));
+        let only_work = ChatScope {
+            profiles: vec![Some("work".into())],
+            ..Default::default()
+        };
+        assert!(project_in_scope(Some(&only_work), &work, &known));
+        assert!(!project_in_scope(Some(&only_work), &home, &known));
+        let default_plus_one = ChatScope {
+            profiles: vec![None],
+            projects: vec!["w".into()],
+            ..Default::default()
+        };
+        assert!(project_in_scope(Some(&default_plus_one), &home, &known));
+        assert!(project_in_scope(Some(&default_plus_one), &stranded, &known));
+        assert!(project_in_scope(Some(&default_plus_one), &work, &known));
+        assert!(!project_in_scope(
+            Some(&ChatScope::default()),
+            &home,
+            &known
+        ));
+        let all = ChatScope {
+            all_profiles: true,
+            ..Default::default()
+        };
+        assert!(project_in_scope(Some(&all), &work, &known));
+    }
+
+    #[test]
+    fn an_old_root_chat_has_no_scope_and_was_never_on_a_phone() {
+        let c: RootChat =
+            serde_json::from_value(serde_json::json!({"id": "c", "title": "t"})).unwrap();
+        assert!(c.scope.is_none() && !c.phone);
+        let v = serde_json::to_value(&c).unwrap();
+        assert!(v.get("scope").is_none() && v.get("phone").is_none());
+    }
+
+    #[test]
     fn root_chat_config_dir_resolves_pinned_account() {
         let dir = temp_dir("root_chat_cfg");
         let store = Store::for_test(&dir);
@@ -4506,6 +4661,8 @@ mod tests {
                 account_id: Some("a1".into()),
                 created_at: 1_724_000_000,
                 profile_id: None,
+                scope: None,
+                phone: false,
             }],
             ..Default::default()
         };

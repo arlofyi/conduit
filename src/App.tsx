@@ -504,10 +504,25 @@ export default function App() {
         st.rootChatFailed(payload.chatId, payload.message);
       },
     );
+    // A turn sent from a PHONE: this window never added the user's bubble (it adds its own
+    // sends locally), and a first phone message may have titled the chat.
+    const unUser = listen<{ chatId: string; item: ChatItem }>("root-chat-user", ({ payload }) => {
+      void useStore
+        .getState()
+        .loadRootChats()
+        .then(() => {
+          const st = useStore.getState();
+          const chatProfile = () => st.rootChats.find((c) => c.id === payload.chatId)?.profileId;
+          if (!inThisWindow(chatProfile, st.windowProfile.profileId, st.profiles)) return;
+          st.rootChatItemArrived(payload.chatId, payload.item);
+          useStore.setState((s2) => ({ rootChatRunning: { ...s2.rootChatRunning, [payload.chatId]: true } }));
+        });
+    });
     return () => {
       void unItem.then((f) => f());
       void unDone.then((f) => f());
       void unErr.then((f) => f());
+      void unUser.then((f) => f());
     };
   }, []);
 

@@ -19,6 +19,7 @@
     "expo-image-manipulator": "~56.0.26",
     "expo-image-picker": "~56.0.25",
     "expo-secure-store": "~56.0.4",
+    "expo-sharing": "~56.0.27",
     "expo-status-bar": "~56.0.4",
     "expo-symbols": "~56.0.7",
     "react": "19.2.3",

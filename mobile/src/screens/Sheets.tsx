@@ -110,7 +110,7 @@ export function SheetRow({
   );
 }
 
-function Group({ children }: { children: React.ReactNode }) {
+export function Group({ children }: { children: React.ReactNode }) {
   const { palette: p } = useTheme();
   return (
     <View
@@ -129,7 +129,7 @@ function Group({ children }: { children: React.ReactNode }) {
   );
 }
 
-function GroupLabel({ children }: { children: string }) {
+export function GroupLabel({ children }: { children: string }) {
   const { palette: p } = useTheme();
   return (
     <Text style={{ marginHorizontal: 32, marginBottom: 6, fontSize: TYPE.footnote, color: p.textMid }}>{children}</Text>
@@ -279,6 +279,20 @@ export function SessionInfoScreen({ navigation, route }: SessionInfoProps) {
             </Text>
           </View>
         ))}
+      </Group>
+      <Group>
+        <SheetRow
+          first
+          symbol="folder"
+          title="Files"
+          detail={session?.silo ? "Private: its files stay on your computer" : "Browse, read and edit this session's files"}
+          tone="accent"
+          disabled={!!session?.silo}
+          onPress={() => {
+            navigation.goBack();
+            navigation.navigate("Files", { sessionId, path: "", title: session?.name ?? project?.name });
+          }}
+        />
       </Group>
     </SheetScaffold>
   );

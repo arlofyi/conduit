@@ -3,7 +3,6 @@
  * exact wire frames the bridge already accepts, so this table is the whole feature.
  */
 import { inputMsg, interruptMsg, promptInput, type ClientMsg } from "../bridge/protocol";
-import { chatOnPhone } from "./agents";
 
 export type QuickActionId = "stop" | "compact" | "clear";
 
@@ -59,7 +58,7 @@ export const QUICK_ACTIONS: readonly QuickAction[] = [
 
 /** The actions to show: Stop only while something is running; slash commands only for Claude. */
 export function quickActionsFor(running: boolean, agent: string): QuickAction[] {
-  const claude = chatOnPhone(agent);
+  const claude = agent === "claude";
   return QUICK_ACTIONS.filter((a) => (running || !a.runningOnly) && (claude || !a.claudeOnly));
 }
 

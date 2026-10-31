@@ -1,4 +1,4 @@
-import { answerMsg, approveMsg, attachMsg, authMsg, discoverMsg, inputMsg, interruptMsg, listMsg, pairMsg, promptInput, type ServerMsg } from "./protocol";
+import { rootChatCreateMsg, rootChatHistoryMsg, rootChatScopeMsg, rootChatSendMsg, rootChatsMsg, rootChatStopMsg, answerMsg, fsAckMsg, fsDownloadMsg, fsListMsg, fsReadMsg, fsWriteMsg, approveMsg, attachMsg, authMsg, discoverMsg, inputMsg, interruptMsg, listMsg, pairMsg, promptInput, type ServerMsg } from "./protocol";
 
 describe("promptInput", () => {
   it("prompt_enter_falls_outside_the_paste", () => {
@@ -75,5 +75,41 @@ describe("answer + approve wire shapes", () => {
       { type: "approveResult", id: "perm-1", ok: false },
     ];
     expect(JSON.parse(JSON.stringify(frames))).toEqual(frames);
+  });
+});
+
+describe("file browser frames", () => {
+  it("fs_spellings_match_bridge_rs", () => {
+    // Same JSON the Rust test in bridge.rs parses (camelCase, lowercase type).
+    expect(fsListMsg("s", "r", "")).toEqual({ type: "fslist", sessionId: "s", requestId: "r", path: "" });
+    expect(fsReadMsg("s", "r", "a")).toEqual({ type: "fsread", sessionId: "s", requestId: "r", path: "a" });
+    expect(fsReadMsg("s", "r", "a", true)).toEqual({ type: "fsread", sessionId: "s", requestId: "r", path: "a", confirm: true });
+    expect(fsWriteMsg("s", "r", "a", "x", { mtimeMs: 1.5, size: 1 })).toEqual({
+      type: "fswrite",
+      sessionId: "s",
+      requestId: "r",
+      path: "a",
+      content: "x",
+      baseMtimeMs: 1.5,
+      baseSize: 1,
+    });
+    expect(fsDownloadMsg("s", "r", "a", true)).toEqual({ type: "fsdownload", sessionId: "s", requestId: "r", path: "a", confirm: true });
+    expect(fsAckMsg("r")).toEqual({ type: "fsack", requestId: "r" });
+  });
+});
+
+describe("general chat frames", () => {
+  it("root_chat_spellings_match_bridge_rs", () => {
+    // Same JSON bridge.rs `parse_client_msg` tests parse (lowercase type, camelCase fields).
+    expect(rootChatsMsg()).toEqual({ type: "rootchats" });
+    const scope = { allProfiles: false, profiles: [null, "work"], projects: ["p1"] };
+    expect(rootChatCreateMsg("r", null, scope)).toEqual({ type: "rootchatcreate", requestId: "r", profileId: null, scope });
+    expect(rootChatHistoryMsg("c")).toEqual({ type: "rootchathistory", chatId: "c" });
+    expect(rootChatSendMsg("c", "hi")).toEqual({ type: "rootchatsend", chatId: "c", text: "hi" });
+    expect(rootChatStopMsg("c")).toEqual({ type: "rootchatstop", chatId: "c" });
+    expect(rootChatScopeMsg("c", null)).toEqual({ type: "rootchatscope", chatId: "c", scope: null });
+    expect(JSON.stringify(rootChatScopeMsg("c", scope))).toBe(
+      '{"type":"rootchatscope","chatId":"c","scope":{"allProfiles":false,"profiles":[null,"work"],"projects":["p1"]}}',
+    );
   });
 });

@@ -28,6 +28,11 @@ import { SettingsScreen } from "./src/screens/SettingsScreen";
 import { AppsScreen } from "./src/screens/AppsScreen";
 import { PortMirrorProvider } from "./src/data/PortMirrorProvider";
 import { NewChatScreen } from "./src/screens/NewChatScreen";
+import { FilesScreen } from "./src/screens/FilesScreen";
+import { FileViewScreen } from "./src/screens/FileViewScreen";
+import { GeneralScreen } from "./src/screens/GeneralScreen";
+import { GeneralChatScreen } from "./src/screens/GeneralChatScreen";
+import { GeneralScopeScreen } from "./src/screens/GeneralScopeScreen";
 import { ChatsMenuScreen, QuickActionsScreen, SessionInfoScreen } from "./src/screens/Sheets";
 import { ListSelectionProvider, useListSelection } from "./src/data/ListSelection";
 import { needsCount, resolveProfile } from "./src/logic/chatList";
@@ -88,6 +93,7 @@ function Tabs() {
   const openPending = useMemo(() => openBySession(pending), [pending]);
   const needs = needsCount(view, profile, openPending);
   const chatsIcon = useTabIcon("bubble.left.and.bubble.right");
+  const generalIcon = useTabIcon("sparkles");
   const appsIcon = useTabIcon("globe");
   const settingsIcon = useTabIcon("gearshape");
   return (
@@ -108,6 +114,7 @@ function Tabs() {
           tabBarBadge: needs > 0 ? needs : undefined,
         }}
       />
+      <Tab.Screen name="General" component={GeneralScreen} options={{ tabBarIcon: generalIcon }} />
       <Tab.Screen name="Apps" component={AppsScreen} options={{ tabBarIcon: appsIcon }} />
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: settingsIcon }} />
     </Tab.Navigator>
@@ -173,6 +180,10 @@ function Inner() {
             <Stack.Screen name="Chat" component={ChatScreen} />
             <Stack.Screen name="Connect" component={ConnectScreen} />
             <Stack.Screen name="Pair" component={PairScreen} />
+            <Stack.Screen name="Files" component={FilesScreen} />
+            <Stack.Screen name="FileView" component={FileViewScreen} />
+            <Stack.Screen name="GeneralChat" component={GeneralChatScreen} />
+            <Stack.Screen name="GeneralScope" component={GeneralScopeScreen} options={sheet} />
             <Stack.Screen name="NewChat" component={NewChatScreen} options={sheet} />
             <Stack.Screen name="ChatsMenu" component={ChatsMenuScreen} options={sheet} />
             <Stack.Screen name="QuickActions" component={QuickActionsScreen} options={sheet} />

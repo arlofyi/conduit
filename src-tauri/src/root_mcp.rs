@@ -161,6 +161,33 @@ pub(crate) fn peek_allowed(store: &Store, session: &Session) -> bool {
     crate::store::can_read(&Session::default(), session)
 }
 
+/// May this CHAT read this session? `peek_allowed`, and never a private session (silo or
+/// local-only) once a phone has driven the chat: the phone link refuses private sessions
+/// everywhere, whatever private mode says, and a chat must not be the way around that.
+pub(crate) fn chat_may_peek(store: &Store, chat_id: &str, session: &Session) -> bool {
+    if !peek_allowed(store, session) {
+        return false;
+    }
+    let phone = store.root_chat(chat_id).is_some_and(|c| c.phone);
+    !(phone && (session.silo || session.local_only))
+}
+
+/// May chat `me` see chat `other` (`chats_list` / `chat_read`)? An unscoped chat, or one
+/// scoped to every profile, sees all chats; a scoped one sees chats in its own profile and
+/// in the profiles its scope names -- never a chat about projects it cannot see.
+fn chat_visible(me: Option<&crate::store::RootChat>, other: &crate::store::RootChat) -> bool {
+    let Some(me) = me else {
+        return true;
+    };
+    match &me.scope {
+        None => true,
+        Some(scope) if scope.all_profiles => true,
+        Some(scope) => {
+            other.profile_id == me.profile_id || scope.profiles.contains(&other.profile_id)
+        }
+    }
+}
+
 pub fn result_envelope(id: Option<Value>, result: Value) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
@@ -298,7 +325,12 @@ fn dispatch_work_inner(
         .and_then(|v| v.as_str())
         .filter(|t| !t.trim().is_empty())
         .ok_or("missing task")?;
-    if !store.list().iter().any(|p| p.id == project_id) {
+    // A project outside the chat's scope is as unknown to it as one that does not exist.
+    if !store
+        .projects_for_chat(chat_id)
+        .iter()
+        .any(|p| p.id == project_id)
+    {
         return Err(format!("unknown project {project_id}"));
     }
     let str_arg = |k: &str| args.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -375,14 +407,15 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
             // "nothing is running there", which is a wrong answer rather than a failed
             // one. Spec §6 wants an error string the chat can recover from -- the same
             // shape `dispatch_work` already uses.
+            let visible = ctx.store.projects_for_chat(&ctx.chat_id);
             if let Some(id) = only {
-                if !ctx.store.list().iter().any(|p| p.id == id) {
+                if !visible.iter().any(|p| p.id == id) {
                     return Err(format!("unknown project {id}"));
                 }
             }
             let status = ctx.fleet.snapshot();
             let mut out: Vec<Value> = Vec::new();
-            for p in ctx.store.list() {
+            for p in visible {
                 if only.is_some_and(|id| id != p.id) {
                     continue;
                 }
@@ -399,7 +432,7 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
                         "activity": st.activity,
                         "branch": s.branch,
                         "hibernated": s.stopped,
-                        "sensitive": !peek_allowed(&ctx.store, s),
+                        "sensitive": !chat_may_peek(&ctx.store, &ctx.chat_id, s),
                     }));
                 }
             }
@@ -412,12 +445,12 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
                 .ok_or("missing sessionId")?;
             let session = ctx
                 .store
-                .list()
+                .projects_for_chat(&ctx.chat_id)
                 .into_iter()
                 .flat_map(|p| p.sessions)
                 .find(|s| s.id == id)
                 .ok_or("unknown session")?;
-            if !peek_allowed(&ctx.store, &session) {
+            if !chat_may_peek(&ctx.store, &ctx.chat_id, &session) {
                 return Err("access-denied: the user marked this session sensitive".into());
             }
             ctx.pty
@@ -426,11 +459,12 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
         }
         "chats_list" => {
             let me = ctx.chat_id.clone();
+            let mine = ctx.store.root_chat(&me);
             let list: Vec<Value> = ctx
                 .store
                 .list_root_chats()
                 .into_iter()
-                .filter(|c| c.id != me)
+                .filter(|c| c.id != me && chat_visible(mine.as_ref(), c))
                 .map(|c| json!({ "id": c.id, "title": c.title, "createdAt": c.created_at }))
                 .collect();
             Ok(json!(list).to_string())
@@ -440,7 +474,13 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
                 .get("chatId")
                 .and_then(|v| v.as_str())
                 .ok_or("missing chatId")?;
-            if !ctx.store.list_root_chats().iter().any(|c| c.id == id) {
+            let mine = ctx.store.root_chat(&ctx.chat_id);
+            if !ctx
+                .store
+                .list_root_chats()
+                .iter()
+                .any(|c| c.id == id && chat_visible(mine.as_ref(), c))
+            {
                 return Err("unknown chat id".into());
             }
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
@@ -732,6 +772,58 @@ mod tests {
                 "{wire} is a routable kind but dispatch_work will not accept it"
             );
         }
+    }
+
+    #[test]
+    fn a_phone_driven_chat_never_reads_a_private_session_and_scope_hides_projects() {
+        let dir = temp_dir("phone-peek");
+        let store = Store::for_test(&dir);
+        let p = store.add_project("/repo".into(), store.active_profile());
+        let other = store.add_project("/other".into(), store.active_profile());
+        let s = store
+            .add_session(
+                &p.id,
+                "Worker".into(),
+                false,
+                crate::agent::AgentId::Claude,
+                crate::store::SessionRole::Worker,
+            )
+            .unwrap();
+        store.set_session_trust(
+            &s.id,
+            SessionTrust {
+                silo: true,
+                ..Default::default()
+            },
+        );
+        let siloed = store
+            .list()
+            .into_iter()
+            .flat_map(|p| p.sessions)
+            .find(|x| x.id == s.id)
+            .unwrap();
+        let chat = store.add_root_chat(None);
+        // Private mode off and a desktop-only chat: unchanged behaviour.
+        assert!(chat_may_peek(&store, &chat.id, &siloed));
+        store.mark_root_chat_phone(&chat.id);
+        assert!(!chat_may_peek(&store, &chat.id, &siloed));
+        // Scope: only the named project is visible; the other is unknown to the chat.
+        store.set_root_chat_scope(
+            &chat.id,
+            Some(crate::store::ChatScope {
+                projects: vec![p.id.clone()],
+                ..Default::default()
+            }),
+        );
+        let seen: Vec<String> = store
+            .projects_for_chat(&chat.id)
+            .into_iter()
+            .map(|x| x.id)
+            .collect();
+        assert_eq!(seen, vec![p.id.clone()]);
+        let proposals = Proposals::default();
+        let args = json!({"projectId": other.id, "task": "x"});
+        assert!(dispatch_work_inner(&store, &proposals, &chat.id, &args, 1).is_err());
     }
 
     #[test]

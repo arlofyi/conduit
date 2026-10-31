@@ -7,6 +7,7 @@
 mod agent;
 mod agent_activity;
 mod agent_profile;
+mod agy_transcript;
 mod agy_usage;
 mod asks;
 mod board;
@@ -52,6 +53,7 @@ mod notify;
 mod openrouter_usage;
 mod orchestration_policy;
 mod pairing;
+mod phone_fs;
 mod plugins;
 mod port_tunnel;
 mod project_new;

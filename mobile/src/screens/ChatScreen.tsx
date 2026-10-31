@@ -443,6 +443,15 @@ export function ChatScreen({ route, navigation }: ChatProps) {
               </Text>
             </View>
           </Pressable>
+          {session && !session.session.silo ? (
+            <GlassCircle
+              symbol="folder"
+              label="Files"
+              onPress={() => navigation.navigate("Files", { sessionId, path: "", title: header.name })}
+              size={38}
+              symbolSize={16}
+            />
+          ) : null}
           {!header.canStop && (
             <GlassCircle
               symbol="slider.horizontal.3"
@@ -510,7 +519,7 @@ const PendingRowView = React.memo(
 );
 
 /** A row re-renders only when what it draws changed (see `sameFeedRow`), not on every new message. */
-const ThreadRowView = React.memo(
+export const ThreadRowView = React.memo(
   ThreadRowBody,
   (a: RowProps, b: RowProps) =>
     sameFeedRow(a.t.row, b.t.row) &&
@@ -559,7 +568,7 @@ function ThreadRowBody({
 }
 
 /** "Today" / "Yesterday" / date, centred between days. */
-function DatePill({ label }: { label: string }) {
+export function DatePill({ label }: { label: string }) {
   const { palette: p } = useTheme();
   return (
     <View style={{ alignItems: "center", marginTop: 14, marginBottom: 4 }}>
@@ -580,7 +589,7 @@ function DatePill({ label }: { label: string }) {
 }
 
 /** The agent at work: WhatsApp's typing bubble, carrying what it is doing right now (hook `activity`). */
-function WorkingBubble({ activity }: { activity?: string }) {
+export function WorkingBubble({ activity }: { activity?: string }) {
   const { palette: p } = useTheme();
   const reduce = useReduceMotion();
   const t = useRef(new Animated.Value(0)).current;
@@ -625,7 +634,7 @@ function WorkingBubble({ activity }: { activity?: string }) {
   );
 }
 
-function CopiedToast({ at, top }: { at: number; top: number }) {
+export function CopiedToast({ at, top }: { at: number; top: number }) {
   const { palette: p } = useTheme();
   const o = useRef(new Animated.Value(0)).current;
   useEffect(() => {

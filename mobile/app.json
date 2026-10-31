@@ -71,7 +71,8 @@
           "cameraPermission": "Conduit uses the camera to scan the pairing code and to take photos you send to an agent.",
           "microphonePermission": false
         }
-      ]
+      ],
+      "expo-sharing"
     ]
   }
 }

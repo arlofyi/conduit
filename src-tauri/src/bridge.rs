@@ -88,11 +88,16 @@ pub enum ClientMsg {
     /// Channel), mirroring the fleet-spawn path.
     Spawn {
         project_id: String,
+        /// The first message. Empty starts the agent idle, waiting for one.
+        #[serde(default)]
         prompt: String,
         #[serde(default)]
         agent: Option<String>,
         #[serde(default)]
         worktree: bool,
+        /// An explicit session title; absent or blank derives one from `prompt`.
+        #[serde(default)]
+        name: Option<String>,
     },
     /// First frame from a paired phone: its device token (verified hash-to-hash).
     Auth {
@@ -162,6 +167,82 @@ pub enum ClientMsg {
         token: Option<String>,
         port: u16,
     },
+    /// The phone's file browser (`phone_fs.rs`): one directory of the session's own
+    /// directory. Answered with `fsListResult`.
+    #[serde(rename_all = "camelCase")]
+    FsList {
+        session_id: String,
+        request_id: String,
+        #[serde(default)]
+        path: String,
+    },
+    /// A file as text for viewing/editing. `confirm` opens a secret. `fsReadResult`.
+    #[serde(rename_all = "camelCase")]
+    FsRead {
+        session_id: String,
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Save an edit; `base*` is the stat the phone read, so a file changed on the computer
+    /// since is a `conflict`, never overwritten. `fsWriteResult`.
+    #[serde(rename_all = "camelCase")]
+    FsWrite {
+        session_id: String,
+        request_id: String,
+        path: String,
+        content: String,
+        base_mtime_ms: f64,
+        base_size: u64,
+    },
+    /// Download a file to the phone: `fsChunk` frames, each acked with `fsAck` before the
+    /// next is sent (one download per socket; a new one replaces it).
+    #[serde(rename_all = "camelCase")]
+    FsDownload {
+        session_id: String,
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    FsAck {
+        request_id: String,
+    },
+    /// The general chat (root chat, `root_chat.rs`): list every chat. `rootChats`.
+    RootChats,
+    /// A new general chat in a profile, optionally scoped. `rootChatCreated`.
+    #[serde(rename_all = "camelCase")]
+    RootChatCreate {
+        request_id: String,
+        #[serde(default)]
+        profile_id: Option<String>,
+        #[serde(default)]
+        scope: Option<crate::store::ChatScope>,
+    },
+    /// A chat's history so far. `rootChatHistory`; later turns stream as `rootChatEvent`.
+    #[serde(rename_all = "camelCase")]
+    RootChatHistory {
+        chat_id: String,
+    },
+    /// Send one message (one paid `claude -p` turn, so budgeted per phone).
+    #[serde(rename_all = "camelCase")]
+    RootChatSend {
+        chat_id: String,
+        text: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    RootChatStop {
+        chat_id: String,
+    },
+    /// Change which projects a chat covers (None = every project). `rootChatScoped`.
+    #[serde(rename_all = "camelCase")]
+    RootChatScope {
+        chat_id: String,
+        #[serde(default)]
+        scope: Option<crate::store::ChatScope>,
+    },
 }
 
 /// What a phone may do to a whole session. Deliberately not "start": opening a chat already
@@ -221,12 +302,14 @@ impl std::fmt::Debug for ClientMsg {
                 prompt,
                 agent,
                 worktree,
+                name,
             } => f
                 .debug_struct("Spawn")
                 .field("project_id", project_id)
                 .field("prompt", prompt)
                 .field("agent", agent)
                 .field("worktree", worktree)
+                .field("name", name)
                 .finish(),
             Self::Auth { .. } => f.debug_struct("Auth").field("token", &R).finish(),
             Self::Pair {
@@ -243,6 +326,76 @@ impl std::fmt::Debug for ClientMsg {
                 .finish(),
             Self::Discover => f.write_str("Discover"),
             Self::Ports => f.write_str("Ports"),
+            Self::FsList {
+                session_id,
+                request_id,
+                path,
+            } => f
+                .debug_struct("FsList")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .field("path", path)
+                .finish(),
+            Self::FsRead {
+                session_id,
+                request_id,
+                path,
+                confirm,
+            }
+            | Self::FsDownload {
+                session_id,
+                request_id,
+                path,
+                confirm,
+            } => f
+                .debug_struct("FsRead/FsDownload")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .field("path", path)
+                .field("confirm", confirm)
+                .finish(),
+            Self::FsWrite {
+                session_id,
+                request_id,
+                path,
+                content,
+                ..
+            } => f
+                .debug_struct("FsWrite")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .field("path", path)
+                .field("content", &content.len())
+                .finish(),
+            Self::RootChats => f.write_str("RootChats"),
+            Self::RootChatCreate {
+                request_id,
+                profile_id,
+                scope,
+            } => f
+                .debug_struct("RootChatCreate")
+                .field("request_id", request_id)
+                .field("profile_id", profile_id)
+                .field("scope", scope)
+                .finish(),
+            Self::RootChatHistory { chat_id } | Self::RootChatStop { chat_id } => f
+                .debug_struct("RootChat")
+                .field("chat_id", chat_id)
+                .finish(),
+            Self::RootChatSend { chat_id, text } => f
+                .debug_struct("RootChatSend")
+                .field("chat_id", chat_id)
+                .field("text", &text.len())
+                .finish(),
+            Self::RootChatScope { chat_id, scope } => f
+                .debug_struct("RootChatScope")
+                .field("chat_id", chat_id)
+                .field("scope", scope)
+                .finish(),
+            Self::FsAck { request_id } => f
+                .debug_struct("FsAck")
+                .field("request_id", request_id)
+                .finish(),
             Self::Tunnel { token, port } => f
                 .debug_struct("Tunnel")
                 .field("token", &token.as_ref().map(|_| R))
@@ -356,6 +509,9 @@ const PING_EVERY: Duration = Duration::from_secs(15);
 /// nothing to write, the Mac would otherwise never notice, and the phone would keep holding
 /// every question it was sent (`has_remote_phone`) while the terminal showed nothing.
 const STALE_AFTER: Duration = Duration::from_secs(35);
+/// The shortest gap between two pushed project lists: a burst of store saves (a delete
+/// writes more than once) costs one frame, not one per write.
+const PROJECTS_PUSH_GAP: Duration = Duration::from_millis(700);
 /// A write that has not completed in this long fails, which ends the connection. A frozen
 /// or wedged phone stops reading while its kernel keeps the socket open (zero window), so
 /// an unbounded write blocks the loop forever: it never reaches the [`STALE_AFTER`] check,
@@ -514,6 +670,9 @@ fn stop_streaming_if_private<R>(
 /// How often the tail re-checks which transcript the attached session is writing (a
 /// `/clear` moves it; a phone-spawned chat has none until its first turn).
 const RESOLVE_EVERY: Duration = Duration::from_secs(1);
+/// How often an attached agy session's conversation database is checked for changes (a
+/// stat of two files; it is only READ when one moved).
+const AGY_POLL: Duration = Duration::from_millis(500);
 /// New sessions a phone may start in [`SPAWN_WINDOW`]. Each one is a real agent process on
 /// the Mac, so a stuck button or a misbehaving client must not be able to start dozens.
 const SPAWNS_MAX: usize = 10;
@@ -536,13 +695,89 @@ fn session_scope(msg: &ClientMsg) -> Option<&str> {
         | ClientMsg::Git { session_id, .. }
         | ClientMsg::Kill { session_id }
         | ClientMsg::Interrupt { session_id }
-        | ClientMsg::Upload { session_id, .. } => Some(session_id),
+        | ClientMsg::Upload { session_id, .. }
+        | ClientMsg::FsList { session_id, .. }
+        | ClientMsg::FsRead { session_id, .. }
+        | ClientMsg::FsWrite { session_id, .. }
+        | ClientMsg::FsDownload { session_id, .. } => Some(session_id),
         _ => None,
     }
 }
 
 /// Take one spawn slot for this phone (`key` = its device id, or the peer IP on loopback).
 /// `false` = the budget is spent; start nothing.
+/// Saves and downloads a phone may make in [`UPLOAD_WINDOW`] (reads and listings are free).
+const FS_OPS_MAX: usize = 120;
+/// An unacked download is dropped after this long.
+const DOWNLOAD_IDLE: Duration = Duration::from_secs(120);
+
+/// The session directory a phone browses, confirmed on disk (see `phone_fs::root_of`).
+fn fs_root(
+    app: &AppHandle,
+    session_id: &str,
+) -> Result<std::path::PathBuf, crate::phone_fs::FsError> {
+    let dir = app
+        .state::<Arc<Store>>()
+        .session_dir(session_id)
+        .ok_or(crate::phone_fs::FsError::NotFound)?;
+    crate::phone_fs::root_of(&dir)
+}
+
+fn fs_error(kind: &str, request_id: &str, e: &crate::phone_fs::FsError) -> serde_json::Value {
+    json!({ "type": kind, "requestId": request_id, "error": e.message() })
+}
+
+/// The next `fsChunk` of an open download, and whether it was the last.
+fn fs_chunk(
+    request_id: &str,
+    d: &mut crate::phone_fs::Download,
+    sent: &mut u64,
+) -> (serde_json::Value, bool) {
+    use base64::Engine;
+    match d.next_chunk() {
+        Ok(bytes) => {
+            *sent += bytes.len() as u64;
+            let done = bytes.len() < crate::phone_fs::CHUNK_RAW || *sent >= d.size;
+            (
+                json!({
+                    "type": "fsChunk",
+                    "requestId": request_id,
+                    "seq": d.seq,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    "done": done,
+                    "size": d.size,
+                    "name": d.name,
+                }),
+                done,
+            )
+        }
+        Err(e) => (fs_error("fsChunk", request_id, &e), true),
+    }
+}
+
+/// General-chat messages a phone may send per [`ROOT_CHAT_WINDOW`]: each is a paid turn.
+const ROOT_CHAT_SENDS_MAX: usize = 60;
+const ROOT_CHAT_WINDOW: Duration = Duration::from_secs(3600);
+
+/// One general chat as a phone sees it -- field by field, never the stored `RootChat`
+/// (which carries the account it bills to).
+fn root_chat_view(c: &crate::store::RootChat, running: bool) -> serde_json::Value {
+    json!({
+        "id": c.id,
+        "title": c.title,
+        "profileId": c.profile_id,
+        "scope": c.scope,
+        "createdAt": c.created_at,
+        "running": running,
+    })
+}
+
+/// A root-chat event (`RootChatState::subscribe`) as the frame a phone receives.
+fn root_chat_event_frame(mut event: serde_json::Value) -> serde_json::Value {
+    event["type"] = json!("rootChatEvent");
+    event
+}
+
 /// Files a phone may send in [`UPLOAD_WINDOW`]. Each one is written into a session's checkout.
 const UPLOADS_MAX: usize = 30;
 const UPLOAD_WINDOW: Duration = Duration::from_secs(600);
@@ -642,12 +877,33 @@ fn spawn_session_name(prompt: &str) -> String {
     let Some(line) = prompt.lines().map(str::trim).find(|l| !l.is_empty()) else {
         return "Mobile".to_string();
     };
+    cap_session_name(line)
+}
+
+/// One line, whitespace collapsed, at most [`SPAWN_NAME_MAX`] characters.
+fn cap_session_name(line: &str) -> String {
     let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() <= SPAWN_NAME_MAX {
         return line;
     }
     let cut: String = line.chars().take(SPAWN_NAME_MAX - 1).collect();
     format!("{}…", cut.trim_end())
+}
+
+/// The name a phone-started session gets: the title the phone typed, else one derived from
+/// the first message (see [`spawn_session_name`]). A title is one line; control characters
+/// (a pasted newline or tab) become spaces.
+fn spawn_name(name: Option<&str>, prompt: &str) -> String {
+    let title: String = name
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if title.trim().is_empty() {
+        spawn_session_name(prompt)
+    } else {
+        cap_session_name(&title)
+    }
 }
 
 /// The reply when a phone has spent its spawn budget.
@@ -708,6 +964,7 @@ fn spawn_reply(
     prompt: &str,
     agent: Option<&str>,
     worktree: bool,
+    name: Option<&str>,
 ) -> serde_json::Value {
     use tauri::Emitter;
     let Some(agent_id) = spawn_agent(agent) else {
@@ -723,7 +980,7 @@ fn spawn_reply(
     }
     let Some(session) = store.add_session(
         project_id,
-        spawn_session_name(prompt),
+        spawn_name(name, prompt),
         worktree,
         agent_id,
         crate::store::SessionRole::Worker,
@@ -1203,6 +1460,10 @@ pub struct BridgeController {
     spawns: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Files sent per phone (same key as `spawns`).
     uploads: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// General-chat turns sent per phone (same key as `spawns`).
+    root_chat_sends: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// File saves and downloads per phone (same key as `spawns`).
+    fs_ops: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Last-message previews for the `projects` frame, keyed by transcript file state.
     last_messages: crate::bridge_view::LastMessageCache,
     /// The question registry and the desktop gate, so the last phone leaving can hand
@@ -1231,6 +1492,8 @@ impl BridgeController {
             pair_prompts: Mutex::new(HashMap::new()),
             spawns: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
+            root_chat_sends: Mutex::new(HashMap::new()),
+            fs_ops: Mutex::new(HashMap::new()),
             last_messages: Default::default(),
             asks: OnceLock::new(),
             permissions: OnceLock::new(),
@@ -1636,6 +1899,10 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut attached: Option<(String, u64, std::sync::mpsc::Receiver<String>)> = None;
     // Half-received phone uploads on this socket (chunked; see uploads.rs).
     let mut uploads = crate::uploads::Assembler::default();
+    // The one open download on this socket: (request id, file, bytes sent, last activity).
+    let mut download: Option<(String, crate::phone_fs::Download, u64, Instant)> = None;
+    // General-chat events, subscribed on this socket's first general-chat message.
+    let mut root_chat_sub: Option<(u64, std::sync::mpsc::Receiver<serde_json::Value>)> = None;
     // (transcript path, lines already sent) — set on attach, advanced while tailing.
     let mut transcript: Option<(PathBuf, usize)> = None;
     // Transcript of the attached session when it is a Claude one (the only agent with a
@@ -1647,6 +1914,10 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut tail_conversation: Option<String> = None;
     let mut attached_claude = false;
     let mut next_resolve = Instant::now();
+    // The attached session's Antigravity conversation, when it is an agy session: its chat
+    // is read from agy's own database (`agy_transcript.rs`), not a Claude transcript.
+    let mut agy_tail: Option<crate::agy_transcript::Tail> = None;
+    let mut next_agy = Instant::now();
     // A `discover` probe's reply, produced on its own thread. One probe at a time.
     let (macs_tx, macs_rx) = std::sync::mpsc::channel::<String>();
     let mut discovering = false;
@@ -1654,6 +1925,11 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     // and HTTP probes). One scan at a time per socket.
     let (ports_tx, ports_rx) = std::sync::mpsc::channel::<String>();
     let mut listing_ports = false;
+    // The project list (2d): `listed` once this socket asked for it, then pushed on change.
+    let mut listed = false;
+    let mut want_projects = false;
+    let mut projects_gen = 0u64;
+    let mut last_projects = Instant::now();
     // The phone's Tailscale user id, from one `whois` the first time it is needed.
     let peer_owner: Arc<OnceLock<Option<u64>>> = Arc::new(OnceLock::new());
     // Ids of the pending questions this socket has pushed (None = `pending` not sent yet),
@@ -1823,38 +2099,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                 }
                 match msg {
                     Some(ClientMsg::List) => {
-                        // Typed, whitelisted tree (see `bridge_view`); never the raw `Project`s.
-                        let running: HashSet<String> = pty.session_ids().into_iter().collect();
-                        // Store is managed as Arc<Store> (lib.rs .manage(Arc::new(Store::new()))) —
-                        // state::<Store>() panics the connection thread on the first `list`.
-                        let store = app.state::<Arc<Store>>();
-                        let fleet = app.state::<Arc<crate::fleet::FleetState>>().snapshot();
-                        let asks = app.state::<Arc<crate::asks::Asks>>().pending();
-                        let view = crate::bridge_view::projects_view(
-                            &store.list(),
-                            &store.list_profiles(),
-                            store.active_profile().as_deref(),
-                            &fleet,
-                            &running,
-                            &asks,
-                            // Resolved exactly as `attach` resolves a transcript; any miss is null.
-                            &|s| {
-                                let conversation = store.claude_conversation_id(&s.id);
-                                ctrl.last_messages
-                                    .path_for(&s.id, &conversation, || {
-                                        crate::pty::session_projects_dir(&store, &s.id).and_then(
-                                            |dir| crate::pty::transcript_path(&conversation, &dir),
-                                        )
-                                    })
-                                    .map_or(serde_json::Value::Null, |p| {
-                                        ctrl.last_messages.for_path(&p)
-                                    })
-                            },
-                        );
-                        ctrl.last_messages.sweep();
-                        if !send_text(&mut ws, view.to_string()) {
-                            break 'conn;
-                        }
+                        // Sent below (2d), where store changes are pushed too.
+                        listed = true;
+                        want_projects = true;
                     }
                     Some(ClientMsg::Attach { session_id }) => {
                         // Auto-wake: an idle session has no live PTY (Conduit spawns it
@@ -1893,6 +2140,10 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             transcript = None;
                             context_path = None;
                             attached_claude = is_claude(&store, &session_id);
+                            agy_tail = (session_agent(&store, &session_id)
+                                == Some(crate::agent::AgentId::Antigravity))
+                            .then(|| crate::agy_transcript::Tail::new(&session_id));
+                            next_agy = Instant::now();
                             let found = crate::pty::session_projects_dir(&store, &session_id)
                                 .and_then(|dir| crate::pty::transcript_path(&conversation, &dir));
                             // No transcript yet (a chat opened the moment it was spawned): the
@@ -1930,6 +2181,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             }
                             tail_conversation = None;
                             attached_claude = false;
+                            agy_tail = None;
                             if !send_text(
                                 &mut ws,
                                 json!({ "type": "error", "message": "no such session" })
@@ -1973,13 +2225,21 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         prompt,
                         agent,
                         worktree,
+                        name,
                     }) => {
                         // Budgeted per phone: its device id, or the peer IP for loopback.
                         let key = device
                             .as_ref()
                             .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
                         let reply = if take_spawn_slot(&ctrl.spawns, &key) {
-                            spawn_reply(&app, &project_id, &prompt, agent.as_deref(), worktree)
+                            spawn_reply(
+                                &app,
+                                &project_id,
+                                &prompt,
+                                agent.as_deref(),
+                                worktree,
+                                name.as_deref(),
+                            )
                         } else {
                             spawn_budget_error()
                         };
@@ -2134,6 +2394,240 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             break 'conn;
                         }
                     }
+                    Some(ClientMsg::FsList {
+                        session_id,
+                        request_id,
+                        path,
+                    }) => {
+                        let reply = match fs_root(&app, &session_id)
+                            .and_then(|root| crate::phone_fs::list(&root, &path))
+                        {
+                            Ok((entries, truncated)) => json!({
+                                "type": "fsListResult", "requestId": request_id, "path": path,
+                                "entries": entries, "truncated": truncated,
+                            }),
+                            Err(e) => fs_error("fsListResult", &request_id, &e),
+                        };
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::FsRead {
+                        session_id,
+                        request_id,
+                        path,
+                        confirm,
+                    }) => {
+                        let reply = match fs_root(&app, &session_id)
+                            .and_then(|root| crate::phone_fs::read(&root, &path, confirm))
+                        {
+                            Ok(t) => {
+                                let mut v = json!({ "type": "fsReadResult", "requestId": request_id, "path": path });
+                                if let (Some(o), Ok(serde_json::Value::Object(t))) =
+                                    (v.as_object_mut(), serde_json::to_value(&t))
+                                {
+                                    o.extend(t);
+                                }
+                                v
+                            }
+                            Err(e) => fs_error("fsReadResult", &request_id, &e),
+                        };
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::FsWrite {
+                        session_id,
+                        request_id,
+                        path,
+                        content,
+                        base_mtime_ms,
+                        base_size,
+                    }) => {
+                        let key = device
+                            .as_ref()
+                            .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
+                        let reply = if !crate::fleet::rate_limited(
+                            &ctrl.fs_ops,
+                            &key,
+                            FS_OPS_MAX,
+                            UPLOAD_WINDOW,
+                        ) {
+                            json!({ "type": "fsWriteResult", "requestId": request_id, "error": "too many saves -- try again later" })
+                        } else {
+                            match fs_root(&app, &session_id).and_then(|root| {
+                                crate::phone_fs::write(
+                                    &root,
+                                    &path,
+                                    &content,
+                                    base_mtime_ms,
+                                    base_size,
+                                )
+                            }) {
+                                Ok(stat) => json!({
+                                    "type": "fsWriteResult", "requestId": request_id, "path": path,
+                                    "mtimeMs": stat.mtime_ms, "size": stat.size,
+                                }),
+                                Err(e) => fs_error("fsWriteResult", &request_id, &e),
+                            }
+                        };
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::FsDownload {
+                        session_id,
+                        request_id,
+                        path,
+                        confirm,
+                    }) => {
+                        download = None;
+                        let key = device
+                            .as_ref()
+                            .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
+                        let opened = if !crate::fleet::rate_limited(
+                            &ctrl.fs_ops,
+                            &key,
+                            FS_OPS_MAX,
+                            UPLOAD_WINDOW,
+                        ) {
+                            Err(crate::phone_fs::FsError::Io(
+                                "too many downloads -- try again later".into(),
+                            ))
+                        } else {
+                            fs_root(&app, &session_id).and_then(|root| {
+                                crate::phone_fs::open_download(&root, &path, confirm)
+                            })
+                        };
+                        let reply = match opened {
+                            Ok(mut d) => {
+                                let mut sent = 0;
+                                let (frame, done) = fs_chunk(&request_id, &mut d, &mut sent);
+                                if !done {
+                                    download = Some((request_id, d, sent, Instant::now()));
+                                }
+                                frame
+                            }
+                            Err(e) => fs_error("fsChunk", &request_id, &e),
+                        };
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(
+                        ref m @ (ClientMsg::RootChats
+                        | ClientMsg::RootChatCreate { .. }
+                        | ClientMsg::RootChatHistory { .. }
+                        | ClientMsg::RootChatSend { .. }
+                        | ClientMsg::RootChatStop { .. }
+                        | ClientMsg::RootChatScope { .. }),
+                    ) => {
+                        use tauri::Emitter;
+                        let chats = app.state::<Arc<crate::root_chat::RootChatState>>();
+                        if root_chat_sub.is_none() {
+                            root_chat_sub = Some(chats.subscribe());
+                        }
+                        let store = app.state::<Arc<Store>>();
+                        let reply = match m {
+                            ClientMsg::RootChats => {
+                                let list: Vec<serde_json::Value> = store
+                                    .list_root_chats()
+                                    .iter()
+                                    .map(|c| root_chat_view(c, chats.is_running(&c.id)))
+                                    .collect();
+                                Some(json!({ "type": "rootChats", "chats": list }))
+                            }
+                            ClientMsg::RootChatCreate {
+                                request_id,
+                                profile_id,
+                                scope,
+                            } => {
+                                let c = store.add_root_chat_with(
+                                    profile_id.clone(),
+                                    scope.clone(),
+                                    true,
+                                );
+                                let _ = app.emit(
+                                    "root-chat-created",
+                                    json!({ "id": c.id, "title": c.title, "seed": "" }),
+                                );
+                                Some(json!({
+                                    "type": "rootChatCreated",
+                                    "requestId": request_id,
+                                    "chat": root_chat_view(&c, false),
+                                }))
+                            }
+                            ClientMsg::RootChatHistory { chat_id } => {
+                                Some(match store.root_chat(chat_id) {
+                                    Some(_) => json!({
+                                        "type": "rootChatHistory",
+                                        "chatId": chat_id,
+                                        "items": crate::root_chat::history_items(&store, chat_id),
+                                        "running": chats.is_running(chat_id),
+                                    }),
+                                    None => json!({ "type": "rootChatEvent", "event": "error",
+                                        "chatId": chat_id, "message": "unknown chat" }),
+                                })
+                            }
+                            ClientMsg::RootChatSend { chat_id, text } => {
+                                let key = device
+                                    .as_ref()
+                                    .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
+                                let refused = if text.trim().is_empty() {
+                                    Some("empty message".to_string())
+                                } else if !crate::fleet::rate_limited(
+                                    &ctrl.root_chat_sends,
+                                    &key,
+                                    ROOT_CHAT_SENDS_MAX,
+                                    ROOT_CHAT_WINDOW,
+                                ) {
+                                    Some("too many messages -- try again later".to_string())
+                                } else {
+                                    crate::root_chat::send_turn(&app, chat_id, text, None, true)
+                                        .err()
+                                };
+                                refused.map(|message| {
+                                    json!({ "type": "rootChatEvent", "event": "error",
+                                        "chatId": chat_id, "message": message })
+                                })
+                            }
+                            ClientMsg::RootChatStop { chat_id } => {
+                                chats.stop(chat_id);
+                                None
+                            }
+                            ClientMsg::RootChatScope { chat_id, scope } => {
+                                let ok = store.set_root_chat_scope(chat_id, scope.clone());
+                                Some(json!({ "type": "rootChatScoped", "chatId": chat_id,
+                                    "ok": ok, "scope": scope }))
+                            }
+                            _ => None,
+                        };
+                        if let Some(r) = reply {
+                            if !send_text(&mut ws, r.to_string()) {
+                                break 'conn;
+                            }
+                        }
+                    }
+                    Some(ClientMsg::FsAck { request_id }) => {
+                        let mut finished = false;
+                        let mut frame = None;
+                        if let Some((rid, d, sent, at)) = download.as_mut() {
+                            if *rid == request_id {
+                                let (f, done) = fs_chunk(rid, d, sent);
+                                *at = Instant::now();
+                                finished = done;
+                                frame = Some(f);
+                            }
+                        }
+                        if finished {
+                            download = None;
+                        }
+                        if let Some(f) = frame {
+                            if !send_text(&mut ws, f.to_string()) {
+                                break 'conn;
+                            }
+                        }
+                    }
                     Some(ClientMsg::SessionAction {
                         request_id,
                         action,
@@ -2281,6 +2775,77 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                 break;
             }
         }
+        // 2d. The project list: on request, and pushed again whenever the store saves (a
+        // delete from this phone lands after its `sessionActionResult`, and a rename or a
+        // new session on the computer would otherwise wait for the phone's next poll).
+        if listed {
+            let gen = app.state::<Arc<Store>>().save_generation();
+            if gen != projects_gen && last_projects.elapsed() >= PROJECTS_PUSH_GAP {
+                want_projects = true;
+            }
+        }
+        if want_projects {
+            want_projects = false;
+            projects_gen = app.state::<Arc<Store>>().save_generation();
+            last_projects = Instant::now();
+            // Typed, whitelisted tree (see `bridge_view`); never the raw `Project`s.
+            let running: HashSet<String> = pty.session_ids().into_iter().collect();
+            // Store is managed as Arc<Store> (lib.rs .manage(Arc::new(Store::new()))) —
+            // state::<Store>() panics the connection thread on the first `list`.
+            let store = app.state::<Arc<Store>>();
+            let fleet = app.state::<Arc<crate::fleet::FleetState>>().snapshot();
+            let asks = app.state::<Arc<crate::asks::Asks>>().pending();
+            let view = crate::bridge_view::projects_view(
+                &store.list(),
+                &store.list_profiles(),
+                store.active_profile().as_deref(),
+                &fleet,
+                &running,
+                &asks,
+                // Resolved exactly as `attach` resolves a transcript; any miss is null.
+                &|s| {
+                    let conversation = store.claude_conversation_id(&s.id);
+                    ctrl.last_messages
+                        .path_for(&s.id, &conversation, || {
+                            crate::pty::session_projects_dir(&store, &s.id)
+                                .and_then(|dir| crate::pty::transcript_path(&conversation, &dir))
+                        })
+                        .map_or(serde_json::Value::Null, |p| ctrl.last_messages.for_path(&p))
+                },
+            );
+            ctrl.last_messages.sweep();
+            if !send_text(&mut ws, view.to_string()) {
+                break;
+            }
+        }
+
+        // 2e. General-chat events (a turn streaming, from this phone or the computer).
+        if let Some((_, rx)) = root_chat_sub.as_ref() {
+            let mut gone = false;
+            for _ in 0..DRAIN_PER_TICK {
+                match rx.try_recv() {
+                    Ok(event) => {
+                        if !send_text(&mut ws, root_chat_event_frame(event).to_string()) {
+                            gone = true;
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if gone {
+                break;
+            }
+        }
+
+        // A download the phone stopped acking (it left the screen, or the link dropped).
+        if download
+            .as_ref()
+            .is_some_and(|(_, _, _, at)| at.elapsed() > DOWNLOAD_IDLE)
+        {
+            download = None;
+        }
+
         // 2c. A finished `ports` scan.
         if let Ok(ports) = ports_rx.try_recv() {
             listing_ports = false;
@@ -2394,6 +2959,39 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             }
         }
 
+        // 4c. An attached agy session: re-read its conversation database when it moved.
+        //     The first read after attach REPLACES the (empty) Claude-path history.
+        if let Some(tail) = agy_tail.as_mut() {
+            if Instant::now() >= next_agy {
+                next_agy = Instant::now() + AGY_POLL;
+                let first = tail.version.is_none();
+                let store = app.state::<Arc<Store>>();
+                let sid = tail.session_id.clone();
+                let update = tail.poll(|| {
+                    let cid = store.session_agent_conversation_id(&sid)?;
+                    let cfg = store.session_account_config_dir(&sid);
+                    let home = crate::agy_usage::resolve_agy_home(cfg.as_deref())?;
+                    crate::agy_transcript::conversation_db(&home, &cid)
+                });
+                let frames: Vec<serde_json::Value> = match update {
+                    crate::agy_transcript::Update::Append(items) if !first => items
+                        .iter()
+                        .map(|i| crate::bridge_view::chat_frame(&sid, i))
+                        .collect(),
+                    crate::agy_transcript::Update::Append(items)
+                    | crate::agy_transcript::Update::Replace(items) => {
+                        vec![json!({ "type": "history", "sessionId": sid, "items": items })]
+                    }
+                    crate::agy_transcript::Update::Nothing => Vec::new(),
+                };
+                for frame in frames {
+                    if !send_text(&mut ws, frame.to_string()) {
+                        break 'conn;
+                    }
+                }
+            }
+        }
+
         // 4b. Tail the transcript for appended lines -> chat items.
         if let (Some((path, cursor)), Some((sid, _, _))) = (transcript.as_mut(), attached.as_ref())
         {
@@ -2407,6 +3005,10 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
 
     unsubscribe_bus(&bus, &mut bus_sub);
     detach(&pty, &attached);
+    if let Some((id, _)) = root_chat_sub {
+        app.state::<Arc<crate::root_chat::RootChatState>>()
+            .unsubscribe(id);
+    }
 }
 
 /// May this peer mirror ports now? A remote phone needs mobile access on as well as the
@@ -2613,6 +3215,15 @@ impl Drop for LiveConn {
 }
 
 /// Whether a session runs the Claude adapter (the only one with a transcript context meter).
+fn session_agent(store: &Store, session_id: &str) -> Option<crate::agent::AgentId> {
+    store
+        .list()
+        .iter()
+        .flat_map(|p| p.sessions.iter())
+        .find(|s| s.id == session_id)
+        .map(|s| s.agent)
+}
+
 fn is_claude(store: &Store, session_id: &str) -> bool {
     store
         .list()
@@ -2690,6 +3301,10 @@ mod tests {
             r#"{"type":"git","session_id":"s","action":"changes"}"#,
             r#"{"type":"kill","session_id":"s"}"#,
             r#"{"type":"interrupt","sessionId":"s"}"#,
+            r#"{"type":"fslist","sessionId":"s","requestId":"r","path":""}"#,
+            r#"{"type":"fsread","sessionId":"s","requestId":"r","path":"a"}"#,
+            r#"{"type":"fswrite","sessionId":"s","requestId":"r","path":"a","content":"x","baseMtimeMs":1.5,"baseSize":1}"#,
+            r#"{"type":"fsdownload","sessionId":"s","requestId":"r","path":"a","confirm":true}"#,
         ];
         let upload =
             r#"{"type":"upload","sessionId":"s","requestId":"r","name":"a.png","data":"aGk="}"#;
@@ -2974,7 +3589,84 @@ mod tests {
                 prompt: "fix the bug".into(),
                 agent: None,
                 worktree: true,
+                name: None,
             })
+        );
+        // A titled spawn with no first message (the agent starts idle).
+        assert_eq!(
+            parse_client_msg(r#"{"type":"spawn","project_id":"p1","name":"Release notes"}"#),
+            Some(ClientMsg::Spawn {
+                project_id: "p1".into(),
+                prompt: String::new(),
+                agent: None,
+                worktree: false,
+                name: Some("Release notes".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_the_general_chat_messages() {
+        assert_eq!(
+            parse_client_msg(r#"{"type":"rootchats"}"#),
+            Some(ClientMsg::RootChats)
+        );
+        assert_eq!(
+            parse_client_msg(
+                r#"{"type":"rootchatcreate","requestId":"r","profileId":null,"scope":{"profiles":[null,"work"],"projects":["p1"]}}"#
+            ),
+            Some(ClientMsg::RootChatCreate {
+                request_id: "r".into(),
+                profile_id: None,
+                scope: Some(crate::store::ChatScope {
+                    all_profiles: false,
+                    profiles: vec![None, Some("work".into())],
+                    projects: vec!["p1".into()],
+                }),
+            })
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"type":"rootchatsend","chatId":"c","text":"hi"}"#),
+            Some(ClientMsg::RootChatSend {
+                chat_id: "c".into(),
+                text: "hi".into()
+            })
+        );
+        // Not session-scoped: a chat is not a session, and the private gate is the chat's
+        // own (`root_mcp::chat_may_peek`).
+        assert_eq!(
+            session_scope(&parse_client_msg(r#"{"type":"rootchatstop","chatId":"c"}"#).unwrap()),
+            None
+        );
+        // The phone never sees which account a chat bills to.
+        let c: crate::store::RootChat = serde_json::from_value(
+            json!({"id": "c", "title": "t", "accountId": "acct", "createdAt": 1}),
+        )
+        .unwrap();
+        assert!(root_chat_view(&c, false).get("accountId").is_none());
+    }
+
+    #[test]
+    fn a_typed_title_wins_over_the_first_message() {
+        assert_eq!(
+            spawn_name(Some("  Release	notes "), "fix it"),
+            "Release notes"
+        );
+        assert_eq!(
+            spawn_name(
+                Some(
+                    "a
+b"
+                ),
+                ""
+            ),
+            "a b"
+        );
+        assert_eq!(spawn_name(Some("   "), "fix it"), "fix it");
+        assert_eq!(spawn_name(None, ""), "Mobile");
+        assert_eq!(
+            spawn_name(Some(&"x".repeat(80)), "").chars().count(),
+            SPAWN_NAME_MAX
         );
     }
 

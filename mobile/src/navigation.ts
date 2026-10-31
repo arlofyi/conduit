@@ -4,6 +4,8 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 export type TabParamList = {
   Chats: undefined;
+  /** the computer's root chat (HQ): a non-coding chat across projects */
+  General: undefined;
   /** the computer's local web apps, mirrored to this phone's localhost */
   Apps: undefined;
   Settings: undefined;
@@ -25,6 +27,14 @@ export type RootStackParamList = {
   QuickActions: { sessionId: string; running: boolean; agent: string };
   /** tap the chat header */
   SessionInfo: { sessionId: string; projectId: string };
+  /** one folder of a session's directory ("" = its root), pushed per folder; `title` names the root */
+  Files: { sessionId: string; path: string; title?: string };
+  /** one file of a session's directory */
+  FileView: { sessionId: string; path: string; title?: string };
+  /** one general chat; `title` until the list knows it */
+  GeneralChat: { chatId: string; title?: string };
+  /** the scope chip on a general chat: which projects it may see */
+  GeneralScope: { chatId: string };
 };
 
 export type ChatsProps = CompositeScreenProps<
@@ -46,3 +56,11 @@ export type NewChatProps = NativeStackScreenProps<RootStackParamList, "NewChat">
 export type ChatsMenuProps = NativeStackScreenProps<RootStackParamList, "ChatsMenu">;
 export type QuickActionsProps = NativeStackScreenProps<RootStackParamList, "QuickActions">;
 export type SessionInfoProps = NativeStackScreenProps<RootStackParamList, "SessionInfo">;
+export type FilesProps = NativeStackScreenProps<RootStackParamList, "Files">;
+export type FileViewProps = NativeStackScreenProps<RootStackParamList, "FileView">;
+export type GeneralProps = CompositeScreenProps<
+  NativeBottomTabScreenProps<TabParamList, "General">,
+  NativeStackScreenProps<RootStackParamList>
+>;
+export type GeneralChatProps = NativeStackScreenProps<RootStackParamList, "GeneralChat">;
+export type GeneralScopeProps = NativeStackScreenProps<RootStackParamList, "GeneralScope">;

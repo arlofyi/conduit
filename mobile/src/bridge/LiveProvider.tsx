@@ -36,7 +36,29 @@ import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocke
 import { answerMsg, approveMsg, discoverMsg, pairMsg, portsMsg, sessionActionMsg, spawnMsg, uploadMsg, type ClientMsg, type WireMac } from "./protocol";
 import { parsePortsFrame, type WebPortsView } from "../logic/ports";
 import type { ActionResult, SessionAction } from "../logic/selection";
-import { chunkBase64 } from "../logic/attachments";
+import { chunkBase64, decodedBytes } from "../logic/attachments";
+import { Directory, File, Paths } from "expo-file-system";
+import {
+  baseName,
+  cacheName,
+  CANCELLED as FS_CANCELLED,
+  NOT_CONNECTED as FS_NOT_CONNECTED,
+  PRIVATE as FS_PRIVATE,
+  TIMEOUT as FS_TIMEOUT,
+} from "../logic/files";
+import {
+  fsAckMsg,
+  fsDownloadMsg,
+  fsListMsg,
+  fsReadMsg,
+  fsWriteMsg,
+  type ServerMsg,
+  type WireFsEntry,
+  type WireFsReply,
+  type WireFsText,
+} from "./protocol";
+import { applyFeed, applyToList, chatOf, EMPTY_FEED, type FeedEvent, type RootChat, type RootFeed, type Scope } from "../logic/general";
+import { rootChatCreateMsg, rootChatHistoryMsg, rootChatScopeMsg, rootChatSendMsg, rootChatsMsg, rootChatStopMsg } from "./protocol";
 
 /** Simulator/dev build: also try loopback, and offer "This computer (simulator)". */
 export const IS_SIMULATOR_OR_DEV = __DEV__;
@@ -121,6 +143,35 @@ const RECONNECT_WAIT_MS = 20_000;
 const CHUNK_TIMEOUT_MS = 30_000;
 const ACTION_TIMEOUT_MS = 15_000;
 
+// ---- file browser outcomes (see the "file browser" block in the provider) ----
+/** `error` is the computer's own word ("confirm", "conflict", "not found"...) or one of
+ * logic/files.ts's phone-side ones; `fsErrorText` words it for the reader. */
+export type FsListOutcome = { ok: true; path: string; entries: WireFsEntry[]; truncated: number } | { ok: false; error: string };
+export type FsReadOutcome = ({ ok: true } & WireFsText) | { ok: false; error: string };
+export type FsWriteOutcome = { ok: true; mtimeMs: number; size: number } | { ok: false; error: string };
+/** `uri` is a file in this phone's cache, ready for an <Image> or the share sheet. */
+export type FsDownloadOutcome = { ok: true; uri: string; name: string; size: number } | { ok: false; error: string };
+export interface FsDownloadOptions {
+  /** resend after the reader confirmed opening a secret */
+  confirm?: boolean;
+  onProgress?: (received: number, total: number) => void;
+  /** polled at each chunk: true stops the download (the reader left) */
+  isCancelled?: () => boolean;
+}
+type FsFail = { type: "fail"; error: string };
+const FS_TIMEOUT_MS = 15_000;
+/** Per chunk: ~384 KiB, the same budget uploads use. */
+const FS_CHUNK_TIMEOUT_MS = 30_000;
+function fsErr(r: WireFsReply | FsFail): string {
+  return "error" in r && typeof r.error === "string" ? r.error : "Your computer sent an unexpected answer.";
+}
+
+// ---- general chat outcomes (see the "general chat" block in the provider) ----
+export type RootCreateOutcome = { ok: true; chat: RootChat } | { ok: false; error: string };
+export type RootScopeOutcome = { ok: true; scope: Scope | null } | { ok: false; error: string };
+const ROOT_TIMEOUT_MS = 12_000;
+const ROOT_NO_ANSWER = "Your computer didn't answer. Check the connection and try again.";
+
 export interface LiveValue {
   /** false until the Keychain Mac list has been read; render nothing route-deciding before */
   loaded: boolean;
@@ -178,7 +229,7 @@ export interface LiveValue {
   /** send prepared frames (quick actions) */
   sendFrames: (frames: ClientMsg[]) => void;
   /** start a new session with its first message; the answer lands in `spawnState` */
-  spawn: (projectId: string, text: string, agent: string) => void;
+  spawn: (projectId: string, text: string, agent: string, name?: string) => void;
   spawnState: SpawnState;
   resetSpawn: () => void;
   /** questions/permissions the current Mac holds for a human, and how each one ended */
@@ -191,6 +242,30 @@ export interface LiveValue {
   upload: (sessionId: string, name: string, data: string) => Promise<UploadOutcome>;
   /** stop or delete sessions on the computer (the Chats list's selection) */
   sessionAction: (action: SessionAction, sessionIds: string[]) => Promise<ActionResult>;
+  /** the file browser: one folder of a session's directory ("" = its root) */
+  fsList: (sessionId: string, path: string) => Promise<FsListOutcome>;
+  /** a file as text (`confirm` opens a secret the computer flagged) */
+  fsRead: (sessionId: string, path: string, confirm?: boolean) => Promise<FsReadOutcome>;
+  /** save an edit; `base` is the stat it started from (a newer file is a "conflict") */
+  fsWrite: (sessionId: string, path: string, content: string, base: { mtimeMs: number; size: number }) => Promise<FsWriteOutcome>;
+  /** copy a file into this phone's cache (one at a time: a new one cancels the last) */
+  fsDownload: (sessionId: string, path: string, opts?: FsDownloadOptions) => Promise<FsDownloadOutcome>;
+  /** the general chat (the computer's root chat): every chat, null until the first `rootChats` */
+  rootChats: RootChat[] | null;
+  /** the feed of each general chat opened since connecting, by chat id */
+  rootFeeds: Record<string, RootFeed>;
+  /** ask for the list again (also subscribes this socket to general-chat events) */
+  refreshRootChats: () => void;
+  /** load a chat's history and keep its feed live; `closeRootChat` stops re-loading it on reconnect */
+  openRootChat: (chatId: string) => void;
+  closeRootChat: (chatId: string) => void;
+  /** start a chat listed under `profileId`, seeing `scope` */
+  createRootChat: (profileId: string | null, scope: Scope | null) => Promise<RootCreateOutcome>;
+  /** send one message (shown at once); false = not connected */
+  sendRootChat: (chatId: string, text: string) => boolean;
+  stopRootChat: (chatId: string) => void;
+  /** change which projects a chat sees (`null` = every project) */
+  setRootChatScope: (chatId: string, scope: Scope | null) => Promise<RootScopeOutcome>;
   /** the in-app banner on screen, if any */
   banner: Banner | null;
   dismissBanner: () => void;
@@ -270,6 +345,239 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   /** bumps on every pair()/cancel so a stale attempt's async callbacks are ignored */
   const pairGen = useRef(0);
 
+  // ---- file browser (desktop phone_fs.rs) -- self-contained: refs, router, four calls ----
+  /** Each fs request waiting on its answer, by requestId (a download re-registers per chunk). */
+  const fsWaitersRef = useRef(new Map<string, { sessionId: string; settle: (m: WireFsReply | FsFail) => void }>());
+  /** The download in flight; the computer runs one per socket and a new one replaces it. */
+  const fsDownloadRef = useRef<string | null>(null);
+  /** Wait for one answer to `requestId`, sending `frame` once the waiter is in place. */
+  const fsExchange = useCallback(
+    (sessionId: string, requestId: string, frame: ClientMsg | null, ms: number): Promise<WireFsReply | FsFail> =>
+      new Promise((resolve) => {
+        const finish = (m: WireFsReply | FsFail) => {
+          clearTimeout(timer);
+          if (fsWaitersRef.current.get(requestId)?.settle === finish) fsWaitersRef.current.delete(requestId);
+          resolve(m);
+        };
+        const timer = setTimeout(() => finish({ type: "fail", error: FS_TIMEOUT }), ms);
+        fsWaitersRef.current.set(requestId, { sessionId, settle: finish });
+        if (frame && !clientRef.current?.send(frame)) finish({ type: "fail", error: FS_NOT_CONNECTED });
+      }),
+    [],
+  );
+  /** Called first for every frame: true when it was an fs answer (consumed). A private-session
+   * refusal fails that session's requests now instead of at their timeout. */
+  const fsRoute = useCallback((m: ServerMsg): boolean => {
+    if (m.type === "error") {
+      if (m.message === FS_PRIVATE && m.sessionId) {
+        for (const w of [...fsWaitersRef.current.values()]) {
+          if (w.sessionId === m.sessionId) w.settle({ type: "fail", error: FS_PRIVATE });
+        }
+      }
+      return false;
+    }
+    if (m.type !== "fsListResult" && m.type !== "fsReadResult" && m.type !== "fsWriteResult" && m.type !== "fsChunk") return false;
+    fsWaitersRef.current.get(m.requestId)?.settle(m);
+    return true;
+  }, []);
+  const fsList = useCallback(
+    async (sessionId: string, path: string): Promise<FsListOutcome> => {
+      const id = genId("fs");
+      const r = await fsExchange(sessionId, id, fsListMsg(sessionId, id, path), FS_TIMEOUT_MS);
+      if (r.type !== "fsListResult" || r.error !== undefined) return { ok: false, error: fsErr(r) };
+      return { ok: true, path: r.path, entries: r.entries ?? [], truncated: r.truncated ?? 0 };
+    },
+    [fsExchange],
+  );
+  const fsRead = useCallback(
+    async (sessionId: string, path: string, confirm = false): Promise<FsReadOutcome> => {
+      const id = genId("fs");
+      const r = await fsExchange(sessionId, id, fsReadMsg(sessionId, id, path, confirm), FS_TIMEOUT_MS);
+      if (r.type !== "fsReadResult" || r.error !== undefined) return { ok: false, error: fsErr(r) };
+      const { type: _t, requestId: _r, error: _e, ...text } = r;
+      return { ok: true, ...text };
+    },
+    [fsExchange],
+  );
+  const fsWrite = useCallback(
+    async (sessionId: string, path: string, content: string, base: { mtimeMs: number; size: number }): Promise<FsWriteOutcome> => {
+      const id = genId("fs");
+      const r = await fsExchange(sessionId, id, fsWriteMsg(sessionId, id, path, content, base), FS_TIMEOUT_MS);
+      if (r.type !== "fsWriteResult" || r.error !== undefined) return { ok: false, error: fsErr(r) };
+      return { ok: true, mtimeMs: r.mtimeMs, size: r.size };
+    },
+    [fsExchange],
+  );
+  const fsDownload = useCallback(
+    async (sessionId: string, path: string, opts: FsDownloadOptions = {}): Promise<FsDownloadOutcome> => {
+      const id = genId("dl");
+      // The computer drops the previous download for this one: end its wait now.
+      const prev = fsDownloadRef.current;
+      if (prev) fsWaitersRef.current.get(prev)?.settle({ type: "fail", error: FS_CANCELLED });
+      fsDownloadRef.current = id;
+      const dir = new Directory(Paths.cache, "conduit-files", id);
+      let file: File | null = null;
+      const fail = (error: string): FsDownloadOutcome => {
+        try {
+          if (dir.exists) dir.delete();
+        } catch {
+          // the cache is the OS's to clear
+        }
+        return { ok: false, error };
+      };
+      let frame: ClientMsg | null = fsDownloadMsg(sessionId, id, path, opts.confirm);
+      let received = 0;
+      for (let expect = 1; ; expect++) {
+        const r = await fsExchange(sessionId, id, frame, FS_CHUNK_TIMEOUT_MS);
+        if (r.type !== "fsChunk" || r.error !== undefined) return fail(fsErr(r));
+        // A newer download replaced this one on the computer, or the reader left.
+        if (fsDownloadRef.current !== id || opts.isCancelled?.()) return fail(FS_CANCELLED);
+        if (r.seq !== expect) return fail("The file arrived out of order. Try again.");
+        try {
+          if (!file) {
+            dir.create({ intermediates: true, idempotent: true });
+            file = new File(dir, cacheName(r.name || baseName(path)));
+            file.create({ overwrite: true });
+          }
+          if (r.data) file.write(r.data, { encoding: "base64", append: true });
+        } catch (e) {
+          return fail(`Couldn't save on this phone: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        received += decodedBytes(r.data);
+        opts.onProgress?.(received, r.size);
+        if (r.done) {
+          if (fsDownloadRef.current === id) fsDownloadRef.current = null;
+          return { ok: true, uri: file.uri, name: r.name, size: r.size };
+        }
+        frame = fsAckMsg(id);
+      }
+    },
+    [fsExchange],
+  );
+  // ---- end file browser ----
+
+  // ---- general chat (desktop root_chat.rs) -- self-contained: state, router, calls ----
+  const [rootChats, setRootChats] = useState<RootChat[] | null>(null);
+  const [rootFeeds, setRootFeeds] = useState<Record<string, RootFeed>>({});
+  /** this socket has sent a rootchat* frame, so the computer pushes events to it; a new
+   * socket (reconnect) re-subscribes and re-loads the open chat */
+  const rootSubscribedRef = useRef(false);
+  const rootOpenRef = useRef<string | null>(null);
+  /** answers waited on: `create:<requestId>` and `scope:<chatId>` */
+  const rootWaitersRef = useRef(new Map<string, (m: ServerMsg | null) => void>());
+  const rootSend = useCallback((frame: ClientMsg): boolean => {
+    const ok = !!clientRef.current?.send(frame);
+    if (ok) rootSubscribedRef.current = true;
+    return ok;
+  }, []);
+  /** Events reach only chats opened here: a feed built from a turn's tail alone would lie. */
+  const patchRootFeed = useCallback((chatId: string, e: FeedEvent) => {
+    setRootFeeds((all) => {
+      const prev = all[chatId];
+      if (!prev && e.t !== "history" && e.t !== "send") return all;
+      const next = applyFeed(prev ?? EMPTY_FEED, e);
+      return next === prev ? all : { ...all, [chatId]: next };
+    });
+  }, []);
+  const rootWait = useCallback(
+    (key: string, frame: ClientMsg): Promise<ServerMsg | null> =>
+      new Promise((resolve) => {
+        const finish = (m: ServerMsg | null) => {
+          clearTimeout(timer);
+          if (rootWaitersRef.current.get(key) === finish) rootWaitersRef.current.delete(key);
+          resolve(m);
+        };
+        const timer = setTimeout(() => finish(null), ROOT_TIMEOUT_MS);
+        rootWaitersRef.current.set(key, finish);
+        if (!rootSend(frame)) finish(null);
+      }),
+    [rootSend],
+  );
+  /** Called for every frame: true when it was a general-chat frame (consumed). */
+  const rootRoute = useCallback(
+    (m: ServerMsg): boolean => {
+      switch (m.type) {
+        case "rootChats":
+          setRootChats((m.chats ?? []).map(chatOf).filter((c): c is RootChat => c !== null));
+          return true;
+        case "rootChatCreated": {
+          const chat = chatOf(m.chat);
+          if (chat) setRootChats((list) => [chat, ...(list ?? []).filter((c) => c.id !== chat.id)]);
+          rootWaitersRef.current.get(`create:${m.requestId}`)?.(m);
+          return true;
+        }
+        case "rootChatHistory": {
+          const running = m.running === true;
+          patchRootFeed(m.chatId, { t: "history", items: m.items ?? [], running });
+          setRootChats((list) => list?.map((c) => (c.id === m.chatId && c.running !== running ? { ...c, running } : c)) ?? list);
+          return true;
+        }
+        case "rootChatScoped":
+          if (m.ok) setRootChats((list) => list?.map((c) => (c.id === m.chatId ? { ...c, scope: m.scope } : c)) ?? list);
+          rootWaitersRef.current.get(`scope:${m.chatId}`)?.(m);
+          return true;
+        case "rootChatEvent":
+          setRootChats((list) => applyToList(list, m));
+          patchRootFeed(m.chatId, { t: "event", ev: m });
+          // A first message titles a "New Chat" on the computer: re-read the list.
+          if (m.event === "done" || m.event === "error") clientRef.current?.send(rootChatsMsg());
+          return true;
+        default:
+          return false;
+      }
+    },
+    [patchRootFeed],
+  );
+  const refreshRootChats = useCallback(() => {
+    rootSend(rootChatsMsg());
+  }, [rootSend]);
+  const openRootChat = useCallback(
+    (chatId: string) => {
+      rootOpenRef.current = chatId;
+      rootSend(rootChatHistoryMsg(chatId));
+    },
+    [rootSend],
+  );
+  const closeRootChat = useCallback((chatId: string) => {
+    if (rootOpenRef.current === chatId) rootOpenRef.current = null;
+  }, []);
+  const createRootChat = useCallback(
+    async (profileId: string | null, scope: Scope | null): Promise<RootCreateOutcome> => {
+      const id = genId("rc");
+      const r = await rootWait(`create:${id}`, rootChatCreateMsg(id, profileId, scope));
+      if (!r) return { ok: false, error: clientRef.current ? ROOT_NO_ANSWER : NOT_CONNECTED };
+      const chat = r.type === "rootChatCreated" ? chatOf(r.chat) : null;
+      return chat ? { ok: true, chat } : { ok: false, error: "Your computer sent an unexpected answer." };
+    },
+    [rootWait],
+  );
+  const sendRootChat = useCallback(
+    (chatId: string, text: string): boolean => {
+      const trimmed = text.trim();
+      if (!trimmed) return false;
+      if (!rootSend(rootChatSendMsg(chatId, trimmed))) return false;
+      patchRootFeed(chatId, { t: "send", text: trimmed });
+      return true;
+    },
+    [rootSend, patchRootFeed],
+  );
+  const stopRootChat = useCallback(
+    (chatId: string) => {
+      if (rootSend(rootChatStopMsg(chatId))) patchRootFeed(chatId, { t: "stop" });
+    },
+    [rootSend, patchRootFeed],
+  );
+  const setRootChatScope = useCallback(
+    async (chatId: string, scope: Scope | null): Promise<RootScopeOutcome> => {
+      const r = await rootWait(`scope:${chatId}`, rootChatScopeMsg(chatId, scope));
+      if (!r) return { ok: false, error: clientRef.current ? ROOT_NO_ANSWER : NOT_CONNECTED };
+      if (r.type !== "rootChatScoped" || !r.ok) return { ok: false, error: "Your computer didn't accept that scope." };
+      return { ok: true, scope: r.scope };
+    },
+    [rootWait],
+  );
+  // ---- end general chat ----
+
   const refreshMacs = useCallback(async () => {
     try {
       const list = await macStore.list();
@@ -326,6 +634,10 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     lastFrameAt.current = null;
     setDiscovered(null);
     setWebPorts(null);
+    setRootChats(null);
+    setRootFeeds({});
+    rootSubscribedRef.current = false;
+    rootOpenRef.current = null;
     pendingRef.current = emptyPending;
     setPending(emptyPending);
     let wasReady = false;
@@ -347,6 +659,11 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               setSessionLive(EMPTY_LIVE);
               client.attach(attachedRef.current);
             }
+            // General-chat events are per socket: subscribe again, and catch the open chat up.
+            if (rootSubscribedRef.current) {
+              client.send(rootChatsMsg());
+              if (rootOpenRef.current) client.send(rootChatHistoryMsg(rootOpenRef.current));
+            }
           }
         },
         onEffect: (e) => {
@@ -361,6 +678,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
         },
         onMessage: (m) => {
           lastFrameAt.current = Date.now();
+          if (fsRoute(m)) return;
+          if (rootRoute(m)) return;
           switch (m.type) {
             case "hello":
               setHello({ macName: m.macName, conduitVersion: m.conduitVersion });
@@ -886,9 +1205,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     for (const f of frames) clientRef.current?.send(f);
   }, []);
 
-  const spawn = useCallback((projectId: string, text: string, agent: string) => {
+  const spawn = useCallback((projectId: string, text: string, agent: string, name = "") => {
     const trimmed = text.trim();
-    if (!trimmed || spawnPending.current) return;
+    if (spawnPending.current) return;
     const client = clientRef.current;
     if (!client) {
       setSpawnState({ phase: "failed", message: "Not connected to your computer." });
@@ -897,7 +1216,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     spawnPending.current = true;
     spawnLate.current = false;
     setSpawnState({ phase: "pending" });
-    client.send(spawnMsg(projectId, trimmed, agent));
+    client.send(spawnMsg(projectId, trimmed, agent, name));
   }, []);
 
   // A spawn the Mac never answers (link dropped mid-request) must not spin forever. It is NOT
@@ -968,15 +1287,41 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       approve,
       upload,
       sessionAction,
+      fsList,
+      fsRead,
+      fsWrite,
+      fsDownload,
+      rootChats,
+      rootFeeds,
+      refreshRootChats,
+      openRootChat,
+      closeRootChat,
+      createRootChat,
+      sendRootChat,
+      stopRootChat,
+      setRootChatScope,
       banner,
       dismissBanner,
     }),
     [
+      rootChats,
+      rootFeeds,
+      refreshRootChats,
+      openRootChat,
+      closeRootChat,
+      createRootChat,
+      sendRootChat,
+      stopRootChat,
+      setRootChatScope,
       pending,
       answer,
       approve,
       upload,
       sessionAction,
+      fsList,
+      fsRead,
+      fsWrite,
+      fsDownload,
       sendFrames,
       spawn,
       spawnState,

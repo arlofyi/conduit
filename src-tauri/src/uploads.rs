@@ -261,7 +261,7 @@ pub fn message_path(file: &str) -> String {
 
 /// True when `p` is a symlink, or on Windows any reparse point (a junction is not a
 /// symlink to `is_symlink`, but it redirects all the same).
-fn is_link(meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_link(meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() {
         return true;
     }

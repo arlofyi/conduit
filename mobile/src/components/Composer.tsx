@@ -35,7 +35,8 @@ export function Composer({
   /** the typed text; the screen adds the attachments' references */
   onSend: (text: string) => void;
   attachments: readonly Attachment[];
-  onAttach: (source: AttachSource) => void;
+  /** absent: no "+" (a chat that takes no files) */
+  onAttach?: (source: AttachSource) => void;
   onRemoveAttachment: (id: string) => void;
   bottomInset: number;
   /** the bar's full height, so the list can keep its last message clear of it */
@@ -74,7 +75,7 @@ export function Composer({
   };
   const choose = (source: AttachSource) => {
     setMenuOpen(false);
-    onAttach(source);
+    onAttach?.(source);
   };
 
   return (
@@ -97,9 +98,9 @@ export function Composer({
           ))}
         </ScrollView>
       ) : null}
-      <AttachMenu open={menuOpen} bottom={barH + 6} onChoose={choose} onClose={() => setMenuOpen(false)} />
+      {onAttach ? <AttachMenu open={menuOpen} bottom={barH + 6} onChoose={choose} onClose={() => setMenuOpen(false)} /> : null}
       <View style={{ flexDirection: "row", alignItems: "flex-end", gap: 8, paddingHorizontal: 10 }}>
-      <GlassCircle symbol="plus" label="Attach a photo or file" onPress={openMenu} size={COMPOSER.min} symbolSize={17} />
+      {onAttach ? <GlassCircle symbol="plus" label="Attach a photo or file" onPress={openMenu} size={COMPOSER.min} symbolSize={17} /> : null}
       <GlassSurface style={{ flex: 1, borderRadius: COMPOSER.min / 2, minHeight: metrics.min }}>
         <Text
           onLayout={(e) => setOneLine(e.nativeEvent.layout.height)}

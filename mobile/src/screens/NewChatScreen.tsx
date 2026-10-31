@@ -1,11 +1,11 @@
 /**
- * "+" on Chats: start a session from the phone — pick the project, pick the agent, type the
- * first message. Sends the bridge's existing `spawn`; the Mac creates the session, opens its
+ * "+" on Chats: start a session from the phone — pick the project, pick the agent, optionally
+ * give it a title and a first message (with neither, the agent starts idle and the computer names it). Sends the bridge's existing `spawn`; the Mac creates the session, opens its
  * tab and hands it the message; on `spawned` this sheet becomes that chat.
  *
- * Agents: only Claude can be started here, because only Claude's conversation reaches the
- * phone (the bridge reads its transcript). The other adapters are listed, disabled, as
- * "Opens on your computer only". The Mac budgets spawns per phone (10 an hour).
+ * Agents: Claude and Antigravity can be started here, because their conversations reach the
+ * phone (Claude's transcript, Antigravity's conversation database). The others are listed, disabled, as
+ * "Opens on your computer only". The computer budgets spawns per phone (10 an hour).
  *
  * Start is disabled while a spawn is pending, and a timed-out spawn is never retried by
  * itself: the Mac may have started it, and a second press is the reader's call.
@@ -42,6 +42,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
   }, [projects]);
   const [agent, setAgent] = useState("claude");
   const [text, setText] = useState("");
+  const [title, setTitle] = useState("");
 
   // A previous attempt's answer must not open a chat now.
   useEffect(() => {
@@ -59,7 +60,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
 
   const pending = spawnState.phase === "pending";
   const ready = conn.phase === "ready";
-  const canStart = ready && !pending && projectId !== null && chatOnPhone(agent) && text.trim().length > 0;
+  const canStart = ready && !pending && projectId !== null && chatOnPhone(agent);
   const project = projects.find((x) => x.id === projectId) ?? null;
 
   return (
@@ -145,7 +146,32 @@ export function NewChatScreen({ navigation }: NewChatProps) {
         })}
       </ScrollView>
 
-      <Label>First message</Label>
+      <Label>Title (optional)</Label>
+      <View style={{ marginHorizontal: 16, marginBottom: 6 }}>
+        <TextInput
+          value={title}
+          onChangeText={setTitle}
+          maxLength={40}
+          placeholder="Named from the first message if left blank"
+          placeholderTextColor={p.textMid}
+          accessibilityLabel="Title"
+          selectionColor={p.accent}
+          keyboardAppearance={p.appearance}
+          returnKeyType="next"
+          style={{
+            height: 44,
+            borderRadius: 12,
+            borderWidth: StyleSheet.hairlineWidth,
+            borderColor: p.border,
+            backgroundColor: p.sidebarBg,
+            paddingHorizontal: 14,
+            color: p.textBright,
+            fontSize: TYPE.callout,
+          }}
+        />
+      </View>
+
+      <Label>First message (optional)</Label>
       <View style={{ marginHorizontal: 16 }}>
         <TextInput
           value={text}
@@ -176,7 +202,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
           <Text style={{ marginTop: 8, fontSize: TYPE.footnote, color: p.red }}>{spawnState.message}</Text>
         ) : null}
         <Pressable
-          onPress={() => projectId && spawn(projectId, text, agent)}
+          onPress={() => projectId && spawn(projectId, text, agent, title)}
           disabled={!canStart}
           accessibilityRole="button"
           accessibilityLabel="Start chat"

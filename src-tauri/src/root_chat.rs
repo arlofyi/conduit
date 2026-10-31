@@ -7,17 +7,70 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 /// Live children, one per chat at most. A child exists only while a turn is streaming;
 /// idle chats hold no process (spawn-per-message).
 #[derive(Default)]
 pub struct RootChatState {
     children: Mutex<HashMap<String, Child>>,
+    /// Phone sockets following chat events (`subscribe`). Each gets every event and keeps
+    /// the ones for the chat it shows.
+    subscribers: Mutex<Vec<(u64, Sender<Value>)>>,
+    next_subscriber: AtomicU64,
+    /// The workspace root the desktop last sent with a turn. Only the desktop knows it (it
+    /// is a frontend setting), so a turn sent from a phone reuses it; home if never set.
+    workspace_root: Mutex<Option<String>>,
 }
 
 impl RootChatState {
+    /// Follow every chat's events: `{event: "user"|"item"|"done"|"error", chatId, ...}`.
+    pub fn subscribe(&self) -> (u64, Receiver<Value>) {
+        let id = self.next_subscriber.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = channel();
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((id, tx));
+        (id, rx)
+    }
+
+    pub fn unsubscribe(&self, id: u64) {
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(i, _)| *i != id);
+    }
+
+    fn publish(&self, event: Value) {
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, tx)| tx.send(event.clone()).is_ok());
+    }
+
+    /// Is a turn streaming for this chat right now?
+    pub fn is_running(&self, chat_id: &str) -> bool {
+        let mut map = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, c| matches!(c.try_wait(), Ok(None)));
+        map.contains_key(chat_id)
+    }
+
+    /// Stop a chat's streaming turn, if any (a tree kill: see `root_chat_stop`).
+    pub fn stop(&self, chat_id: &str) {
+        if let Some(c) = self
+            .children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(chat_id)
+        {
+            crate::pty::kill_process_tree(c);
+        }
+    }
+
     /// True if any turn is mid-stream. Reaps exited children first so a finished child
     /// can't hold the quit guard open.
     /// End every streaming turn. Called on app exit: these children live outside the PTY
@@ -42,12 +95,38 @@ pub fn root_chat_send(
     chat_id: String,
     text: String,
     workspace_root: Option<String>,
-    state: State<Arc<RootChatState>>,
-    store: State<Arc<crate::store::Store>>,
+) -> Result<(), String> {
+    send_turn(&app, &chat_id, &text, workspace_root, false)
+}
+
+/// Where a phone-sent turn's chat is titled from: its first line, like a phone-started
+/// session (the desktop titles its own chats with a model call after the first reply).
+pub fn title_from(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(if line.chars().count() <= 40 {
+        line
+    } else {
+        format!("{}…", line.chars().take(39).collect::<String>().trim_end())
+    })
+}
+
+/// Run one turn of a root chat. `from_phone`: the turn came over the mobile bridge, so the
+/// desktop is told about the user's message (it adds its OWN sends locally) and the chat
+/// is marked as phone-driven.
+pub fn send_turn(
+    app: &tauri::AppHandle,
+    chat_id: &str,
+    text: &str,
+    workspace_root: Option<String>,
+    from_phone: bool,
 ) -> Result<(), String> {
     use crate::NoWindow;
+    let state = app.state::<Arc<RootChatState>>();
+    let store = app.state::<Arc<crate::store::Store>>();
+    let chat_id = chat_id.to_string();
 
-    store
+    let chat = store
         .root_chat(&chat_id)
         .ok_or_else(|| format!("unknown root chat {chat_id}"))?;
     {
@@ -59,8 +138,20 @@ pub fn root_chat_send(
         }
     }
 
+    let workspace_root = {
+        let mut remembered = state
+            .workspace_root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match workspace_root.filter(|s| !s.is_empty()) {
+            Some(w) => {
+                *remembered = Some(w.clone());
+                Some(w)
+            }
+            None => remembered.clone(),
+        }
+    };
     let cwd = workspace_root
-        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(dirs::home_dir)
         .ok_or("no workspace root and no resolvable home directory")?;
@@ -82,11 +173,27 @@ pub fn root_chat_send(
         .as_deref()
         .is_some_and(|d| crate::pty::transcript_exists(&chat_id, d));
 
-    let roster: Vec<(String, String)> = store
-        .list()
+    // Only the projects in the chat's scope: the roster is what the chat believes exists.
+    let in_scope = store.projects_for_chat(&chat_id);
+    let roster: Vec<(String, String)> = in_scope
         .iter()
         .map(|p| (p.name.clone(), p.path.clone()))
         .collect();
+    // Registered projects OUTSIDE the scope are denied to the file tools. A deny is the only
+    // rule that holds: Read/Glob/Grep need no permission, so an allow list cannot narrow
+    // them (measured: a scoped allow still read an out-of-scope file). Never deny a folder
+    // that CONTAINS an in-scope project -- a deny would win over it too.
+    let denied_paths: Vec<String> = if chat.scope.is_some() {
+        let inside: Vec<&str> = in_scope.iter().map(|p| p.path.as_str()).collect();
+        store
+            .list()
+            .iter()
+            .map(|p| p.path.clone())
+            .filter(|path| !inside.iter().any(|i| contains_path(path, i)))
+            .collect()
+    } else {
+        Vec::new()
+    };
     // Scratch + shared memory exist before the child looks for them; the memory index
     // is injected fresh each spawn, so a write from any chat is visible to all on
     // their very next turn.
@@ -103,7 +210,19 @@ pub fn root_chat_send(
         &memory_index,
         mcp_config.is_some(),
     );
-    let cmd = build_command(&chat_id, resume, &charter, &dirs, mcp_config.as_deref());
+    // The charter rides a FILE: it is many lines, and a newline ends a cmd.exe command line,
+    // so on Windows an inline charter cut the command short and the rest of it reached
+    // claude as stray arguments (`--session-id` was lost, the chat never resumed).
+    let charter_path = dirs.scratch.join("charter.md");
+    std::fs::write(&charter_path, &charter).map_err(|e| format!("write charter: {e}"))?;
+    let cmd = build_command(
+        &chat_id,
+        resume,
+        &charter_path.to_string_lossy(),
+        &dirs,
+        mcp_config.as_deref(),
+        &denied_paths,
+    );
 
     // Interactive login shell for PATH parity with the titler / pty.rs (GUI-launched
     // apps get the bare Finder PATH; nvm/Homebrew claude would be missing otherwise).
@@ -111,7 +230,11 @@ pub fn root_chat_send(
     let mut builder = {
         let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
         let mut c = Command::new(shell);
-        c.args(["/C", &cmd]);
+        // RAW: `args` would re-quote the already cmd-quoted line with MSVCRT rules (`"` ->
+        // `\"`), which cmd.exe does not understand (see "Where the Windows spawn command
+        // lives" in CLAUDE.md).
+        use std::os::windows::process::CommandExt;
+        c.arg("/C").raw_arg(&cmd);
         c
     };
     #[cfg(not(windows))]
@@ -135,6 +258,17 @@ pub fn root_chat_send(
     }
 
     let mut child = builder.spawn().map_err(|e| format!("spawn claude: {e}"))?;
+    if from_phone {
+        store.mark_root_chat_phone(&chat_id);
+        if chat.title == "New Chat" {
+            if let Some(t) = title_from(text) {
+                store.rename_root_chat(&chat_id, &t);
+            }
+        }
+        let user = json!({ "kind": "bubble", "role": "user", "text": text });
+        let _ = app.emit("root-chat-user", json!({ "chatId": chat_id, "item": user }));
+    }
+    state.publish(json!({ "event": "user", "chatId": chat_id, "text": text }));
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(text.as_bytes());
         // Dropped here -> EOF, so `claude -p` reads the full prompt (titler pattern).
@@ -143,6 +277,7 @@ pub fn root_chat_send(
     let stderr = child.stderr.take();
 
     let state_arc = Arc::clone(state.inner());
+    let app = app.clone();
     state_arc
         .children
         .lock()
@@ -155,6 +290,9 @@ pub fn root_chat_send(
             match classify_line(&line) {
                 LineOut::Items(items) => {
                     for item in items {
+                        state_arc.publish(
+                            json!({ "event": "item", "chatId": chat_id, "item": item.clone() }),
+                        );
                         let _ =
                             app.emit("root-chat-item", json!({ "chatId": chat_id, "item": item }));
                     }
@@ -162,6 +300,9 @@ pub fn root_chat_send(
                 LineOut::Done(mut done) => {
                     saw_done = true;
                     done["chatId"] = json!(chat_id);
+                    let mut ev = done.clone();
+                    ev["event"] = json!("done");
+                    state_arc.publish(ev);
                     let _ = app.emit("root-chat-done", done);
                 }
                 LineOut::Nothing => {}
@@ -194,6 +335,7 @@ pub fn root_chat_send(
                 Some(s) => format!("claude exited with {s}: {tail}"),
                 None => format!("claude terminated: {tail}"),
             };
+            state_arc.publish(json!({ "event": "error", "chatId": chat_id, "message": message }));
             let _ = app.emit(
                 "root-chat-error",
                 json!({ "chatId": chat_id, "message": message }),
@@ -205,16 +347,9 @@ pub fn root_chat_send(
 
 #[tauri::command]
 pub fn root_chat_stop(chat_id: String, state: State<Arc<RootChatState>>) {
-    if let Some(c) = state
-        .children
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_mut(&chat_id)
-    {
-        // A tree kill: `c` is the `cmd.exe /C` wrapper, and killing only it on Windows left
-        // the real `claude -p` running the turn to the end.
-        crate::pty::kill_process_tree(c);
-    }
+    // A tree kill: the child is the `cmd.exe /C` wrapper, and killing only it on Windows
+    // left the real `claude -p` running the turn to the end.
+    state.stop(&chat_id);
 }
 
 /// Parse a chat's transcript into renderable items. Shared by the `root_chat_history`
@@ -398,12 +533,13 @@ pub fn build_charter(
 pub fn build_command(
     chat_id: &str,
     resume: bool,
-    charter: &str,
+    charter_file: &str,
     dirs: &Dirs,
     mcp_config: Option<&str>,
+    denied_paths: &[String],
 ) -> String {
     let id = crate::pty::quote_cmdline_arg(chat_id);
-    let sys = crate::pty::quote_cmdline_arg(charter);
+    let sys = crate::pty::quote_cmdline_arg(charter_file);
     let scratch = dirs.scratch.to_string_lossy();
     let memory = dirs.memory.to_string_lossy();
     // The orchestration tools must be ALLOWED, not merely configured. `-p` auto-denies
@@ -429,9 +565,17 @@ pub fn build_command(
     ));
     // Deny the dangerous gh tail: `gh api` is arbitrary REST (a DELETE smuggles past
     // any prefix matcher), and auth/secrets/repo-deletion have no PM use.
-    let deny = crate::pty::quote_cmdline_arg(
-        "NotebookEdit,Bash(gh repo delete:*),Bash(gh secret:*),Bash(gh auth:*),Bash(gh api:*)",
-    );
+    // A scoped chat is also denied the file tools on every project outside its scope.
+    let out_of_scope: String = denied_paths
+        .iter()
+        .map(|p| {
+            let r = permission_path(p);
+            format!(",Read({r}/**),Glob({r}/**),Grep({r}/**)")
+        })
+        .collect();
+    let deny = crate::pty::quote_cmdline_arg(&format!(
+        "NotebookEdit,Bash(gh repo delete:*),Bash(gh secret:*),Bash(gh auth:*),Bash(gh api:*){out_of_scope}"
+    ));
     let add = crate::pty::quote_cmdline_arg(&dirs.root.to_string_lossy());
     let mode = if resume {
         format!("--resume {id}")
@@ -451,14 +595,66 @@ pub fn build_command(
          --disallowedTools {deny} \
          --add-dir {add}{mcp} \
          --strict-mcp-config \
-         --append-system-prompt {sys} {mode}"
+         --append-system-prompt-file {sys} {mode}"
     )
+}
+
+/// Is `inner` the folder `outer` or somewhere inside it? (Separator- and case-insensitive,
+/// which errs toward NOT denying -- the safe side for this question.)
+fn contains_path(outer: &str, inner: &str) -> bool {
+    let norm = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let (o, i) = (norm(outer), norm(inner));
+    i == o || i.starts_with(&format!("{o}/"))
+}
+
+/// An absolute path in Claude Code's permission-rule syntax: `//` + the path, with a
+/// Windows drive written as Claude normalizes it (`C:\\a\\b` -> `//c/a/b`).
+pub fn permission_path(path: &str) -> String {
+    let p = path.replace('\\', "/");
+    let p = p.trim_end_matches('/');
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        format!("//{}{}", (b[0] as char).to_ascii_lowercase(), &p[2..])
+    } else {
+        format!("/{p}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_folder_holding_an_in_scope_project_is_never_denied() {
+        assert!(contains_path("C:\\work", "c:/work/app"));
+        assert!(contains_path("/a/b", "/a/b/"));
+        assert!(!contains_path("/a/b", "/a/bc"));
+        assert!(!contains_path("/a/b/c", "/a/b"));
+        let d = Dirs::under(std::path::Path::new("/data"), "x");
+        let cmd = build_command("x", false, "c", &d, None, &["/other/proj".to_string()]);
+        assert!(cmd.contains("Read(//other/proj/**)"));
+    }
+
+    #[test]
+    fn permission_paths_are_absolute_in_claudes_syntax() {
+        assert_eq!(permission_path("/Users/me/proj"), "//Users/me/proj");
+        assert_eq!(
+            permission_path("C:\\Users\\me\\proj\\"),
+            "//c/Users/me/proj"
+        );
+        assert_eq!(permission_path("d:/work"), "//d/work");
+    }
+
+    #[test]
+    fn a_phone_turn_titles_its_chat_from_the_first_line() {
+        assert_eq!(
+            title_from("\n  what is  open?\nmore").as_deref(),
+            Some("what is open?")
+        );
+        assert_eq!(title_from("  "), None);
+        assert_eq!(title_from(&"a".repeat(60)).unwrap().chars().count(), 40);
+    }
 
     #[test]
     fn classify_result_line_as_done() {
@@ -570,12 +766,12 @@ mod tests {
     #[test]
     fn command_pins_session_id_first_then_resumes() {
         let d = tdirs();
-        let fresh = build_command("abc-123", false, "charter text", &d, None);
+        let fresh = build_command("abc-123", false, "charter text", &d, None, &[]);
         assert!(fresh.contains("--session-id"), "{fresh}");
         assert!(fresh.contains("--output-format stream-json"));
         assert!(fresh.contains("--strict-mcp-config"));
-        assert!(fresh.contains("--append-system-prompt"));
-        let resumed = build_command("abc-123", true, "charter text", &d, None);
+        assert!(fresh.contains("--append-system-prompt-file"));
+        let resumed = build_command("abc-123", true, "charter text", &d, None, &[]);
         assert!(resumed.contains("--resume"));
         assert!(!resumed.contains("--session-id"));
     }
@@ -584,7 +780,7 @@ mod tests {
     fn command_includes_the_mcp_config_when_the_root_server_is_up() {
         let d = tdirs();
         let path = "/tmp/App Support/rootchat-mcp-abc.json";
-        let with = build_command("abc-123", false, "charter", &d, Some(path));
+        let with = build_command("abc-123", false, "charter", &d, Some(path), &[]);
         // The path must arrive as ONE shell word: Conduit's data dir has a space on
         // macOS ("Application Support"), so an unquoted interpolation would split into
         // two words under `sh -c` and the flag would silently take a truncated argument.
@@ -610,7 +806,7 @@ mod tests {
             "the root MCP namespace must be on the allow list, or every tool call is denied: {with}"
         );
         // No server: no flag, no namespace, and the chat degrades to its Phase 2 tool set.
-        let without = build_command("abc-123", false, "charter", &d, None);
+        let without = build_command("abc-123", false, "charter", &d, None, &[]);
         assert!(!without.contains("--mcp-config"));
         assert!(
             !without.contains("mcp__"),
@@ -624,7 +820,7 @@ mod tests {
         let d = tdirs();
         let s = d.scratch.to_string_lossy();
         let m = d.memory.to_string_lossy();
-        let cmd = build_command("abc-123", false, "charter text", &d, None);
+        let cmd = build_command("abc-123", false, "charter text", &d, None, &[]);
         // Allow: read tools + gh + writes scoped to the two Conduit-owned dirs.
         assert!(
             cmd.contains("Read,Glob,Grep,WebSearch,WebFetch,Bash(gh:*)"),

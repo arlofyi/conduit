@@ -734,6 +734,29 @@ plus install/remove/status), and one listener in `App.tsx`.
   sidebar click end in the same state, and a broadcast never runs a delete twice. A phone
   delete keeps the worktree -- the desktop asks before removing one; a remote tap cannot.
 
+## Where the phone's files, Antigravity chats and general chat live
+
+Design: `docs/superpowers/specs/2026-10-31-phone-sessions-files-general-chat-design.md`.
+
+- **Files** (`phone_fs.rs`, `fs*` messages): session-scoped, so `session_scope` is the
+  privacy gate -- a new fs message must be added there (a test pins it). A phone path is
+  validated per segment and WALKED with `symlink_metadata`; never join it onto the root as a
+  string, and never follow a link. Secrets read only with `confirm` and are never written.
+  A save carries the stat the phone read; a mismatch is `conflict`, never an overwrite.
+- **Antigravity chat** (`agy_transcript.rs`): each step is rewritten as a Claude JSONL line
+  and parsed by `transcript::parse_line`, so phone and desktop renderers need no agy case.
+  Never open agy's db plainly read-only when there is no `-wal`: that CREATES sidecar files
+  next to agy's (`immutable=1` then). The protobuf field numbers are internal to agy and
+  pinned in the findings doc; an agy update can move them.
+- **The project list is pushed**: `Store::save_generation` moves on every persisted write
+  and the bridge re-sends `projects` (step 2d). Don't add a second builder for that frame.
+- **General chat = root chat.** `root_chat::send_turn` runs a turn for the desktop command
+  and the bridge alike; `RootChatState::subscribe` is how a socket follows turns.
+  `RootChat.scope` filters the charter roster and every root-MCP tool through
+  `store.projects_for_chat`. File reads are narrowed by DENY rules on out-of-scope project
+  paths -- an allow list cannot narrow Read/Glob/Grep (measured). `RootChat.phone` is sticky
+  and makes `chat_may_peek` refuse private sessions regardless of private mode.
+
 ## Where port mirroring lives
 
 A paired phone opens this computer's local web apps at the SAME `http://localhost:<port>`

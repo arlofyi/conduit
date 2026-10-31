@@ -13,6 +13,26 @@ All notable changes to Conduit are documented here. This project uses
   API) keep working, because every listed port is mirrored. Apps stay private to your
   computer: each connection goes through Conduit's link and needs the phone's pairing, and
   debugger ports are never offered. Turn it off under Settings → Mobile.
+- **Added — Antigravity chats on the phone.** Antigravity sessions now open on the phone as
+  a real conversation (messages, commands it ran, files it read and edited), read from
+  Antigravity's own conversation history on your computer, and you can start a new
+  Antigravity session from the phone's "+" as well as Claude.
+- **Added — Project files on the phone.** Browse a session's folder from its info sheet or
+  the folder button in the chat, read files (Markdown rendered), view images, edit and save
+  text files, and download any file to the phone through the share sheet. A file changed
+  on your computer since you opened it is never overwritten. `.git` is hidden, links are
+  never followed, and secrets such as `.env` or key files ask before they open and can't be
+  edited from the phone. Private sessions stay closed.
+- **Added — General chat on the phone.** The new General tab is the root chat from your
+  computer: ask questions across your projects without a coding session. A new chat covers
+  every project in the profile you're viewing; widen it to all profiles, or pick profiles
+  and projects. A chat only sees, and can only read the files of, the projects in its scope,
+  and a chat used from the phone never reads a private session.
+- **Changed — Name a new session from the phone, with or without a first message.** The
+  "+" screen has a Title field, and the first message is optional: leave it empty and the
+  agent starts and waits for you.
+- **Fixed — A session deleted from the phone disappears at once.** The phone's list now
+  updates the moment anything changes on your computer, instead of waiting for a refresh.
 
 ## 0.49.0 — 2026-10-31
 
