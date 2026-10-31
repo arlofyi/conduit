@@ -555,9 +555,13 @@ fn a_non_ascii_name_and_path_survive_an_oem_console_codepage() {
     let shim = c.get_program().to_owned();
     let mut cmd = Command::new("cmd.exe");
     // The shim runs under a cmd.exe that switches the codepage first, with the fixture's
-    // hermetic environment carried across.
+    // hermetic environment carried across. CREATE_NO_WINDOW gives it its OWN hidden
+    // console, so `chcp 437` cannot leak into the harness's console (and the developer's
+    // terminal) the way it would on a shared one; `/D` skips any AutoRun command.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.envs(c.get_envs().filter_map(|(k, v)| v.map(|v| (k, v))));
-    cmd.arg("/C").raw_arg(format!(
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.args(["/D", "/C"]).raw_arg(format!(
         "\"chcp 437 >nul & \"{}\" \"{}\" --agent claude --name \"Crème brûlée\"\"",
         shim.to_string_lossy(),
         project.display()

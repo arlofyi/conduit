@@ -2602,7 +2602,7 @@ mod tests {
         let bat = dir.join("q.cmd");
         fs::write(&bat, format!("@echo {}\r\n", line.join(" "))).unwrap();
         let out = std::process::Command::new("cmd.exe")
-            .arg("/C")
+            .args(["/D", "/C"])
             .raw_arg(format!("\"{}\"", bat.display()))
             .output()
             .unwrap();
