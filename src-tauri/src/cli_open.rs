@@ -25,6 +25,68 @@ use tiny_http::{Request, Response};
 /// server never answers a preflight.
 pub const TOKEN_HEADER: &str = "x-conduit-token";
 
+/// The console codepage the Windows shim wrote its body in (`chcp`'s number). See
+/// `decode_body`.
+pub const CODEPAGE_HEADER: &str = "x-conduit-codepage";
+
+/// Turn the raw request body into text.
+///
+/// The POSIX shim and any UTF-8 console send UTF-8, which is taken as is. The Windows
+/// shim cannot: cmd.exe hands a batch file its arguments, and writes a redirected
+/// `echo`, in the console's OEM codepage (437/850 on most Western installs), so a name
+/// or path with an accented letter arrives as e.g. `Caf\x82`, which is not UTF-8. It used
+/// to be dropped as an empty body and refused as a 400 the shim blamed on the worktree
+/// slug. Measured: switching the console to 65001 inside the shim does NOT help, because
+/// the arguments are already in the old codepage by the time its first line runs. So the
+/// shim reports the codepage it wrote in and the bytes are decoded with it here, falling
+/// back to the system OEM codepage for a shim too old to send the header.
+pub fn decode_body(raw: Vec<u8>, codepage: Option<u32>) -> String {
+    match String::from_utf8(raw) {
+        Ok(text) => text,
+        Err(e) => decode_legacy(e.as_bytes(), codepage).unwrap_or_default(),
+    }
+}
+
+#[cfg(windows)]
+fn decode_legacy(bytes: &[u8], codepage: Option<u32>) -> Option<String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetOEMCP() -> u32;
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            src: *const u8,
+            src_len: i32,
+            dst: *mut u16,
+            dst_len: i32,
+        ) -> i32;
+    }
+    // 65001 would be a body that already failed UTF-8; nothing to recover.
+    let cp = codepage
+        .filter(|&c| c != 0 && c != 65001)
+        .unwrap_or_else(|| unsafe { GetOEMCP() });
+    let len = i32::try_from(bytes.len()).ok()?;
+    // SAFETY: `bytes` is a valid slice of `len` bytes; the first call only sizes the
+    // output, the second writes at most `n` u16s into a buffer of exactly `n`.
+    let n = unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; n as usize];
+    let written = unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n) };
+    if written <= 0 {
+        return None;
+    }
+    wide.truncate(written as usize);
+    Some(String::from_utf16_lossy(&wide))
+}
+
+/// Off Windows nothing writes a legacy codepage; a non-UTF-8 body stays a refusal.
+#[cfg(not(windows))]
+fn decode_legacy(_bytes: &[u8], _codepage: Option<u32>) -> Option<String> {
+    None
+}
+
 /// Cap the body so a runaway or hostile POST cannot exhaust memory -- same reasoning as
 /// the hook loop's 1 MB cap, tighter because an open request is a path and a word.
 const MAX_BODY: u64 = 64 * 1024;
@@ -247,8 +309,13 @@ pub fn handle_open<F: FnOnce(OpenPayload)>(mut request: Request, expected: &str,
         })
         .collect();
 
-    let mut body = String::new();
-    let _ = request.as_reader().take(MAX_BODY).read_to_string(&mut body);
+    let codepage = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(CODEPAGE_HEADER))
+        .and_then(|(_, v)| v.trim().parse::<u32>().ok());
+    let mut raw = Vec::new();
+    let _ = request.as_reader().take(MAX_BODY).read_to_end(&mut raw);
+    let body = decode_body(raw, codepage);
 
     match parse_open(&headers, &body, expected).and_then(resolve) {
         Ok(open) => {
@@ -273,6 +340,27 @@ mod tests {
     }
 
     const TOK: &str = "abc123";
+
+    #[test]
+    fn a_utf8_body_is_taken_as_is_whatever_codepage_is_claimed() {
+        let raw = "{\"name\":\"Café 日本\"}".as_bytes().to_vec();
+        assert_eq!(decode_body(raw.clone(), None), "{\"name\":\"Café 日本\"}");
+        assert_eq!(decode_body(raw, Some(437)), "{\"name\":\"Café 日本\"}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_oem_body_is_decoded_with_the_shims_codepage() {
+        // "Café" as cmd.exe writes it under codepage 437 (é = 0x82) and 1252 (é = 0xE9).
+        assert_eq!(decode_body(b"Caf\x82".to_vec(), Some(437)), "Café");
+        assert_eq!(decode_body(b"Caf\xE9".to_vec(), Some(1252)), "Café");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_non_utf8_body_stays_refused_off_windows() {
+        assert_eq!(decode_body(b"Caf\x82".to_vec(), Some(437)), "");
+    }
 
     #[test]
     fn accepts_a_well_formed_request() {

@@ -1232,16 +1232,37 @@ pub(crate) fn shell_quote(s: &str) -> String {
 /// and an even number of carets in front of a `%` cancels the escape and lets it expand
 /// again (empirically verified against a real cmd.exe: `^^%FOO%` still substitutes,
 /// `^%FOO^%` does not, regardless of whether the text sits inside quotes).
+///
+/// **That rule is for a COMMAND LINE only** (`cmd /C <line>`, which root chat still
+/// uses -- see `win_quote_cmdline`). Agent invocations no longer run from a command line:
+/// they are written into a `.cmd` spawn script (`write_spawn_script`), and a batch file
+/// parses `%` differently. There a lone `%` starts a variable reference that runs to the
+/// NEXT `%` -- across quotes and across arguments -- and an undefined one expands to
+/// nothing, while a caret inside double quotes is literal text. So the command-line
+/// escape mangled every prompt with a `%` in it: `"80^%" "a^^b" "x ^%Y^% z"` reached the
+/// agent as the single argument `80^Y^ z` (measured against a real cmd.exe). In a batch
+/// file `%%` is the escape for a literal `%`, and it also blocks `%VAR%` expansion.
 #[cfg(windows)]
 pub(crate) fn win_quote(s: &str) -> String {
+    win_quote_with(s, |q| q.replace('%', "%%"))
+}
+
+/// `win_quote` for a string run as a `cmd /C` COMMAND LINE rather than from a batch file
+/// (root chat's `claude -p`). See the escaping notes above `win_quote`.
+#[cfg(windows)]
+pub(crate) fn win_quote_cmdline(s: &str) -> String {
+    win_quote_with(s, |q| q.replace('^', "^^").replace('%', "^%"))
+}
+
+#[cfg(windows)]
+fn win_quote_with(s: &str, escape_percent: impl Fn(&str) -> String) -> String {
     let simple = !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_./:@=\\".contains(c));
     if simple {
         s.to_string()
     } else {
-        let escaped = s.replace('^', "^^").replace('%', "^%");
-        format!("\"{}\"", escaped.replace('"', "\"\""))
+        format!("\"{}\"", escape_percent(s).replace('"', "\"\""))
     }
 }
 
@@ -1384,7 +1405,7 @@ const WIN_INLINE_PROMPT_MAX: usize = 2000;
 #[cfg_attr(not(windows), allow(dead_code))]
 fn windows_prompt_arg(initial_prompt: Option<&str>, prompt_file: Option<&str>) -> Option<String> {
     let p = initial_prompt?;
-    // Measured AFTER quoting: `win_quote` doubles every `"` and carets every `%` and `^`,
+    // Measured AFTER quoting: `win_quote` doubles every `"` and every `%`,
     // so a short prompt full of them can still overrun the batch line.
     let quoted = quote_arg(p);
     let inline_ok = quoted.len() <= WIN_INLINE_PROMPT_MAX && !p.contains(['\n', '\r']);
@@ -1405,6 +1426,19 @@ pub(crate) fn quote_arg(s: &str) -> String {
     #[cfg(windows)]
     {
         win_quote(s)
+    }
+    #[cfg(not(windows))]
+    {
+        shell_quote(s)
+    }
+}
+
+/// `quote_arg` for a string that runs as a `cmd /C` COMMAND LINE on Windows instead of
+/// from the spawn script (root chat). POSIX quoting is the same either way.
+pub(crate) fn quote_cmdline_arg(s: &str) -> String {
+    #[cfg(windows)]
+    {
+        win_quote_cmdline(s)
     }
     #[cfg(not(windows))]
     {
@@ -2515,26 +2549,67 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn win_quote_neutralizes_percent_expansion() {
+    fn win_quote_cmdline_neutralizes_percent_expansion() {
         // cmd.exe expands %VAR% even inside double quotes -- a mission/prompt string
         // containing e.g. "%CONDUIT_OC_APIKEY%" must never reach the command line
         // un-escaped. Verified empirically against a real cmd.exe (see the doc comment
         // on win_quote): '^' before '%' blocks expansion; escaping '%' alone does not.
         assert_eq!(
-            win_quote("leak %CONDUIT_OC_APIKEY% here"),
+            win_quote_cmdline("leak %CONDUIT_OC_APIKEY% here"),
             "\"leak ^%CONDUIT_OC_APIKEY^% here\""
         );
         // An attacker-supplied caret placed right before a '%' must not be able to
         // cancel the escape by pairing up with it (an even number of carets in front
         // of a '%' un-escapes it) -- caret must be escaped before percent is.
         assert_eq!(
-            win_quote("leak ^%CONDUIT_OC_APIKEY% here"),
+            win_quote_cmdline("leak ^%CONDUIT_OC_APIKEY% here"),
             "\"leak ^^^%CONDUIT_OC_APIKEY^% here\""
         );
         assert_eq!(
-            win_quote("leak ^^%CONDUIT_OC_APIKEY% here"),
+            win_quote_cmdline("leak ^^%CONDUIT_OC_APIKEY% here"),
             "\"leak ^^^^^%CONDUIT_OC_APIKEY^% here\""
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_quote_doubles_percent_for_the_batch_spawn_script() {
+        assert_eq!(
+            win_quote("leak %CONDUIT_OC_APIKEY% here"),
+            "\"leak %%CONDUIT_OC_APIKEY%% here\""
+        );
+        // A caret is literal inside quotes in a batch file, so it is left alone.
+        assert_eq!(win_quote("a^b 80%"), "\"a^b 80%%\"");
+    }
+
+    /// Runs the quoted words through a REAL batch file, the way a spawn script runs them,
+    /// and checks what arrives. `echo` prints its arguments after cmd's percent pass, so
+    /// each word must come back exactly as `"<original>"`.
+    #[cfg(windows)]
+    #[test]
+    fn win_quote_survives_a_real_batch_file() {
+        use std::os::windows::process::CommandExt;
+        let words = [
+            "raise coverage to 80%",
+            "a^b and a^^b",
+            "leak %USERNAME% here",
+            "two 50% and 60%",
+            "caret then percent ^%PATH%",
+        ];
+        let line: Vec<String> = words.iter().map(|w| win_quote(w)).collect();
+        let dir = std::env::temp_dir().join(format!("conduit-winquote-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let bat = dir.join("q.cmd");
+        fs::write(&bat, format!("@echo {}\r\n", line.join(" "))).unwrap();
+        let out = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C"])
+            .raw_arg(format!("\"{}\"", bat.display()))
+            .output()
+            .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let got = String::from_utf8_lossy(&out.stdout);
+        let want: Vec<String> = words.iter().map(|w| format!("\"{w}\"")).collect();
+        assert_eq!(got.trim_end(), want.join(" "));
     }
 
     #[cfg(windows)]

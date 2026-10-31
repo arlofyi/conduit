@@ -14,11 +14,12 @@ use serde::Serialize;
 /// Present in every generated shim. `remove` refuses to delete a file without it (or a
 /// legacy marker), so it can never destroy an unrelated `conduit` the user put on PATH
 /// themselves.
-pub const SHIM_MARKER: &str = "conduit-cli-shim-v2";
+pub const SHIM_MARKER: &str = "conduit-cli-shim-v3";
 
 /// Markers of shims earlier Conduit versions wrote. Still ours: `install` replaces them
 /// and `remove` deletes them; `status` reports them as installed but outdated.
-pub const LEGACY_MARKERS: &[&str] = &["conduit-cli-shim-v1"];
+/// v2: the Windows shim did not report its codepage, and broke on a `)` in a path.
+pub const LEGACY_MARKERS: &[&str] = &["conduit-cli-shim-v1", "conduit-cli-shim-v2"];
 
 /// Whether a file's text is a shim some Conduit version wrote.
 fn is_ours(text: &str) -> bool {
@@ -290,7 +291,9 @@ endlocal
 :name_ok
 
 if "%target%"=="" set "target=."
-if not exist "%target%\" (echo conduit: not a directory: %target% 1>&2 & exit /b 1)
+rem A path is only ever expanded inside double quotes and never inside a ( ) block: a
+rem `)` in it (`D:\app (v2)`) closes a block early, and an unquoted `&` runs its tail.
+if not exist "%target%\" goto bad_target
 for %%I in ("%target%") do set "path_abs=%%~fI"
 
 set "prompt_abs="
@@ -300,14 +303,17 @@ if exist "%prompt_file%\" goto bad_prompt
 for %%I in ("%prompt_file%") do set "prompt_abs=%%~fI"
 goto prompt_ok
 :bad_prompt
-echo conduit: not a file: %prompt_file% 1>&2
+echo conduit: not a file: "%prompt_file%" 1>&2
+exit /b 1
+:bad_target
+echo conduit: not a directory: "%target%" 1>&2
 exit /b 1
 :prompt_ok
 
 if not defined worktree goto worktree_ok
 git -C "%path_abs%" rev-parse --show-toplevel >nul 2>&1
 if not errorlevel 1 goto worktree_ok
-echo conduit: %path_abs% is not a git work tree; opening without a worktree 1>&2
+echo conduit: "%path_abs%" is not a git work tree; opening without a worktree 1>&2
 set "worktree="
 :worktree_ok
 
@@ -354,18 +360,26 @@ rem the other's body or finding it deleted. The loser of the mkdir draws again.
 set "tries=0"
 :claim
 set /a tries+=1
-if !tries! gtr 50 (echo conduit: could not create a temporary file in %TEMP% 1>&2 & exit /b 1)
+if !tries! gtr 50 goto no_temp
 set "bodydir=%TEMP%\conduit-open-!RANDOM!!RANDOM!!RANDOM!"
 mkdir "!bodydir!" 2>NUL || goto claim
 set "bodyfile=!bodydir!\body.json"
 >"!bodyfile!" echo(!body!
+
+rem The body is in the console's codepage, not UTF-8 (cmd passed the arguments in it
+rem already, so switching to 65001 here cannot recover them). Conduit decodes with the
+rem number sent below. `chcp` prints e.g. "Active code page: 850." in the user's language.
+set "cp="
+for /f "tokens=2 delims=:" %%c in ('chcp') do set "cp=%%c"
+for %%n in (!cp!) do set "cp=%%n"
+if defined cp set "cp=!cp:.=!"
 
 rem The status, not curl's exit code, tells "not running" (000) from "refused": without -f
 rem curl exits 0 on a 4xx, and a refusal must not read as Conduit being absent.
 set "code=000"
 if "!port!"=="" goto posted
 if "!token!"=="" goto posted
-for /f "delims=" %%c in ('curl.exe -s -o NUL -w "%%{{http_code}}" -m 5 -X POST -H "Content-Type: application/json" -H "X-Conduit-Token: !token!" --data-binary "@!bodyfile!" "http://127.0.0.1:!port!/open" 2^>NUL') do set "code=%%c"
+for /f "delims=" %%c in ('curl.exe -s -o NUL -w "%%{{http_code}}" -m 5 -X POST -H "Content-Type: application/json" -H "X-Conduit-Token: !token!" -H "X-Conduit-Codepage: !cp!" --data-binary "@!bodyfile!" "http://127.0.0.1:!port!/open" 2^>NUL') do set "code=%%c"
 :posted
 rd /s /q "!bodydir!" >nul 2>&1
 if "!code!"=="" set "code=000"
@@ -388,6 +402,9 @@ echo conduit: Conduit refused the CLI token; restart Conduit, or check CONDUIT_D
 exit /b 1
 :http_error
 echo conduit: Conduit answered HTTP !code!. 1>&2
+exit /b 1
+:no_temp
+echo conduit: could not create a temporary file in "%TEMP%" 1>&2
 exit /b 1
 "##,
         TAB = '\t'
@@ -728,9 +745,10 @@ mod tests {
     }
 
     #[test]
-    fn shims_carry_the_v2_marker_and_new_flags() {
+    fn shims_carry_the_current_marker_and_new_flags() {
         for t in [shim_sh(), shim_cmd()] {
-            assert!(t.contains("conduit-cli-shim-v2"));
+            assert!(t.contains(SHIM_MARKER));
+            assert!(t.contains("conduit-cli-shim-v3"));
             for f in ["--worktree", "--name", "--prompt-file"] {
                 assert!(t.contains(f), "{f}");
             }

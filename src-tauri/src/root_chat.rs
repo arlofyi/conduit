@@ -402,8 +402,8 @@ pub fn build_command(
     dirs: &Dirs,
     mcp_config: Option<&str>,
 ) -> String {
-    let id = crate::pty::quote_arg(chat_id);
-    let sys = crate::pty::quote_arg(charter);
+    let id = crate::pty::quote_cmdline_arg(chat_id);
+    let sys = crate::pty::quote_cmdline_arg(charter);
     let scratch = dirs.scratch.to_string_lossy();
     let memory = dirs.memory.to_string_lossy();
     // The orchestration tools must be ALLOWED, not merely configured. `-p` auto-denies
@@ -423,16 +423,16 @@ pub fn build_command(
     // Allow: read tools, the GitHub CLI, and writes scoped to the two Conduit-owned
     // dirs. Generic Bash/Write/Edit are NOT denied — they are simply unallowed, which
     // `-p` auto-denies; a blanket deny would override the scoped allows (deny wins).
-    let allow = crate::pty::quote_arg(&format!(
+    let allow = crate::pty::quote_cmdline_arg(&format!(
         "Read,Glob,Grep,WebSearch,WebFetch,Bash(gh:*),\
          Write({scratch}/**),Edit({scratch}/**),Write({memory}/**),Edit({memory}/**){root_tools}"
     ));
     // Deny the dangerous gh tail: `gh api` is arbitrary REST (a DELETE smuggles past
     // any prefix matcher), and auth/secrets/repo-deletion have no PM use.
-    let deny = crate::pty::quote_arg(
+    let deny = crate::pty::quote_cmdline_arg(
         "NotebookEdit,Bash(gh repo delete:*),Bash(gh secret:*),Bash(gh auth:*),Bash(gh api:*)",
     );
-    let add = crate::pty::quote_arg(&dirs.root.to_string_lossy());
+    let add = crate::pty::quote_cmdline_arg(&dirs.root.to_string_lossy());
     let mode = if resume {
         format!("--resume {id}")
     } else {
@@ -443,7 +443,7 @@ pub fn build_command(
     // with exactly its Phase 2 surface rather than a half-state that believes it can
     // dispatch.
     let mcp = mcp_config
-        .map(|p| format!(" --mcp-config {}", crate::pty::quote_arg(p)))
+        .map(|p| format!(" --mcp-config {}", crate::pty::quote_cmdline_arg(p)))
         .unwrap_or_default();
     format!(
         "claude -p --output-format stream-json --verbose \
@@ -588,12 +588,12 @@ mod tests {
         // The path must arrive as ONE shell word: Conduit's data dir has a space on
         // macOS ("Application Support"), so an unquoted interpolation would split into
         // two words under `sh -c` and the flag would silently take a truncated argument.
-        // Comparing against `crate::pty::quote_arg`'s own output (rather than a hardcoded
+        // Comparing against `crate::pty::quote_cmdline_arg`'s own output (rather than a hardcoded
         // quote character) keeps this correct on both the sh/single-quote and the
         // cmd.exe/double-quote platform, and still fails if `build_command` stops calling
         // it: an unquoted `--mcp-config /tmp/App Support/...` does not contain the quoted
         // substring below.
-        let quoted = crate::pty::quote_arg(path);
+        let quoted = crate::pty::quote_cmdline_arg(path);
         assert!(
             with.contains(&format!("--mcp-config {quoted}")),
             "expected the mcp-config path quoted as one shell word: {with}"
