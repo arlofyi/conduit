@@ -53,4 +53,5 @@ composer's "+" opened stop/compact/clear (steering), which is where every chat a
 
 - Pasting an image straight into Claude's TUI as `[Image #1]` (needs the clipboard on the
   desktop, which a phone cannot drive).
-- Upload progress for large files (one frame; the chip shows a spinner).
+- A progress bar for large files (chunks are acked, so it is possible; the chip shows a
+  spinner for now).
