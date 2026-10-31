@@ -24,6 +24,7 @@ tauri-plugin-window-state = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-clipboard-manager = "2"
+tauri-plugin-single-instance = "2"
 # E2E only, and never in a shipped build: the embedded WebDriver provider works by
 # running a WebDriver server INSIDE the app, which is a full remote-control surface.
 # Enabled solely by `--features wdio` for the e2e workflow; release.yml passes no

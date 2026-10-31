@@ -3220,7 +3220,30 @@ fn reveal_path(path: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    // One Conduit per data dir. A second launch (an installer's "launch now" racing the
+    // user's own click) otherwise ran a full, windowless second app -- its own hook
+    // server, bridge and MCP ports -- reading and writing the SAME state.json. The
+    // plugin must be registered FIRST so the second process exits before any other
+    // plugin's setup runs. Its lock is keyed on the bundle identifier alone (mutex /
+    // socket / D-Bus name), with no override on Windows or macOS, so a dev build
+    // isolated by CONDUIT_DATA_DIR_NAME would be swallowed by the installed app; it is
+    // therefore skipped whenever that override is set (dev builds and the e2e harness).
+    let builder = tauri::Builder::default();
+    let builder = if std::env::var_os("CONDUIT_DATA_DIR_NAME").is_none() {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let window = app
+                .get_webview_window("main")
+                .or_else(|| app.webview_windows().into_values().next());
+            if let Some(w) = window {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
+    } else {
+        builder
+    };
+    let builder = builder
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
