@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.49.0 — 2026-10-31
+
 - **Added — Send photos and files from the phone.** The composer's "+" now offers Photos,
   Camera and File. Each file goes to your computer as soon as you pick it, lands in the
   session's folder under `.conduit-uploads/` (ignored by git, cleared after a week), and the
