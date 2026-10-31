@@ -203,7 +203,10 @@ export type ServerMsg =
   | { type: "resolved"; id: string; by: WireBy }
   // ok:false = already resolved elsewhere, a private session, or answers the Mac would not accept
   | { type: "answerResult"; askId: string; ok: boolean }
-  | { type: "approveResult"; id: string; ok: boolean };
+  | { type: "approveResult"; id: string; ok: boolean }
+  /** the answer to one `upload`: the file's path for the message, or why not */
+  | { type: "uploadResult"; requestId: string; ok: true; path: string }
+  | { type: "uploadResult"; requestId: string; ok: false; error: string };
 
 // ---- client → server ----
 // Spellings are mixed ON PURPOSE (pinned by Rust tests): attach/input/resize/git/kill/spawn use
@@ -222,7 +225,8 @@ export type ClientMsg =
   | { type: "spawn"; project_id: string; prompt: string; agent?: string; worktree?: boolean }
   | { type: "interrupt"; sessionId: string }
   | { type: "answer"; askId: string; answers: Record<string, string> }
-  | { type: "approve"; id: string; allow: boolean };
+  | { type: "approve"; id: string; allow: boolean }
+  | { type: "upload"; sessionId: string; requestId: string; name: string; data: string };
 
 export const authMsg = (token: string): ClientMsg => ({ type: "auth", token });
 
@@ -243,6 +247,14 @@ export const interruptMsg = (id: string): ClientMsg => ({ type: "interrupt", ses
 export const answerMsg = (askId: string, answers: Record<string, string>): ClientMsg => ({ type: "answer", askId, answers });
 /** Allow or deny a held permission. */
 export const approveMsg = (id: string, allow: boolean): ClientMsg => ({ type: "approve", id, allow });
+/** Send one file (base64 body) into a session's `.conduit-uploads/`; answered by `uploadResult`. */
+export const uploadMsg = (sessionId: string, requestId: string, name: string, data: string): ClientMsg => ({
+  type: "upload",
+  sessionId,
+  requestId,
+  name,
+  data,
+});
 /** Start a new session in a project with its first message; the Mac answers `spawned` or `error`. */
 export const spawnMsg = (projectId: string, prompt: string, agent: string): ClientMsg => ({
   type: "spawn",

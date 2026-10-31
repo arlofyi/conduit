@@ -75,6 +75,7 @@ mod transcript;
 mod transcript_index;
 mod transcript_user;
 mod updates;
+mod uploads;
 mod usage_tally;
 mod window_registry;
 mod worktree;

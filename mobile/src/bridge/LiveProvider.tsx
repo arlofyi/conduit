@@ -33,7 +33,7 @@ import { BridgeClient } from "./BridgeClient";
 import { initialConn, lifecycleAction, type ConnError, type ConnState } from "./connection";
 import { appendWire, mapHistory, mapProjectsView, sameView, statusPatch, type LivePatch } from "./live";
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
-import { answerMsg, approveMsg, discoverMsg, pairMsg, spawnMsg, type ClientMsg, type WireMac } from "./protocol";
+import { answerMsg, approveMsg, discoverMsg, pairMsg, spawnMsg, uploadMsg, type ClientMsg, type WireMac } from "./protocol";
 
 /** Simulator/dev build: also try loopback, and offer "This Mac (simulator)". */
 export const IS_SIMULATOR_OR_DEV = __DEV__;
@@ -106,6 +106,10 @@ const SPAWN_TIMEOUT_MS = 12_000;
 
 let localSeq = 0;
 
+export type UploadOutcome = { ok: true; path: string } | { ok: false; error: string };
+/** A 10 MB file over a slow cellular link still finishes well inside this. */
+const UPLOAD_TIMEOUT_MS = 90_000;
+
 export interface LiveValue {
   /** false until the Keychain Mac list has been read; render nothing route-deciding before */
   loaded: boolean;
@@ -168,6 +172,8 @@ export interface LiveValue {
   answer: (askId: string, answers: Record<string, string>, summary: string) => void;
   /** allow or deny a held permission */
   approve: (id: string, allow: boolean) => void;
+  /** send one file into a session's `.conduit-uploads/`; resolves with its path or why not */
+  upload: (sessionId: string, name: string, data: string) => Promise<UploadOutcome>;
   /** the in-app banner on screen, if any */
   banner: Banner | null;
   dismissBanner: () => void;
@@ -202,6 +208,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [lastSeen, setLastSeen] = useState<number | null>(null);
   /** the last view, for diffing the next one into unread counts */
   const viewRef = useRef<ProjectsView | null>(null);
+  /** Uploads waiting for their `uploadResult`, by requestId. */
+  const uploadsRef = useRef(new Map<string, { sessionId: string; done: (o: UploadOutcome) => void }>());
   /** the session the Mac is streaming to this socket; outlives `attachedRef` after the chat closes */
   const streamingRef = useRef<string | null>(null);
   /** last frame from the Mac; copied into `lastSeen` only when the link drops (a state per frame
@@ -344,6 +352,14 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
             case "error": {
               // A chat this phone started, stuck on the Mac's folder-trust prompt (null otherwise).
               const stall = trustStallNotice(m.message, m.sessionId, attachedRef.current, genId("n"));
+              if (m.message === PRIVATE_SESSION && m.sessionId) {
+                // A private session takes no files: fail its uploads now, not at the timeout.
+                for (const [id, w] of uploadsRef.current) {
+                  if (w.sessionId !== m.sessionId) continue;
+                  uploadsRef.current.delete(id);
+                  w.done({ ok: false, error: "This session is private: it can't take files from the phone." });
+                }
+              }
               if (m.message === PRIVATE_SESSION) {
                 // The Mac refused the chat that is open (at attach, or because it was made
                 // private while streaming): say so instead of an empty feed. A refusal for a
@@ -391,6 +407,14 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
             case "answerResult":
               dispatchPending({ t: "result", id: m.askId, ok: m.ok, now: Date.now() });
               break;
+            case "uploadResult": {
+              const waiter = uploadsRef.current.get(m.requestId);
+              if (waiter) {
+                uploadsRef.current.delete(m.requestId);
+                waiter.done(m.ok ? { ok: true, path: m.path } : { ok: false, error: m.error });
+              }
+              break;
+            }
             case "approveResult":
               dispatchPending({ t: "result", id: m.id, ok: m.ok, now: Date.now() });
               break;
@@ -721,6 +745,32 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     [sendFor],
   );
 
+  const upload = useCallback(
+    (sessionId: string, name: string, data: string): Promise<UploadOutcome> =>
+      new Promise<UploadOutcome>((resolve) => {
+        const client = clientRef.current;
+        const requestId = genId("up");
+        let settled = false;
+        // A link that drops mid-upload never answers; say so instead of spinning forever.
+        const timer = setTimeout(() => {
+          uploadsRef.current.delete(requestId);
+          done({ ok: false, error: "Your computer didn't answer. Check the connection and try again." });
+        }, UPLOAD_TIMEOUT_MS);
+        function done(o: UploadOutcome) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(o);
+        }
+        uploadsRef.current.set(requestId, { sessionId, done });
+        if (!client?.send(uploadMsg(sessionId, requestId, name, data))) {
+          uploadsRef.current.delete(requestId);
+          done({ ok: false, error: "Not connected to your computer." });
+        }
+      }),
+    [],
+  );
+
   const prompt = useCallback((sessionId: string, text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -812,6 +862,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       pending,
       answer,
       approve,
+      upload,
       banner,
       dismissBanner,
     }),
@@ -819,6 +870,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       pending,
       answer,
       approve,
+      upload,
       sendFrames,
       spawn,
       spawnState,

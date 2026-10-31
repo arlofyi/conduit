@@ -129,6 +129,16 @@ pub enum ClientMsg {
         id: String,
         allow: bool,
     },
+    /// A file for a session (photo, camera shot, document): `data` is the base64 body.
+    /// Written into the session's `.conduit-uploads/` and acked with `uploadResult`
+    /// carrying the same `requestId` (see `uploads.rs`).
+    #[serde(rename_all = "camelCase")]
+    Upload {
+        session_id: String,
+        request_id: String,
+        name: String,
+        data: String,
+    },
 }
 
 /// Manual `Debug`: `Auth.token`, `Pair.secret` and `Pair.nonce` are plaintext secrets and
@@ -211,6 +221,19 @@ impl std::fmt::Debug for ClientMsg {
                 .debug_struct("Approve")
                 .field("id", id)
                 .field("allow", allow)
+                .finish(),
+            // The body is megabytes of base64; its length is what a log needs.
+            Self::Upload {
+                session_id,
+                request_id,
+                name,
+                data,
+            } => f
+                .debug_struct("Upload")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .field("name", name)
+                .field("data", &data.len())
                 .finish(),
         }
     }
@@ -449,13 +472,45 @@ fn session_scope(msg: &ClientMsg) -> Option<&str> {
         | ClientMsg::Resize { session_id, .. }
         | ClientMsg::Git { session_id, .. }
         | ClientMsg::Kill { session_id }
-        | ClientMsg::Interrupt { session_id } => Some(session_id),
+        | ClientMsg::Interrupt { session_id }
+        | ClientMsg::Upload { session_id, .. } => Some(session_id),
         _ => None,
     }
 }
 
 /// Take one spawn slot for this phone (`key` = its device id, or the peer IP on loopback).
 /// `false` = the budget is spent; start nothing.
+/// Files a phone may send in [`UPLOAD_WINDOW`]. Each one is written into a session's checkout.
+const UPLOADS_MAX: usize = 30;
+const UPLOAD_WINDOW: Duration = Duration::from_secs(600);
+
+/// The `uploadResult` frame for one `upload`: the path for the message, or why not.
+fn upload_reply(
+    session_dir: Option<String>,
+    request_id: &str,
+    name: &str,
+    data: &str,
+    allowed: bool,
+) -> serde_json::Value {
+    let result = match (session_dir, allowed) {
+        (_, false) => {
+            Err("Too many files sent in the last few minutes. Try again shortly.".to_string())
+        }
+        (None, _) => Err("That session no longer exists.".to_string()),
+        (Some(dir), true) => {
+            crate::uploads::save(std::path::Path::new(&dir), name, data).map_err(|e| e.to_string())
+        }
+    };
+    match result {
+        Ok(path) => {
+            json!({ "type": "uploadResult", "requestId": request_id, "ok": true, "path": path })
+        }
+        Err(error) => {
+            json!({ "type": "uploadResult", "requestId": request_id, "ok": false, "error": error })
+        }
+    }
+}
+
 fn take_spawn_slot(spawns: &Mutex<HashMap<String, VecDeque<Instant>>>, key: &str) -> bool {
     crate::fleet::rate_limited(spawns, key, SPAWNS_MAX, SPAWN_WINDOW)
 }
@@ -1032,6 +1087,8 @@ pub struct BridgeController {
     pair_prompts: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// New sessions started per phone (device id; peer IP on loopback).
     spawns: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// Files sent per phone (same key as `spawns`).
+    uploads: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Last-message previews for the `projects` frame, keyed by transcript file state.
     last_messages: crate::bridge_view::LastMessageCache,
     /// The question registry and the desktop gate, so the last phone leaving can hand
@@ -1054,6 +1111,7 @@ impl BridgeController {
             auth_failures: Mutex::new(HashMap::new()),
             pair_prompts: Mutex::new(HashMap::new()),
             spawns: Mutex::new(HashMap::new()),
+            uploads: Mutex::new(HashMap::new()),
             last_messages: Default::default(),
             asks: OnceLock::new(),
             permissions: OnceLock::new(),
@@ -1851,6 +1909,27 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             }
                         }
                     }
+                    Some(ClientMsg::Upload {
+                        session_id,
+                        request_id,
+                        name,
+                        data,
+                    }) => {
+                        let key = device
+                            .as_ref()
+                            .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
+                        let allowed = crate::fleet::rate_limited(
+                            &ctrl.uploads,
+                            &key,
+                            UPLOADS_MAX,
+                            UPLOAD_WINDOW,
+                        );
+                        let dir = app.state::<Arc<Store>>().session_dir(&session_id);
+                        let reply = upload_reply(dir, &request_id, &name, &data, allowed);
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
                     // Already authenticated (or loopback): a repeat `auth` changes nothing.
                     Some(ClientMsg::Auth { .. }) | None => {}
                 }
@@ -2275,6 +2354,9 @@ mod tests {
             r#"{"type":"kill","session_id":"s"}"#,
             r#"{"type":"interrupt","sessionId":"s"}"#,
         ];
+        let upload =
+            r#"{"type":"upload","sessionId":"s","requestId":"r","name":"a.png","data":"aGk="}"#;
+        assert_eq!(session_scope(&parse_client_msg(upload).unwrap()), Some("s"));
         for raw in scoped {
             let m = parse_client_msg(raw).unwrap();
             assert_eq!(session_scope(&m), Some("s"), "{raw}");
@@ -2290,6 +2372,45 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn upload_debug_never_prints_the_body() {
+        let m = parse_client_msg(
+            r#"{"type":"upload","sessionId":"s","requestId":"r","name":"a.png","data":"c2VjcmV0LWJvZHk="}"#,
+        )
+        .unwrap();
+        let dbg = format!("{m:?}");
+        assert!(!dbg.contains("c2VjcmV0"), "{dbg}");
+        assert!(dbg.contains("data: 16"), "{dbg}");
+    }
+
+    #[test]
+    fn upload_reply_answers_every_request_by_its_id() {
+        let ok = upload_reply(None, "r1", "a.png", "aGk=", true);
+        assert_eq!(ok["requestId"], "r1");
+        assert_eq!(ok["ok"], false, "an unknown session cannot take a file");
+        let limited = upload_reply(Some("/nowhere".into()), "r2", "a.png", "aGk=", false);
+        assert_eq!(
+            (limited["requestId"].as_str(), limited["ok"].as_bool()),
+            (Some("r2"), Some(false))
+        );
+        let root = std::env::temp_dir().join(format!("conduit-upr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let good = upload_reply(
+            Some(root.to_string_lossy().into_owned()),
+            "r3",
+            "a.png",
+            "aGk=",
+            true,
+        );
+        assert_eq!(good["ok"], true);
+        assert!(good["path"]
+            .as_str()
+            .unwrap()
+            .starts_with(".conduit-uploads/"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!((UPLOADS_MAX, UPLOAD_WINDOW), (30, Duration::from_secs(600)));
     }
 
     #[test]

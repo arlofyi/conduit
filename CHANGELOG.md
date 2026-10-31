@@ -5,6 +5,18 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Send photos and files from the phone.** The composer's "+" now offers Photos,
+  Camera and File. Each file goes to your computer as soon as you pick it, lands in the
+  session's folder under `.conduit-uploads/` (ignored by git, cleared after a week), and the
+  message hands it to the agent. Photos are shrunk on the phone first, so they send quickly
+  on cellular. Up to 6 files per message, 10 MB each.
+- **Changed — Steering has its own button.** Compact and clear moved from the composer's "+"
+  to a button in the chat's header; Stop stays there while a turn runs.
+- **Added — The phone app runs on Android.** Icons, the tab bar, the keyboard and the
+  connection to your computer all work there now: every icon used to render blank, the
+  keyboard covered the message box, and the app was not allowed the plain connection
+  Tailscale carries (Tailscale encrypts it).
+- **Fixed — Your own messages on the phone no longer show their time twice.**
 - **Fixed — Windows: a `%` in a session's first message no longer garbles it.** A short
   task such as "raise coverage to 80%" reached the agent as "80^", and two `%` signs
   swallowed everything between them. `^` is no longer doubled either.
