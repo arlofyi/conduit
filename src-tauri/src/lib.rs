@@ -45,6 +45,7 @@ mod hooks;
 mod hotexit;
 pub mod ide_host;
 mod local_llm;
+mod local_ports;
 mod menu;
 mod mobile_devices;
 mod notify;
@@ -52,6 +53,7 @@ mod openrouter_usage;
 mod orchestration_policy;
 mod pairing;
 mod plugins;
+mod port_tunnel;
 mod project_new;
 mod proposals;
 mod pty;
@@ -3732,6 +3734,7 @@ pub fn run() {
             tailscale::tailscale_status,
             mobile_devices::mobile_settings,
             mobile_devices::mobile_set_enabled,
+            mobile_devices::mobile_set_mirroring,
             mobile_devices::mobile_revoke_device,
             pairing::pair_start,
             pairing::pair_cancel,

@@ -11,6 +11,8 @@ export interface Prefs {
   notifyPermission: boolean;
   /** banner when a session finishes */
   notifyFinished: boolean;
+  /** mirror the computer's local web apps onto this phone's localhost (Android; Apps tab) */
+  mirrorPorts: boolean;
   theme: ThemeId;
 }
 
@@ -20,10 +22,11 @@ export const DEFAULT_PREFS: Prefs = {
   notifyQuestion: true,
   notifyPermission: true,
   notifyFinished: false,
+  mirrorPorts: false,
   theme: DEFAULT_THEME,
 };
 
-type BoolKey = "notifyQuestion" | "notifyPermission" | "notifyFinished";
+type BoolKey = "notifyQuestion" | "notifyPermission" | "notifyFinished" | "mirrorPorts";
 
 /** Unknown or wrong-typed fields fall back to their defaults one at a time; a corrupt blob
  * is the defaults. */
@@ -46,6 +49,7 @@ export function parsePrefs(raw: string | null): Prefs {
     notifyQuestion: bool("notifyQuestion"),
     notifyPermission: bool("notifyPermission"),
     notifyFinished: bool("notifyFinished"),
+    mirrorPorts: bool("mirrorPorts"),
     theme,
   };
 }

@@ -152,6 +152,16 @@ pub enum ClientMsg {
         action: SessionActionKind,
         session_ids: Vec<String>,
     },
+    /// Which local web apps a phone may mirror (`local_ports.rs`). Answered with `ports`.
+    Ports,
+    /// First frame of a TUNNEL socket (port mirroring): its own WebSocket per TCP
+    /// connection, authenticated like `auth`, then raw bytes in binary frames. Answered with
+    /// `tunnelOk` or an `error`. Loopback peers send no token, as they send no `auth`.
+    Tunnel {
+        #[serde(default)]
+        token: Option<String>,
+        port: u16,
+    },
 }
 
 /// What a phone may do to a whole session. Deliberately not "start": opening a chat already
@@ -232,6 +242,12 @@ impl std::fmt::Debug for ClientMsg {
                 .field("nonce", &R)
                 .finish(),
             Self::Discover => f.write_str("Discover"),
+            Self::Ports => f.write_str("Ports"),
+            Self::Tunnel { token, port } => f
+                .debug_struct("Tunnel")
+                .field("token", &token.as_ref().map(|_| R))
+                .field("port", port)
+                .finish(),
             Self::Interrupt { session_id } => f
                 .debug_struct("Interrupt")
                 .field("session_id", session_id)
@@ -322,6 +338,11 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 const CONTEXT_EVERY: Duration = Duration::from_secs(15);
 /// Wire protocol version announced in `hello`.
 const PROTOCOL_VERSION: u32 = 1;
+/// Concurrent tunnels one phone may hold. A browser opens ~6 per origin; a few apps with
+/// hot-reload sockets fit easily, a runaway loop does not.
+const TUNNELS_PER_DEVICE: usize = 64;
+/// How long a tunnel waits for the local app to accept.
+const TUNNEL_CONNECT: Duration = Duration::from_secs(3);
 
 /// How often a connection diffs the pending questions against what it has pushed.
 const PUSH_EVERY: Duration = Duration::from_millis(250);
@@ -1189,6 +1210,11 @@ pub struct BridgeController {
     asks: OnceLock<(Arc<Asks>, Arc<AskGate>)>,
     /// The permission registry, for the same hand-off (`wire_permissions`).
     permissions: OnceLock<Arc<Broker>>,
+    /// Which local ports serve a web app (port mirroring); the tunnel's allowlist.
+    web_ports: Arc<crate::local_ports::WebPorts>,
+    /// Open tunnels' stop flags, by device id ("" for loopback). NOT `live`: a tunnel is
+    /// not a phone a question can be held for. Revoke, access-off and mirroring-off set them.
+    tunnels: Mutex<HashMap<String, Vec<Arc<AtomicBool>>>>,
 }
 
 impl BridgeController {
@@ -1208,6 +1234,48 @@ impl BridgeController {
             last_messages: Default::default(),
             asks: OnceLock::new(),
             permissions: OnceLock::new(),
+            web_ports: Default::default(),
+            tunnels: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Claim a tunnel slot for `device` ("" = loopback). None when it already has
+    /// [`TUNNELS_PER_DEVICE`] open.
+    fn open_tunnel(&self, device: &str) -> Option<Arc<AtomicBool>> {
+        let mut map = lock(&self.tunnels);
+        let slots = map.entry(device.to_string()).or_default();
+        if slots.len() >= TUNNELS_PER_DEVICE {
+            return None;
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        slots.push(flag.clone());
+        Some(flag)
+    }
+
+    fn close_tunnel(&self, device: &str, flag: &Arc<AtomicBool>) {
+        let mut map = lock(&self.tunnels);
+        if let Some(v) = map.get_mut(device) {
+            v.retain(|f| !Arc::ptr_eq(f, flag));
+            if v.is_empty() {
+                map.remove(device);
+            }
+        }
+    }
+
+    fn stop_tunnels_of(&self, device: &str) {
+        if let Some(flags) = lock(&self.tunnels).remove(device) {
+            for f in flags {
+                f.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// End every open tunnel now (mirroring or mobile access switched off).
+    pub fn close_all_tunnels(&self) {
+        for (_, flags) in lock(&self.tunnels).drain() {
+            for f in flags {
+                f.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -1365,6 +1433,7 @@ impl BridgeController {
     /// Close every open socket of a device (revoke). Immediate: each connection checks
     /// its flag on every 20 ms tick.
     pub fn disconnect_device(&self, device_id: &str) {
+        self.stop_tunnels_of(device_id);
         let (removed, now_empty) = {
             let mut live = lock(&self.live);
             let removed = live.remove(device_id);
@@ -1381,6 +1450,7 @@ impl BridgeController {
     }
 
     pub(crate) fn disconnect_all_devices(&self) {
+        self.close_all_tunnels();
         let drained: Vec<_> = lock(&self.live).drain().collect();
         let any = !drained.is_empty();
         for (_, flags) in drained {
@@ -1580,6 +1650,10 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     // A `discover` probe's reply, produced on its own thread. One probe at a time.
     let (macs_tx, macs_rx) = std::sync::mpsc::channel::<String>();
     let mut discovering = false;
+    // A `ports` scan's reply, produced on its own thread (it runs the OS's socket listing
+    // and HTTP probes). One scan at a time per socket.
+    let (ports_tx, ports_rx) = std::sync::mpsc::channel::<String>();
+    let mut listing_ports = false;
     // The phone's Tailscale user id, from one `whois` the first time it is needed.
     let peer_owner: Arc<OnceLock<Option<u64>>> = Arc::new(OnceLock::new());
     // Ids of the pending questions this socket has pushed (None = `pending` not sent yet),
@@ -1666,6 +1740,28 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         let _ = ws.flush();
                         break;
                     }
+                    // A tunnel socket (port mirroring): authenticate, then this thread
+                    // becomes the byte pipe and never returns to the control loop.
+                    Some(ClientMsg::Tunnel {
+                        token: Some(token),
+                        port,
+                    }) => match ctrl.authenticate(peer, &token) {
+                        Ok(id) => {
+                            serve_tunnel(&ctrl, ws, &id, port);
+                            return;
+                        }
+                        Err(outcome) => {
+                            let reply = if outcome == AuthOutcome::Unavailable {
+                                unavailable()
+                            } else {
+                                unauthorized()
+                            };
+                            let _ = ws.send(Message::Text(reply.to_string()));
+                            let _ = ws.close(None);
+                            let _ = ws.flush();
+                            break;
+                        }
+                    },
                     // Anything else before auth ends the connection.
                     _ => break,
                 };
@@ -2074,8 +2170,26 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             break 'conn;
                         }
                     }
+                    Some(ClientMsg::Ports) => {
+                        if !listing_ports {
+                            listing_ports = true;
+                            let (tx, ctrl) = (ports_tx.clone(), ctrl.clone());
+                            let remote = device.is_some();
+                            thread::spawn(move || {
+                                let _ = tx.send(ports_payload(&ctrl, remote).to_string());
+                            });
+                        }
+                    }
+                    // Loopback (trusted, no token) may open a tunnel too. A remote phone's
+                    // CONTROL socket may not turn into one: it is registered in `live`.
+                    Some(ClientMsg::Tunnel { port, .. }) if device.is_none() => {
+                        unsubscribe_bus(&bus, &mut bus_sub);
+                        detach(&pty, &attached);
+                        serve_tunnel(&ctrl, ws, "", port);
+                        return;
+                    }
                     // Already authenticated (or loopback): a repeat `auth` changes nothing.
-                    Some(ClientMsg::Auth { .. }) | None => {}
+                    Some(ClientMsg::Auth { .. } | ClientMsg::Tunnel { .. }) | None => {}
                 }
             }
             Ok(Message::Close(_)) => break,
@@ -2164,6 +2278,13 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
         if let Ok(macs) = macs_rx.try_recv() {
             discovering = false;
             if ws.send(Message::Text(macs)).is_err() {
+                break;
+            }
+        }
+        // 2c. A finished `ports` scan.
+        if let Ok(ports) = ports_rx.try_recv() {
+            listing_ports = false;
+            if !send_text(&mut ws, ports) {
                 break;
             }
         }
@@ -2286,6 +2407,78 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
 
     unsubscribe_bus(&bus, &mut bus_sub);
     detach(&pty, &attached);
+}
+
+/// May this peer mirror ports now? A remote phone needs mobile access on as well as the
+/// mirroring switch; loopback (the Simulator, the sidecar) only the switch.
+fn mirroring_allowed(ctrl: &BridgeController, remote: bool) -> bool {
+    if remote {
+        ctrl.devices.mirroring()
+    } else {
+        ctrl.devices.mirroring_switch()
+    }
+}
+
+/// The `ports` reply: the web ports a tunnel may reach, or none while mirroring is off.
+fn ports_payload(ctrl: &BridgeController, remote: bool) -> serde_json::Value {
+    let enabled = mirroring_allowed(ctrl, remote);
+    let ports = if enabled {
+        ctrl.web_ports.list()
+    } else {
+        Vec::new()
+    };
+    json!({ "type": "ports", "enabled": enabled, "ports": ports })
+}
+
+/// Become a tunnel to local `port` for `device` ("" = loopback), or refuse and close. The
+/// port must be one the scan found, dialled on the loopback address it was found on --
+/// never a host, never another address. Blocks this connection's thread until the tunnel
+/// ends. Refusal reasons: `port` (not a web port now, or mirroring off), `busy`,
+/// `unauthorized` (revoked between auth and here).
+fn serve_tunnel(ctrl: &BridgeController, mut ws: WebSocket<TcpStream>, device: &str, port: u16) {
+    let refuse = |ws: &mut WebSocket<TcpStream>, why: &str| {
+        let _ = ws.send(Message::Text(
+            json!({ "type": "error", "message": why }).to_string(),
+        ));
+        let _ = ws.close(None);
+        let _ = ws.flush();
+    };
+    let remote = !device.is_empty();
+    if !mirroring_allowed(ctrl, remote) {
+        return refuse(&mut ws, "port");
+    }
+    let Some(target) = ctrl.web_ports.target_for(port) else {
+        return refuse(&mut ws, "port");
+    };
+    let Some(flag) = ctrl.open_tunnel(device) else {
+        return refuse(&mut ws, "busy");
+    };
+    // Re-check now that the slot is registered: a revoke or a switch going off between
+    // the checks above and here found no flag to set.
+    let still = mirroring_allowed(ctrl, remote) && (!remote || ctrl.still_admitted(device));
+    if !still {
+        ctrl.close_tunnel(device, &flag);
+        return refuse(&mut ws, if remote { "unauthorized" } else { "port" });
+    }
+    let Ok(app) = TcpStream::connect_timeout(&SocketAddr::new(target, port), TUNNEL_CONNECT) else {
+        ctrl.close_tunnel(device, &flag);
+        return refuse(&mut ws, "port");
+    };
+    if !send_text(
+        &mut ws,
+        json!({ "type": "tunnelOk", "port": port }).to_string(),
+    ) {
+        ctrl.close_tunnel(device, &flag);
+        return;
+    }
+    lift_preauth_cap(&mut ws);
+    let timing = crate::port_tunnel::Timing {
+        write_stall: WRITE_STALL,
+        ping_every: PING_EVERY,
+        stale_after: STALE_AFTER,
+    };
+    crate::port_tunnel::relay(ws, app, &flag, timing);
+    ctrl.close_tunnel(device, &flag);
 }
 
 /// Send `pending` (first call) or the `pendingAdded` / `resolved` frames for what changed
@@ -3083,6 +3276,69 @@ mod tests {
             Err(StatusCode::FORBIDDEN)
         );
         assert_eq!(handshake_with_origins(&[]), Ok(()));
+    }
+
+    #[test]
+    fn parses_ports_and_tunnel_and_redacts_the_tunnel_token() {
+        assert_eq!(
+            parse_client_msg(r#"{"type":"ports"}"#),
+            Some(ClientMsg::Ports)
+        );
+        let t = parse_client_msg(r#"{"type":"tunnel","token":"tok42","port":5173}"#).unwrap();
+        assert_eq!(
+            t,
+            ClientMsg::Tunnel {
+                token: Some("tok42".into()),
+                port: 5173
+            }
+        );
+        let shown = format!("{t:?}");
+        assert!(
+            !shown.contains("tok42") && shown.contains("5173"),
+            "{shown}"
+        );
+        // Loopback sends no token.
+        assert_eq!(
+            parse_client_msg(r#"{"type":"tunnel","port":80}"#),
+            Some(ClientMsg::Tunnel {
+                token: None,
+                port: 80
+            })
+        );
+        // A port outside u16 is not a tunnel at all.
+        assert_eq!(parse_client_msg(r#"{"type":"tunnel","port":70000}"#), None);
+    }
+
+    #[test]
+    fn a_tunnel_slot_cap_and_a_revoke_stop_open_tunnels() {
+        let ctrl = BridgeController::new(Arc::new(MobileDevices::load(
+            std::env::temp_dir().join(format!("conduit-tun-{}.json", uuid::Uuid::new_v4())),
+        )));
+        let flags: Vec<_> = (0..TUNNELS_PER_DEVICE)
+            .map(|_| ctrl.open_tunnel("phone").unwrap())
+            .collect();
+        assert!(ctrl.open_tunnel("phone").is_none(), "capped per device");
+        assert!(ctrl.open_tunnel("other").is_some(), "the cap is per device");
+        ctrl.close_tunnel("phone", &flags[0]);
+        assert!(
+            ctrl.open_tunnel("phone").is_some(),
+            "a closed slot is reusable"
+        );
+        ctrl.disconnect_device("phone");
+        assert!(
+            flags[1..].iter().all(|f| f.load(Ordering::SeqCst)),
+            "revoke stops them"
+        );
+        ctrl.close_all_tunnels();
+        assert!(lock(&ctrl.tunnels).is_empty());
+    }
+
+    #[test]
+    #[ignore = "scans this machine's real sockets; run by hand"]
+    fn print_this_machines_web_ports() {
+        for p in crate::local_ports::WebPorts::default().list() {
+            eprintln!("{} {:?} via {}", p.port, p.process, p.target);
+        }
     }
 
     #[test]

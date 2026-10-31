@@ -210,7 +210,11 @@ export type ServerMsg =
   | { type: "uploadResult"; requestId: string; ok: true; path: string }
   | { type: "uploadResult"; requestId: string; ok: false; error: string }
   /** the answer to one `sessionaction`: what was done, and what was refused and why */
-  | { type: "sessionActionResult"; requestId: string; action: "stop" | "delete"; done: string[]; skipped: { id: string; reason: string }[] };
+  | { type: "sessionActionResult"; requestId: string; action: "stop" | "delete"; done: string[]; skipped: { id: string; reason: string }[] }
+  /** answer to `ports`: the computer's local web apps a phone may mirror (empty when off) */
+  | { type: "ports"; enabled: boolean; ports: { port: number; process: string | null }[] }
+  /** tunnel sockets only: the computer accepted a `tunnel` frame; raw TCP bytes follow */
+  | { type: "tunnelOk"; port: number };
 
 // ---- client → server ----
 // Spellings are mixed ON PURPOSE (pinned by Rust tests): attach/input/resize/git/kill/spawn use
@@ -231,7 +235,8 @@ export type ClientMsg =
   | { type: "answer"; askId: string; answers: Record<string, string> }
   | { type: "approve"; id: string; allow: boolean }
   | { type: "upload"; sessionId: string; requestId: string; name: string; data: string; seq: number; done: boolean }
-  | { type: "sessionaction"; requestId: string; action: "stop" | "delete"; sessionIds: string[] };
+  | { type: "sessionaction"; requestId: string; action: "stop" | "delete"; sessionIds: string[] }
+  | { type: "ports" };
 
 export const authMsg = (token: string): ClientMsg => ({ type: "auth", token });
 
@@ -244,6 +249,9 @@ export function pairMsg(
 }
 
 export const discoverMsg = (): ClientMsg => ({ type: "discover" });
+/** Ask for the computer's local web apps; answered by `ports`. (The `tunnel` frame that opens
+ * one is sent by the native mirror on its own socket, never on this one.) */
+export const portsMsg = (): ClientMsg => ({ type: "ports" });
 export const listMsg = (): ClientMsg => ({ type: "list" });
 export const attachMsg = (id: string): ClientMsg => ({ type: "attach", session_id: id });
 export const inputMsg = (id: string, data: string): ClientMsg => ({ type: "input", session_id: id, data });

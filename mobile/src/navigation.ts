@@ -4,6 +4,8 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 export type TabParamList = {
   Chats: undefined;
+  /** the computer's local web apps, mirrored to this phone's localhost */
+  Apps: undefined;
   Settings: undefined;
 };
 
@@ -27,6 +29,10 @@ export type RootStackParamList = {
 
 export type ChatsProps = CompositeScreenProps<
   NativeBottomTabScreenProps<TabParamList, "Chats">,
+  NativeStackScreenProps<RootStackParamList>
+>;
+export type AppsProps = CompositeScreenProps<
+  NativeBottomTabScreenProps<TabParamList, "Apps">,
   NativeStackScreenProps<RootStackParamList>
 >;
 export type SettingsProps = CompositeScreenProps<

@@ -734,6 +734,27 @@ plus install/remove/status), and one listener in `App.tsx`.
   sidebar click end in the same state, and a broadcast never runs a delete twice. A phone
   delete keeps the worktree -- the desktop asks before removing one; a remote tap cannot.
 
+## Where port mirroring lives
+
+A paired phone opens this computer's local web apps at the SAME `http://localhost:<port>`
+(`local_ports.rs` finds them, `port_tunnel.rs` moves the bytes, `bridge.rs` `tunnel`/`ports`;
+phone: `mobile/modules/port-mirror`, an Android foreground service). Same host and port is
+the point -- a frontend calling `localhost:8000`, Vite's host check and the secure-context
+rule all keep working, which browsing to the computer's tailnet name breaks.
+
+- **The scan IS the tunnel's allowlist.** A tunnel reaches only a port the scan found, on the
+  loopback address it was found on -- never a host or another address. Excluded: Conduit's
+  own pid and `CONDUIT_RESERVED`, Windows pid 0/4, the OS's ephemeral range (IPC servers
+  with their own tokens), and `DEBUGGER_PORTS` (an inspector socket is code execution, and
+  while mirroring any app on the phone can reach a mirrored port). Kept only if it answers a
+  `HEAD /` with an `HTTP/` status line.
+- netstat rows are matched by foreign port `:0`, never by `LISTENING` (Windows localizes it).
+- **A tunnel is not a phone.** It never registers in `live` (it would hold questions for a
+  phone nobody is looking at); it registers in `tunnels`, which revoke, access-off and
+  mirroring-off stop. A remote CONTROL socket may not become a tunnel.
+- `mirrorOff` in `mobile-devices.json` is inverted on purpose: absent reads as "on".
+- Design: `docs/superpowers/specs/2026-10-31-port-mirroring-design.md`.
+
 ## Where the IDE integration lives
 
 Conduit announces itself to the `claude` CLI as an IDE (the VS Code/JetBrains protocol):

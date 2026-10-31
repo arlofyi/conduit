@@ -5,6 +5,15 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Your computer's web apps on your phone.** Anything running on your computer's
+  `localhost` (a dev server, a Docker container, an agent's preview) opens on a paired
+  Android phone at the same address, `http://localhost:<port>`, with no change to the app
+  or to Tailscale. The phone's new Apps tab lists what is running; switch on mirroring and
+  tap one to open it in your browser. Pages that call other local ports (a frontend and its
+  API) keep working, because every listed port is mirrored. Apps stay private to your
+  computer: each connection goes through Conduit's link and needs the phone's pairing, and
+  debugger ports are never offered. Turn it off under Settings → Mobile.
+
 ## 0.49.0 — 2026-10-31
 
 - **Added — Send photos and files from the phone.** The composer's "+" now offers Photos,

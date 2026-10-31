@@ -17,6 +17,7 @@ import type { AndroidSymbol, SFSymbol } from "expo-symbols";
 export const ANDROID_SYMBOLS = {
   "arrow.down.right.and.arrow.up.left": "close_fullscreen",
   "arrow.triangle.branch": "fork_right",
+  "arrow.up.right.square": "open_in_new",
   "bubble.left.and.bubble.right": "forum",
   camera: "photo_camera",
   checkmark: "check",
@@ -38,6 +39,7 @@ export const ANDROID_SYMBOLS = {
   folder: "folder",
   "gauge.with.dots.needle.33percent": "speed",
   gearshape: "settings",
+  globe: "public",
   "info.circle": "info",
   laptopcomputer: "computer",
   "lock.fill": "lock",

@@ -25,6 +25,8 @@ import { ConnectScreen } from "./src/screens/ConnectScreen";
 import { PairScreen } from "./src/screens/PairScreen";
 import { ChatsScreen } from "./src/screens/ChatsScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
+import { AppsScreen } from "./src/screens/AppsScreen";
+import { PortMirrorProvider } from "./src/data/PortMirrorProvider";
 import { NewChatScreen } from "./src/screens/NewChatScreen";
 import { ChatsMenuScreen, QuickActionsScreen, SessionInfoScreen } from "./src/screens/Sheets";
 import { ListSelectionProvider, useListSelection } from "./src/data/ListSelection";
@@ -86,6 +88,7 @@ function Tabs() {
   const openPending = useMemo(() => openBySession(pending), [pending]);
   const needs = needsCount(view, profile, openPending);
   const chatsIcon = useTabIcon("bubble.left.and.bubble.right");
+  const appsIcon = useTabIcon("globe");
   const settingsIcon = useTabIcon("gearshape");
   return (
     <Tab.Navigator
@@ -105,6 +108,7 @@ function Tabs() {
           tabBarBadge: needs > 0 ? needs : undefined,
         }}
       />
+      <Tab.Screen name="Apps" component={AppsScreen} options={{ tabBarIcon: appsIcon }} />
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: settingsIcon }} />
     </Tab.Navigator>
   );
@@ -194,9 +198,11 @@ export default function App() {
           <ThemeProvider>
             <ReduceMotionProvider>
               <LiveProvider>
-                <ListSelectionProvider>
-                  <Inner />
-                </ListSelectionProvider>
+                <PortMirrorProvider>
+                  <ListSelectionProvider>
+                    <Inner />
+                  </ListSelectionProvider>
+                </PortMirrorProvider>
               </LiveProvider>
             </ReduceMotionProvider>
           </ThemeProvider>

@@ -66,6 +66,8 @@ export interface MobileDevice {
 export interface MobileSettings {
   enabled: boolean;
   port: number | null;
+  /** paired phones may open this computer's local web apps (port mirroring) */
+  mirroring: boolean;
   devices: MobileDevice[];
 }
 

@@ -53,6 +53,13 @@ export function MobilePanel() {
       .catch((e) => setError(String(e)));
   };
 
+  const setMirroring = (on: boolean) => {
+    setError(null);
+    invoke("mobile_set_mirroring", { on })
+      .then(refreshCfg)
+      .catch((e) => setError(String(e)));
+  };
+
   const revoke = (id: string) => {
     setError(null);
     setRevoking(null);
@@ -91,6 +98,15 @@ export function MobilePanel() {
         disabled={!cfg || (!running && !cfg.enabled)}
         onChange={setEnabled}
       />
+      {cfg?.enabled && (
+        <SettingRow
+          id="mobile-mirroring"
+          title="Local web apps on your phone"
+          detail="Paired phones can open the web apps running on this computer (dev servers, Docker, previews) at the same localhost address. Nothing is exposed to your network: each connection goes through this link and needs the phone's pairing. Debugger ports are never offered."
+          checked={cfg.mirroring}
+          onChange={setMirroring}
+        />
+      )}
       {error && <Notice tone="error">{error}</Notice>}
       {cfg?.enabled && <PairCard now={now} running={running} />}
       <div className="mobile-devices">

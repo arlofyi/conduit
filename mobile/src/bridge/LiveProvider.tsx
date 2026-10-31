@@ -33,7 +33,8 @@ import { BridgeClient } from "./BridgeClient";
 import { initialConn, lifecycleAction, type ConnError, type ConnState } from "./connection";
 import { appendWire, mapHistory, mapProjectsView, sameView, statusPatch, type LivePatch } from "./live";
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
-import { answerMsg, approveMsg, discoverMsg, pairMsg, sessionActionMsg, spawnMsg, uploadMsg, type ClientMsg, type WireMac } from "./protocol";
+import { answerMsg, approveMsg, discoverMsg, pairMsg, portsMsg, sessionActionMsg, spawnMsg, uploadMsg, type ClientMsg, type WireMac } from "./protocol";
+import { parsePortsFrame, type WebPortsView } from "../logic/ports";
 import type { ActionResult, SessionAction } from "../logic/selection";
 import { chunkBase64 } from "../logic/attachments";
 
@@ -142,6 +143,10 @@ export interface LiveValue {
   /** ask the current Mac for Conduit Macs on the same tailnet user; answered in `discovered` */
   discover: () => void;
   discovered: WireMac[] | null;
+  /** the current computer's local web apps (Apps tab); null until the first `ports` answer */
+  webPorts: WebPortsView | null;
+  /** ask the computer for its local web apps now; answered into `webPorts` */
+  refreshPorts: () => void;
   pairing: PairingState | null;
   pair: (target: PairTarget) => void;
   cancelPairing: () => void;
@@ -216,6 +221,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [hello, setHello] = useState<HelloInfo | null>(null);
   const [notice, setNotice] = useState<ConnError | null>(null);
   const [discovered, setDiscovered] = useState<WireMac[] | null>(null);
+  const [webPorts, setWebPorts] = useState<WebPortsView | null>(null);
   const [pairing, setPairing] = useState<PairingState | null>(null);
   const [view, setView] = useState<ProjectsView | null>(null);
   const [viewAt, setViewAt] = useState(0);
@@ -319,6 +325,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     streamingRef.current = null;
     lastFrameAt.current = null;
     setDiscovered(null);
+    setWebPorts(null);
     pendingRef.current = emptyPending;
     setPending(emptyPending);
     let wasReady = false;
@@ -395,6 +402,11 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                 spawnLate.current = false;
                 setSpawnState({ phase: "failed", message: spawnErrorText(m.message) });
               }
+              break;
+            }
+            case "ports": {
+              const next = parsePortsFrame(m);
+              if (next) setWebPorts(next);
               break;
             }
             case "macs":
@@ -696,6 +708,10 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     return () => clearInterval(t);
   }, [ready, foreground, macKey]);
 
+  const refreshPorts = useCallback(() => {
+    clientRef.current?.send(portsMsg());
+  }, []);
+
   const refreshProjects = useCallback(() => {
     clientRef.current?.list();
   }, []);
@@ -925,6 +941,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       forget,
       discover,
       discovered,
+      webPorts,
+      refreshPorts,
       pairing,
       pair,
       cancelPairing,
@@ -975,6 +993,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       forget,
       discover,
       discovered,
+      webPorts,
+      refreshPorts,
       pairing,
       pair,
       cancelPairing,
