@@ -1,5 +1,5 @@
 /**
- * "+" on Chats: start a session from the phone — pick the project, pick the agent, optionally
+ * "+" on Sessions: start a session from the phone — pick the project, pick the agent, optionally
  * give it a title and a first message (with neither, the agent starts idle and the computer names it). Sends the bridge's existing `spawn`; the Mac creates the session, opens its
  * tab and hands it the message; on `spawned` this sheet becomes that chat.
  *
@@ -64,7 +64,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
   const project = projects.find((x) => x.id === projectId) ?? null;
 
   return (
-    <SheetScaffold title="New chat" onClose={() => navigation.goBack()}>
+    <SheetScaffold title="New session" onClose={() => navigation.goBack()}>
       <Label>Project</Label>
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentInsetAdjustmentBehavior="never" style={{ flexGrow: 0 }} contentContainerStyle={{ gap: 8, paddingHorizontal: 16, paddingBottom: 4 }}>
         {projects.map((x) => {
@@ -205,7 +205,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
           onPress={() => projectId && spawn(projectId, text, agent, title)}
           disabled={!canStart}
           accessibilityRole="button"
-          accessibilityLabel="Start chat"
+          accessibilityLabel="Start session"
           accessibilityState={{ disabled: !canStart, busy: pending }}
           style={({ pressed }) => ({
             marginTop: 14,
@@ -221,7 +221,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
         >
           {pending ? <ActivityIndicator color={p.meText} /> : null}
           <Text style={{ fontSize: TYPE.body, fontWeight: "600", color: canStart || pending ? p.meText : p.textDim }}>
-            {pending ? "Starting…" : "Start chat"}
+            {pending ? "Starting…" : "Start session"}
           </Text>
         </Pressable>
       </View>

@@ -163,3 +163,23 @@ export function idleStopTargets(input: IdleStopInput): { projectId: string; sess
   }
   return out;
 }
+
+/** Sessions pinned "keep running" -- exempt from the idle auto-stop. The pin is
+ *  `Session.keepRunning` in the Rust store (so a paired phone reads and sets the same
+ *  flag); it used to live in this machine's localStorage. */
+export function keepRunningIds(sessions: { id: string; keepRunning?: boolean }[]): Set<string> {
+  return new Set(sessions.filter((s) => s.keepRunning === true).map((s) => s.id));
+}
+
+/** Legacy localStorage pins (`conduit.keepRunning`) still to copy into the store: pinned
+ *  there, the session still exists, and the store does not already pin it. */
+export function legacyPinsToMigrate(
+  legacy: Record<string, true>,
+  sessions: { id: string; keepRunning?: boolean }[],
+): string[] {
+  const byId = new Map(sessions.map((s) => [s.id, s]));
+  return Object.keys(legacy).filter((id) => {
+    const s = byId.get(id);
+    return s !== undefined && s.keepRunning !== true;
+  });
+}

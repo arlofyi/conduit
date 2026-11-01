@@ -202,27 +202,114 @@ pub fn send_turn(
     let _ = std::fs::create_dir_all(&dirs.memory);
     let memory_index =
         cap_index(&std::fs::read_to_string(dirs.memory.join("MEMORY.md")).unwrap_or_default());
-    let mcp_config = crate::root_mcp::write_mcp_config(crate::root_mcp::port(), &chat_id);
-    let charter = build_charter(
-        &cwd.to_string_lossy(),
-        &roster,
-        &dirs,
-        &memory_index,
-        mcp_config.is_some(),
-    );
-    // The charter rides a FILE: it is many lines, and a newline ends a cmd.exe command line,
-    // so on Windows an inline charter cut the command short and the rest of it reached
-    // claude as stray arguments (`--session-id` was lost, the chat never resumed).
-    let charter_path = dirs.scratch.join("charter.md");
-    std::fs::write(&charter_path, &charter).map_err(|e| format!("write charter: {e}"))?;
-    let cmd = build_command(
-        &chat_id,
-        resume,
-        &charter_path.to_string_lossy(),
-        &dirs,
-        mcp_config.as_deref(),
-        &denied_paths,
-    );
+    let agy = chat.agent == crate::agent::AgentId::Antigravity;
+    let effort = crate::root_chat_options::effective_effort(chat.effort.as_deref(), chat.research);
+    let (cmd, run_dir, stdin_text) = if agy {
+        // agy has no system-prompt flag, but it follows an `AGENTS.md` in its working
+        // directory (measured), and an Antigravity chat runs IN its own scratchpad.
+        let base = build_charter_for(
+            true,
+            &cwd.to_string_lossy(),
+            &roster,
+            &dirs,
+            &memory_index,
+            false,
+        );
+        let mut charter = crate::root_chat_agy::charter(&base);
+        if chat.research {
+            charter.push_str(RESEARCH_BRIEF);
+        }
+        std::fs::write(dirs.scratch.join("AGENTS.md"), &charter)
+            .map_err(|e| format!("write charter: {e}"))?;
+        let settings_path = dirs.scratch.join("agy-settings.json");
+        std::fs::write(
+            &settings_path,
+            crate::root_chat_agy::settings_json(&denied_paths),
+        )
+        .map_err(|e| format!("write agy settings: {e}"))?;
+        // Resume only a conversation that still exists: replaying a vanished id would fail
+        // every turn from now on, so a missing one starts fresh (and is re-captured).
+        let conversation = chat.agy_conversation_id.as_deref().filter(|cid| {
+            crate::agy_usage::resolve_agy_home(config_dir.as_deref())
+                .and_then(|home| crate::agy_transcript::conversation_db(&home, cid))
+                .is_some()
+        });
+        let add_dirs: Vec<String> = in_scope.iter().map(|p| p.path.clone()).collect();
+        let cmd = crate::root_chat_agy::build_command(
+            &settings_path.to_string_lossy(),
+            conversation,
+            chat.model.as_deref(),
+            effort.as_deref(),
+            &add_dirs,
+        );
+        (
+            cmd,
+            dirs.scratch.clone(),
+            crate::root_chat_agy::stdin_line(text),
+        )
+    } else {
+        // One --mcp-config file: Conduit's root server (when it is up) plus the user MCP
+        // servers this chat opted into, read from the chat's own profile. Only servers that
+        // are still defined are loaded AND allowed.
+        let port = crate::root_mcp::port();
+        let root = (port != 0).then_some((port, chat_id.as_str()));
+        let user = if chat.mcps.is_empty() {
+            serde_json::Map::new()
+        } else {
+            let claude_json = crate::root_chat_options::claude_profile_paths(config_dir.as_deref())
+                .and_then(|(j, _)| std::fs::read_to_string(j).ok())
+                .unwrap_or_default();
+            crate::root_chat_options::chosen_mcp_servers(&claude_json, &chat.mcps)
+        };
+        let user_mcps: Vec<String> = user.keys().cloned().collect();
+        let mcp_config = crate::root_chat_options::merged_mcp_config(root, &user).and_then(|doc| {
+            let path = crate::store::data_dir().join(format!("rootchat-mcp-{chat_id}.json"));
+            write_private(&path, &doc).ok()?;
+            Some(path.to_string_lossy().into_owned())
+        });
+        let mut charter = build_charter(
+            &cwd.to_string_lossy(),
+            &roster,
+            &dirs,
+            &memory_index,
+            root.is_some() && mcp_config.is_some(),
+        );
+        if mcp_config.is_some() && !user_mcps.is_empty() {
+            charter.push_str(&format!(
+                "\n\nAlso connected: the user's MCP servers {} -- their tools (named \
+                 `mcp__<server>__<tool>`) are allowed in this chat.",
+                user_mcps.join(", ")
+            ));
+        }
+        if chat.research {
+            charter.push_str(RESEARCH_BRIEF);
+        }
+        // The charter rides a FILE: it is many lines, and a newline ends a cmd.exe command
+        // line, so on Windows an inline charter cut the command short and the rest of it
+        // reached claude as stray arguments (`--session-id` was lost, the chat never resumed).
+        let charter_path = dirs.scratch.join("charter.md");
+        std::fs::write(&charter_path, &charter).map_err(|e| format!("write charter: {e}"))?;
+        let no_mcps: Vec<String> = Vec::new();
+        let cmd = build_command_with(
+            &chat_id,
+            resume,
+            &charter_path.to_string_lossy(),
+            &dirs,
+            mcp_config.as_deref(),
+            &denied_paths,
+            &TurnFlags {
+                model: chat.model.as_deref(),
+                effort: effort.as_deref(),
+                user_mcps: if mcp_config.is_some() {
+                    &user_mcps
+                } else {
+                    &no_mcps
+                },
+            },
+        );
+        (cmd, cwd.clone(), text.to_string())
+    };
+    let agent_name = if agy { "agy" } else { "claude" };
 
     // Interactive login shell for PATH parity with the titler / pty.rs (GUI-launched
     // apps get the bare Finder PATH; nvm/Homebrew claude would be missing otherwise).
@@ -245,19 +332,27 @@ pub fn send_turn(
         c
     };
     builder
-        .current_dir(&cwd)
+        .current_dir(&run_dir)
         .env_remove("npm_config_prefix")
         .no_window()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(cfg) = config_dir.as_deref().filter(|s| !s.is_empty()) {
-        for (k, v) in crate::agent::adapter_for(crate::agent::AgentId::Claude).account_env(cfg) {
+        // The chat's own agent decides the redirect (an agy chat is pinned to an agy login).
+        let agent = if agy {
+            crate::agent::AgentId::Antigravity
+        } else {
+            crate::agent::AgentId::Claude
+        };
+        for (k, v) in crate::agent::adapter_for(agent).account_env(cfg) {
             builder.env(k, v);
         }
     }
 
-    let mut child = builder.spawn().map_err(|e| format!("spawn claude: {e}"))?;
+    let mut child = builder
+        .spawn()
+        .map_err(|e| format!("spawn {agent_name}: {e}"))?;
     if from_phone {
         store.mark_root_chat_phone(&chat_id);
         if chat.title == "New Chat" {
@@ -270,13 +365,15 @@ pub fn send_turn(
     }
     state.publish(json!({ "event": "user", "chatId": chat_id, "text": text }));
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
-        // Dropped here -> EOF, so `claude -p` reads the full prompt (titler pattern).
+        let _ = stdin.write_all(stdin_text.as_bytes());
+        // Dropped here -> EOF, so `claude -p` reads the full prompt (titler pattern) and
+        // agy's stream-json input ends after this one turn.
     }
     let stdout = child.stdout.take().ok_or("child stdout unavailable")?;
     let stderr = child.stderr.take();
 
     let state_arc = Arc::clone(state.inner());
+    let store_arc = Arc::clone(store.inner());
     let app = app.clone();
     state_arc
         .children
@@ -284,11 +381,47 @@ pub fn send_turn(
         .unwrap_or_else(|e| e.into_inner())
         .insert(chat_id.clone(), child);
 
+    let mut classify: Box<dyn FnMut(&str) -> TurnOut + Send> = if agy {
+        use crate::root_chat_agy::AgyOut;
+        let mut stream = crate::root_chat_agy::AgyStream::default();
+        Box::new(move |l| match stream.line(l) {
+            AgyOut::Init(c) => TurnOut::Conversation(c),
+            AgyOut::Items(i) => TurnOut::Items(i),
+            AgyOut::Done(Ok(d)) => TurnOut::Done(d),
+            AgyOut::Done(Err(m)) => TurnOut::Failed(m),
+            AgyOut::Nothing => TurnOut::Nothing,
+        })
+    } else {
+        Box::new(|l| match classify_line(l) {
+            LineOut::Items(i) => TurnOut::Items(i),
+            LineOut::Done(d) => TurnOut::Done(d),
+            LineOut::Nothing => TurnOut::Nothing,
+        })
+    };
+
     std::thread::spawn(move || {
         let mut saw_done = false;
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            match classify_line(&line) {
-                LineOut::Items(items) => {
+            match classify(&line) {
+                TurnOut::Conversation(cid) => {
+                    let known = store_arc
+                        .root_chat(&chat_id)
+                        .and_then(|c| c.agy_conversation_id);
+                    if known.as_deref() != Some(cid.as_str()) {
+                        store_arc.set_root_chat_agy_conversation(&chat_id, &cid);
+                    }
+                }
+                TurnOut::Failed(message) => {
+                    saw_done = true;
+                    state_arc.publish(
+                        json!({ "event": "error", "chatId": chat_id, "message": message }),
+                    );
+                    let _ = app.emit(
+                        "root-chat-error",
+                        json!({ "chatId": chat_id, "message": message }),
+                    );
+                }
+                TurnOut::Items(items) => {
                     for item in items {
                         state_arc.publish(
                             json!({ "event": "item", "chatId": chat_id, "item": item.clone() }),
@@ -297,7 +430,7 @@ pub fn send_turn(
                             app.emit("root-chat-item", json!({ "chatId": chat_id, "item": item }));
                     }
                 }
-                LineOut::Done(mut done) => {
+                TurnOut::Done(mut done) => {
                     saw_done = true;
                     done["chatId"] = json!(chat_id);
                     let mut ev = done.clone();
@@ -305,7 +438,7 @@ pub fn send_turn(
                     state_arc.publish(ev);
                     let _ = app.emit("root-chat-done", done);
                 }
-                LineOut::Nothing => {}
+                TurnOut::Nothing => {}
             }
         }
         // Stream over: reap the child and surface silent failures (spawn errors land in
@@ -331,9 +464,9 @@ pub fn send_turn(
                 tail = trimmed[cut..].to_string();
             }
             let message = match status {
-                Some(s) if s.success() => "claude exited without a result".to_string(),
-                Some(s) => format!("claude exited with {s}: {tail}"),
-                None => format!("claude terminated: {tail}"),
+                Some(s) if s.success() => format!("{agent_name} exited without a result"),
+                Some(s) => format!("{agent_name} exited with {s}: {tail}"),
+                None => format!("{agent_name} terminated: {tail}"),
             };
             state_arc.publish(json!({ "event": "error", "chatId": chat_id, "message": message }));
             let _ = app.emit(
@@ -343,6 +476,37 @@ pub fn send_turn(
         }
     });
     Ok(())
+}
+
+/// One stdout line of either agent's turn, as the reader thread acts on it.
+enum TurnOut {
+    Items(Vec<Value>),
+    Done(Value),
+    /// The turn ended with an error the agent reported itself (agy `status: ERROR`).
+    Failed(String),
+    /// agy's conversation id (its `init` line): stored so the next turn resumes it.
+    Conversation(String),
+    Nothing,
+}
+
+/// Write a file only its owner can read where the platform allows it (the MCP config may
+/// carry a user server's tokens). On Windows the data dir's inherited ACL is already
+/// per-user. Never logged.
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(text.as_bytes())
 }
 
 #[tauri::command]
@@ -355,6 +519,23 @@ pub fn root_chat_stop(chat_id: String, state: State<Arc<RootChatState>>) {
 /// Parse a chat's transcript into renderable items. Shared by the `root_chat_history`
 /// command and root_mcp's `chat_read`, so the two can never drift.
 pub fn history_items(store: &crate::store::Store, chat_id: &str) -> Vec<Value> {
+    // An Antigravity chat's history is agy's own conversation database, read by the same
+    // decoder a phone uses for an agy session.
+    if let Some(chat) = store
+        .root_chat(chat_id)
+        .filter(|c| c.agent == crate::agent::AgentId::Antigravity)
+    {
+        let cfg = store.root_chat_config_dir(chat_id);
+        return chat
+            .agy_conversation_id
+            .as_deref()
+            .and_then(|cid| {
+                let home = crate::agy_usage::resolve_agy_home(cfg.as_deref())?;
+                crate::agy_transcript::conversation_db(&home, cid)
+            })
+            .and_then(|db| crate::agy_transcript::read_items(&db).ok())
+            .unwrap_or_default();
+    }
     let projects = match store.root_chat_config_dir(chat_id) {
         Some(cfg) if !cfg.is_empty() => PathBuf::from(cfg).join("projects"),
         _ => match crate::pty::claude_projects_dir() {
@@ -463,9 +644,57 @@ pub fn cap_index(s: &str) -> String {
 /// registered-project roster — rebuilt every message, so none of it is ever stale.
 ///
 /// `has_tools` must track whether the spawn actually carries `--mcp-config` (i.e.
-/// `root_mcp::write_mcp_config` returned `Some`) — the charter must never promise tools
+/// the root MCP server is up and its config was written) — the charter must never promise tools
 /// the process cannot reach.
 pub fn build_charter(
+    workspace_root: &str,
+    projects: &[(String, String)],
+    dirs: &Dirs,
+    memory_index: &str,
+    has_tools: bool,
+) -> String {
+    build_charter_for(
+        false,
+        workspace_root,
+        projects,
+        dirs,
+        memory_index,
+        has_tools,
+    )
+}
+
+/// What a Claude chat can run, stated exactly. `-p` refuses every unallowed call before it
+/// runs, and a model never told it has no shell keeps trying one: measured in a real chat,
+/// 3 of 24 calls were refusals (`Bash` with `$var`, PowerShell scripts, `pwsh -File`).
+/// This must match `build_command`'s allow list -- the test pins both halves.
+pub const TOOL_POLICY: &str = "Tools -- exactly what this chat can run. Anything else is \
+     refused before it runs, so never try it:\n\
+     - Files: Read, Glob and Grep, anywhere you are allowed to look. Glob returns matches \
+     NEWEST FIRST (by modification time), so a Glob over a project (e.g. `**/*.md` with \
+     the project's path) is how to answer \"what changed recently\".\n\
+     - Web: WebSearch and WebFetch.\n\
+     - Writing: Write and Edit, ONLY inside your scratchpad and the shared memory below.\n\
+     - Bash: ONLY the `gh` CLI, one plain command at a time (`gh pr list --repo o/r`, \
+     `gh issue view 12`, `gh run view`). No pipes, `&&`, `;`, redirects, `$VAR` or \
+     `$(...)` -- a command containing any of them is refused.\n\
+     - There is NO general shell: no other Bash command, no PowerShell, no `pwsh -File`, \
+     no scripts, no git, no package managers. Do not try to work around this. If \
+     something truly needs a shell, say so and write a brief for a coding session \
+     instead.";
+
+/// Appended to the charter for a deep-research chat.
+pub const RESEARCH_BRIEF: &str = "\n\nDeep research mode: the user wants a thorough, sourced \
+     answer, not a quick one. Search broadly -- many queries, phrased different ways. Read \
+     the primary sources themselves (WebFetch the page; do not stop at search snippets), \
+     cross-check every important claim against at least one independent source, cite the \
+     links you relied on next to the claims they support, and say plainly what is \
+     uncertain, disputed or could not be verified.";
+
+/// The charter, for a Claude chat (`agy == false`) or the shared base of an Antigravity
+/// chat's (`root_chat_agy::charter` adds what differs there): the Claude-only tool policy,
+/// GitHub powers and writable dirs are left out of the latter.
+pub fn build_charter_for(
+    agy: bool,
     workspace_root: &str,
     projects: &[(String, String)],
     dirs: &Dirs,
@@ -488,6 +717,19 @@ pub fn build_charter(
     } else {
         memory_index
     };
+    if agy {
+        return format!(
+            "You are Conduit's general chat: a project-management and ideation partner for \
+             the user's whole workspace. You are not a code agent: you never modify project \
+             files or write code into repositories. When a conversation lands on something \
+             that should be built, produce a concise implementation brief the user can hand \
+             to a coding session in the relevant project.\n\n\
+             Shared memory (written by the user's other chats; read it when useful):\n\
+             {memory}\nThe current index:\n{index}\n\n\
+             Workspace root: {workspace_root}\n\n\
+             Registered Conduit projects:\n{roster}"
+        );
+    }
     let orchestration = if has_tools {
         "\n\nOrchestration: you can see and act across the whole workspace. \
          `sessions_list` and `session_peek` show what every agent session is doing; \
@@ -514,6 +756,7 @@ pub fn build_charter(
          creating repos/PRs/issues, or editing things you did not create. `gh api`, \
          `gh auth`, `gh secret`, and repo deletion are denied by policy — use typed \
          subcommands.\n\n\
+         {TOOL_POLICY}\n\n\
          Scratchpad (private to THIS chat — drafts, notes, working files):\n{scratch}\n\n\
          Shared memory (every root chat reads and writes it):\n{memory}\n\
          `MEMORY.md` there is the index — one line per fact file. To remember something \
@@ -528,8 +771,11 @@ pub fn build_charter(
 
 /// The full shell command for one message. `resume` = a transcript for this chat id
 /// already exists (decided by the caller via `pty::transcript_exists`). `mcp_config` is
-/// the path to the per-chat `--mcp-config` file (`root_mcp::write_mcp_config`), or `None`
+/// the path to the per-chat `--mcp-config` file (`root_chat_options::merged_mcp_config`), or `None`
 /// when the root MCP server never bound a port.
+///
+/// The tests' shorthand for [`build_command_with`] with no per-chat choices.
+#[cfg(test)]
 pub fn build_command(
     chat_id: &str,
     resume: bool,
@@ -537,6 +783,37 @@ pub fn build_command(
     dirs: &Dirs,
     mcp_config: Option<&str>,
     denied_paths: &[String],
+) -> String {
+    build_command_with(
+        chat_id,
+        resume,
+        charter_file,
+        dirs,
+        mcp_config,
+        denied_paths,
+        &TurnFlags::default(),
+    )
+}
+
+/// A Claude chat's per-turn choices (`RootChat` model / effort / MCP servers).
+#[derive(Default)]
+pub struct TurnFlags<'a> {
+    pub model: Option<&'a str>,
+    /// Already raised for deep research (`root_chat_options::effective_effort`).
+    pub effort: Option<&'a str>,
+    /// User MCP servers written into `mcp_config` beside Conduit's: each must ALSO be on
+    /// `--allowedTools`, or `-p` denies its every call (same rule as the root namespace).
+    pub user_mcps: &'a [String],
+}
+
+pub fn build_command_with(
+    chat_id: &str,
+    resume: bool,
+    charter_file: &str,
+    dirs: &Dirs,
+    mcp_config: Option<&str>,
+    denied_paths: &[String],
+    flags: &TurnFlags,
 ) -> String {
     let id = crate::pty::quote_cmdline_arg(chat_id);
     let sys = crate::pty::quote_cmdline_arg(charter_file);
@@ -551,11 +828,20 @@ pub fn build_command(
     // reads a different settings tree.) Naming the SERVER allows all seven, so an eighth
     // tool cannot ship unreachable. Gated on the same condition as the flag: with no
     // server there is nothing to allow, and the chat keeps exactly its Phase 2 surface.
-    let root_tools = if mcp_config.is_some() {
+    let mut root_tools = if mcp_config.is_some() {
         format!(",{}", crate::root_mcp::TOOL_NAMESPACE)
     } else {
         String::new()
     };
+    if mcp_config.is_some() {
+        for name in flags
+            .user_mcps
+            .iter()
+            .filter(|n| crate::root_chat_options::valid_mcp_name(n))
+        {
+            root_tools.push_str(&format!(",mcp__{name}"));
+        }
+    }
     // Allow: read tools, the GitHub CLI, and writes scoped to the two Conduit-owned
     // dirs. Generic Bash/Write/Edit are NOT denied — they are simply unallowed, which
     // `-p` auto-denies; a blanket deny would override the scoped allows (deny wins).
@@ -589,12 +875,25 @@ pub fn build_command(
     let mcp = mcp_config
         .map(|p| format!(" --mcp-config {}", crate::pty::quote_cmdline_arg(p)))
         .unwrap_or_default();
+    let mut choice = String::new();
+    if let Some(m) = flags
+        .model
+        .filter(|m| crate::root_chat_options::valid_model(m))
+    {
+        choice.push_str(&format!(" --model {}", crate::pty::quote_cmdline_arg(m)));
+    }
+    if let Some(e) = flags
+        .effort
+        .filter(|e| crate::root_chat_options::valid_effort(e))
+    {
+        choice.push_str(&format!(" --effort {e}"));
+    }
     format!(
         "claude -p --output-format stream-json --verbose \
          --allowedTools {allow} \
          --disallowedTools {deny} \
          --add-dir {add}{mcp} \
-         --strict-mcp-config \
+         --strict-mcp-config{choice} \
          --append-system-prompt-file {sys} {mode}"
     )
 }
@@ -841,6 +1140,110 @@ mod tests {
         // The writable root rides --add-dir so file tools may leave the cwd.
         assert!(cmd.contains("--add-dir"));
         assert!(cmd.contains(d.root.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn charter_states_exactly_what_the_chat_can_run() {
+        let c = build_charter("/w", &[], &tdirs(), "", true);
+        assert!(
+            c.contains(TOOL_POLICY),
+            "the tool policy must be in every Claude charter"
+        );
+        // The measured failures: a shell the model believed it had.
+        for must in [
+            "NO general shell",
+            "PowerShell",
+            "pwsh -File",
+            "$VAR",
+            "Glob",
+            "NEWEST FIRST",
+        ] {
+            assert!(TOOL_POLICY.contains(must), "policy must mention {must}");
+        }
+        // And it must agree with the allow list: everything it names as runnable is allowed,
+        // and Bash is allowed ONLY as `gh`.
+        let cmd = build_command("x", false, "c", &tdirs(), None, &[]);
+        for tool in [
+            "Read",
+            "Glob",
+            "Grep",
+            "WebSearch",
+            "WebFetch",
+            "Bash(gh:*)",
+        ] {
+            assert!(cmd.contains(tool), "{tool} must be allowed: {cmd}");
+        }
+        for not_allowed in ["Bash,", "Bash(*", "PowerShell", "Bash(git", "Bash(pwsh"] {
+            assert!(
+                !cmd.contains(not_allowed),
+                "{not_allowed} must stay unallowed: {cmd}"
+            );
+        }
+        // An Antigravity chat gets neither the Claude tool policy nor the writable dirs.
+        let agy = build_charter_for(true, "/w", &[], &tdirs(), "", false);
+        assert!(!agy.contains(TOOL_POLICY));
+        assert!(!agy.contains("Bash"));
+        assert!(agy.contains("never modify project files"));
+    }
+
+    #[test]
+    fn chat_choices_become_flags_and_user_mcps_are_allowed() {
+        let d = tdirs();
+        let mcps = vec!["github".to_string(), "bad,name".to_string()];
+        let cmd = build_command_with(
+            "x",
+            false,
+            "c",
+            &d,
+            Some("/cfg.json"),
+            &[],
+            &TurnFlags {
+                model: Some("opus"),
+                effort: Some("max"),
+                user_mcps: &mcps,
+            },
+        );
+        assert!(cmd.contains(" --model opus"), "{cmd}");
+        assert!(cmd.contains(" --effort max"), "{cmd}");
+        assert!(cmd.contains(",mcp__github"), "{cmd}");
+        assert!(
+            !cmd.contains("bad,name"),
+            "an unusable name never reaches the allow list"
+        );
+        assert!(cmd.contains(crate::root_mcp::TOOL_NAMESPACE));
+        assert!(cmd.contains("--strict-mcp-config"));
+        // Garbage never reaches the command line.
+        let bad = build_command_with(
+            "x",
+            false,
+            "c",
+            &d,
+            None,
+            &[],
+            &TurnFlags {
+                model: Some("a\" && calc"),
+                effort: Some("turbo"),
+                user_mcps: &mcps,
+            },
+        );
+        assert!(
+            !bad.contains("--model") && !bad.contains("--effort"),
+            "{bad}"
+        );
+        assert!(!bad.contains("mcp__"), "no config, nothing to allow: {bad}");
+        // No choices: exactly the old command.
+        assert_eq!(
+            build_command("x", false, "c", &d, None, &[]),
+            build_command_with("x", false, "c", &d, None, &[], &TurnFlags::default())
+        );
+        assert!(!build_command("x", false, "c", &d, None, &[]).contains("--model"));
+    }
+
+    #[test]
+    fn research_brief_asks_for_sources() {
+        for must in ["WebFetch", "cite", "uncertain"] {
+            assert!(RESEARCH_BRIEF.contains(must), "{must}");
+        }
     }
 
     #[test]

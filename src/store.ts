@@ -69,6 +69,7 @@ import {
 import { formatWithFallback } from "./format/fallback";
 import {
   launchResumeTargets,
+  legacyPinsToMigrate,
   parseLifecycle,
   type SessionLifecyclePrefs,
 } from "./sessionLifecycle";
@@ -120,6 +121,9 @@ export interface Session {
   agentState?: string | null;
   /** MCP registry names this session may load; absent/null = inherit everything. */
   mcpServers?: string[] | null;
+  /** Pinned "keep running": the idle auto-stop skips it. Persisted in the Rust store
+   *  (absent = false) so a paired phone reads and sets the same pin. */
+  keepRunning?: boolean;
 }
 
 /** A registered agent account (mirrors the Rust serde struct, camelCase). */
@@ -647,6 +651,9 @@ function writePlanConnected(v: Record<string, boolean>): void {
   }
 }
 
+// LEGACY: "keep running" pins used to live here, per machine. They are now
+// `Session.keepRunning` in the Rust store (a paired phone reads and sets it). `load` copies
+// any pins left here into the store ONCE, then removes this key; nothing writes it any more.
 const KEEP_RUNNING_KEY = "conduit.keepRunning";
 function readKeepRunning(): Record<string, true> {
   try {
@@ -658,11 +665,11 @@ function readKeepRunning(): Record<string, true> {
     return {};
   }
 }
-function writeKeepRunning(v: Record<string, true>): void {
+function clearLegacyKeepRunning(): void {
   try {
-    localStorage.setItem(KEEP_RUNNING_KEY, JSON.stringify(v));
+    localStorage.removeItem(KEEP_RUNNING_KEY);
   } catch {
-    /* quota — non-fatal */
+    /* non-fatal */
   }
 }
 
@@ -1476,9 +1483,9 @@ interface AppState {
   /** Session ids that existed at launch. Anything else was created this run. */
   launchSessionIds: Record<string, true>;
   unparkSession: (sessionId: string) => void;
-  /** Persisted per machine. Sessions the user pinned "keep running": exempt from the idle
-   *  auto-stop, for work the process tree cannot reveal (an agent waiting on a remote job). */
-  keepRunning: Record<string, true>;
+  /** Flip a session's "keep running" pin (`Session.keepRunning`, persisted in the Rust
+   *  store): exempt from the idle auto-stop, for work the process tree cannot reveal (an
+   *  agent waiting on a remote job). */
   toggleKeepRunning: (sessionId: string) => void;
   /** Persisted. When true (default), Claude sessions announce Conduit as their IDE:
    *  diff review lands in a Monaco overlay, editor selections reach the session. */
@@ -2054,7 +2061,6 @@ export const useStore = create<AppState>((set, get) => {
     parkedSessions: {},
     launchResume: {},
     launchSessionIds: {},
-    keepRunning: readKeepRunning(),
     announceAsIde: readAnnounceAsIde(),
     pendingDiffs: [],
     openBehavior: readOpenBehavior(),
@@ -2218,6 +2224,31 @@ export const useStore = create<AppState>((set, get) => {
         windowProfile: wp,
       });
       void get().loadRootChats();
+      // One-time move of this machine's legacy "keep running" pins into the store. Main
+      // window only (one writer). The localStorage key is removed once every copy landed;
+      // a failure keeps it, and the next launch tries again.
+      if (wp.isMain) {
+        const legacy = readKeepRunning();
+        if (Object.keys(legacy).length) {
+          const ids = legacyPinsToMigrate(legacy, projects.flatMap((p) => p.sessions));
+          void Promise.all(
+            ids.map((sessionId) => invoke("set_session_keep_running", { sessionId, keep: true })),
+          )
+            .then(() => {
+              const moved = new Set(ids);
+              set((s) => ({
+                projects: s.projects.map((p) => ({
+                  ...p,
+                  sessions: p.sessions.map((x) =>
+                    moved.has(x.id) ? { ...x, keepRunning: true } : x,
+                  ),
+                })),
+              }));
+              clearLegacyKeepRunning();
+            })
+            .catch(() => {});
+        }
+      }
     },
 
     mergeSyncedSlices: async () => {
@@ -3894,11 +3925,16 @@ export const useStore = create<AppState>((set, get) => {
     },
 
     toggleKeepRunning: (sessionId) => {
-      const keepRunning = { ...get().keepRunning };
-      if (keepRunning[sessionId]) delete keepRunning[sessionId];
-      else keepRunning[sessionId] = true;
-      writeKeepRunning(keepRunning);
-      set({ keepRunning });
+      const cur = get().projects.flatMap((p) => p.sessions).find((x) => x.id === sessionId);
+      if (!cur) return;
+      const keep = !cur.keepRunning;
+      set((s) => ({
+        projects: s.projects.map((p) => ({
+          ...p,
+          sessions: p.sessions.map((x) => (x.id === sessionId ? { ...x, keepRunning: keep } : x)),
+        })),
+      }));
+      void invoke("set_session_keep_running", { sessionId, keep }).catch(() => {});
     },
 
     unparkSession: (sessionId) => {

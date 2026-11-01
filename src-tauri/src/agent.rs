@@ -929,21 +929,63 @@ impl ProviderAdapter for AntigravityAdapter {
     // `agy` and running `agy plugin import gemini` to actually inspect that directory is
     // the tracked, non-blocking follow-up spike; only promote this adapter to Tier 2/1 once
     // that's been done for real, per the branch it lands on.
+    // `agy --help` lists `--model <id>` and `--effort low|medium|high|xhigh|max`; the phone's
+    // session options pin them, and they apply at the next start (agy has no in-session
+    // model command Conduit can drive).
+    fn supports_model_flags(&self) -> bool {
+        true
+    }
     fn build_invocation(
+        &self,
+        session_id: &str,
+        projects_dir: Option<&Path>,
+        flags: &str,
+        prompt_arg: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> String {
+        self.build_invocation_with_retry_flags(
+            session_id,
+            projects_dir,
+            flags,
+            flags,
+            prompt_arg,
+            resume_token,
+        )
+    }
+    fn build_invocation_with_retry_flags(
         &self,
         _session_id: &str,
         _projects_dir: Option<&Path>,
-        _flags: &str,
-        _prompt_arg: Option<&str>,
+        flags: &str,
+        retry_flags: &str,
+        prompt_arg: Option<&str>,
         resume_token: Option<&str>,
     ) -> String {
+        // The first message rides `--prompt-interactive` ("run an initial prompt interactively
+        // and continue the session"); without it a phone's first message never reached agy.
+        // `prompt_arg` is already one ready-to-splice shell word. Every leg carries it: a leg
+        // that failed to start never ran it.
+        let p = prompt_arg
+            .map(|q| format!(" --prompt-interactive {q}"))
+            .unwrap_or_default();
+        let (flags, retry_flags) = (format!("{flags}{p}"), format!("{retry_flags}{p}"));
         // agy can't pin our id, so we resume by the conversation id we captured after the first
         // launch (the newest `conversations/<uuid>.db`). `--conversation=<id>` reopens that exact
         // conversation; `|| agy` falls back to a fresh session if the id is stale/gone. We avoid
         // `--continue` (it's global and cross-contaminates concurrent agy sessions).
+        // A pinned model/effort agy rejects makes it exit non-zero: the middle leg retries the
+        // SAME conversation without the pins before giving up on it -- otherwise a bad pin
+        // would silently cost the conversation, not just the pin.
         match resume_token {
-            Some(id) => format!("agy --conversation={} || agy", crate::pty::quote_arg(id)),
-            None => "agy || agy".to_string(),
+            Some(id) => {
+                let conv = format!("agy --conversation={}", crate::pty::quote_arg(id));
+                if flags == retry_flags {
+                    format!("{conv}{flags} || agy{retry_flags}")
+                } else {
+                    format!("{conv}{flags} || {conv}{retry_flags} || agy{retry_flags}")
+                }
+            }
+            None => format!("agy{flags} || agy{retry_flags}"),
         }
     }
     fn account_env(&self, config_dir: &str) -> Vec<(String, String)> {
@@ -2381,6 +2423,54 @@ mod tests {
         );
         assert!(cmd.ends_with("|| agy"), "{cmd}");
         assert!(!cmd.contains("--continue"), "{cmd}");
+    }
+
+    #[test]
+    fn antigravity_runs_the_first_message_on_every_leg() {
+        let q = "\"%CONDUIT_INITIAL_PROMPT%\"";
+        let cmd = AntigravityAdapter.build_invocation_with_retry_flags(
+            "sid",
+            None,
+            " --model m",
+            "",
+            Some(q),
+            None,
+        );
+        assert_eq!(
+            cmd,
+            format!("agy --model m --prompt-interactive {q} || agy --prompt-interactive {q}")
+        );
+        // No first message: no flag.
+        assert!(!AntigravityAdapter
+            .build_invocation("sid", None, "", None, None)
+            .contains("--prompt-interactive"));
+    }
+
+    #[test]
+    fn antigravity_pins_model_and_effort_and_a_rejected_pin_keeps_the_conversation() {
+        assert!(AntigravityAdapter.supports_model_flags());
+        let pins = " --model gemini-3.8-flash-high --effort high";
+        let fresh =
+            AntigravityAdapter.build_invocation_with_retry_flags("sid", None, pins, "", None, None);
+        assert_eq!(fresh, format!("agy{pins} || agy"));
+        let id = "d1d8a55b-cc27-4dd4-bc62-2f73015960d2";
+        let cmd = AntigravityAdapter.build_invocation_with_retry_flags(
+            "sid",
+            None,
+            pins,
+            "",
+            None,
+            Some(id),
+        );
+        let legs: Vec<&str> = cmd.split(" || ").collect();
+        assert_eq!(legs.len(), 3, "{cmd}");
+        // First the pinned launch, then the SAME conversation without pins, then fresh.
+        assert!(legs[0].contains(id) && legs[0].ends_with(pins), "{cmd}");
+        assert!(
+            legs[1].contains(id) && !legs[1].contains("--model"),
+            "{cmd}"
+        );
+        assert_eq!(legs[2], "agy");
     }
 
     #[test]

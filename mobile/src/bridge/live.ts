@@ -182,6 +182,10 @@ function sessionOf(v: unknown): WireViewSession | null {
     needs: silo && needs ? { kind: "input", text: null } : needs,
     // The Mac sends null for a silo session; never show one regardless.
     lastMessage: silo ? null : lastMessageOf(s.lastMessage),
+    // session controls (2026-11-01); an older desktop omits them
+    effort: str(s.effort),
+    keepRunning: s.keepRunning === true,
+    usageKey: str(s.usageKey),
   };
 }
 

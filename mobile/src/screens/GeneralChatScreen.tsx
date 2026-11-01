@@ -1,16 +1,18 @@
 /**
  * One general chat (the computer's root chat): the same feed rendering as a session chat, a
  * composer, Stop while a turn runs, and a scope chip naming which projects it may see.
- * Proposed work is approved on the computer, so this screen never shows approval cards.
+ * Proposed work is approved on the computer, so this screen never shows approval cards. The
+ * header names the chat's agent + model and opens its settings; `/` in the composer offers the
+ * computer's skills.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, Keyboard, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
-import { Composer } from "../components/Composer";
+import { Composer, type ComposerSuggestion } from "../components/Composer";
 import { GlassCircle, GlassSurface, Icon, MaterialBar } from "../components/Glass";
 import { groupFeed } from "../logic/feed";
-import { EMPTY_CHAT_INFO, EMPTY_FEED, scopeSummary } from "../logic/general";
+import { chatBadge, emptyChatInfo, EMPTY_FEED, insertSkill, scopeSummary, skillSuggestions } from "../logic/general";
 import { layoutThread, type ThreadRow } from "../logic/thread";
 import type { GeneralChatProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
@@ -24,7 +26,7 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
   const { chatId } = route.params;
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
-  const { view, conn, rootChats, rootFeeds, openRootChat, closeRootChat, sendRootChat, stopRootChat } = useLive();
+  const { view, conn, rootChats, rootFeeds, openRootChat, closeRootChat, sendRootChat, stopRootChat, rootChatOptions, loadRootChatOptions } = useLive();
   const list = useRef<FlatList<ThreadRow>>(null);
 
   useEffect(() => {
@@ -33,10 +35,26 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
   }, [chatId, openRootChat, closeRootChat]);
 
   const chat = rootChats?.find((c) => c.id === chatId) ?? null;
-  const title = chat?.title ?? route.params.title ?? "General chat";
+  const title = chat?.title ?? route.params.title ?? "Chat";
   const state = rootFeeds[chatId] ?? EMPTY_FEED;
   const running = state.running;
   const scope = chat ? scopeSummary(chat.scope, view) : null;
+  const badge = chat ? chatBadge(chat, rootChatOptions) : null;
+
+  // Skills for `/` in the composer, and agent/model names for the header.
+  // Asked once per chat open / reconnect until a live answer arrives (an older desktop never
+  // answers, and then the header simply names the agent).
+  const connected = conn.phase === "ready";
+  const optionsLive = rootChatOptions?.live === true;
+  useEffect(() => {
+    if (connected && !optionsLive) void loadRootChatOptions();
+  }, [connected, optionsLive, chatId, loadRootChatOptions]);
+  const skills = rootChatOptions?.skills;
+  const suggest = useCallback(
+    (draft: string): ComposerSuggestion[] =>
+      skills ? skillSuggestions(draft, skills).map((k) => ({ key: k.name, label: `/${k.name}`, detail: k.description || undefined, insert: insertSkill(k.name) })) : [],
+    [skills],
+  );
 
   const thread = useMemo(() => layoutThread(groupFeed(state.feed), Date.now()), [state.feed]);
   const data = useMemo(() => [...thread].reverse(), [thread]);
@@ -87,7 +105,7 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
     : !state.loaded
       ? "Loading…"
       : state.feed.length === 0 && !running
-        ? EMPTY_CHAT_INFO
+        ? emptyChatInfo(chat?.agent)
         : null;
 
   return (
@@ -140,6 +158,7 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
               attachments={NO_ATTACHMENTS}
               onRemoveAttachment={noop}
               onHeight={setComposerH}
+              suggest={suggest}
             />
           </View>
         </View>
@@ -150,11 +169,16 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
           onLayout={(e) => setHeaderH(e.nativeEvent.layout.height)}
           style={{ paddingTop: insets.top + 4, paddingBottom: 8, paddingHorizontal: 10, flexDirection: "row", alignItems: "center", gap: 10 }}
         >
-          <GlassCircle symbol="chevron.left" label="Back to general chats" onPress={() => navigation.goBack()} size={38} symbolSize={16} />
+          <GlassCircle symbol="chevron.left" label="Back to chats" onPress={() => navigation.goBack()} size={38} symbolSize={16} />
           <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
             <Text style={{ fontWeight: "600", fontSize: TYPE.callout, color: p.textBright }} numberOfLines={1}>
               {title}
             </Text>
+            {badge ? (
+              <Text style={{ fontSize: TYPE.caption, color: p.textMid }} numberOfLines={1} accessibilityLabel={`Runs on ${badge}`}>
+                {badge}
+              </Text>
+            ) : null}
             {scope ? (
               <Pressable
                 onPress={() => navigation.navigate("GeneralScope", { chatId })}
@@ -191,6 +215,14 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
                 </Text>
               </GlassSurface>
             </Pressable>
+          ) : chat ? (
+            <GlassCircle
+              symbol="slider.horizontal.3"
+              label="Chat settings: model, effort, deep research, MCP servers"
+              onPress={() => navigation.navigate("GeneralSettings", { chatId })}
+              size={36}
+              symbolSize={15}
+            />
           ) : null}
         </View>
         <View style={{ height: StyleSheet.hairlineWidth, backgroundColor: p.border }} />

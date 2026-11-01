@@ -7,6 +7,7 @@
 mod agent;
 mod agent_activity;
 mod agent_profile;
+mod agy_prompts;
 mod agy_transcript;
 mod agy_usage;
 mod asks;
@@ -54,12 +55,15 @@ mod openrouter_usage;
 mod orchestration_policy;
 mod pairing;
 mod phone_fs;
+mod phone_usage;
 mod plugins;
 mod port_tunnel;
 mod project_new;
 mod proposals;
 mod pty;
 mod root_chat;
+mod root_chat_agy;
+mod root_chat_options;
 mod root_mcp;
 mod routing;
 mod scrollback;
@@ -67,6 +71,7 @@ mod search;
 #[cfg_attr(windows, allow(dead_code))]
 mod session_budget;
 mod session_files;
+mod session_options;
 mod status_rules;
 mod store;
 mod subagents;
@@ -2176,6 +2181,29 @@ fn switch_session_model(
     store: State<Arc<Store>>,
     pty: State<Arc<PtyManager>>,
 ) -> ModelSwitch {
+    apply_model_switch(
+        &store,
+        &pty,
+        &session_id,
+        &model,
+        provider.as_deref(),
+        effort.as_deref(),
+    )
+}
+
+/// The body of `switch_session_model`, shared with the mobile bridge's `sessionset` so a
+/// phone and the desktop change a model through exactly one path.
+pub(crate) fn apply_model_switch(
+    store: &Store,
+    pty: &PtyManager,
+    session_id: &str,
+    model: &str,
+    provider: Option<&str>,
+    effort: Option<&str>,
+) -> ModelSwitch {
+    let session_id = session_id.to_string();
+    let provider = provider.map(str::to_string);
+    let effort = effort.map(str::to_string);
     let model = model.trim().to_string();
     // Persist first: whatever happens to the live process, the next spawn must agree with
     // what the user just chose.
@@ -2523,6 +2551,13 @@ fn stop_session(
 #[tauri::command]
 fn start_session(session_id: String, store: State<Arc<Store>>) {
     store.set_session_stopped(&session_id, false);
+}
+
+/// Pin or unpin "keep running" (exempt from the idle auto-stop). The store is the truth
+/// so a phone and the desktop agree; see `Session::keep_running`.
+#[tauri::command]
+fn set_session_keep_running(session_id: String, keep: bool, store: State<Arc<Store>>) -> bool {
+    store.set_session_keep_running(&session_id, keep)
 }
 
 /// Stop every idle session in one project. Returns the ids actually stopped, so the UI can
@@ -3404,6 +3439,8 @@ pub fn run() {
                 .clone();
             let asks_state = app.state::<Arc<asks::Asks>>().inner().clone();
             let ask_gate = app.state::<Arc<asks::AskGate>>().inner().clone();
+            // agy prompts as permission cards (agy fires no permission hook).
+            agy_prompts::start(app.handle().clone());
             hooks::start(
                 app.handle().clone(),
                 hook_state,
@@ -3588,6 +3625,7 @@ pub fn run() {
             pty_kill,
             stop_session,
             start_session,
+            set_session_keep_running,
             stop_idle_sessions,
             ide_diff_verdict,
             ide_editor_context,

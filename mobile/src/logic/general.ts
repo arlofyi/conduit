@@ -1,5 +1,5 @@
 /**
- * The General tab: the computer's root chat (HQ), a non-coding chat that looks across the
+ * The Chats tab (route `General`): the computer's root chat (HQ), a non-coding chat that looks across the
  * user's projects. Pure rules for the list, the scope picker and each chat's feed, so the
  * screens only draw what these return.
  *
@@ -8,7 +8,7 @@
  * made before scopes existed).
  */
 import { appendWire, mapHistory } from "../bridge/live";
-import type { WireChatItem, WireProjectsView, WireRootChat, WireRootChatEvent, WireScope } from "../bridge/protocol";
+import type { WireChatItem, WireProjectsView, WireRootChat, WireRootChatEvent, WireRootChatSettings, WireScope } from "../bridge/protocol";
 import type { ChatItem } from "../data/types";
 import { ALL_PROFILES, type ProfileSel } from "./chatList";
 import { capFeed, genId } from "./feed";
@@ -18,6 +18,13 @@ export type RootChat = WireRootChat;
 
 export const SCOPE_EXPLAINER = "The chat can only see and read the projects you pick here.";
 export const EMPTY_CHAT_INFO = "Ask anything across your projects. Proposed work still needs your approval on your computer.";
+/** Antigravity chats have no Conduit tools: nothing to propose, so nothing to approve. */
+export const EMPTY_CHAT_INFO_AGY = "Ask anything across your projects. This chat can read them, but it can't start work on your computer.";
+
+/** The empty-chat note for a chat's agent. */
+export function emptyChatInfo(agent: string | undefined): string {
+  return agent === "antigravity" ? EMPTY_CHAT_INFO_AGY : EMPTY_CHAT_INFO;
+}
 
 // ---- default scope + listing ----
 
@@ -229,5 +236,202 @@ export function chatOf(v: unknown): RootChat | null {
     scope: scope && typeof scope === "object" ? editableScope(scope) : null,
     createdAt: typeof c.createdAt === "number" ? c.createdAt : 0,
     running: c.running === true,
+    agent: typeof c.agent === "string" && c.agent ? c.agent : "claude",
+    model: typeof c.model === "string" && c.model ? c.model : null,
+    effort: typeof c.effort === "string" && c.effort ? c.effort : null,
+    research: c.research === true,
+    mcps: Array.isArray(c.mcps) ? unique(c.mcps.filter((m): m is string => typeof m === "string")) : [],
   };
+}
+
+// ---- chat options: agent, model, effort, deep research, MCP servers ----
+
+export interface AgentOption {
+  id: string;
+  label: string;
+  models: { id: string; label: string }[];
+  efforts: string[];
+}
+
+export interface RootChatOptions {
+  agents: AgentOption[];
+  skills: { name: string; description: string }[];
+  mcps: { name: string }[];
+  /** false: the computer did not answer `rootchatoptions` (an older desktop); Claude only */
+  live: boolean;
+}
+
+/** What an older desktop (no `rootchatoptions`) can run: Claude, on its defaults. */
+export const FALLBACK_OPTIONS: RootChatOptions = {
+  agents: [{ id: "claude", label: "Claude", models: [], efforts: [] }],
+  skills: [],
+  mcps: [],
+  live: false,
+};
+
+export const MCP_EXPLAINER =
+  "MCP servers give the chat their tools (a GitHub server lets it read issues, for example). Only the ones you tick are loaded.";
+export const RESEARCH_EXPLAINER = "Thinks longer, searches widely, reads its sources and cites them. Slower.";
+
+function str(v: unknown): string | null {
+  return typeof v === "string" && v.trim() ? v : null;
+}
+
+/** Defensive read of a `rootChatOptions` frame; null when it names no usable agent. */
+export function optionsOf(v: unknown): RootChatOptions | null {
+  const o = v as Record<string, unknown> | null;
+  if (!o || !Array.isArray(o.agents)) return null;
+  const agents: AgentOption[] = [];
+  for (const a of o.agents as Record<string, unknown>[]) {
+    const id = str(a?.id);
+    if (!id || agents.some((x) => x.id === id)) continue;
+    const models = Array.isArray(a.models)
+      ? (a.models as Record<string, unknown>[]).flatMap((m) => {
+          const mid = str(m?.id);
+          return mid ? [{ id: mid, label: str(m.label) ?? mid }] : [];
+        })
+      : [];
+    const efforts = Array.isArray(a.efforts) ? unique((a.efforts as unknown[]).filter((e): e is string => str(e) !== null)) : [];
+    agents.push({ id, label: str(a.label) ?? id, models, efforts });
+  }
+  if (agents.length === 0) return null;
+  const skills = Array.isArray(o.skills)
+    ? (o.skills as Record<string, unknown>[]).flatMap((k) => {
+        const name = str(k?.name)?.replace(/^\//, "");
+        return name ? [{ name, description: str(k.description) ?? "" }] : [];
+      })
+    : [];
+  const mcps = Array.isArray(o.mcps)
+    ? unique((o.mcps as Record<string, unknown>[]).map((m) => str(m?.name)).filter((n): n is string => n !== null)).map((name) => ({ name }))
+    : [];
+  return { agents, skills, mcps, live: true };
+}
+
+/** A chat's options as the forms edit them. null model/effort = the agent's default. */
+export interface ChatSettings {
+  agent: string;
+  model: string | null;
+  effort: string | null;
+  research: boolean;
+  mcps: string[];
+}
+
+export function agentOption(opts: RootChatOptions, agent: string): AgentOption | null {
+  return opts.agents.find((a) => a.id === agent) ?? null;
+}
+
+/** A new chat's options: Claude when offered (else the first agent), on its defaults. */
+export function defaultSettings(opts: RootChatOptions): ChatSettings {
+  const agent = agentOption(opts, "claude")?.id ?? opts.agents[0]?.id ?? "claude";
+  return { agent, model: null, effort: null, research: false, mcps: [] };
+}
+
+/** The options a chat has now. */
+export function settingsOf(chat: RootChat): ChatSettings {
+  return {
+    agent: chat.agent ?? "claude",
+    model: chat.model ?? null,
+    effort: chat.effort ?? null,
+    research: chat.research === true,
+    mcps: unique(chat.mcps ?? []),
+  };
+}
+
+/** Another agent: a model or effort the new agent does not offer goes back to its default. */
+export function pickAgent(s: ChatSettings, opts: RootChatOptions, agent: string): ChatSettings {
+  const a = agentOption(opts, agent);
+  return {
+    ...s,
+    agent,
+    model: a && s.model !== null && a.models.some((m) => m.id === s.model) ? s.model : null,
+    effort: a && s.effort !== null && a.efforts.includes(s.effort) ? s.effort : null,
+  };
+}
+
+export function toggleMcp(s: ChatSettings, name: string): ChatSettings {
+  return { ...s, mcps: s.mcps.includes(name) ? s.mcps.filter((m) => m !== name) : [...s.mcps, name] };
+}
+
+/** The `rootchatcreate` options: the agent, plus only what differs from the computer's defaults. */
+export function createSettings(s: ChatSettings): WireRootChatSettings {
+  return {
+    agent: s.agent,
+    ...(s.model ? { model: s.model } : {}),
+    ...(s.effort ? { effort: s.effort } : {}),
+    ...(s.research ? { research: true } : {}),
+    ...(s.mcps.length ? { mcps: unique(s.mcps) } : {}),
+  };
+}
+
+/** The `rootchatsettings` patch: only the fields that changed ("" = back to the default), or
+ * null when nothing did. The agent is fixed per chat and never sent. */
+export function settingsPatch(before: ChatSettings, after: ChatSettings): Omit<WireRootChatSettings, "agent"> | null {
+  const patch: Omit<WireRootChatSettings, "agent"> = {};
+  if (before.model !== after.model) patch.model = after.model ?? "";
+  if (before.effort !== after.effort) patch.effort = after.effort ?? "";
+  if (before.research !== after.research) patch.research = after.research;
+  const set = (xs: string[]) => [...new Set(xs)].sort().join("\u0000");
+  if (set(before.mcps) !== set(after.mcps)) patch.mcps = unique(after.mcps);
+  return Object.keys(patch).length ? patch : null;
+}
+
+export function agentLabel(opts: RootChatOptions | null, agent: string): string {
+  const known = opts ? agentOption(opts, agent)?.label : null;
+  if (known) return known;
+  return agent === "antigravity" ? "Antigravity" : agent === "claude" ? "Claude" : agent;
+}
+
+export function modelName(opts: RootChatOptions | null, agent: string, model: string | null): string {
+  if (!model) return "Default model";
+  return (opts ? agentOption(opts, agent)?.models.find((m) => m.id === model)?.label : null) ?? model;
+}
+
+/** The line under a chat's title: "Claude · Opus 4.6 · high effort · Deep research". */
+export function chatBadge(chat: RootChat, opts: RootChatOptions | null): string {
+  const s = settingsOf(chat);
+  const parts = [agentLabel(opts, s.agent)];
+  if (s.model) parts.push(modelName(opts, s.agent, s.model));
+  if (s.effort) parts.push(`${s.effort} effort`);
+  if (s.research) parts.push("Deep research");
+  return parts.join(" · ");
+}
+
+// ---- new chat: profile + scope ----
+
+export type ScopeMode = "profile" | "all" | "custom";
+
+/** The scope a new chat gets for `mode`: everything in its profile, everything, or the picked set. */
+export function newChatScope(mode: ScopeMode, profileId: string | null, custom: Scope): Scope {
+  if (mode === "all") return { allProfiles: true, profiles: [], projects: [] };
+  if (mode === "profile") return { allProfiles: false, profiles: [profileId], projects: [] };
+  return custom;
+}
+
+/** The profiles a new chat can be listed under: the computer's, Default first if missing. */
+export function profileChoices(view: WireProjectsView | null): { id: string | null; name: string }[] {
+  const list = (view?.profiles ?? []).map((p) => ({ id: p.id, name: p.name }));
+  if (!list.some((p) => p.id === null)) list.unshift({ id: null, name: "Default" });
+  return list;
+}
+
+// ---- skills in the composer ----
+
+const MAX_SUGGESTIONS = 8;
+
+/** Skills offered while the message is a bare `/word` at its very start; [] otherwise. */
+export function skillSuggestions(
+  draft: string,
+  skills: readonly { name: string; description: string }[],
+): { name: string; description: string }[] {
+  const m = /^\/([^\s/]*)$/.exec(draft);
+  if (!m) return [];
+  const q = m[1].toLowerCase();
+  const starts = skills.filter((k) => k.name.toLowerCase().startsWith(q));
+  const contains = q ? skills.filter((k) => !k.name.toLowerCase().startsWith(q) && k.name.toLowerCase().includes(q)) : [];
+  return [...starts, ...contains].slice(0, MAX_SUGGESTIONS);
+}
+
+/** What tapping a skill leaves in the composer. */
+export function insertSkill(name: string): string {
+  return `/${name.replace(/^\//, "")} `;
 }

@@ -600,6 +600,28 @@ enum AskDecision {
     },
 }
 
+/// The `/permission` gate for a card Conduit raises itself rather than for a hook post (agy's
+/// prompts, `agy_prompts.rs`): `Some(held_for_phone)` when someone could show it, else None.
+/// Same rule as a hook: the desktop gate, or a connected remote phone for a non-private session.
+pub(crate) fn card_holder(app: &AppHandle, session: &str) -> Option<bool> {
+    let gate = app.try_state::<Arc<crate::asks::AskGate>>()?;
+    let store = app.try_state::<Arc<crate::store::Store>>()?;
+    let bridge = app.try_state::<Arc<crate::bridge::BridgeController>>();
+    let holders = Holders {
+        desktop: gate.is_open(),
+        phone: bridge.as_ref().is_some_and(|b| b.has_remote_phone()),
+    };
+    let list = store.list();
+    holder_for(
+        holders,
+        false,
+        Some(session),
+        |id| store.has_session(id),
+        |id| crate::bridge_view::session_is_private(&list, id),
+    )
+    .map(|(_, held_for_phone)| held_for_phone)
+}
+
 /// Who could show a card right now: the desktop gate (`set_ask_gate`) and whether an
 /// authenticated remote phone is connected (`BridgeController::has_remote_phone`).
 #[derive(Clone, Copy, Debug, PartialEq)]

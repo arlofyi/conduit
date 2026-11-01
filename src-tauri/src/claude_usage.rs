@@ -230,7 +230,7 @@ struct CachedPlan {
 /// How long a cached read may stand in for a live one. Both Claude windows are measured in
 /// hours, so a reading up to an hour old is still roughly true; past that, admitting we do
 /// not know beats showing a number the user might act on.
-const PLAN_STALE_MAX_SECS: u64 = 60 * 60;
+pub(crate) const PLAN_STALE_MAX_SECS: u64 = 60 * 60;
 
 /// How long a successful read may be served DIRECTLY, skipping a new network fetch
 /// entirely -- not merely as a failure fallback. Multi-window profiles means several
@@ -251,7 +251,7 @@ fn now_secs() -> u64 {
 }
 
 /// The map key for an account (the env default has no id).
-fn account_key(account_id: Option<&str>) -> String {
+pub(crate) fn account_key(account_id: Option<&str>) -> String {
     account_id
         .map(String::from)
         .unwrap_or_else(|| "default".into())
@@ -296,6 +296,17 @@ impl ClaudeAuth {
             .get(key)
             .filter(|c| now.saturating_sub(c.fetched_at) <= PLAN_STALE_MAX_SECS)
             .cloned()
+    }
+
+    /// The last good read for this account and when it was taken (unix seconds), whatever
+    /// its age -- for the phone's `usage` reply, which decides staleness itself and must
+    /// never trigger a fetch of its own (the endpoint rate-limits).
+    pub fn cached_plan(&self, key: &str) -> Option<(Vec<PlanWindow>, u64)> {
+        self.last_plan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|c| (c.windows.clone(), c.fetched_at))
     }
 
     /// The last good read for this account, if it's fresh enough to serve WITHOUT

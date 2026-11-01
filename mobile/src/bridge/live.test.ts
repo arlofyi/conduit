@@ -114,6 +114,9 @@ describe("mapProjectsView", () => {
     updatedAt: 1700000000000,
     needs: { kind: "ask", text: "Ship it?" },
     lastMessage: { role: "assistant", text: "Done: tests pass.", at: "2026-10-29T20:11:42.123Z" },
+    effort: "high",
+    keepRunning: true,
+    usageKey: "claude:default",
   };
   const frame = {
     type: "projects",
@@ -174,6 +177,10 @@ describe("mapProjectsView", () => {
         updatedAt: null,
         needs: null,
         lastMessage: null,
+        // an older desktop sends no session-control fields
+        effort: null,
+        keepRunning: false,
+        usageKey: null,
       },
     ]);
   });

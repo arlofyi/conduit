@@ -7,7 +7,7 @@
 import { useFocusEffect } from "@react-navigation/native";
 import * as Sharing from "expo-sharing";
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Alert, FlatList, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Alert, FlatList, Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
 import type { WireFsEntry } from "../bridge/protocol";
@@ -27,7 +27,9 @@ import {
   SECRET_PROMPT,
   sortEntries,
 } from "../logic/files";
+import { folderLabel } from "../logic/saveFolder";
 import { listTime } from "../logic/time";
+import { rememberedFolder, saveToFolder } from "../data/saveFolder";
 import type { FilesProps, RootStackParamList } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, TYPE } from "../theme/type";
@@ -73,10 +75,15 @@ export function FilesHeader({
 
 export type DownloadProgress = { name: string; received: number; total: number };
 
+/** What happens once a download is on the phone. */
+export type DownloadAction = "save" | "saveElsewhere" | "share";
+
 /**
- * Download a file into the phone's cache and open the share sheet on it ("Save to Files",
- * another app, AirDrop / Nearby Share). A secret asks first. One at a time: the computer runs
- * one download per connection.
+ * Download a file into the phone's cache, then SAVE it into a folder (Android's Storage Access
+ * Framework: the last folder is remembered, "Choose folder" picks another) or SHARE it (the
+ * share sheet: another app, Nearby Share; on iOS also "Save to Files", which is why iOS goes
+ * straight to it -- SAF is Android-only). A secret asks first. One at a time: the computer
+ * runs one download per connection.
  */
 export function useShareDownload(sessionId: string) {
   const { fsDownload } = useLive();
@@ -90,8 +97,37 @@ export function useShareDownload(sessionId: string) {
     [],
   );
 
+  const share = useCallback(async (uri: string, name: string) => {
+    try {
+      if (!(await Sharing.isAvailableAsync())) {
+        Alert.alert("Downloaded", "Sharing isn't available on this phone.");
+        return;
+      }
+      await Sharing.shareAsync(uri, { mimeType: mimeOf(name), dialogTitle: name });
+    } catch (e) {
+      Alert.alert("Couldn't share", e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const save = useCallback(
+    async (uri: string, name: string, elsewhere: boolean) => {
+      const r = await saveToFolder(uri, name, mimeOf(name), elsewhere);
+      if (r.ok) {
+        Alert.alert("Saved", `Saved ${name} to ${r.folder}.`);
+        return;
+      }
+      if (r.cancelled) return;
+      Alert.alert("Couldn't save", r.error, [
+        { text: "Cancel", style: "cancel" },
+        { text: "Share…", onPress: () => void share(uri, name) },
+        { text: "Choose folder", onPress: () => void save(uri, name, true) },
+      ]);
+    },
+    [share],
+  );
+
   const run = useCallback(
-    async (path: string, name: string, size: number | null, confirm: boolean) => {
+    async (path: string, name: string, size: number | null, confirm: boolean, action: DownloadAction) => {
       if (busy.current) return;
       if (size !== null && size > DOWNLOAD_MAX) {
         Alert.alert("Too large", `Files over ${formatSize(DOWNLOAD_MAX)} can't be downloaded to the phone.`);
@@ -112,39 +148,70 @@ export function useShareDownload(sessionId: string) {
         if (r.error === NEEDS_CONFIRM && !confirm) {
           Alert.alert(name, SECRET_PROMPT, [
             { text: "Cancel", style: "cancel" },
-            { text: "Download", onPress: () => void run(path, name, size, true) },
+            { text: "Download", onPress: () => void run(path, name, size, true, action) },
           ]);
           return;
         }
         Alert.alert("Couldn't download", fsErrorText(r.error));
         return;
       }
-      try {
-        if (!(await Sharing.isAvailableAsync())) {
-          Alert.alert("Downloaded", "Sharing isn't available on this phone.");
-          return;
-        }
-        await Sharing.shareAsync(r.uri, { mimeType: mimeOf(r.name || name), dialogTitle: r.name || name });
-      } catch (e) {
-        Alert.alert("Couldn't share", e instanceof Error ? e.message : String(e));
+      const fileName = r.name || name;
+      if (action === "share") await share(r.uri, fileName);
+      else await save(r.uri, fileName, action === "saveElsewhere");
+    },
+    [fsDownload, sessionId, share, save],
+  );
+
+  /** Android: where it goes, asked BEFORE the download so the wait ends in the folder. */
+  const choose = useCallback(
+    async (go: (action: DownloadAction) => void, name: string) => {
+      if (Platform.OS !== "android") {
+        go("share");
+        return;
+      }
+      const last = await rememberedFolder();
+      if (last) {
+        Alert.alert(
+          name,
+          `Save to ${folderLabel(last)}?`,
+          [
+            { text: "Share…", onPress: () => go("share") },
+            { text: "Choose folder", onPress: () => go("saveElsewhere") },
+            { text: "Save", onPress: () => go("save") },
+          ],
+          { cancelable: true },
+        );
+      } else {
+        Alert.alert(
+          name,
+          "Save it into a folder on this phone, or share it to an app.",
+          [
+            { text: "Cancel", style: "cancel" },
+            { text: "Share…", onPress: () => go("share") },
+            { text: "Save to folder", onPress: () => go("save") },
+          ],
+          { cancelable: true },
+        );
       }
     },
-    [fsDownload, sessionId],
+    [],
   );
 
   const start = useCallback(
     (path: string, name: string, opts: { size?: number | null; sensitive?: boolean; confirmed?: boolean } = {}) => {
+      if (busy.current) return;
       const size = opts.size ?? null;
+      const pick = (confirm: boolean) => void choose((action) => void run(path, name, size, confirm, action), name);
       if (opts.sensitive && !opts.confirmed) {
         Alert.alert(name, SECRET_PROMPT, [
           { text: "Cancel", style: "cancel" },
-          { text: "Download", onPress: () => void run(path, name, size, true) },
+          { text: "Download", onPress: () => pick(true) },
         ]);
         return;
       }
-      void run(path, name, size, !!opts.confirmed);
+      pick(!!opts.confirmed);
     },
-    [run],
+    [run, choose],
   );
 
   const cancel = useCallback(() => {
@@ -278,7 +345,7 @@ export function FilesScreen({ navigation, route }: FilesProps) {
       { text: "Cancel", style: "cancel" },
       { text: "Open", onPress: () => open(e) },
       {
-        text: "Download to phone",
+        text: "Save to phone",
         onPress: () => download.start(joinPath(path, e.name), e.name, { size: e.size, sensitive: e.sensitive }),
       },
     ]);

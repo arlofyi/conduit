@@ -1,17 +1,17 @@
 /**
- * The General tab: the computer's root chats (HQ), listed under the profile the Chats tab has
- * selected (every chat under "All profiles"), newest first. "+" starts one that sees the
- * selected profile's projects, or everything under "All profiles".
+ * The Chats tab (route `General`): the computer's root chats (HQ), listed under the profile the
+ * Sessions tab has selected (every chat under "All profiles"), newest first. "+" opens the
+ * new-chat sheet (GeneralOptions.tsx): profile, scope, agent, model, effort, research, MCP.
  */
 import { useFocusEffect } from "@react-navigation/native";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { Alert, FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
+import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
 import { GlassCircle, Icon } from "../components/Glass";
 import { useListSelection } from "../data/ListSelection";
 import { ALL_PROFILES, profileName, relativeTime, resolveProfile } from "../logic/chatList";
-import { chatsForProfile, createProfileId, defaultScope, scopeSummary, type RootChat } from "../logic/general";
+import { agentLabel, chatsForProfile, scopeSummary, type RootChat } from "../logic/general";
 import type { GeneralProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, TYPE } from "../theme/type";
@@ -21,7 +21,7 @@ const CLOCK_MS = 30_000;
 export function GeneralScreen({ navigation }: GeneralProps) {
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
-  const { view, conn, rootChats, refreshRootChats, createRootChat } = useLive();
+  const { view, conn, rootChats, refreshRootChats, rootChatOptions } = useLive();
   const { profileSel } = useListSelection();
   const ready = conn.phase === "ready";
 
@@ -52,22 +52,12 @@ export function GeneralScreen({ navigation }: GeneralProps) {
     return () => clearTimeout(t);
   }, [refreshing]);
 
-  const [creating, setCreating] = useState(false);
-  const create = async () => {
-    if (creating) return;
-    setCreating(true);
-    const r = await createRootChat(createProfileId(sel, view), defaultScope(sel));
-    setCreating(false);
-    if (r.ok) navigation.navigate("GeneralChat", { chatId: r.chat.id, title: r.chat.title });
-    else Alert.alert("Couldn't start a chat", r.error);
-  };
-
   const where = view ? (sel === ALL_PROFILES ? "All profiles" : `${profileName(view, sel)} profile`) : null;
   const empty = !ready
     ? "Not connected to your computer."
     : rootChats === null
       ? "Loading…"
-      : "No general chats here yet. Tap + to ask something across your projects.";
+      : "No chats here yet. Tap + to ask something across your projects.";
 
   return (
     <View style={{ flex: 1, backgroundColor: p.panelBg }}>
@@ -75,7 +65,7 @@ export function GeneralScreen({ navigation }: GeneralProps) {
         <GlassCircle symbol="ellipsis" label="Profile and computer" onPress={() => navigation.navigate("ChatsMenu")} />
         <View style={{ flex: 1, alignItems: "center" }}>
           <Text accessibilityRole="header" style={{ fontSize: TYPE.headline, fontWeight: "600", color: p.textBright }}>
-            General
+            Chats
           </Text>
           {where ? (
             <Text style={{ fontSize: TYPE.caption, color: p.textMid }} numberOfLines={1}>
@@ -83,7 +73,7 @@ export function GeneralScreen({ navigation }: GeneralProps) {
             </Text>
           ) : null}
         </View>
-        <GlassCircle symbol="plus" primary label="New general chat" disabled={!ready || creating} onPress={create} />
+        <GlassCircle symbol="plus" primary label="New chat" disabled={!ready} onPress={() => navigation.navigate("GeneralNew")} />
       </View>
       <FlatList
         data={rows}
@@ -92,7 +82,8 @@ export function GeneralScreen({ navigation }: GeneralProps) {
           <ChatRow
             chat={item}
             first={index === 0}
-            scope={scopeSummary(item.scope, view)}
+            // a non-Claude chat says which agent answers it
+            scope={item.agent && item.agent !== "claude" ? `${scopeSummary(item.scope, view)} · ${agentLabel(rootChatOptions, item.agent)}` : scopeSummary(item.scope, view)}
             time={relativeTime(item.createdAt * 1000, now)}
             onOpen={() => navigation.navigate("GeneralChat", { chatId: item.id, title: item.title })}
           />

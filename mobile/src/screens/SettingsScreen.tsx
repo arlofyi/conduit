@@ -1,8 +1,10 @@
 import React from "react";
 import { Alert, ScrollView, Switch, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useLive } from "../bridge/LiveProvider";
+import { useIsFocused } from "@react-navigation/native";
+import { useLive, useUsagePolling } from "../bridge/LiveProvider";
 import { Card, Row, SectionLabel } from "../components/form";
+import { UsageSection } from "../components/UsageSection";
 import { usePrefs } from "../data/PrefsProvider";
 import type { Prefs } from "../data/prefs";
 import { connStatus } from "../logic/connCopy";
@@ -17,7 +19,9 @@ const hostPort = (url: string) => url.replace(/^wss?:\/\//, "");
 export function SettingsScreen({ navigation }: SettingsProps) {
   const { palette: p, cycle } = useTheme();
   const insets = useSafeAreaInsets();
-  const { currentMac, conn, address, hello, forget } = useLive();
+  const { currentMac, conn, address, hello, forget, usage } = useLive();
+  // Usage first: polled while this tab is showing (at most once a minute).
+  useUsagePolling(useIsFocused());
   const { prefs, setPrefs } = usePrefs();
 
   const macName = hello?.macName ?? currentMac?.macName ?? "—";
@@ -62,6 +66,21 @@ export function SettingsScreen({ navigation }: SettingsProps) {
         <Text style={{ fontSize: TYPE.title, fontWeight: "700", color: p.textBright }}>Settings</Text>
       </View>
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 32 }}>
+        <SectionLabel>Usage</SectionLabel>
+        <UsageSection usage={usage} connected={conn.phase === "ready"} />
+
+        <SectionLabel>Notify me when</SectionLabel>
+        <Card>
+          {toggle("notifyQuestion", "A session asks a question", true)}
+          {toggle("notifyPermission", "A permission is needed")}
+          {toggle("notifyFinished", "A session finishes")}
+        </Card>
+
+        <SectionLabel>Appearance</SectionLabel>
+        <Card>
+          <Row first title="Theme" value={p.label} onPress={cycle} accessibilityLabel={`Theme, ${p.label}. Tap to change.`} />
+        </Card>
+
         <SectionLabel>Connection</SectionLabel>
         <Card>
           <Row first title="Computer" value={macName} />
@@ -87,18 +106,6 @@ export function SettingsScreen({ navigation }: SettingsProps) {
           />
           <Row title="Switch computer…" tone="accent" onPress={() => navigation.navigate("Connect")} />
           <Row title="Forget this computer" tone="danger" onPress={confirmForget} disabled={!currentMac} />
-        </Card>
-
-        <SectionLabel>Notify me when</SectionLabel>
-        <Card>
-          {toggle("notifyQuestion", "A session asks a question", true)}
-          {toggle("notifyPermission", "A permission is needed")}
-          {toggle("notifyFinished", "A session finishes")}
-        </Card>
-
-        <SectionLabel>Appearance</SectionLabel>
-        <Card>
-          <Row first title="Theme" value={p.label} onPress={cycle} accessibilityLabel={`Theme, ${p.label}. Tap to change.`} />
         </Card>
       </ScrollView>
     </View>

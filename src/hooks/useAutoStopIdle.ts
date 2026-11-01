@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useStore } from "../store";
-import { idleStopTargets } from "../sessionLifecycle";
+import { idleStopTargets, keepRunningIds } from "../sessionLifecycle";
 
 /** How often finished sessions are checked. A minute of slack on a 5-minute rule. */
 const CHECK_EVERY_MS = 30_000;
@@ -34,7 +34,7 @@ export function useAutoStopIdle() {
         ),
         live: st.live,
         visible: visibleSessions(st),
-        pinned: new Set(Object.keys(st.keepRunning)),
+        pinned: keepRunningIds(st.projects.flatMap((p) => p.sessions)),
         prefs,
       });
       if (!targets.length) return;
@@ -48,11 +48,12 @@ export function useAutoStopIdle() {
           }),
         );
         const now = useStore.getState();
+        const pinned = keepRunningIds(now.projects.flatMap((p) => p.sessions));
         for (const t of targets) {
           if (busy.has(t.sessionId)) continue;
           // Re-read: the agent may have started again while the check ran.
           const status = now.live[t.sessionId]?.status;
-          if (status === "running" || now.keepRunning[t.sessionId]) continue;
+          if (status === "running" || pinned.has(t.sessionId)) continue;
           void now.stopSession(t.projectId, t.sessionId);
         }
       } catch {

@@ -261,7 +261,9 @@ impl LastMessageCache {
 }
 
 /// The `projects` frame. `last_message` resolves a (non-silo, Claude) session's preview;
-/// it is never called for a silo'd or non-Claude session.
+/// it is never called for a silo'd or non-Claude session. `usage_key` names the session's
+/// `usage` row (`phone_usage::session_usage_key`), or None.
+#[allow(clippy::too_many_arguments)]
 pub fn projects_view(
     projects: &[Project],
     profiles: &[Profile],
@@ -270,6 +272,7 @@ pub fn projects_view(
     running: &HashSet<String>,
     asks: &[AskView],
     last_message: &dyn Fn(&Session) -> Value,
+    usage_key: &dyn Fn(&Project, &Session) -> Option<String>,
 ) -> Value {
     let mut profile_list = vec![json!({ "id": Value::Null, "name": "Default" })];
     profile_list.extend(
@@ -314,6 +317,10 @@ pub fn projects_view(
                         "agent": s.agent,
                         "branch": s.branch,
                         "model": s.model,
+                        "effort": s.effort,
+                        "keepRunning": s.keep_running,
+                        // Opaque (a hash of agent + account), never the account id.
+                        "usageKey": usage_key(p, s),
                         "stopped": s.stopped,
                         "running": running.contains(&s.id),
                         "silo": silo,
@@ -619,7 +626,16 @@ mod tests {
     }
 
     fn view(p: &[Project], fleet: &HashMap<String, FleetStatus>, asks: &[AskView]) -> Value {
-        projects_view(p, &[], None, fleet, &HashSet::new(), asks, &|_| Value::Null)
+        projects_view(
+            p,
+            &[],
+            None,
+            fleet,
+            &HashSet::new(),
+            asks,
+            &|_| Value::Null,
+            &|_, _| None,
+        )
     }
 
     #[test]
@@ -639,7 +655,9 @@ mod tests {
                 "activity",
                 "agent",
                 "branch",
+                "effort",
                 "id",
+                "keepRunning",
                 "lastMessage",
                 "model",
                 "name",
@@ -648,7 +666,8 @@ mod tests {
                 "silo",
                 "status",
                 "stopped",
-                "updatedAt"
+                "updatedAt",
+                "usageKey"
             ]
         );
         let text = v.to_string();
@@ -797,6 +816,7 @@ mod tests {
             &HashSet::new(),
             &[],
             &|s| panic!("read attempted for {}", s.id),
+            &|_, _| None,
         );
         for i in 0..3 {
             assert!(v["projects"][0]["sessions"][i]["lastMessage"].is_null());
@@ -813,6 +833,7 @@ mod tests {
             &HashSet::new(),
             &[],
             &|s| json!({ "role": "user", "text": s.id, "at": null }),
+            &|_, _| None,
         );
         assert_eq!(
             v["projects"][0]["sessions"][0]["lastMessage"],
@@ -834,6 +855,7 @@ mod tests {
             &HashSet::new(),
             &[],
             &|_| Value::Null,
+            &|_, _| None,
         );
         assert_eq!(v["type"], "projects");
         assert_eq!(v["profiles"][0], json!({ "id": null, "name": "Default" }));
@@ -847,6 +869,7 @@ mod tests {
             &HashSet::new(),
             &[],
             &|_| Value::Null,
+            &|_, _| None,
         );
         assert!(none["activeProfileId"].is_null());
     }

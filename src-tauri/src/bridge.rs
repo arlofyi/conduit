@@ -157,6 +157,34 @@ pub enum ClientMsg {
         action: SessionActionKind,
         session_ids: Vec<String>,
     },
+    /// What a session can be switched to and steered with (`session_options.rs`): models,
+    /// efforts, commands/skills, MCP servers. Session-scoped. Answered with `sessionOptions`.
+    #[serde(rename_all = "camelCase")]
+    SessionOptions {
+        session_id: String,
+        request_id: String,
+    },
+    /// Change a session's model / effort / name / keep-running; only the fields present.
+    /// Session-scoped. Answered with `sessionSetResult`.
+    #[serde(rename_all = "camelCase")]
+    SessionSet {
+        session_id: String,
+        request_id: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        keep_running: Option<bool>,
+    },
+    /// Every agent account's usage, from cached reads only (`phone_usage.rs`). Answered
+    /// with `usage`.
+    #[serde(rename_all = "camelCase")]
+    Usage {
+        request_id: String,
+    },
     /// Which local web apps a phone may mirror (`local_ports.rs`). Answered with `ports`.
     Ports,
     /// First frame of a TUNNEL socket (port mirroring): its own WebSocket per TCP
@@ -220,6 +248,39 @@ pub enum ClientMsg {
         profile_id: Option<String>,
         #[serde(default)]
         scope: Option<crate::store::ChatScope>,
+        /// "claude" | "antigravity"; absent (an older phone) = claude. Read strictly.
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        research: bool,
+        #[serde(default)]
+        mcps: Vec<String>,
+    },
+    /// Change a chat's model / effort / deep research / MCP servers. A field not sent is
+    /// unchanged; a `model` or `effort` of "" goes back to the agent's default.
+    /// `rootChatSettings`.
+    #[serde(rename_all = "camelCase")]
+    RootChatSettings {
+        chat_id: String,
+        request_id: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        research: Option<bool>,
+        #[serde(default)]
+        mcps: Option<Vec<String>>,
+    },
+    /// What a new general chat can be set to: agents with their models and efforts, the
+    /// user's skills and MCP server NAMES. `rootChatOptions`.
+    #[serde(rename_all = "camelCase")]
+    RootChatOptions {
+        request_id: String,
     },
     /// A chat's history so far. `rootChatHistory`; later turns stream as `rootChatEvent`.
     #[serde(rename_all = "camelCase")]
@@ -372,11 +433,41 @@ impl std::fmt::Debug for ClientMsg {
                 request_id,
                 profile_id,
                 scope,
+                agent,
+                model,
+                effort,
+                research,
+                mcps,
             } => f
                 .debug_struct("RootChatCreate")
                 .field("request_id", request_id)
                 .field("profile_id", profile_id)
                 .field("scope", scope)
+                .field("agent", agent)
+                .field("model", model)
+                .field("effort", effort)
+                .field("research", research)
+                .field("mcps", mcps)
+                .finish(),
+            Self::RootChatSettings {
+                chat_id,
+                request_id,
+                model,
+                effort,
+                research,
+                mcps,
+            } => f
+                .debug_struct("RootChatSettings")
+                .field("chat_id", chat_id)
+                .field("request_id", request_id)
+                .field("model", model)
+                .field("effort", effort)
+                .field("research", research)
+                .field("mcps", mcps)
+                .finish(),
+            Self::RootChatOptions { request_id } => f
+                .debug_struct("RootChatOptions")
+                .field("request_id", request_id)
                 .finish(),
             Self::RootChatHistory { chat_id } | Self::RootChatStop { chat_id } => f
                 .debug_struct("RootChat")
@@ -425,6 +516,34 @@ impl std::fmt::Debug for ClientMsg {
                 .field("request_id", request_id)
                 .field("action", action)
                 .field("session_ids", session_ids)
+                .finish(),
+            Self::SessionOptions {
+                session_id,
+                request_id,
+            } => f
+                .debug_struct("SessionOptions")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .finish(),
+            Self::SessionSet {
+                session_id,
+                request_id,
+                model,
+                effort,
+                name,
+                keep_running,
+            } => f
+                .debug_struct("SessionSet")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .field("model", model)
+                .field("effort", effort)
+                .field("name", name)
+                .field("keep_running", keep_running)
+                .finish(),
+            Self::Usage { request_id } => f
+                .debug_struct("Usage")
+                .field("request_id", request_id)
                 .finish(),
             // The body is megabytes of base64; its length is what a log needs.
             Self::Upload {
@@ -699,7 +818,9 @@ fn session_scope(msg: &ClientMsg) -> Option<&str> {
         | ClientMsg::FsList { session_id, .. }
         | ClientMsg::FsRead { session_id, .. }
         | ClientMsg::FsWrite { session_id, .. }
-        | ClientMsg::FsDownload { session_id, .. } => Some(session_id),
+        | ClientMsg::FsDownload { session_id, .. }
+        | ClientMsg::SessionOptions { session_id, .. }
+        | ClientMsg::SessionSet { session_id, .. } => Some(session_id),
         _ => None,
     }
 }
@@ -769,7 +890,110 @@ fn root_chat_view(c: &crate::store::RootChat, running: bool) -> serde_json::Valu
         "scope": c.scope,
         "createdAt": c.created_at,
         "running": running,
+        "agent": c.agent,
+        "model": c.model,
+        "effort": c.effort,
+        "research": c.research,
+        "mcps": c.mcps,
     })
+}
+
+/// The user-scope MCP server names in a Claude profile (None = the default profile).
+fn user_mcp_names_for(config_dir: Option<&str>) -> Vec<String> {
+    crate::root_chat_options::claude_profile_paths(config_dir)
+        .and_then(|(json, _)| std::fs::read_to_string(json).ok())
+        .map(|t| crate::root_chat_options::user_mcp_names(&t))
+        .unwrap_or_default()
+}
+
+/// "" (or absent) means "the agent's default".
+fn non_empty(s: &Option<String>) -> Option<String> {
+    s.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// A `rootchatcreate`'s options, validated. `known_mcps` = the user-scope MCP names of the
+/// profile a new Claude chat is pinned to.
+fn root_chat_create_options(
+    agent: Option<&str>,
+    model: &Option<String>,
+    effort: &Option<String>,
+    research: bool,
+    mcps: &[String],
+    known_mcps: &[String],
+) -> Result<crate::store::RootChatOptions, String> {
+    let agent = match agent {
+        None => crate::agent::AgentId::Claude,
+        Some(a) => crate::root_chat_options::chat_agent_from_wire(a)
+            .ok_or_else(|| format!("unknown agent {a}"))?,
+    };
+    let (model, effort) = (non_empty(model), non_empty(effort));
+    crate::root_chat_options::validate_settings(
+        agent,
+        model.as_deref(),
+        effort.as_deref(),
+        Some(mcps),
+        known_mcps,
+    )?;
+    let mut mcps = mcps.to_vec();
+    mcps.dedup();
+    Ok(crate::store::RootChatOptions {
+        agent,
+        model,
+        effort,
+        research,
+        mcps,
+    })
+}
+
+/// Apply a `rootchatsettings` and build its `rootChatSettings` reply.
+#[allow(clippy::too_many_arguments)]
+fn root_chat_settings_reply(
+    store: &Store,
+    chat_id: &str,
+    request_id: &str,
+    model: &Option<String>,
+    effort: &Option<String>,
+    research: Option<bool>,
+    mcps: &Option<Vec<String>>,
+    running: bool,
+) -> serde_json::Value {
+    let refuse = |note: String| {
+        json!({ "type": "rootChatSettings", "requestId": request_id, "ok": false,
+            "note": note, "chat": serde_json::Value::Null })
+    };
+    let Some(chat) = store.root_chat(chat_id) else {
+        return refuse("unknown chat".into());
+    };
+    let known = match mcps {
+        Some(list) if !list.is_empty() => {
+            user_mcp_names_for(store.root_chat_config_dir(chat_id).as_deref())
+        }
+        _ => Vec::new(),
+    };
+    if let Err(e) = crate::root_chat_options::validate_settings(
+        chat.agent,
+        model.as_deref().map(str::trim),
+        effort.as_deref().map(str::trim),
+        mcps.as_deref(),
+        &known,
+    ) {
+        return refuse(e);
+    }
+    let updated = store.set_root_chat_settings(
+        chat_id,
+        model.as_ref().map(|_| non_empty(model)),
+        effort.as_ref().map(|_| non_empty(effort)),
+        research,
+        mcps.clone(),
+    );
+    match updated {
+        Some(c) => json!({ "type": "rootChatSettings", "requestId": request_id, "ok": true,
+            "chat": root_chat_view(&c, running) }),
+        None => refuse("unknown chat".into()),
+    }
 }
 
 /// A root-chat event (`RootChatState::subscribe`) as the frame a phone receives.
@@ -1925,6 +2149,10 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     // and HTTP probes). One scan at a time per socket.
     let (ports_tx, ports_rx) = std::sync::mpsc::channel::<String>();
     let mut listing_ports = false;
+    // A `rootchatoptions` reply, built on its own thread (it may wait briefly for
+    // `agy models`). One at a time per socket.
+    let (chat_options_tx, chat_options_rx) = std::sync::mpsc::channel::<String>();
+    let mut listing_chat_options = false;
     // The project list (2d): `listed` once this socket asked for it, then pushed on change.
     let mut listed = false;
     let mut want_projects = false;
@@ -2520,15 +2748,63 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         | ClientMsg::RootChatHistory { .. }
                         | ClientMsg::RootChatSend { .. }
                         | ClientMsg::RootChatStop { .. }
-                        | ClientMsg::RootChatScope { .. }),
+                        | ClientMsg::RootChatScope { .. }
+                        | ClientMsg::RootChatSettings { .. }
+                        | ClientMsg::RootChatOptions { .. }),
                     ) => {
                         use tauri::Emitter;
                         let chats = app.state::<Arc<crate::root_chat::RootChatState>>();
+                        let store = app.state::<Arc<Store>>();
                         if root_chat_sub.is_none() {
                             root_chat_sub = Some(chats.subscribe());
+                            // The phone waits only seconds for `rootChatOptions`; start the
+                            // agy model list now so that reply is answered from cache.
+                            crate::root_chat_options::prewarm_agy_models(
+                                store.default_account_config_dir_for(
+                                    crate::agent::AgentId::Antigravity,
+                                ),
+                            );
                         }
-                        let store = app.state::<Arc<Store>>();
                         let reply = match m {
+                            ClientMsg::RootChatOptions { request_id } => {
+                                if !listing_chat_options {
+                                    listing_chat_options = true;
+                                    let tx = chat_options_tx.clone();
+                                    let claude_cfg = store.default_account_config_dir_for(
+                                        crate::agent::AgentId::Claude,
+                                    );
+                                    let agy_cfg = store.default_account_config_dir_for(
+                                        crate::agent::AgentId::Antigravity,
+                                    );
+                                    let rid = request_id.clone();
+                                    std::thread::spawn(move || {
+                                        let frame = crate::root_chat_options::options_frame(
+                                            &rid,
+                                            claude_cfg.as_deref(),
+                                            agy_cfg.as_deref(),
+                                        );
+                                        let _ = tx.send(frame.to_string());
+                                    });
+                                }
+                                None
+                            }
+                            ClientMsg::RootChatSettings {
+                                chat_id,
+                                request_id,
+                                model,
+                                effort,
+                                research,
+                                mcps,
+                            } => Some(root_chat_settings_reply(
+                                &store,
+                                chat_id,
+                                request_id,
+                                model,
+                                effort,
+                                *research,
+                                mcps,
+                                chats.is_running(chat_id),
+                            )),
                             ClientMsg::RootChats => {
                                 let list: Vec<serde_json::Value> = store
                                     .list_root_chats()
@@ -2541,21 +2817,57 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                                 request_id,
                                 profile_id,
                                 scope,
+                                agent,
+                                model,
+                                effort,
+                                research,
+                                mcps,
                             } => {
-                                let c = store.add_root_chat_with(
-                                    profile_id.clone(),
-                                    scope.clone(),
-                                    true,
-                                );
-                                let _ = app.emit(
-                                    "root-chat-created",
-                                    json!({ "id": c.id, "title": c.title, "seed": "" }),
-                                );
-                                Some(json!({
-                                    "type": "rootChatCreated",
-                                    "requestId": request_id,
-                                    "chat": root_chat_view(&c, false),
-                                }))
+                                let known = if mcps.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    user_mcp_names_for(
+                                        store
+                                            .default_account_config_dir_for(
+                                                crate::agent::AgentId::Claude,
+                                            )
+                                            .as_deref(),
+                                    )
+                                };
+                                match root_chat_create_options(
+                                    agent.as_deref(),
+                                    model,
+                                    effort,
+                                    *research,
+                                    mcps,
+                                    &known,
+                                ) {
+                                    Ok(opts) => {
+                                        let c = store.add_root_chat_opts(
+                                            profile_id.clone(),
+                                            scope.clone(),
+                                            true,
+                                            opts,
+                                        );
+                                        let _ = app.emit(
+                                            "root-chat-created",
+                                            json!({ "id": c.id, "title": c.title, "seed": "" }),
+                                        );
+                                        Some(json!({
+                                            "type": "rootChatCreated",
+                                            "requestId": request_id,
+                                            "ok": true,
+                                            "chat": root_chat_view(&c, false),
+                                        }))
+                                    }
+                                    Err(note) => Some(json!({
+                                        "type": "rootChatCreated",
+                                        "requestId": request_id,
+                                        "ok": false,
+                                        "note": note,
+                                        "chat": serde_json::Value::Null,
+                                    })),
+                                }
                             }
                             ClientMsg::RootChatHistory { chat_id } => {
                                 Some(match store.root_chat(chat_id) {
@@ -2660,6 +2972,51 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             "done": done,
                             "skipped": skipped,
                         });
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    // Session controls (2026-11-01 spec section 2). Both are behind the
+                    // private gate above (`session_scope`). Discovery reads a few small
+                    // files; `agy models` runs on its own thread, never here.
+                    Some(ClientMsg::SessionOptions {
+                        session_id,
+                        request_id,
+                    }) => {
+                        let reply =
+                            crate::session_options::options_frame(&app, &session_id, &request_id);
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::SessionSet {
+                        session_id,
+                        request_id,
+                        model,
+                        effort,
+                        name,
+                        keep_running,
+                    }) => {
+                        let reply = crate::session_options::apply_set(
+                            &app,
+                            &session_id,
+                            &request_id,
+                            model,
+                            effort,
+                            name,
+                            keep_running,
+                        );
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    // Cached reads only, rebuilt at most every 30 s: never a new poll of a
+                    // rate-limited usage endpoint.
+                    Some(ClientMsg::Usage { request_id }) => {
+                        let reply = crate::phone_usage::usage_frame(
+                            &request_id,
+                            crate::phone_usage::rows(&app),
+                        );
                         if !send_text(&mut ws, reply.to_string()) {
                             break 'conn;
                         }
@@ -2795,6 +3152,11 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             let store = app.state::<Arc<Store>>();
             let fleet = app.state::<Arc<crate::fleet::FleetState>>().snapshot();
             let asks = app.state::<Arc<crate::asks::Asks>>().pending();
+            // Which `usage` row each session draws from (opaque keys; see `phone_usage`).
+            let usage_rows = crate::phone_usage::row_keys(&crate::phone_usage::rows(&app));
+            let default_accounts = store.default_accounts();
+            let known_accounts: HashSet<String> =
+                store.list_accounts().into_iter().map(|a| a.id).collect();
             let view = crate::bridge_view::projects_view(
                 &store.list(),
                 &store.list_profiles(),
@@ -2811,6 +3173,15 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                                 .and_then(|dir| crate::pty::transcript_path(&conversation, &dir))
                         })
                         .map_or(serde_json::Value::Null, |p| ctrl.last_messages.for_path(&p))
+                },
+                &|p, s| {
+                    crate::phone_usage::session_usage_key(
+                        s,
+                        p,
+                        &default_accounts,
+                        &known_accounts,
+                        &usage_rows,
+                    )
                 },
             );
             ctrl.last_messages.sweep();
@@ -2850,6 +3221,12 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
         if let Ok(ports) = ports_rx.try_recv() {
             listing_ports = false;
             if !send_text(&mut ws, ports) {
+                break;
+            }
+        }
+        if let Ok(options) = chat_options_rx.try_recv() {
+            listing_chat_options = false;
+            if !send_text(&mut ws, options) {
                 break;
             }
         }
@@ -3305,6 +3682,8 @@ mod tests {
             r#"{"type":"fsread","sessionId":"s","requestId":"r","path":"a"}"#,
             r#"{"type":"fswrite","sessionId":"s","requestId":"r","path":"a","content":"x","baseMtimeMs":1.5,"baseSize":1}"#,
             r#"{"type":"fsdownload","sessionId":"s","requestId":"r","path":"a","confirm":true}"#,
+            r#"{"type":"sessionoptions","sessionId":"s","requestId":"r"}"#,
+            r#"{"type":"sessionset","sessionId":"s","requestId":"r","keepRunning":true}"#,
         ];
         let upload =
             r#"{"type":"upload","sessionId":"s","requestId":"r","name":"a.png","data":"aGk="}"#;
@@ -3317,6 +3696,7 @@ mod tests {
             r#"{"type":"list"}"#,
             r#"{"type":"discover"}"#,
             r#"{"type":"spawn","project_id":"p","prompt":"x"}"#,
+            r#"{"type":"usage","requestId":"r"}"#,
         ] {
             assert_eq!(
                 session_scope(&parse_client_msg(raw).unwrap()),
@@ -3324,6 +3704,37 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn session_controls_parse_with_optional_fields() {
+        let m = parse_client_msg(
+            r#"{"type":"sessionset","sessionId":"s","requestId":"r","model":"opus","effort":"high","name":"N","keepRunning":false}"#,
+        );
+        assert!(matches!(
+            m,
+            Some(ClientMsg::SessionSet { ref model, ref effort, ref name, keep_running: Some(false), .. })
+                if model.as_deref() == Some("opus") && effort.as_deref() == Some("high") && name.as_deref() == Some("N")
+        ));
+        let m = parse_client_msg(r#"{"type":"sessionset","sessionId":"s","requestId":"r"}"#);
+        assert!(matches!(
+            m,
+            Some(ClientMsg::SessionSet {
+                model: None,
+                effort: None,
+                name: None,
+                keep_running: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_client_msg(r#"{"type":"usage","requestId":"r"}"#),
+            Some(ClientMsg::Usage { .. })
+        ));
+        assert!(matches!(
+            parse_client_msg(r#"{"type":"sessionoptions","sessionId":"s","requestId":"r"}"#),
+            Some(ClientMsg::SessionOptions { .. })
+        ));
     }
 
     #[test]
@@ -3623,6 +4034,45 @@ mod tests {
                     profiles: vec![None, Some("work".into())],
                     projects: vec!["p1".into()],
                 }),
+                agent: None,
+                model: None,
+                effort: None,
+                research: false,
+                mcps: vec![],
+            })
+        );
+        assert_eq!(
+            parse_client_msg(
+                r#"{"type":"rootchatcreate","requestId":"r","agent":"antigravity","model":"m","effort":"high","research":true,"mcps":["gh"]}"#
+            ),
+            Some(ClientMsg::RootChatCreate {
+                request_id: "r".into(),
+                profile_id: None,
+                scope: None,
+                agent: Some("antigravity".into()),
+                model: Some("m".into()),
+                effort: Some("high".into()),
+                research: true,
+                mcps: vec!["gh".into()],
+            })
+        );
+        assert_eq!(
+            parse_client_msg(
+                r#"{"type":"rootchatsettings","chatId":"c","requestId":"r","model":""}"#
+            ),
+            Some(ClientMsg::RootChatSettings {
+                chat_id: "c".into(),
+                request_id: "r".into(),
+                model: Some(String::new()),
+                effort: None,
+                research: None,
+                mcps: None,
+            })
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"type":"rootchatoptions","requestId":"r"}"#),
+            Some(ClientMsg::RootChatOptions {
+                request_id: "r".into()
             })
         );
         assert_eq!(
@@ -3644,6 +4094,81 @@ mod tests {
         )
         .unwrap();
         assert!(root_chat_view(&c, false).get("accountId").is_none());
+    }
+
+    #[test]
+    fn a_general_chat_view_carries_its_options_and_never_the_account() {
+        let c: crate::store::RootChat = serde_json::from_value(json!({
+            "id": "c", "title": "t", "accountId": "acct", "createdAt": 1,
+            "agent": "antigravity", "model": "m", "effort": "max", "research": true,
+            "mcps": ["gh"], "agyConversationId": "u"
+        }))
+        .unwrap();
+        let v = root_chat_view(&c, true);
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "agent",
+                "createdAt",
+                "effort",
+                "id",
+                "mcps",
+                "model",
+                "profileId",
+                "research",
+                "running",
+                "scope",
+                "title"
+            ]
+        );
+        assert_eq!(v["agent"], "antigravity");
+        assert_eq!(v["mcps"], json!(["gh"]));
+        // An old chat reads as a plain Claude chat.
+        let old: crate::store::RootChat =
+            serde_json::from_value(json!({"id": "c", "title": "t"})).unwrap();
+        let v = root_chat_view(&old, false);
+        assert_eq!(v["agent"], "claude");
+        assert_eq!(v["research"], false);
+    }
+
+    #[test]
+    fn general_chat_create_options_are_read_strictly() {
+        let known = vec!["gh".to_string()];
+        let o = root_chat_create_options(None, &None, &None, false, &[], &known).unwrap();
+        assert_eq!(o, crate::store::RootChatOptions::default());
+        let o = root_chat_create_options(
+            Some("antigravity"),
+            &Some("".into()),
+            &Some("high".into()),
+            true,
+            &[],
+            &known,
+        )
+        .unwrap();
+        assert_eq!(o.agent, crate::agent::AgentId::Antigravity);
+        assert!(o.model.is_none(), "an empty model is the default");
+        assert_eq!(o.effort.as_deref(), Some("high"));
+        assert!(root_chat_create_options(Some("codex"), &None, &None, false, &[], &known).is_err());
+        assert!(
+            root_chat_create_options(Some("Claude"), &None, &None, false, &[], &known).is_err()
+        );
+        assert!(
+            root_chat_create_options(None, &Some("a;b".into()), &None, false, &[], &known).is_err()
+        );
+        assert!(
+            root_chat_create_options(None, &None, &None, false, &["nope".into()], &known).is_err()
+        );
+        assert!(root_chat_create_options(
+            Some("antigravity"),
+            &None,
+            &None,
+            false,
+            &["gh".into()],
+            &known
+        )
+        .is_err());
     }
 
     #[test]

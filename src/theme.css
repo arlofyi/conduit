@@ -5450,6 +5450,7 @@ input[type="number"]:focus {
   color: var(--hq-ink-2);
   border-bottom: 1px solid color-mix(in srgb, var(--hq-line) 60%, transparent);
 }
+.hq-thread-meta { font-weight: 400; color: var(--hq-ink-3); }
 .hq-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 24px 20px; }
 .hq-column {
   width: 100%; max-width: 720px; margin: 0 auto;

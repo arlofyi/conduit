@@ -57,8 +57,12 @@ import {
   type WireFsReply,
   type WireFsText,
 } from "./protocol";
-import { applyFeed, applyToList, chatOf, EMPTY_FEED, type FeedEvent, type RootChat, type RootFeed, type Scope } from "../logic/general";
-import { rootChatCreateMsg, rootChatHistoryMsg, rootChatScopeMsg, rootChatSendMsg, rootChatsMsg, rootChatStopMsg } from "./protocol";
+import { applyFeed, applyToList, chatOf, EMPTY_FEED, FALLBACK_OPTIONS, optionsOf, type FeedEvent, type RootChat, type RootChatOptions, type RootFeed, type Scope } from "../logic/general";
+import { rootChatCreateMsg, rootChatHistoryMsg, rootChatOptionsMsg, rootChatScopeMsg, rootChatSendMsg, rootChatSettingsMsg, rootChatsMsg, rootChatStopMsg, type WireRootChatSettings } from "./protocol";
+
+import { sessionOptionsMsg, sessionSetMsg, usageMsg, type SessionSetPatch } from "./protocol";
+import { parseSessionOptions, type SessionOptions } from "../logic/sessionOptions";
+import { parseUsageFrame, type UsageRow } from "../logic/usage";
 
 /** Simulator/dev build: also try loopback, and offer "This computer (simulator)". */
 export const IS_SIMULATOR_OR_DEV = __DEV__;
@@ -169,8 +173,25 @@ function fsErr(r: WireFsReply | FsFail): string {
 // ---- general chat outcomes (see the "general chat" block in the provider) ----
 export type RootCreateOutcome = { ok: true; chat: RootChat } | { ok: false; error: string };
 export type RootScopeOutcome = { ok: true; scope: Scope | null } | { ok: false; error: string };
+export type RootSettingsOutcome = { ok: true; chat: RootChat | null } | { ok: false; error: string };
+/** An older desktop never answers `rootchatoptions`: don't make the new-chat sheet wait long. */
+const ROOT_OPTIONS_TIMEOUT_MS = 6_000;
 const ROOT_TIMEOUT_MS = 12_000;
 const ROOT_NO_ANSWER = "Your computer didn't answer. Check the connection and try again.";
+
+// ---- session controls + usage outcomes (see the "session controls" block in the provider) ----
+export type SessionOptionsOutcome = { ok: true; options: SessionOptions } | { ok: false; error: string };
+export type SessionSetOutcome = { ok: boolean; note: string | null };
+/** The latest `usage` answer and when it arrived (ms). */
+export interface UsageState {
+  rows: UsageRow[];
+  at: number;
+}
+const CTL_TIMEOUT_MS = 10_000;
+/** The desktop serves cached reads only, but there is still no point asking more often. */
+export const USAGE_POLL_MS = 60_000;
+const CTL_NO_ANSWER = "Your computer didn't answer. Its Conduit may need an update for this.";
+const CTL_PRIVATE = "This session is private: change it on your computer.";
 
 export interface LiveValue {
   /** false until the Keychain Mac list has been read; render nothing route-deciding before */
@@ -259,14 +280,28 @@ export interface LiveValue {
   /** load a chat's history and keep its feed live; `closeRootChat` stops re-loading it on reconnect */
   openRootChat: (chatId: string) => void;
   closeRootChat: (chatId: string) => void;
-  /** start a chat listed under `profileId`, seeing `scope` */
-  createRootChat: (profileId: string | null, scope: Scope | null) => Promise<RootCreateOutcome>;
+  /** start a chat listed under `profileId`, seeing `scope`, with its agent/model/effort/... */
+  createRootChat: (profileId: string | null, scope: Scope | null, settings?: WireRootChatSettings) => Promise<RootCreateOutcome>;
+  /** what a chat can be set to on this computer: null until asked, `live: false` from an
+   * older desktop that never answered (Claude only) */
+  rootChatOptions: RootChatOptions | null;
+  /** ask for `rootChatOptions` (again); resolves with what arrived, or null on no answer */
+  loadRootChatOptions: () => Promise<RootChatOptions | null>;
+  /** change one chat's model/effort/research/MCP servers (only the fields named) */
+  setRootChatSettings: (chatId: string, patch: Omit<WireRootChatSettings, "agent">) => Promise<RootSettingsOutcome>;
   /** send one message (shown at once); false = not connected */
   sendRootChat: (chatId: string, text: string) => boolean;
   stopRootChat: (chatId: string) => void;
   /** change which projects a chat sees (`null` = every project) */
   setRootChatScope: (chatId: string, scope: Scope | null) => Promise<RootScopeOutcome>;
   /** the in-app banner on screen, if any */
+  // ---- session controls + usage ----
+  /** every agent account's usage; null until the first answer (older desktops never answer) */
+  usage: UsageState | null;
+  /** ask for usage unless asked within USAGE_POLL_MS (`force` skips that) */
+  refreshUsage: (force?: boolean) => void;
+  sessionOptions: (sessionId: string) => Promise<SessionOptionsOutcome>;
+  sessionSet: (sessionId: string, patch: SessionSetPatch) => Promise<SessionSetOutcome>;
   banner: Banner | null;
   dismissBanner: () => void;
 }
@@ -459,6 +494,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   // ---- general chat (desktop root_chat.rs) -- self-contained: state, router, calls ----
   const [rootChats, setRootChats] = useState<RootChat[] | null>(null);
   const [rootFeeds, setRootFeeds] = useState<Record<string, RootFeed>>({});
+  const [rootChatOptions, setRootChatOptions] = useState<RootChatOptions | null>(null);
   /** this socket has sent a rootchat* frame, so the computer pushes events to it; a new
    * socket (reconnect) re-subscribes and re-loads the open chat */
   const rootSubscribedRef = useRef(false);
@@ -480,14 +516,14 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
   const rootWait = useCallback(
-    (key: string, frame: ClientMsg): Promise<ServerMsg | null> =>
+    (key: string, frame: ClientMsg, timeoutMs = ROOT_TIMEOUT_MS): Promise<ServerMsg | null> =>
       new Promise((resolve) => {
         const finish = (m: ServerMsg | null) => {
           clearTimeout(timer);
           if (rootWaitersRef.current.get(key) === finish) rootWaitersRef.current.delete(key);
           resolve(m);
         };
-        const timer = setTimeout(() => finish(null), ROOT_TIMEOUT_MS);
+        const timer = setTimeout(() => finish(null), timeoutMs);
         rootWaitersRef.current.set(key, finish);
         if (!rootSend(frame)) finish(null);
       }),
@@ -516,6 +552,18 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           if (m.ok) setRootChats((list) => list?.map((c) => (c.id === m.chatId ? { ...c, scope: m.scope } : c)) ?? list);
           rootWaitersRef.current.get(`scope:${m.chatId}`)?.(m);
           return true;
+        case "rootChatSettings": {
+          const chat = m.ok ? chatOf(m.chat) : null;
+          if (chat) setRootChats((list) => list?.map((c) => (c.id === chat.id ? chat : c)) ?? list);
+          rootWaitersRef.current.get(`settings:${m.requestId}`)?.(m);
+          return true;
+        }
+        case "rootChatOptions": {
+          const opts = optionsOf(m);
+          if (opts) setRootChatOptions(opts);
+          rootWaitersRef.current.get(`options:${m.requestId}`)?.(m);
+          return true;
+        }
         case "rootChatEvent":
           setRootChats((list) => applyToList(list, m));
           patchRootFeed(m.chatId, { t: "event", ev: m });
@@ -542,9 +590,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     if (rootOpenRef.current === chatId) rootOpenRef.current = null;
   }, []);
   const createRootChat = useCallback(
-    async (profileId: string | null, scope: Scope | null): Promise<RootCreateOutcome> => {
+    async (profileId: string | null, scope: Scope | null, settings?: WireRootChatSettings): Promise<RootCreateOutcome> => {
       const id = genId("rc");
-      const r = await rootWait(`create:${id}`, rootChatCreateMsg(id, profileId, scope));
+      const r = await rootWait(`create:${id}`, rootChatCreateMsg(id, profileId, scope, settings));
       if (!r) return { ok: false, error: clientRef.current ? ROOT_NO_ANSWER : NOT_CONNECTED };
       const chat = r.type === "rootChatCreated" ? chatOf(r.chat) : null;
       return chat ? { ok: true, chat } : { ok: false, error: "Your computer sent an unexpected answer." };
@@ -576,7 +624,100 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     },
     [rootWait],
   );
+  const loadRootChatOptions = useCallback(async (): Promise<RootChatOptions | null> => {
+    const id = genId("ro");
+    const r = await rootWait(`options:${id}`, rootChatOptionsMsg(id), ROOT_OPTIONS_TIMEOUT_MS);
+    const opts = r && r.type === "rootChatOptions" ? optionsOf(r) : null;
+    // No answer: an older desktop (Claude only). Keep a live answer from earlier if there is one.
+    if (!opts) setRootChatOptions((cur) => cur ?? FALLBACK_OPTIONS);
+    return opts;
+  }, [rootWait]);
+  const setRootChatSettings = useCallback(
+    async (chatId: string, patch: Omit<WireRootChatSettings, "agent">): Promise<RootSettingsOutcome> => {
+      const id = genId("rs");
+      const r = await rootWait(`settings:${id}`, rootChatSettingsMsg(chatId, id, patch));
+      if (!r) return { ok: false, error: clientRef.current ? ROOT_NO_ANSWER : NOT_CONNECTED };
+      if (r.type !== "rootChatSettings" || !r.ok) {
+        const note = r.type === "rootChatSettings" && typeof r.note === "string" && r.note ? r.note : null;
+        return { ok: false, error: note ?? "Your computer didn't accept those settings." };
+      }
+      return { ok: true, chat: chatOf(r.chat) };
+    },
+    [rootWait],
+  );
   // ---- end general chat ----
+
+  // ---- session controls + usage (2026-11-01 spec section 2) -- self-contained ----
+  const [usage, setUsage] = useState<UsageState | null>(null);
+  /** when `usage` was last ASKED for (a send that went out), for the 60 s throttle */
+  const usageAskedRef = useRef(0);
+  /** answers waited on, by requestId; `sessionId` lets a private refusal fail them at once */
+  const ctlWaitersRef = useRef(new Map<string, { sessionId: string | null; settle: (m: ServerMsg | null) => void }>());
+  const ctlWait = useCallback(
+    (requestId: string, sessionId: string | null, frame: ClientMsg): Promise<ServerMsg | null> =>
+      new Promise((resolve) => {
+        const finish = (m: ServerMsg | null) => {
+          clearTimeout(timer);
+          if (ctlWaitersRef.current.get(requestId)?.settle === finish) ctlWaitersRef.current.delete(requestId);
+          resolve(m);
+        };
+        const timer = setTimeout(() => finish(null), CTL_TIMEOUT_MS);
+        ctlWaitersRef.current.set(requestId, { sessionId, settle: finish });
+        if (!clientRef.current?.send(frame)) finish(null);
+      }),
+    [],
+  );
+  /** Called for every frame: true when it was a session-control / usage answer (consumed). */
+  const ctlRoute = useCallback((m: ServerMsg): boolean => {
+    if (m.type === "error") {
+      if (m.message === PRIVATE_SESSION && m.sessionId) {
+        for (const w of [...ctlWaitersRef.current.values()]) {
+          if (w.sessionId === m.sessionId) w.settle(m);
+        }
+      }
+      return false;
+    }
+    if (m.type === "usage") {
+      const rows = parseUsageFrame(m);
+      if (rows) setUsage({ rows, at: Date.now() });
+      return true;
+    }
+    if (m.type === "sessionOptions" || m.type === "sessionSetResult") {
+      const id = (m as { requestId?: unknown }).requestId;
+      if (typeof id === "string") ctlWaitersRef.current.get(id)?.settle(m);
+      return true;
+    }
+    return false;
+  }, []);
+  const refreshUsage = useCallback((force = false) => {
+    if (!force && Date.now() - usageAskedRef.current < USAGE_POLL_MS) return;
+    if (clientRef.current?.send(usageMsg(genId("us")))) usageAskedRef.current = Date.now();
+  }, []);
+  const sessionOptions = useCallback(
+    async (sessionId: string): Promise<SessionOptionsOutcome> => {
+      const id = genId("so");
+      const r = await ctlWait(id, sessionId, sessionOptionsMsg(sessionId, id));
+      if (!r) return { ok: false, error: clientRef.current ? CTL_NO_ANSWER : NOT_CONNECTED };
+      if (r.type === "error") return { ok: false, error: CTL_PRIVATE };
+      const options = parseSessionOptions(r);
+      return options ? { ok: true, options } : { ok: false, error: "Your computer sent an unexpected answer." };
+    },
+    [ctlWait],
+  );
+  const sessionSet = useCallback(
+    async (sessionId: string, patch: SessionSetPatch): Promise<SessionSetOutcome> => {
+      const id = genId("ss");
+      const r = await ctlWait(id, sessionId, sessionSetMsg(sessionId, id, patch));
+      if (!r) return { ok: false, note: clientRef.current ? CTL_NO_ANSWER : NOT_CONNECTED };
+      if (r.type === "error") return { ok: false, note: CTL_PRIVATE };
+      if (r.type !== "sessionSetResult") return { ok: false, note: "Your computer sent an unexpected answer." };
+      // the name / model / keep-running shown in lists and headers come from the view
+      clientRef.current?.list();
+      return { ok: r.ok === true, note: typeof r.note === "string" && r.note ? r.note : null };
+    },
+    [ctlWait],
+  );
+  // ---- end session controls ----
 
   const refreshMacs = useCallback(async () => {
     try {
@@ -636,6 +777,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     setWebPorts(null);
     setRootChats(null);
     setRootFeeds({});
+    setUsage(null);
+    usageAskedRef.current = 0;
+    setRootChatOptions(null);
     rootSubscribedRef.current = false;
     rootOpenRef.current = null;
     pendingRef.current = emptyPending;
@@ -680,6 +824,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           lastFrameAt.current = Date.now();
           if (fsRoute(m)) return;
           if (rootRoute(m)) return;
+          if (ctlRoute(m)) return;
           switch (m.type) {
             case "hello":
               setHello({ macName: m.macName, conduitVersion: m.conduitVersion });
@@ -1231,7 +1376,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       clientRef.current?.list();
       setSpawnState({
         phase: "failed",
-        message: "Your computer hasn't answered yet. Check Chats before starting another — it may have started.",
+        message: "Your computer hasn't answered yet. Check Sessions before starting another — it may have started.",
       });
     }, SPAWN_TIMEOUT_MS);
     return () => clearTimeout(t);
@@ -1300,10 +1445,21 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       sendRootChat,
       stopRootChat,
       setRootChatScope,
+      rootChatOptions,
+      loadRootChatOptions,
+      setRootChatSettings,
+      usage,
+      refreshUsage,
+      sessionOptions,
+      sessionSet,
       banner,
       dismissBanner,
     }),
     [
+      usage,
+      refreshUsage,
+      sessionOptions,
+      sessionSet,
       rootChats,
       rootFeeds,
       refreshRootChats,
@@ -1313,6 +1469,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       sendRootChat,
       stopRootChat,
       setRootChatScope,
+      rootChatOptions,
+      loadRootChatOptions,
+      setRootChatSettings,
       pending,
       answer,
       approve,
@@ -1367,4 +1526,20 @@ export function useLive(): LiveValue {
   const v = useContext(Ctx);
   if (!v) throw new Error("useLive must be used within a LiveProvider");
   return v;
+}
+
+/**
+ * Keep the usage meters fresh while a screen that shows them is focused: ask when it gains
+ * focus or the link comes back, then at most every USAGE_POLL_MS. A backgrounded app's socket
+ * is closed, so the interval's sends simply go nowhere until it is back in front.
+ */
+export function useUsagePolling(active: boolean): void {
+  const { refreshUsage, conn } = useLive();
+  const ready = conn.phase === "ready";
+  useEffect(() => {
+    if (!active || !ready) return;
+    refreshUsage();
+    const t = setInterval(() => refreshUsage(), USAGE_POLL_MS);
+    return () => clearInterval(t);
+  }, [active, ready, refreshUsage]);
 }

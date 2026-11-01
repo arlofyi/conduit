@@ -32,6 +32,7 @@ import { FilesScreen } from "./src/screens/FilesScreen";
 import { FileViewScreen } from "./src/screens/FileViewScreen";
 import { GeneralScreen } from "./src/screens/GeneralScreen";
 import { GeneralChatScreen } from "./src/screens/GeneralChatScreen";
+import { GeneralNewScreen, GeneralSettingsScreen } from "./src/screens/GeneralOptions";
 import { GeneralScopeScreen } from "./src/screens/GeneralScopeScreen";
 import { ChatsMenuScreen, QuickActionsScreen, SessionInfoScreen } from "./src/screens/Sheets";
 import { ListSelectionProvider, useListSelection } from "./src/data/ListSelection";
@@ -110,11 +111,13 @@ function Tabs() {
         name="Chats"
         component={ChatsScreen}
         options={{
+          // route names stay Chats/General; what the reader sees is Sessions/Chats
+          title: "Sessions",
           tabBarIcon: chatsIcon,
           tabBarBadge: needs > 0 ? needs : undefined,
         }}
       />
-      <Tab.Screen name="General" component={GeneralScreen} options={{ tabBarIcon: generalIcon }} />
+      <Tab.Screen name="General" component={GeneralScreen} options={{ title: "Chats", tabBarIcon: generalIcon }} />
       <Tab.Screen name="Apps" component={AppsScreen} options={{ tabBarIcon: appsIcon }} />
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: settingsIcon }} />
     </Tab.Navigator>
@@ -184,6 +187,8 @@ function Inner() {
             <Stack.Screen name="FileView" component={FileViewScreen} />
             <Stack.Screen name="GeneralChat" component={GeneralChatScreen} />
             <Stack.Screen name="GeneralScope" component={GeneralScopeScreen} options={sheet} />
+            <Stack.Screen name="GeneralNew" component={GeneralNewScreen} options={sheet} />
+            <Stack.Screen name="GeneralSettings" component={GeneralSettingsScreen} options={sheet} />
             <Stack.Screen name="NewChat" component={NewChatScreen} options={sheet} />
             <Stack.Screen name="ChatsMenu" component={ChatsMenuScreen} options={sheet} />
             <Stack.Screen name="QuickActions" component={QuickActionsScreen} options={sheet} />

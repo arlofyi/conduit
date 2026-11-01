@@ -16,15 +16,23 @@ export type TabParamList = {
 export type RootStackParamList = {
   Tabs: NavigatorScreenParams<TabParamList> | undefined;
   /** what the list knows about the session; the chat fills in the rest once attached */
-  Chat: { sessionId: string; projectId: string; name: string; branch: string | null };
+  Chat: {
+    sessionId: string;
+    projectId: string;
+    name: string;
+    branch: string | null;
+    /** set by the session sheet: put `/command ` into the composer (`nonce` makes a repeat count) */
+    insert?: { command: string; nonce: number };
+  };
   Connect: undefined;
   Pair: undefined;
   /** "+" on Chats: start a session */
   NewChat: undefined;
   /** "…" on Chats: profile + Switch computer */
   ChatsMenu: undefined;
-  /** "+" in the composer */
-  QuickActions: { sessionId: string; running: boolean; agent: string };
+  /** the chat header's preferences button: files, session options, commands, MCP servers,
+   * compact / clear / stop. `projectId`/`name`/`branch` let it hand a command back to the chat. */
+  QuickActions: { sessionId: string; running: boolean; agent: string; projectId?: string; name?: string; branch?: string | null };
   /** tap the chat header */
   SessionInfo: { sessionId: string; projectId: string };
   /** one folder of a session's directory ("" = its root), pushed per folder; `title` names the root */
@@ -35,6 +43,10 @@ export type RootStackParamList = {
   GeneralChat: { chatId: string; title?: string };
   /** the scope chip on a general chat: which projects it may see */
   GeneralScope: { chatId: string };
+  /** "+" on the Chats (general) tab: profile, scope, agent, model, effort, research, MCP servers */
+  GeneralNew: undefined;
+  /** a general chat's settings button: model, effort, research, MCP servers (agent read-only) */
+  GeneralSettings: { chatId: string };
 };
 
 export type ChatsProps = CompositeScreenProps<
@@ -64,3 +76,5 @@ export type GeneralProps = CompositeScreenProps<
 >;
 export type GeneralChatProps = NativeStackScreenProps<RootStackParamList, "GeneralChat">;
 export type GeneralScopeProps = NativeStackScreenProps<RootStackParamList, "GeneralScope">;
+export type GeneralNewProps = NativeStackScreenProps<RootStackParamList, "GeneralNew">;
+export type GeneralSettingsProps = NativeStackScreenProps<RootStackParamList, "GeneralSettings">;

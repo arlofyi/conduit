@@ -169,7 +169,7 @@ export function ChatsScreen({ navigation }: ChatsProps) {
           onDelete={() => run("delete")}
         />
       ) : (
-      /* compact top bar: "…" (profile, Switch computer) · Chats · "+" (new chat) */
+      /* compact top bar: "…" (profile, Switch computer) · Sessions · "+" (new session) */
       <View
         style={{
           paddingTop: insets.top + 4,
@@ -186,12 +186,12 @@ export function ChatsScreen({ navigation }: ChatsProps) {
           accessibilityRole="header"
           style={{ flex: 1, textAlign: "center", fontSize: TYPE.headline, fontWeight: "600", color: p.textBright }}
         >
-          Chats
+          Sessions
         </Text>
         <GlassCircle
           symbol="plus"
           primary
-          label="New chat"
+          label="New session"
           disabled={!ready || !view || view.projects.length === 0}
           onPress={() => navigation.navigate("NewChat")}
         />

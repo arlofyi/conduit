@@ -68,6 +68,12 @@ export const ANDROID_SYMBOLS = {
   "wifi.slash": "wifi_off",
   xmark: "close",
   "xmark.circle.fill": "cancel",
+  bolt: "bolt",
+  magnifyingglass: "search",
+  pin: "push_pin",
+  power: "power_settings_new",
+  "server.rack": "dns",
+  terminal: "terminal",
 } as const satisfies Partial<Record<SFSymbol, AndroidSymbol>>;
 
 /** Every symbol the app draws: an SF Symbol name that has an Android equivalent. */

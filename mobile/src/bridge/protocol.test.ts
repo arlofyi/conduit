@@ -1,4 +1,4 @@
-import { rootChatCreateMsg, rootChatHistoryMsg, rootChatScopeMsg, rootChatSendMsg, rootChatsMsg, rootChatStopMsg, answerMsg, fsAckMsg, fsDownloadMsg, fsListMsg, fsReadMsg, fsWriteMsg, approveMsg, attachMsg, authMsg, discoverMsg, inputMsg, interruptMsg, listMsg, pairMsg, promptInput, type ServerMsg } from "./protocol";
+import { rootChatCreateMsg, rootChatOptionsMsg, rootChatSettingsMsg, rootChatHistoryMsg, rootChatScopeMsg, rootChatSendMsg, rootChatsMsg, rootChatStopMsg, answerMsg, fsAckMsg, fsDownloadMsg, fsListMsg, fsReadMsg, fsWriteMsg, approveMsg, attachMsg, authMsg, discoverMsg, inputMsg, interruptMsg, listMsg, pairMsg, promptInput, type ServerMsg } from "./protocol";
 
 describe("promptInput", () => {
   it("prompt_enter_falls_outside_the_paste", () => {
@@ -111,5 +111,43 @@ describe("general chat frames", () => {
     expect(JSON.stringify(rootChatScopeMsg("c", scope))).toBe(
       '{"type":"rootchatscope","chatId":"c","scope":{"allProfiles":false,"profiles":[null,"work"],"projects":["p1"]}}',
     );
+  });
+
+  it("root_chat_options_frames_match_the_contract", () => {
+    const scope = { allProfiles: true, profiles: [], projects: [] };
+    expect(rootChatCreateMsg("r", "work", scope, { agent: "antigravity", model: undefined, effort: "high", research: true, mcps: ["github"] })).toEqual({
+      type: "rootchatcreate",
+      requestId: "r",
+      profileId: "work",
+      scope,
+      agent: "antigravity",
+      effort: "high",
+      research: true,
+      mcps: ["github"],
+    });
+    expect(rootChatSettingsMsg("c", "q", { model: "", research: false })).toEqual({
+      type: "rootchatsettings",
+      chatId: "c",
+      requestId: "q",
+      model: "",
+      research: false,
+    });
+    expect(rootChatOptionsMsg("o")).toEqual({ type: "rootchatoptions", requestId: "o" });
+  });
+});
+
+describe("session controls + usage frames (2026-11-01 spec)", () => {
+  it("sessionset carries only the keys being changed", () => {
+    const { sessionSetMsg, sessionOptionsMsg, usageMsg } = jest.requireActual("./protocol") as typeof import("./protocol");
+    expect(sessionSetMsg("s1", "r1", { effort: "high" })).toEqual({ type: "sessionset", sessionId: "s1", requestId: "r1", effort: "high" });
+    expect(sessionSetMsg("s1", "r2", { keepRunning: false, name: "x" })).toEqual({
+      type: "sessionset",
+      sessionId: "s1",
+      requestId: "r2",
+      name: "x",
+      keepRunning: false,
+    });
+    expect(sessionOptionsMsg("s1", "r3")).toEqual({ type: "sessionoptions", sessionId: "s1", requestId: "r3" });
+    expect(usageMsg("r4")).toEqual({ type: "usage", requestId: "r4" });
   });
 });

@@ -1,6 +1,7 @@
 /**
- * Cards for what the Mac is holding for a human: Claude's questions (AskUserQuestion) and tool
- * permissions. Which state a card is in -- live, sending, settled, private -- is decided in
+ * Cards for what the Mac is holding for a human: an agent's questions (Claude's AskUserQuestion) and tool
+ * permissions. (Claude's PermissionRequest, and Antigravity's run_command prompts, which reach the phone as the same
+ * `permission` item.) Which state a card is in -- live, sending, settled, private -- is decided in
  * logic/pending.ts (`cardView`); this file only draws it, in the desktop's chat-mode language
  * (`.hq-question` + the desktop AskCard's answer model: numbered options, a Recommended tag,
  * checkboxes and "Send N" for multi-select, "Something else…" free text).

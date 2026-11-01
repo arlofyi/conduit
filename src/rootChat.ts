@@ -14,6 +14,22 @@ export interface RootChat {
   createdAt: number;
   /** Profile this chat is visible under (sidebar filter); absent/null = Default. */
   profileId?: string | null;
+  /** Which agent runs the turns; absent = "claude". Fixed per chat. */
+  agent?: string;
+  model?: string;
+  effort?: string;
+  research?: boolean;
+  mcps?: string[];
+}
+
+/** The header's one-line summary of a chat's non-default options ("" when all default). */
+export function chatOptionsLabel(c: Pick<RootChat, "agent" | "model" | "effort" | "research">): string {
+  const parts: string[] = [];
+  if (c.agent === "antigravity") parts.push("Antigravity");
+  if (c.model) parts.push(c.model);
+  if (c.effort) parts.push(`${c.effort} effort`);
+  if (c.research) parts.push("deep research");
+  return parts.join(" · ");
 }
 
 export function appendItem(items: ChatItem[] | undefined, item: ChatItem): ChatItem[] {

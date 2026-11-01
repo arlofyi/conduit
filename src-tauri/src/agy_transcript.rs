@@ -103,6 +103,66 @@ pub fn read_items(db: &Path) -> Result<Vec<Value>, String> {
     Ok(items)
 }
 
+/// `steps.status` of a tool step agy is holding for the user's yes/no (measured live: a
+/// `run_command` step sits at 9 while the TUI shows "Run this command?", then moves to running
+/// / done on a yes, 6 on Esc, 7 on "No").
+pub const STATUS_WAITING: i64 = 9;
+
+/// A tool call agy is waiting on the user to allow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Waiting {
+    pub idx: i64,
+    /// agy's tool name (`run_command`, `write_to_file`, ...).
+    pub tool: String,
+    /// The call's arguments as agy sent them (JSON object; `{}` when unreadable).
+    pub args: Value,
+}
+
+/// Every step currently waiting on the user, oldest first.
+pub fn waiting_steps(db: &Path) -> Result<Vec<Waiting>, String> {
+    let conn = open_read_only(db)?;
+    let mut stmt = conn
+        .prepare("SELECT idx, metadata, step_payload FROM steps WHERE status = ?1 ORDER BY idx")
+        .map_err(|e| format!("agy steps: {e}"))?;
+    let rows = stmt
+        .query_map([STATUS_WAITING], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| format!("agy steps: {e}"))?;
+    let mut out = Vec::new();
+    for (idx, metadata, payload) in rows.flatten() {
+        let payload_msg = Msg::parse(&payload);
+        let meta = Msg::parse(&metadata).or_else(|| payload_msg.as_ref().and_then(|p| p.msg(5)));
+        let call = meta.as_ref().and_then(|m| m.msg(4));
+        let tool = call
+            .as_ref()
+            .and_then(|c| c.str(2))
+            .unwrap_or("tool")
+            .to_string();
+        let args = call
+            .as_ref()
+            .and_then(|c| c.str(3))
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        out.push(Waiting { idx, tool, args });
+    }
+    Ok(out)
+}
+
+/// One step's status, or None when it cannot be read.
+pub fn step_status(db: &Path, idx: i64) -> Option<i64> {
+    let conn = open_read_only(db).ok()?;
+    conn.query_row("SELECT status FROM steps WHERE idx = ?1", [idx], |r| {
+        r.get(0)
+    })
+    .ok()
+}
+
 /// Open without ever writing agy's directory.
 ///
 /// While agy runs, its `-wal`/`-shm` exist and hold the newest steps, so a normal read-only open
@@ -398,7 +458,7 @@ fn summary_of(args: &Value) -> Option<String> {
 
 /// Map an agy tool call onto the Claude tool whose rendering fits it, carrying across the one
 /// argument that renderer shows. Unknown tools keep their own name and render as generic.
-fn claude_tool(name: &str, args: &Value) -> (String, Value) {
+pub(crate) fn claude_tool(name: &str, args: &Value) -> (String, Value) {
     let s = |keys: &[&str]| -> Value {
         keys.iter()
             .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
@@ -440,7 +500,7 @@ fn timestamp(t: &Msg) -> Option<String> {
     Some(rfc3339(secs, nanos))
 }
 
-fn rfc3339(secs: i64, nanos: u64) -> String {
+pub(crate) fn rfc3339(secs: i64, nanos: u64) -> String {
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
     // Howard Hinnant's civil_from_days.
@@ -848,6 +908,19 @@ CREATE TABLE `gen_metadata` (`idx` integer,`data` blob,`size` integer NOT NULL D
         let items = read_items(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         items
+    }
+
+    #[test]
+    fn finds_the_step_waiting_on_permission_with_its_tool_and_status() {
+        let dir = temp_home("waiting");
+        let (path, conn) = make_db(&dir, &conversation());
+        drop(conn);
+        let w = waiting_steps(&path).unwrap();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].tool, "list_dir");
+        assert_eq!(step_status(&path, w[0].idx), Some(STATUS_WAITING));
+        assert_eq!(step_status(&path, 9999), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

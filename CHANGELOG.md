@@ -5,6 +5,20 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Session options on the phone.** A chat's options sheet on a paired phone
+  switches its model (live, through the agent's own `/model`, where the agent has one), sets
+  its reasoning effort (an idle session restarts to apply it, keeping its conversation),
+  renames it, and pins it "keep running" so the idle auto-stop leaves it alone. The pin is
+  now stored with the session rather than per computer, so the phone and the sidebar's
+  "Keep running" always agree; existing pins carry over on first launch.
+- **Added — Commands and skills on the phone.** The options sheet lists the session's slash
+  commands with a one-line description: Claude's useful built-ins, your own custom commands
+  and skills (yours and the project's), and Antigravity's skills, plus which MCP servers the
+  session loads.
+- **Added — Usage on the phone.** The phone shows each agent account's plan usage (the
+  5-hour and weekly windows, Antigravity's per-model pools, OpenRouter spend) with the same
+  names and "used" direction as the desktop meter. It reuses what the computer last read, so
+  checking from the phone never adds a request to a rate-limited usage service.
 - **Added — Your computer's web apps on your phone.** Anything running on your computer's
   `localhost` (a dev server, a Docker container, an agent's preview) opens on a paired
   Android phone at the same address, `http://localhost:<port>`, with no change to the app
@@ -17,17 +31,37 @@ All notable changes to Conduit are documented here. This project uses
   a real conversation (messages, commands it ran, files it read and edited), read from
   Antigravity's own conversation history on your computer, and you can start a new
   Antigravity session from the phone's "+" as well as Claude.
+- **Added — Answer Antigravity's permission prompts from the phone.** When an Antigravity
+  session stops to ask "Run this command?", the phone (and the desktop's permission cards)
+  now show the request with Allow and Deny, like Claude's. Allow runs it; Deny cancels the
+  step and Antigravity asks what to do instead. Answering in the terminal clears the card.
 - **Added — Project files on the phone.** Browse a session's folder from its info sheet or
   the folder button in the chat, read files (Markdown rendered), view images, edit and save
-  text files, and download any file to the phone through the share sheet. A file changed
+  text files, and save any file to a folder you choose on the phone (or share it). A file changed
   on your computer since you opened it is never overwritten. `.git` is hidden, links are
   never followed, and secrets such as `.env` or key files ask before they open and can't be
   edited from the phone. Private sessions stay closed.
-- **Added — General chat on the phone.** The new General tab is the root chat from your
+- **Added — General chat on the phone.** The new Chats tab (the old Chats tab, your sessions, is now Sessions) is the root chat from your
   computer: ask questions across your projects without a coding session. A new chat covers
   every project in the profile you're viewing; widen it to all profiles, or pick profiles
   and projects. A chat only sees, and can only read the files of, the projects in its scope,
   and a chat used from the phone never reads a private session.
+- **Added — Choose the agent, model and effort for a general chat.** A new chat on the phone
+  can run on Claude or Antigravity (fixed for that chat), with a model and reasoning effort
+  you pick; model and effort can be changed mid-chat from the chat's header. The desktop
+  chat header shows a chat's non-default choices.
+- **Added — Deep research in general chat.** Switch it on and the chat works harder: it
+  searches widely, reads the sources themselves, cross-checks, cites its links and says what
+  it could not verify.
+- **Added — Your MCP servers in general chat.** A Claude general chat can load MCP servers
+  you have set up for Claude Code (user scope), chosen per chat, alongside Conduit's own.
+- **Added — Antigravity general chats.** A general chat on Antigravity reads your projects
+  and the web, keeps its conversation between messages, and shows its history on the phone
+  and the computer. It cannot run commands or write files, and it has no Conduit tools.
+- **Fixed — General chat no longer tries shell commands it is not allowed to run.** The chat
+  is now told exactly what it can use (files, the web, `gh`, its own notes), so it stops
+  attempting PowerShell or shell scripts that were always refused and showed up as failed
+  tool calls.
 - **Changed — Name a new session from the phone, with or without a first message.** The
   "+" screen has a Title field, and the first message is optional: leave it empty and the
   agent starts and waits for you.

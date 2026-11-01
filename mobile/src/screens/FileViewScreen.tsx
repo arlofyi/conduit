@@ -321,7 +321,7 @@ export function FileViewScreen({ navigation, route }: FileViewProps) {
       {showsText && doc && canEdit(doc) ? (
         <GlassCircle symbol="pencil" label="Edit" onPress={startEdit} size={36} symbolSize={15} />
       ) : null}
-      {doc ? <GlassCircle symbol="square.and.arrow.down" label="Download to phone" onPress={startDownload} size={36} symbolSize={15} /> : null}
+      {doc ? <GlassCircle symbol="square.and.arrow.down" label="Save to phone or share" onPress={startDownload} size={36} symbolSize={15} /> : null}
     </View>
   );
 

@@ -1,6 +1,6 @@
 /**
- * The chat screen's header: "Project · title", the agent avatar, and the sub-line
- * `waiting on you | working… | idle · <model> · <n>% context`. Pure, so the precedence
+ * The chat screen's header: "Project · title", the agent avatar, the sub-line
+ * `waiting on you | working… | idle · <n>% context`, and the model / effort / usage indicators. Pure, so the precedence
  * between the polled `projects` view and the live hook stream is tested here.
  */
 import type { WireProjectsView, WireViewProject, WireViewSession } from "../bridge/protocol";
@@ -30,9 +30,19 @@ export interface ChatHeader {
   initials: string;
   color: string | null;
   state: HeaderState;
+  /** `waiting on you | working… | idle · <n>% context` (the model has its own chip) */
   subline: string;
   /** Stop is offered only while a turn is running */
   canStop: boolean;
+  /** the model chip: a family name ("Opus") or the id as given; null = unknown */
+  model: string | null;
+  /** the session's effort level as the desktop names it; null = not reported */
+  effort: string | null;
+  keepRunning: boolean;
+  agent: string;
+  /** the `usage` row this session's account draws from (older desktops: null) */
+  usageKey: string | null;
+  projectName: string | null;
 }
 
 export function headerState(status: SessionStatus): HeaderState {
@@ -116,7 +126,13 @@ export function chatHeader(a: {
     initials: hit ? agentInitials(hit.session.agent) : "?",
     color: hit ? accentFor(hit.project) : null,
     state,
-    subline: subline({ state, model, fraction: a.context ? a.context.fraction : null }),
+    subline: subline({ state, model: null, fraction: a.context ? a.context.fraction : null }),
     canStop: state === "running",
+    model,
+    effort: hit?.session.effort ?? null,
+    keepRunning: hit?.session.keepRunning === true,
+    agent: hit?.session.agent ?? "",
+    usageKey: hit?.session.usageKey ?? null,
+    projectName: hit?.project.name ?? null,
   };
 }

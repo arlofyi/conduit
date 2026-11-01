@@ -13,7 +13,7 @@
 //!
 //! Task 3 lands the transport (`dispatch_tool`, `handle_request`, `start`) on top of
 //! Task 2's declarative half, wired into `lib.rs`'s `setup` next to `fleet_mcp::start`.
-//! `write_mcp_config`/`port` are called by `root_chat::root_chat_send`, which resolves the
+//! `mcp_config_json`/`port` are called by `root_chat::root_chat_send`, which resolves the
 //! generated config into root chat's own `claude -p` invocation on every spawn.
 //!
 //! `Ctx` and `handle_request` take an `EmitSink`, not an `AppHandle` -- same reasoning as
@@ -110,7 +110,7 @@ fn agent_ids() -> Vec<String> {
 }
 
 /// The live port, published once the server binds. 0 = not up, which makes
-/// `write_mcp_config` decline and root chat degrade to its Phase 2 tool set.
+/// root chat skip its `--mcp-config` entry and degrade to its Phase 2 tool set.
 static PORT: AtomicU16 = AtomicU16::new(0);
 
 /// The bound port, read by `root_chat::root_chat_send` to resolve the per-chat
@@ -129,20 +129,6 @@ pub fn mcp_config_json(port: u16, chat_id: &str) -> String {
         }
     })
     .to_string()
-}
-
-/// Write the per-chat mcp-config into Conduit's data dir; return its path.
-///
-/// `root_chat::root_chat_send` calls this before every spawn; a port of 0 (server never
-/// bound) means `None`, no `--mcp-config` flag, and the chat degrades to its Phase 2 tool
-/// set rather than a half-state that promises tools it cannot reach.
-pub fn write_mcp_config(port: u16, chat_id: &str) -> Option<String> {
-    if port == 0 {
-        return None;
-    }
-    let path = crate::store::data_dir().join(format!("rootchat-mcp-{chat_id}.json"));
-    std::fs::write(&path, mcp_config_json(port, chat_id)).ok()?;
-    Some(path.to_string_lossy().into_owned())
 }
 
 /// May root chat read this session's output? Root chat is a CLOUD agent with no clearance

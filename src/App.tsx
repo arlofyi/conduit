@@ -878,15 +878,29 @@ export default function App() {
   // windows converge through `store-saved`. A phone delete keeps the session's worktree: the
   // desktop asks before removing one (it may hold uncommitted work), a remote tap cannot.
   useEffect(() => {
-    const un = listen<{ action: "stop" | "delete"; projectId: string; sessionId: string }>(
-      "mobile-session-action",
-      ({ payload }) => {
-        const st = useStore.getState();
-        if (!st.windowProfile.isMain) return;
-        if (payload.action === "stop") void st.stopSession(payload.projectId, payload.sessionId);
-        else void st.removeSession(payload.projectId, payload.sessionId);
-      },
-    );
+    // `restart` (a phone changed an idle session's effort or model) is the same stop + start
+    // as the sidebar's (stop_session RETIRES, so the scrollback and conversation survive);
+    // `rename` is the desktop's own rename, so both views agree.
+    const un = listen<{
+      action: "stop" | "delete" | "restart" | "rename";
+      projectId: string;
+      sessionId: string;
+      name?: string;
+    }>("mobile-session-action", ({ payload }) => {
+      const st = useStore.getState();
+      if (!st.windowProfile.isMain) return;
+      const { projectId, sessionId } = payload;
+      if (payload.action === "stop") void st.stopSession(projectId, sessionId);
+      else if (payload.action === "delete") void st.removeSession(projectId, sessionId);
+      else if (payload.action === "restart") {
+        void (async () => {
+          await st.stopSession(projectId, sessionId);
+          await useStore.getState().startSession(projectId, sessionId);
+        })();
+      } else if (payload.action === "rename" && payload.name) {
+        void st.renameSession(projectId, sessionId, payload.name);
+      }
+    });
     return () => {
       void un.then((f) => f());
     };

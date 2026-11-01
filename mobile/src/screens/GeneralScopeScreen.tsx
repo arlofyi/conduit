@@ -30,7 +30,6 @@ export function GeneralScopeScreen({ navigation, route }: GeneralScopeProps) {
   const [scope, setScope] = useState<Scope>(() => editableScope(chat?.scope ?? null));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const groups = view ? scopeGroups(view) : [];
   const unchanged = sameScope(scope, editableScope(chat?.scope ?? null));
 
   const save = async () => {
@@ -48,49 +47,7 @@ export function GeneralScopeScreen({ navigation, route }: GeneralScopeProps) {
       <Text style={{ marginHorizontal: 32, marginBottom: 12, fontSize: TYPE.footnote, color: p.textMid, lineHeight: 18 }}>
         {SCOPE_EXPLAINER}
       </Text>
-      <Group>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 12, minHeight: MIN_TOUCH + 6, paddingHorizontal: 16 }}>
-          <Text style={{ flex: 1, fontSize: TYPE.body, color: p.textBright }}>All profiles</Text>
-          <Switch
-            value={scope.allProfiles}
-            onValueChange={(v) => setScope((s) => setAllProfiles(s, v))}
-            trackColor={{ true: p.accent, false: p.selectionBg }}
-            accessibilityLabel="All profiles"
-          />
-        </View>
-      </Group>
-      {scope.allProfiles
-        ? null
-        : groups.map((g) => {
-            const whole = scope.profiles.includes(g.profileId);
-            return (
-              <View key={g.profileId ?? "default"}>
-                <GroupLabel>{g.name}</GroupLabel>
-                <Group>
-                  <SheetRow
-                    first
-                    symbol={whole ? "checkmark.square.fill" : "square"}
-                    title={`All of ${g.name}`}
-                    detail={`${g.projects.length} project${g.projects.length === 1 ? "" : "s"}, and any added later`}
-                    selected={whole}
-                    onPress={() => setScope((s) => toggleProfile(s, g.profileId))}
-                  />
-                  {g.projects.map((pr) => {
-                    const cover = projectCover(scope, pr.id, g.profileId, view);
-                    return (
-                      <SheetRow
-                        key={pr.id}
-                        symbol={cover ? "checkmark.square.fill" : "square"}
-                        title={pr.name}
-                        disabled={cover === "profile"}
-                        onPress={() => setScope((s) => toggleProject(s, pr.id))}
-                      />
-                    );
-                  })}
-                </Group>
-              </View>
-            );
-          })}
+      <ScopeEditor scope={scope} onChange={setScope} />
       <Text style={{ marginHorizontal: 32, marginBottom: 10, fontSize: TYPE.footnote, color: error ? p.red : p.textMid }}>
         {error ?? `Sees: ${scopeSummary(scope, view)}`}
       </Text>
@@ -112,5 +69,60 @@ export function GeneralScopeScreen({ navigation, route }: GeneralScopeProps) {
         {saving ? <ActivityIndicator color={p.meText} /> : <Text style={{ color: p.meText, fontWeight: "600", fontSize: TYPE.callout }}>Save</Text>}
       </Pressable>
     </SheetScaffold>
+  );
+}
+
+/** Everything, or any mix of whole profiles and single projects (grouped by profile). Shared
+ * by this sheet and the new-chat sheet. */
+export function ScopeEditor({ scope, onChange }: { scope: Scope; onChange: (s: Scope) => void }) {
+  const { palette: p } = useTheme();
+  const { view } = useLive();
+  const groups = view ? scopeGroups(view) : [];
+  return (
+    <>
+      <Group>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 12, minHeight: MIN_TOUCH + 6, paddingHorizontal: 16 }}>
+          <Text style={{ flex: 1, fontSize: TYPE.body, color: p.textBright }}>All profiles</Text>
+          <Switch
+            value={scope.allProfiles}
+            onValueChange={(v) => onChange(setAllProfiles(scope, v))}
+            trackColor={{ true: p.accent, false: p.selectionBg }}
+            accessibilityLabel="All profiles"
+          />
+        </View>
+      </Group>
+      {scope.allProfiles
+        ? null
+        : groups.map((g) => {
+            const whole = scope.profiles.includes(g.profileId);
+            return (
+              <View key={g.profileId ?? "default"}>
+                <GroupLabel>{g.name}</GroupLabel>
+                <Group>
+                  <SheetRow
+                    first
+                    symbol={whole ? "checkmark.square.fill" : "square"}
+                    title={`All of ${g.name}`}
+                    detail={`${g.projects.length} project${g.projects.length === 1 ? "" : "s"}, and any added later`}
+                    selected={whole}
+                    onPress={() => onChange(toggleProfile(scope, g.profileId))}
+                  />
+                  {g.projects.map((pr) => {
+                    const cover = projectCover(scope, pr.id, g.profileId, view);
+                    return (
+                      <SheetRow
+                        key={pr.id}
+                        symbol={cover ? "checkmark.square.fill" : "square"}
+                        title={pr.name}
+                        disabled={cover === "profile"}
+                        onPress={() => onChange(toggleProject(scope, pr.id))}
+                      />
+                    );
+                  })}
+                </Group>
+              </View>
+            );
+          })}
+    </>
   );
 }

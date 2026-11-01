@@ -639,7 +639,7 @@ plus install/remove/status), and one listener in `App.tsx`.
   (`AgentId::from_wire`; the lenient deserialize would start Claude under an invented id),
   the name comes from the first message's first line (<= 40 chars, else "Mobile"), and each
   phone gets 10 per hour (`take_spawn_slot`, keyed by device id, or peer IP on loopback).
-  The phone offers only Claude, the one agent whose chat it can show.
+  The phone offers Claude and Antigravity, the agents whose chat it can show.
 - **Questions and permissions are held for whoever can see a card** (`hooks::holder_for`,
   shared by `/ask` and `/permission`): the desktop gate, OR a connected REMOTE phone when
   the session is not private. Loopback (the Simulator) never counts as a phone -- only an
@@ -748,6 +748,14 @@ Design: `docs/superpowers/specs/2026-10-31-phone-sessions-files-general-chat-des
   Never open agy's db plainly read-only when there is no `-wal`: that CREATES sidecar files
   next to agy's (`immutable=1` then). The protobuf field numbers are internal to agy and
   pinned in the findings doc; an agy update can move them.
+- **agy permission prompts** (`agy_prompts.rs`): agy fires no permission hook, but holds a
+  tool step at `steps.status = 9` while its menu is up. A watcher registers those in the SAME
+  `Broker` as Claude's `/permission` (gated by `hooks::card_holder`), so no surface needs an
+  agy case. Answers are KEYSTROKES, measured: Allow = `1`, Deny = Esc. Never send a digit for
+  "No" -- option counts differ per tool and a digit can land on "Yes, always". The step is
+  re-read before sending; a step that leaves 9 by itself was answered in the TUI (`by:
+  terminal`). Measuring agy from a Claude session needs the REAL `HOME`/`USERPROFILE`: a
+  redirected home shows agy's first-run onboarding (ToS with data sharing pre-ticked).
 - **The project list is pushed**: `Store::save_generation` moves on every persisted write
   and the bridge re-sends `projects` (step 2d). Don't add a second builder for that frame.
 - **General chat = root chat.** `root_chat::send_turn` runs a turn for the desktop command
@@ -756,6 +764,25 @@ Design: `docs/superpowers/specs/2026-10-31-phone-sessions-files-general-chat-des
   `store.projects_for_chat`. File reads are narrowed by DENY rules on out-of-scope project
   paths -- an allow list cannot narrow Read/Glob/Grep (measured). `RootChat.phone` is sticky
   and makes `chat_may_peek` refuse private sessions regardless of private mode.
+- **The charter's `TOOL_POLICY` must match `build_command`'s allow list** (a test pins both).
+  `-p` refuses an unallowed call before it runs, and a model never told it had no shell kept
+  trying `Bash` with `$var`, PowerShell and `pwsh -File` (measured: every one a refusal). Do
+  not "fix" that by widening the allow list -- `fd -x`, `rg --pre`, `git -c` are exec vectors.
+- **Chat options** (`root_chat_options.rs`): `RootChat.agent/model/effort/research/mcps`.
+  User MCP servers are read from the chat profile's `.claude.json` (`claude_profile_paths`
+  mirrors the spawn redirect), merged into the ONE `--mcp-config` file (written 0600 where the
+  OS allows; Conduit's `conduit-root` entry always wins its name) and each added to
+  `--allowedTools` as `mcp__<name>` -- under `-p` an unallowed MCP tool is denied. The phone
+  only ever gets server NAMES, never definitions (env/headers carry secrets).
+- **Antigravity chats** (`root_chat_agy.rs`; findings in
+  `docs/superpowers/specs/2026-11-01-agy-print-mode-findings.md`). The prompt goes on STDIN as
+  one `--input-format stream-json` line, never the command line (`-p` takes the prompt as its
+  own value). The conversation id comes from the stream's `init` line. The charter is an
+  `AGENTS.md` in the chat's scratch dir (its cwd) -- agy has no system-prompt flag. Print mode
+  auto-denies unallowed tools without hanging, BUT the user's own `permissions.allow` still
+  applies, so `--settings` DENIES `command(*)`, `write_file(*)`, `execute_url(*)`, `mcp(*)` and
+  `read_file(<out-of-scope project>)`; `--add-dir` does not scope reads. Never emit an empty
+  `read_file()` rule: it denies the cwd.
 
 ## Where port mirroring lives
 

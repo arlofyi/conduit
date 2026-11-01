@@ -17,7 +17,8 @@ import {
   type NativeSyntheticEvent,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useLive } from "../bridge/LiveProvider";
+import { useIsFocused } from "@react-navigation/native";
+import { useLive, useUsagePolling } from "../bridge/LiveProvider";
 import type { WireDiff } from "../bridge/protocol";
 import { AgentAvatar, useReduceMotion } from "../components/AgentAvatar";
 import { AssistantMarkdown } from "../components/AssistantMarkdown";
@@ -39,6 +40,9 @@ import type {
 import { chatOnPhone, glyphStateFor, NO_PHONE_CHAT_TEXT } from "../logic/agents";
 import { PRIVATE_SESSION_TEXT } from "../logic/frames";
 import { chatHeader } from "../logic/chatHeader";
+import { composerSuggestions, effortLevel, effortName, type CommandOption } from "../logic/sessionOptions";
+import { headerGauge, pct, rowForSession } from "../logic/usage";
+import { EffortBars, UsageRing } from "../components/UsageMeters";
 import { outputPreview } from "../logic/chatView";
 import { mix, readableInk } from "../logic/color";
 import { callVerb, groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
@@ -61,7 +65,9 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   const { palette: p } = useTheme();
   const h = hq(p);
   const insets = useSafeAreaInsets();
-  const { sessionLive, context, view, attach, detach, prompt, pending, answer, approve, upload } = useLive();
+  const { sessionLive, context, view, attach, detach, prompt, pending, answer, approve, upload, usage, sessionOptions, conn } = useLive();
+  // The header's mini gauge draws this session's agent account (polled while the chat is showing).
+  useUsagePolling(useIsFocused());
   const list = useRef<FlatList<DisplayRow>>(null);
 
   // Attach to this session's live stream (transcript history + tail + status) while the screen
@@ -89,6 +95,27 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   }, [view, sessionId]);
   const projectName = session?.project.name ?? null;
   const agent = session?.session.agent ?? "";
+  // The session's commands/skills (composer `/` suggestions) and its effort ladder (header bars).
+  // An older computer never answers: no suggestions, and the bars use the common ladder.
+  const [commands, setCommands] = useState<readonly CommandOption[]>(NO_COMMANDS);
+  const [efforts, setEfforts] = useState<readonly string[]>([]);
+  const ready = conn.phase === "ready";
+  const silo = session?.session.silo === true;
+  useEffect(() => {
+    if (!ready || silo) return;
+    let live = true;
+    sessionOptions(sessionId).then((r) => {
+      if (!live || !r.ok) return;
+      setCommands(r.options.commands);
+      setEfforts(r.options.efforts);
+    });
+    return () => {
+      live = false;
+    };
+  }, [sessionId, ready, silo, sessionOptions]);
+  const suggest = useCallback((d: string) => composerSuggestions(d, commands), [commands]);
+  const effort = effortLevel(header.effort, efforts);
+  const gauge = headerGauge(rowForSession(usage?.rows ?? null, header.usageKey, header.agent));
   // The Mac follows the session onto a new transcript itself (/clear, a just-spawned chat) and
   // re-sends `history`, so the chat never has to re-attach to catch up.
 
@@ -412,6 +439,8 @@ export function ChatScreen({ route, navigation }: ChatProps) {
               onAttach={onAttach}
               onRemoveAttachment={removeAttachment}
               onHeight={setComposerH}
+              suggest={commands.length > 0 ? suggest : undefined}
+              insert={route.params.insert}
             />
           )}
         </View>
@@ -424,7 +453,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
           onLayout={(e) => setHeaderH(e.nativeEvent.layout.height)}
           style={{ paddingTop: insets.top + 4, paddingBottom: 8, paddingHorizontal: 10, flexDirection: "row", alignItems: "center", gap: 10 }}
         >
-          <GlassCircle symbol="chevron.left" label="Back to chats" onPress={() => navigation.goBack()} size={38} symbolSize={16} />
+          <GlassCircle symbol="chevron.left" label="Back to sessions" onPress={() => navigation.goBack()} size={38} symbolSize={16} />
           <Pressable
             onPress={() => navigation.navigate("SessionInfo", { sessionId, projectId })}
             accessibilityRole="button"
@@ -441,39 +470,45 @@ export function ChatScreen({ route, navigation }: ChatProps) {
                 {projectName ? <Text style={{ color: p.textDim }}>{"  ·  "}</Text> : null}
                 <Text style={{ color: stateColor }}>{header.subline}</Text>
               </Text>
+              {header.model || effort || gauge ? (
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginTop: 3, minWidth: 0 }}>
+                  {header.model ? (
+                    <View
+                      accessible
+                      accessibilityLabel={`Model ${header.model}`}
+                      style={{ flexShrink: 1, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 6, backgroundColor: p.selectionBg }}
+                    >
+                      <Text maxFontSizeMultiplier={1.4} style={{ color: p.textMid, fontSize: TYPE.micro, fontWeight: "600" }} numberOfLines={1}>
+                        {header.model}
+                      </Text>
+                    </View>
+                  ) : null}
+                  {effort && header.effort ? (
+                    <View accessible accessibilityLabel={`Effort ${effortName(header.effort)}`} style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+                      <EffortBars filled={effort.filled} steps={effort.steps} height={11} color={p.textMid} />
+                    </View>
+                  ) : null}
+                  {gauge ? (
+                    <View accessible accessibilityLabel={gauge.a11y} style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+                      <UsageRing used={gauge.window.used} size={14} stroke={2.5} />
+                      <Text maxFontSizeMultiplier={1.4} style={{ color: p.textMid, fontSize: TYPE.micro, fontVariant: ["tabular-nums"] }}>
+                        {pct(gauge.window.used)}%
+                      </Text>
+                    </View>
+                  ) : null}
+                </View>
+              ) : null}
             </View>
           </Pressable>
-          {session && !session.session.silo ? (
-            <GlassCircle
-              symbol="folder"
-              label="Files"
-              onPress={() => navigation.navigate("Files", { sessionId, path: "", title: header.name })}
-              size={38}
-              symbolSize={16}
-            />
-          ) : null}
-          {!header.canStop && (
-            <GlassCircle
-              symbol="slider.horizontal.3"
-              label="Steer: compact or clear the conversation"
-              onPress={() => navigation.navigate("QuickActions", { sessionId, running, agent })}
-              size={38}
-              symbolSize={17}
-            />
-          )}
-          {header.canStop && (
-            <Pressable
-              onPress={() => navigation.navigate("QuickActions", { sessionId, running: true, agent })}
-              hitSlop={8}
-              accessibilityRole="button"
-              accessibilityLabel="Stop or steer the current turn"
-            >
-              <GlassSurface interactive style={{ height: 34, borderRadius: 17, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", gap: 5 }}>
-                <Icon name="stop.fill" size={11} color={p.red} />
-                <Text maxFontSizeMultiplier={1.6} style={{ color: p.red, fontSize: TYPE.footnote, fontWeight: "600" }}>Stop</Text>
-              </GlassSurface>
-            </Pressable>
-          )}
+          <GlassCircle
+            symbol="slider.horizontal.3"
+            label={running ? "Session options: interrupt, files, model, commands" : "Session options: files, model, commands, compact or stop"}
+            onPress={() =>
+              navigation.navigate("QuickActions", { sessionId, running, agent, projectId, name: route.params.name, branch: route.params.branch })
+            }
+            size={38}
+            symbolSize={17}
+          />
         </View>
         <View style={{ height: 1, backgroundColor: header.color ? mix(header.color, p.panelBg, 0.55) : h.hairline }} />
       </MaterialBar>
@@ -489,6 +524,7 @@ type DisplayRow =
   | { type: "pending"; key: string; card: CardView };
 
 const NO_ROWS: DisplayRow[] = [];
+const NO_COMMANDS: readonly CommandOption[] = [];
 
 function threadKey(t: DisplayRow): string {
   return t.key;

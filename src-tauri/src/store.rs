@@ -205,6 +205,13 @@ pub struct Session {
     /// and skip_serializing_if keeps older state.json files byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<String>,
+    /// Pinned "keep running": the idle auto-stop (`useAutoStopIdle`) never retires it, for
+    /// work the process tree cannot reveal (an agent waiting on a remote job). Lived in the
+    /// desktop's localStorage until the phone needed to read and set it; the desktop migrates
+    /// its legacy pins here once. Skipped when false so older state.json files stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_running: bool,
 }
 
 /// Directed READ policy: may `caller` read `target`'s output? The single source of truth for
@@ -425,7 +432,7 @@ pub struct Profile {
 /// projects (design doc 2026-08-26). `id` doubles as the pinned Claude session id — the
 /// first send uses `--session-id <id>`, later sends `--resume <id>` — so there is no
 /// separate captured session id.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RootChat {
     pub id: String,
@@ -449,6 +456,42 @@ pub struct RootChat {
     /// everywhere else and a chat must not become the way around that.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub phone: bool,
+    /// Which agent runs the turns: Claude (`claude -p`) or Antigravity (`agy` print mode).
+    /// Fixed at creation -- the two keep their history in different stores, so switching
+    /// would orphan the conversation. Anything but `antigravity` runs as Claude.
+    #[serde(default, skip_serializing_if = "is_claude")]
+    pub agent: AgentId,
+    /// `--model` for every turn (an alias or a full id). None = the agent's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `--effort` for every turn (low|medium|high|xhigh|max). None = the agent's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Deep research: effort raised to at least `high` and a research brief in the charter.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub research: bool,
+    /// User-scope MCP servers (names from the profile's `.claude.json`) this chat loads
+    /// beside Conduit's own. Claude chats only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcps: Vec<String>,
+    /// An Antigravity chat's own conversation id, captured from its first turn's `init`
+    /// event and replayed as `--conversation`. Claude chats resume by `id` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_conversation_id: Option<String>,
+}
+
+fn is_claude(a: &AgentId) -> bool {
+    *a == AgentId::Claude
+}
+
+/// What a new root chat runs with (see the matching `RootChat` fields).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RootChatOptions {
+    pub agent: AgentId,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub research: bool,
+    pub mcps: Vec<String>,
 }
 
 /// The projects a root chat may see and act on: the union of whole profiles and single
@@ -1226,11 +1269,29 @@ impl Store {
         scope: Option<ChatScope>,
         phone: bool,
     ) -> RootChat {
+        self.add_root_chat_opts(profile_id, scope, phone, RootChatOptions::default())
+    }
+
+    /// A new chat with its agent, model, effort, research and MCP choices. The account is
+    /// the CHAT'S AGENT's global default at this moment (an Antigravity chat's history lives
+    /// under the agy login's home, not Claude's).
+    pub fn add_root_chat_opts(
+        &self,
+        profile_id: Option<String>,
+        scope: Option<ChatScope>,
+        phone: bool,
+        opts: RootChatOptions,
+    ) -> RootChat {
+        let agent = if opts.agent == AgentId::Antigravity {
+            AgentId::Antigravity
+        } else {
+            AgentId::Claude
+        };
         let account_id = self
             .default_accounts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&AgentId::Claude)
+            .get(&agent)
             .cloned();
         let chat = RootChat {
             id: Uuid::new_v4().to_string(),
@@ -1244,6 +1305,12 @@ impl Store {
             profile_id,
             scope,
             phone,
+            agent,
+            model: opts.model,
+            effort: opts.effort,
+            research: opts.research,
+            mcps: opts.mcps,
+            agy_conversation_id: None,
         };
         self.root_chats
             .lock()
@@ -1298,14 +1365,47 @@ impl Store {
         self.update_root_chat(id, |c| c.phone = true);
     }
 
+    /// Change a chat's model / effort / research / MCP choices (each `None` = unchanged;
+    /// an empty model or effort clears it). The agent is fixed. Returns the updated chat.
+    pub fn set_root_chat_settings(
+        &self,
+        id: &str,
+        model: Option<Option<String>>,
+        effort: Option<Option<String>>,
+        research: Option<bool>,
+        mcps: Option<Vec<String>>,
+    ) -> Option<RootChat> {
+        let found = self.update_root_chat(id, |c| {
+            if let Some(m) = model {
+                c.model = m;
+            }
+            if let Some(e) = effort {
+                c.effort = e;
+            }
+            if let Some(r) = research {
+                c.research = r;
+            }
+            if let Some(m) = mcps {
+                c.mcps = m;
+            }
+        });
+        found.then(|| self.root_chat(id)).flatten()
+    }
+
+    /// Record an Antigravity chat's conversation id (captured from its first turn).
+    pub fn set_root_chat_agy_conversation(&self, id: &str, conversation_id: &str) {
+        let cid = conversation_id.to_string();
+        self.update_root_chat(id, |c| c.agy_conversation_id = Some(cid));
+    }
+
     fn update_root_chat(&self, id: &str, f: impl FnOnce(&mut RootChat)) -> bool {
         let changed = {
             let mut chats = self.root_chats.lock().unwrap_or_else(|e| e.into_inner());
             match chats.iter_mut().find(|c| c.id == id) {
                 Some(c) => {
-                    let before = format!("{:?}{}", c.scope, c.phone);
+                    let before = format!("{c:?}");
                     f(c);
-                    Some(before != format!("{:?}{}", c.scope, c.phone))
+                    Some(before != format!("{c:?}"))
                 }
                 None => None,
             }
@@ -2126,6 +2226,24 @@ impl Store {
         if changed {
             self.save(&projects);
         }
+    }
+
+    /// Pin or unpin "keep running" (see `Session::keep_running`). Saves only on a change.
+    /// False when the session is unknown.
+    pub fn set_session_keep_running(&self, session_id: &str, keep: bool) -> bool {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = projects
+            .iter_mut()
+            .flat_map(|p| &mut p.sessions)
+            .find(|s| s.id == session_id)
+        else {
+            return false;
+        };
+        if s.keep_running != keep {
+            s.keep_running = keep;
+            self.save(&projects);
+        }
+        true
     }
 
     /// Record the agent's latest activity (see `Session::agent_state`). Saves only on an
@@ -3753,6 +3871,21 @@ mod tests {
     }
 
     #[test]
+    fn keep_running_is_absent_when_false_and_round_trips() {
+        let v = serde_json::to_value(mk("plain")).unwrap();
+        assert!(v.get("keepRunning").is_none(), "{v}");
+        let mut s = mk("pinned");
+        s.keep_running = true;
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["keepRunning"], true);
+        let back: Session = serde_json::from_value(v).unwrap();
+        assert!(back.keep_running);
+        let old: Session =
+            serde_json::from_value(serde_json::json!({"id": "x", "name": "x"})).unwrap();
+        assert!(!old.keep_running);
+    }
+
+    #[test]
     fn can_read_allows_self_and_equal_public_clearance() {
         let a = mk("a");
         let b = mk("b");
@@ -4625,6 +4758,78 @@ mod tests {
     }
 
     #[test]
+    fn an_old_root_chat_runs_claude_with_no_options_and_writes_none_back() {
+        let c: RootChat =
+            serde_json::from_value(serde_json::json!({"id": "c", "title": "t"})).unwrap();
+        assert_eq!(c.agent, AgentId::Claude);
+        assert!(c.model.is_none() && c.effort.is_none() && !c.research && c.mcps.is_empty());
+        let v = serde_json::to_value(&c).unwrap();
+        for k in [
+            "agent",
+            "model",
+            "effort",
+            "research",
+            "mcps",
+            "agyConversationId",
+        ] {
+            assert!(
+                v.get(k).is_none(),
+                "{k} must be skipped at its default: {v}"
+            );
+        }
+        // An agent id this build does not know degrades to Claude instead of failing the load.
+        let odd: RootChat =
+            serde_json::from_value(serde_json::json!({"id": "c", "title": "t", "agent": "gpt-9"}))
+                .unwrap();
+        assert_eq!(odd.agent, AgentId::Claude);
+        let agy: RootChat = serde_json::from_value(serde_json::json!({
+            "id": "c", "title": "t", "agent": "antigravity", "model": "m", "effort": "high",
+            "research": true, "mcps": ["x"], "agyConversationId": "u"
+        }))
+        .unwrap();
+        let back = serde_json::to_value(&agy).unwrap();
+        assert_eq!(back["agent"], "antigravity");
+        assert_eq!(back["mcps"], serde_json::json!(["x"]));
+        assert_eq!(back["agyConversationId"], "u");
+    }
+
+    #[test]
+    fn root_chat_settings_change_only_what_was_sent() {
+        let dir = temp_dir("root_chat_settings");
+        let store = Store::for_test(&dir);
+        let chat = store.add_root_chat_opts(
+            None,
+            None,
+            true,
+            RootChatOptions {
+                agent: AgentId::Antigravity,
+                model: Some("m1".into()),
+                effort: Some("low".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(chat.agent, AgentId::Antigravity);
+        let c = store
+            .set_root_chat_settings(&chat.id, None, Some(None), Some(true), None)
+            .unwrap();
+        assert_eq!(c.model.as_deref(), Some("m1"));
+        assert!(c.effort.is_none());
+        assert!(c.research);
+        assert!(store
+            .set_root_chat_settings("nope", None, None, None, None)
+            .is_none());
+        store.set_root_chat_agy_conversation(&chat.id, "conv");
+        assert_eq!(
+            store
+                .root_chat(&chat.id)
+                .unwrap()
+                .agy_conversation_id
+                .as_deref(),
+            Some("conv")
+        );
+    }
+
+    #[test]
     fn root_chat_config_dir_resolves_pinned_account() {
         let dir = temp_dir("root_chat_cfg");
         let store = Store::for_test(&dir);
@@ -4663,6 +4868,7 @@ mod tests {
                 profile_id: None,
                 scope: None,
                 phone: false,
+                ..Default::default()
             }],
             ..Default::default()
         };
