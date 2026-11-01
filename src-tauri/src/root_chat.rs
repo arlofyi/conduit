@@ -1559,7 +1559,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(cmd.contains(" --model opus"), "{cmd}");
+        assert!(
+            cmd.contains(&format!(
+                " --model {}",
+                crate::pty::quote_cmdline_arg("opus")
+            )),
+            "{cmd}"
+        );
         assert!(cmd.contains(" --effort max"), "{cmd}");
         assert!(cmd.contains(",mcp__github"), "{cmd}");
         assert!(

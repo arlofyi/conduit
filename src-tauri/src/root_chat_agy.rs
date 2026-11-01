@@ -253,7 +253,10 @@ mod tests {
         assert!(cmd.starts_with("agy --output-format stream-json --input-format stream-json"));
         assert!(!cmd.contains(" -p"), "the prompt rides stdin: {cmd}");
         assert!(cmd.contains(&format!("--conversation {CONV}")));
-        assert!(cmd.contains("--model gemini-3.8-flash-low"));
+        assert!(cmd.contains(&format!(
+            "--model {}",
+            crate::pty::quote_cmdline_arg("gemini-3.8-flash-low")
+        )));
         assert!(cmd.contains("--effort high"));
         assert!(cmd.contains(&format!(
             "--add-dir {}",
