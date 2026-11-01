@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.50.0 — 2026-11-01
+
 - **Added — Session controls on the phone.** One sheet (the tune button in a chat's header)
   holds every session action: interrupt, switch the model (live, through the agent's own
   `/model`, where it has one), set the reasoning effort (an idle session restarts to apply it,
