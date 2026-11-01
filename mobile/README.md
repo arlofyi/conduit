@@ -7,6 +7,18 @@ design in
 
 ## What it does
 
+<p align="center">
+  <img src="../docs/screenshots/mobile-sessions.jpg" width="230" alt="Sessions tab with a 'While you were away' summary and sessions across projects">
+  <img src="../docs/screenshots/mobile-session-sheet.jpg" width="230" alt="A session's sheet: project, agent, context, files, model, effort, rename and keep running">
+  <img src="../docs/screenshots/mobile-chats.jpg" width="230" alt="The Chats tab (general chat) with the new-chat agent picker">
+</p>
+<p align="center">
+  <img src="../docs/screenshots/mobile-chat-settings.jpg" width="230" alt="General chat settings: attached projects, agent, model, effort, deep research and MCP servers">
+  <img src="../docs/screenshots/mobile-apps.jpg" width="230" alt="The Apps tab listing the computer's local web apps to mirror">
+  <img src="../docs/screenshots/mobile-settings.jpg" width="230" alt="Settings: plan usage per account as rings, and the notification switches">
+</p>
+
+
 The app is the phone half of Conduit's mobile bridge (`src-tauri/src/bridge.rs`). It opens on
 **Connect** until a computer is chosen, then shows four tabs:
 
