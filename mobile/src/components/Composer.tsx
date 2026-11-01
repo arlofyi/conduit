@@ -41,7 +41,11 @@ export function Composer({
   onHeight,
   suggest,
   insert,
+  offline,
 }: {
+  /** set while nothing can be sent (offline): the hint replaces the placeholder, Send and "+"
+   * are off, and the draft stays so it can be sent once the link is back */
+  offline?: string;
   /** optional: put `/command ` into the draft (the session sheet's commands list); a new
    * `nonce` repeats it */
   insert?: { command: string; nonce: number };
@@ -67,7 +71,7 @@ export function Composer({
   const input = useRef<TextInput>(null);
   const metrics = composerMetrics(oneLine, PAD_V);
   const height = composerHeight(draft, content, metrics);
-  const canSend = canSendWith(draft, attachments);
+  const canSend = !offline && canSendWith(draft, attachments);
   const [menuOpen, setMenuOpen] = useState(false);
   const [barH, setBarH] = useState(0);
   const suggestions = suggest ? suggest(draft) : [];
@@ -132,7 +136,9 @@ export function Composer({
       {suggestions.length > 0 ? <SuggestionList items={suggestions} onPick={pickSuggestion} /> : null}
       {onAttach ? <AttachMenu open={menuOpen} bottom={barH + 6} onChoose={choose} onClose={() => setMenuOpen(false)} /> : null}
       <View style={{ flexDirection: "row", alignItems: "flex-end", gap: 8, paddingHorizontal: 10 }}>
-      {onAttach ? <GlassCircle symbol="plus" label="Attach a photo or file" onPress={openMenu} size={COMPOSER.min} symbolSize={17} /> : null}
+      {onAttach ? (
+        <GlassCircle symbol="plus" label="Attach a photo or file" onPress={openMenu} size={COMPOSER.min} symbolSize={17} disabled={!!offline} />
+      ) : null}
       <GlassSurface style={{ flex: 1, borderRadius: COMPOSER.min / 2, minHeight: metrics.min }}>
         <Text
           onLayout={(e) => setOneLine(e.nativeEvent.layout.height)}
@@ -160,7 +166,7 @@ export function Composer({
           onChangeText={setDraft}
           multiline
           scrollEnabled={height >= metrics.max}
-          placeholder="Message"
+          placeholder={offline ?? "Message"}
           placeholderTextColor={p.textMid}
           accessibilityLabel={`Message ${name}`}
           selectionColor={p.accent}
@@ -181,7 +187,7 @@ export function Composer({
         onPress={send}
         disabled={!canSend}
         accessibilityRole="button"
-        accessibilityLabel="Send"
+        accessibilityLabel={offline ? `Send. ${offline}` : "Send"}
         accessibilityState={{ disabled: !canSend }}
         hitSlop={4}
         style={({ pressed }) => ({

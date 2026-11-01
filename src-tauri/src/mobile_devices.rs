@@ -305,7 +305,7 @@ pub fn mobile_set_enabled(
 
 /// Port mirroring on/off. Off closes every open tunnel at once (a phone's browser loses
 /// the page); the phones' own switches are left alone and simply find no ports.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn mobile_set_mirroring(
     state: tauri::State<'_, Arc<MobileDevices>>,
     bridge: tauri::State<'_, Arc<crate::bridge::BridgeController>>,

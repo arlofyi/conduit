@@ -240,7 +240,7 @@ pub fn write_token_file_in(dir: &Path) -> String {
     );
     let path = token_file_path_in(dir);
     if let Err(e) = fs::write(&path, format!("{token}\n")) {
-        eprintln!("conduit: could not write cli token: {e}");
+        crate::diag::error("cli", format!("could not write cli token: {e}"));
     }
     #[cfg(unix)]
     {

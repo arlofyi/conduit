@@ -347,30 +347,8 @@ export function settingsOf(chat: RootChat): ChatSettings {
   };
 }
 
-/** Another agent: a model or effort the new agent does not offer goes back to its default. */
-export function pickAgent(s: ChatSettings, opts: RootChatOptions, agent: string): ChatSettings {
-  const a = agentOption(opts, agent);
-  return {
-    ...s,
-    agent,
-    model: a && s.model !== null && a.models.some((m) => m.id === s.model) ? s.model : null,
-    effort: a && s.effort !== null && a.efforts.includes(s.effort) ? s.effort : null,
-  };
-}
-
 export function toggleMcp(s: ChatSettings, name: string): ChatSettings {
   return { ...s, mcps: s.mcps.includes(name) ? s.mcps.filter((m) => m !== name) : [...s.mcps, name] };
-}
-
-/** The `rootchatcreate` options: the agent, plus only what differs from the computer's defaults. */
-export function createSettings(s: ChatSettings): WireRootChatSettings {
-  return {
-    agent: s.agent,
-    ...(s.model ? { model: s.model } : {}),
-    ...(s.effort ? { effort: s.effort } : {}),
-    ...(s.research ? { research: true } : {}),
-    ...(s.mcps.length ? { mcps: unique(s.mcps) } : {}),
-  };
 }
 
 /** The `rootchatsettings` patch: only the fields that changed ("" = back to the default), or

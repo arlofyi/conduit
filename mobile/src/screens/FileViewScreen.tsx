@@ -18,6 +18,7 @@ import {
   ScrollView,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -40,8 +41,10 @@ import {
 } from "../logic/files";
 import type { FileViewProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
-import { MONO, TYPE } from "../theme/type";
+import { MIN_TOUCH, MONO, TYPE } from "../theme/type";
+import { useKeyboardInset } from "../hooks/useKeyboardInset";
 import { DownloadStrip, FilesHeader, useShareDownload } from "./FilesScreen";
+import { diag } from "../data/diagnostics";
 
 type Doc = WireFsText;
 type Load = { phase: "loading" } | { phase: "ok"; doc: Doc } | { phase: "error"; error: string };
@@ -88,8 +91,12 @@ function Note({ text, tone = "info" }: { text: string; tone?: "info" | "warn" })
 /** Lines in monospace, virtualized (a 1 MB file is tens of thousands of lines). */
 function CodeView({ text, numbers, wrap }: { text: string; numbers: boolean; wrap: boolean }) {
   const { palette: p } = useTheme();
+  const insets = useSafeAreaInsets();
+  // The code text scales with the system font size, so the gutter's digit width must too, or
+  // large text wraps or clips the line numbers.
+  const { fontScale } = useWindowDimensions();
   const lines = useMemo(() => splitLines(text), [text]);
-  const gutter = String(lines.length).length * 8 + 14;
+  const gutter = Math.ceil(String(lines.length).length * 8 * fontScale) + 14;
   const list = (
     <FlatList
       data={lines}
@@ -97,12 +104,12 @@ function CodeView({ text, numbers, wrap }: { text: string; numbers: boolean; wra
       initialNumToRender={80}
       maxToRenderPerBatch={80}
       windowSize={15}
-      contentContainerStyle={{ paddingVertical: 10, paddingRight: 12 }}
+      contentContainerStyle={{ paddingTop: 10, paddingBottom: 10 + insets.bottom, paddingRight: 12 }}
       renderItem={({ item, index }) => (
         <View style={{ flexDirection: "row" }}>
           {numbers ? (
             <Text
-              style={{ width: gutter, paddingRight: 8, textAlign: "right", fontFamily: MONO, fontSize: CODE_SIZE, lineHeight: CODE_LEAD, color: p.textDim }}
+              style={{ width: gutter, paddingRight: 8, textAlign: "right", fontFamily: MONO, fontSize: CODE_SIZE, lineHeight: CODE_LEAD, color: p.textMid }}
             >
               {index + 1}
             </Text>
@@ -225,20 +232,11 @@ export function FileViewScreen({ navigation, route }: FileViewProps) {
     ]);
   });
 
-  // The editor clears the keyboard by hand on Android (edge-to-edge: the window no longer
-  // resizes), as the chat composer does.
-  const [kb, setKb] = useState(0);
-  useEffect(() => {
-    const ios = Platform.OS === "ios";
-    const show = Keyboard.addListener(ios ? "keyboardWillShow" : "keyboardDidShow", (e) =>
-      setKb(ios ? e.endCoordinates.height : e.endCoordinates.height + insets.bottom),
-    );
-    const hide = Keyboard.addListener(ios ? "keyboardWillHide" : "keyboardDidHide", () => setKb(0));
-    return () => {
-      show.remove();
-      hide.remove();
-    };
-  }, [insets.bottom]);
+  // The editor clears the keyboard by hand on both platforms (no KeyboardAvoidingView here; on
+  // Android edge-to-edge the window no longer resizes), as the chat composer does.
+  // With it down, the editor's last lines clear the home indicator / gesture bar instead.
+  const { keyboardUp, androidKeyboard, iosKeyboard } = useKeyboardInset();
+  const kb = keyboardUp ? (Platform.OS === "ios" ? iosKeyboard : androidKeyboard) : insets.bottom;
 
   const startEdit = () => {
     if (!doc) return;
@@ -276,6 +274,7 @@ export function FileViewScreen({ navigation, route }: FileViewProps) {
       setConflict(true);
       return;
     }
+    diag.error("files", "edit.saveFailed", undefined, r.error);
     Alert.alert("Couldn't save", fsErrorText(r.error));
   };
 
@@ -305,10 +304,24 @@ export function FileViewScreen({ navigation, route }: FileViewProps) {
 
   const right = editing ? (
     <View style={{ flexDirection: "row", gap: 14, alignItems: "center" }}>
-      <Pressable onPress={cancelEdit} hitSlop={8} accessibilityRole="button" disabled={saving}>
+      <Pressable
+        onPress={cancelEdit}
+        hitSlop={8}
+        accessibilityRole="button"
+        disabled={saving}
+        style={{ minHeight: MIN_TOUCH, marginVertical: -3, justifyContent: "center" }}
+      >
         <Text style={{ color: p.textMid, fontSize: TYPE.subhead }}>Cancel</Text>
       </Pressable>
-      <Pressable onPress={() => void save()} hitSlop={8} accessibilityRole="button" disabled={saving || !dirty}>
+      <Pressable
+        onPress={() => void save()}
+        hitSlop={8}
+        accessibilityRole="button"
+        accessibilityLabel="Save"
+        accessibilityState={{ disabled: saving || !dirty, busy: saving }}
+        disabled={saving || !dirty}
+        style={{ minHeight: MIN_TOUCH, minWidth: MIN_TOUCH, marginVertical: -3, alignItems: "center", justifyContent: "center" }}
+      >
         {saving ? (
           <ActivityIndicator size="small" color={p.accent} />
         ) : (

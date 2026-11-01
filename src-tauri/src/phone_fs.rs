@@ -9,8 +9,11 @@
 //! name, or a link that points elsewhere. A final canonicalize + `strip_prefix` is a second,
 //! independent check.
 //!
-//! Hidden from phones entirely: `.git` (and anything inside it), the upload folder, and the
-//! editor's own temp files. Secrets (`.env`, keys, credential files) are LISTED, marked
+//! Hidden from phones entirely: `.git` (and anything inside it), the upload folder, the
+//! editor's own temp files, and `.claude/worktrees` (see [`WORKTREES`]). Every name check is
+//! case-insensitive -- Windows and macOS file systems are, so `.GIT` IS `.git` there -- and on
+//! Windows an 8.3 short-name alias (`GIT~1`, `CLAUDE~1`) is refused outright, since it names
+//! a long-named entry without spelling it. Secrets (`.env`, keys, credential files) are LISTED, marked
 //! `sensitive`, opened or downloaded only with an explicit `confirm`, and never written.
 //! File contents are never logged.
 
@@ -31,6 +34,37 @@ pub const CHUNK_RAW: usize = 384 * 1024;
 
 /// Names never shown to, or reachable from, a phone.
 const HIDDEN: &[&str] = &[".git", crate::uploads::UPLOAD_DIR];
+
+/// `<repo>/.claude/worktrees` holds every worktree session's checkout
+/// (`worktree::worktree_path`). A session WITHOUT a worktree browses the project root, so
+/// without this a phone could open a PRIVATE sibling session's worktree through it -- the
+/// privacy gate only refuses the private session's own id. The whole folder is hidden rather
+/// than only private sessions' slugs: that needs no store lookup at browse time, cannot go
+/// stale when a session turns private (or a slug is reused), and loses nothing -- a worktree
+/// session's own files are reachable as that session, whose root IS its worktree.
+const WORKTREES: (&str, &str) = (".claude", "worktrees");
+
+fn name_is(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+fn is_hidden_name(name: &str) -> bool {
+    HIDDEN.iter().any(|h| name_is(name, h)) || is_editor_temp(name)
+}
+
+/// Is `name`, inside a directory named `parent`, the hidden worktrees folder?
+fn is_hidden_child(parent: Option<&str>, name: &str) -> bool {
+    parent.is_some_and(|p| name_is(p, WORKTREES.0)) && name_is(name, WORKTREES.1)
+}
+
+/// A Windows 8.3 short-name alias: a `~` followed by a digit (`PROGRA~1`, `CLAUDE~1.TXT`).
+/// It can name a hidden long-named entry without spelling it, so Windows refuses it; a real
+/// long name with that shape is the price.
+fn is_short_name_alias(seg: &str) -> bool {
+    seg.as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'~' && w[1].is_ascii_digit())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsError {
@@ -80,13 +114,13 @@ fn valid_segment(seg: &str) -> bool {
         && !seg.contains(['\\', ':', '\0'])
         && !seg.ends_with(['.', ' '])
         && !reserved_windows_name(seg)
-        && !HIDDEN.contains(&seg)
-        && !is_editor_temp(seg)
+        && !is_hidden_name(seg)
+        && !(cfg!(windows) && is_short_name_alias(seg))
 }
 
 /// The desktop editor's atomic-write temp (`.<name>.conduit-tmp-<pid>-<nanos>`).
 fn is_editor_temp(name: &str) -> bool {
-    name.starts_with('.') && name.contains(".conduit-tmp-")
+    name.starts_with('.') && name.to_ascii_lowercase().contains(".conduit-tmp-")
 }
 
 /// Split a phone path into validated segments. `""` and `"/"` are the root itself.
@@ -97,6 +131,9 @@ pub fn segments(rel: &str) -> Result<Vec<&str>, FsError> {
     }
     let segs: Vec<&str> = rel.split('/').collect();
     if segs.len() > 64 || !segs.iter().all(|s| valid_segment(s)) {
+        return Err(FsError::BadPath);
+    }
+    if segs.windows(2).any(|w| is_hidden_child(Some(w[0]), w[1])) {
         return Err(FsError::BadPath);
     }
     Ok(segs)
@@ -204,11 +241,12 @@ pub fn list(root: &Path, rel: &str) -> Result<(Vec<Entry>, usize), FsError> {
     if !meta.is_dir() {
         return Err(FsError::NotFound);
     }
+    let parent = segments(rel)?.last().copied();
     let rd = fs::read_dir(&dir).map_err(|e| FsError::Io(e.to_string()))?;
     let mut out = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if HIDDEN.contains(&name.as_str()) || is_editor_temp(&name) {
+        if is_hidden_name(&name) || is_hidden_child(parent, &name) {
             continue;
         }
         let Ok(m) = fs::symlink_metadata(e.path()) else {
@@ -420,6 +458,53 @@ mod tests {
         assert!(segments("console.log").is_ok());
         assert!(segments("com10").is_ok());
         assert!(segments("com0").is_ok());
+    }
+
+    #[test]
+    fn hidden_names_are_refused_whatever_their_case() {
+        for bad in [
+            ".GIT/config",
+            "sub/.Git",
+            ".Conduit-Uploads/a.png",
+            ".main.rs.CONDUIT-TMP-1-2",
+            ".claude/worktrees",
+            ".claude/worktrees/secret-slug/src/main.rs",
+            ".CLAUDE/Worktrees/x",
+            "nested/.claude/worktrees/x",
+        ] {
+            assert_eq!(segments(bad), Err(FsError::BadPath), "{bad:?}");
+        }
+        // The rest of .claude, and a folder merely named worktrees elsewhere, stay reachable.
+        assert!(segments(".claude/settings.json").is_ok());
+        assert!(segments("docs/worktrees").is_ok());
+    }
+
+    #[test]
+    fn short_name_aliases_are_recognized() {
+        assert!(is_short_name_alias("GIT~1"));
+        assert!(is_short_name_alias("CLAUDE~12.TXT"));
+        assert!(!is_short_name_alias("notes~"));
+        assert!(!is_short_name_alias("a~b"));
+        #[cfg(windows)]
+        assert_eq!(segments("CLAUDE~1/worktrees"), Err(FsError::BadPath));
+    }
+
+    #[test]
+    fn worktrees_folder_is_hidden_from_a_project_root_listing() {
+        let root = tmp("wt");
+        fs::create_dir_all(root.join(".claude").join("worktrees").join("private-one")).unwrap();
+        fs::write(root.join(".claude").join("settings.json"), "{}").unwrap();
+        fs::create_dir_all(root.join(".GIT")).unwrap();
+        let (entries, _) = list(&root, ".claude").unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["settings.json"]);
+        let (top, _) = list(&root, "").unwrap();
+        assert!(top.iter().all(|e| !e.name.eq_ignore_ascii_case(".git")));
+        assert_eq!(
+            list(&root, ".claude/worktrees/private-one"),
+            Err(FsError::BadPath)
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

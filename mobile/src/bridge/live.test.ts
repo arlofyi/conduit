@@ -133,6 +133,13 @@ describe("mapProjectsView", () => {
     expect(v.projects[0]).toEqual({ ...frame.projects[0], sessions: [session] });
   });
 
+  it("carries a failed turn's kind only when there is one", () => {
+    const failed = mapProjectsView({ ...frame, projects: [{ ...frame.projects[0], sessions: [{ ...session, failed: "rate_limit" }] }] });
+    expect(failed.projects[0].sessions[0].failed).toBe("rate_limit");
+    const fine = mapProjectsView({ ...frame, projects: [{ ...frame.projects[0], sessions: [{ ...session, failed: null }] }] });
+    expect(fine.projects[0].sessions[0]).not.toHaveProperty("failed");
+  });
+
   it("never lets a silo session carry activity or question text", () => {
     const v = mapProjectsView({
       ...frame,
@@ -202,6 +209,8 @@ describe("statusPatch", () => {
   });
   it("stop → done, notification → needsInput, sessionend → idle", () => {
     expect(statusPatch("stop", {})).toMatchObject({ status: "done" });
+    // StopFailure (an API error ended the turn) fires instead of Stop
+    expect(statusPatch("stopfailure", {})).toMatchObject({ status: "done", clearActivity: true });
     expect(statusPatch("notification", { message: "needs you" })).toMatchObject({ status: "needsInput" });
     expect(statusPatch("sessionend", {})).toMatchObject({ status: "idle" });
   });

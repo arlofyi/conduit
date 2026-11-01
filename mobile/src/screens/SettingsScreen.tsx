@@ -5,6 +5,8 @@ import { useIsFocused } from "@react-navigation/native";
 import { useLive, useUsagePolling } from "../bridge/LiveProvider";
 import { Card, Row, SectionLabel } from "../components/form";
 import { UsageSection } from "../components/UsageSection";
+import { StorageCard } from "../components/StorageCard";
+import { DiagnosticsCard } from "../components/DiagnosticsCard";
 import { usePrefs } from "../data/PrefsProvider";
 import { useBgWatch } from "../data/BgWatchProvider";
 import { anyNotify } from "../logic/watch";
@@ -27,7 +29,14 @@ export function SettingsScreen({ navigation }: SettingsProps) {
   const { prefs, setPrefs } = usePrefs();
   // Android: these switches also reach the lock screen (modules/bg-watch).
   const bg = useBgWatch();
-  const notifyKeys: (keyof Prefs)[] = ["notifyQuestion", "notifyPermission", "notifyFinished"];
+  const notifyKeys: (keyof Prefs)[] = [
+    "notifyQuestion",
+    "notifyPermission",
+    "notifyFinished",
+    "notifyFailed",
+    "notifyStopped",
+    "notifyUnreachable",
+  ];
 
   const macName = hello?.macName ?? currentMac?.macName ?? "—";
   const status = connStatus(conn, macName);
@@ -49,10 +58,11 @@ export function SettingsScreen({ navigation }: SettingsProps) {
     );
   };
 
-  const toggle = (key: keyof Omit<Prefs, "theme">, title: string, first?: boolean) => (
+  const toggle = (key: keyof Omit<Prefs, "theme">, title: string, first?: boolean, subtitle?: string) => (
     <Row
       first={first}
       title={title}
+      subtitle={subtitle}
       accessibilityLabel={title}
       right={
         <Switch
@@ -83,6 +93,15 @@ export function SettingsScreen({ navigation }: SettingsProps) {
           {toggle("notifyQuestion", "A session asks a question", true)}
           {toggle("notifyPermission", "A permission is needed")}
           {toggle("notifyFinished", "A session finishes")}
+          {toggle("notifyFailed", "A turn fails", false, "It ended on an error: a rate limit, sign-in or API problem")}
+          {toggle("notifyStopped", "A running session is stopped", false, "From your computer, this phone, or the idle auto-stop")}
+          {bg.available &&
+            toggle(
+              "notifyUnreachable",
+              "Your computer is out of reach",
+              false,
+              "With the screen off, for 10 minutes, while Tailscale is on. Never when you turn Tailscale off.",
+            )}
           {bg.available && anyNotify(prefs) && !bg.notificationsAllowed && (
             <Row
               title="Notifications are off for Conduit"
@@ -92,6 +111,15 @@ export function SettingsScreen({ navigation }: SettingsProps) {
               onPress={() => {
                 bg.requestNotifications().catch(() => {});
               }}
+            />
+          )}
+          {bg.available && anyNotify(prefs) && bg.stoppedByUser && (
+            <Row
+              title="Stopped from the notification"
+              subtitle="Nothing reaches you while the screen is off until you turn this back on (or change a switch above)."
+              value="Turn on"
+              tone="accent"
+              onPress={bg.resumeWatching}
             />
           )}
           {bg.available && anyNotify(prefs) && bg.notificationsAllowed && bg.batteryRestricted && !prefs.batteryHintDismissed && (
@@ -112,6 +140,8 @@ export function SettingsScreen({ navigation }: SettingsProps) {
         <Card>
           <Row first title="Theme" value={p.label} onPress={cycle} accessibilityLabel={`Theme, ${p.label}. Tap to change.`} />
         </Card>
+
+        <StorageCard />
 
         <SectionLabel>Connection</SectionLabel>
         <Card>
@@ -139,6 +169,8 @@ export function SettingsScreen({ navigation }: SettingsProps) {
           <Row title="Switch computer…" tone="accent" onPress={() => navigation.navigate("Connect")} />
           <Row title="Forget this computer" tone="danger" onPress={confirmForget} disabled={!currentMac} />
         </Card>
+
+        <DiagnosticsCard />
       </ScrollView>
     </View>
   );

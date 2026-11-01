@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import expo.modules.bgwatch.NativeLog
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -37,11 +38,21 @@ class PortMirrorService : Service() {
 
   override fun onBind(intent: Intent?): IBinder? = null
 
+  override fun onCreate() {
+    super.onCreate()
+    NativeLog.init(this)
+  }
+
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     val cfg = MirrorState.config
     // startForeground first, always: a service started with startForegroundService that stops
     // without calling it crashes the app.
-    goForeground(cfg)
+    try {
+      goForeground(cfg)
+    } catch (e: Exception) {
+      NativeLog.error("mirror", "foreground.refused", e)
+      throw e
+    }
     val stopAsked = intent?.action == ACTION_STOP
     if (stopAsked || cfg == null) {
       if (stopAsked) MirrorState.stoppedReason = "stopped"
@@ -67,10 +78,12 @@ class PortMirrorService : Service() {
     val endpointChanged = prev == null || prev.url != cfg.url || prev.token != cfg.token
     val want = cfg.ports.associateBy { it.remote }
     val drop = listeners.keys.filter { r -> endpointChanged || want[r]?.local != listeners[r]?.map?.local }
-    for (r in drop) {
-      listeners.remove(r)?.close()
-      MirrorState.removeStatus(r)
-    }
+    // Close AND wait for the old listeners: a replacement on the same local port would
+    // otherwise race the old accept thread (still binding, or not yet closed) and fail "in use".
+    val old = drop.mapNotNull { listeners.remove(it) }
+    old.forEach { it.close() }
+    old.forEach { it.join(JOIN_MS) }
+    for (r in drop) MirrorState.removeStatus(r)
     for ((r, m) in want) {
       if (r !in listeners) listeners[r] = PortListener(m, cfg).also { it.start() }
     }
@@ -94,6 +107,7 @@ class PortMirrorService : Service() {
   /** The computer refused the token (revoked, or mirroring turned off there): stop everything
    * rather than retry it on every browser connection. */
   private fun unauthorized() {
+    NativeLog.warn("mirror", "tunnel.unauthorized")
     MirrorState.stoppedReason = "unauthorized"
     MirrorState.config = null
     main.post { stopSelf() }
@@ -102,21 +116,51 @@ class PortMirrorService : Service() {
   private inner class PortListener(val map: PortMap, private val cfg: MirrorConfig) {
     @Volatile private var server: ServerSocket? = null
     @Volatile private var stopped = false
+    @Volatile private var worker: Thread? = null
 
     fun start() {
-      thread(name = "port-mirror-accept-${map.local}", isDaemon = true) { run() }
+      worker = thread(name = "port-mirror-accept-${map.local}", isDaemon = true) {
+        // Thread root: a bug here ends this one listener (logged), never the whole app.
+        try {
+          run()
+        } catch (t: Throwable) {
+          NativeLog.error("mirror", "listener.crashed", t, "port ${map.local}")
+          if (!stopped) MirrorState.setStatus(PortStatus(map.remote, map.local, false, "failed"))
+          runCatching { server?.close() }
+        }
+      }
+    }
+
+    /** Loopback ONLY: never the phone's Wi-Fi or cellular address. */
+    private fun bind(): ServerSocket {
+      val s = ServerSocket()
+      try {
+        s.reuseAddress = true
+        s.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), map.local), 64)
+      } catch (e: Exception) {
+        runCatching { s.close() }
+        throw e
+      }
+      return s
     }
 
     private fun run() {
       val s = try {
-        ServerSocket().apply {
-          reuseAddress = true
-          // Loopback ONLY: never the phone's Wi-Fi or cellular address.
-          bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), map.local), 64)
+        bind()
+      } catch (_: Exception) {
+        // One retry: a listener we just replaced (or another app's) may be releasing the port.
+        if (!stopped) runCatching { Thread.sleep(BIND_RETRY_MS) }
+        try {
+          if (stopped) return
+          bind()
+        } catch (e: Exception) {
+          // A replaced listener must not overwrite its successor's status.
+          if (!stopped) {
+            NativeLog.warn("mirror", "bind.failed", e, "port ${map.local}")
+            MirrorState.setStatus(PortStatus(map.remote, map.local, false, "in use"))
+          }
+          return
         }
-      } catch (e: Exception) {
-        MirrorState.setStatus(PortStatus(map.remote, map.local, false, "in use"))
-        return
       }
       if (stopped) {
         runCatching { s.close() }
@@ -141,6 +185,13 @@ class PortMirrorService : Service() {
     fun close() {
       stopped = true
       runCatching { server?.close() }
+    }
+
+    /** Wait (bounded) for the accept thread to end, so its port is free and it writes no status. */
+    fun join(ms: Long) {
+      val w = worker ?: return
+      if (w === Thread.currentThread()) return
+      runCatching { w.join(ms) }
     }
   }
 
@@ -194,5 +245,7 @@ class PortMirrorService : Service() {
     const val ACTION_STOP = "expo.modules.portmirror.STOP"
     private const val CHANNEL_ID = "port_mirror"
     private const val NOTIFICATION_ID = 0x504d
+    private const val JOIN_MS = 1_000L
+    private const val BIND_RETRY_MS = 250L
   }
 }

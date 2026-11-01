@@ -12,6 +12,7 @@ import { PortMirror, type MirrorStatus } from "../../modules/port-mirror";
 import { useLive } from "../bridge/LiveProvider";
 import { mirrorPlan, type AppliedMirror } from "../logic/ports";
 import { usePrefs } from "./PrefsProvider";
+import { diag } from "./diagnostics";
 
 /** How often the computer's list is re-read while mirroring and the Apps tab is not open. */
 export const MIRROR_POLL_MS = 30_000;
@@ -28,6 +29,11 @@ export interface PortMirrorValue {
   lastStop: string | null;
 }
 
+/** PortMirror.start's rejection when Android refuses a background start */
+export const START_REFUSED_CODE = "ERR_PORT_MIRROR_START";
+/** `lastStop` for that refusal (the Apps tab words it) */
+export const START_REFUSED = "backgroundStart";
+
 const IDLE: MirrorStatus = { running: false, reason: null, ports: [] };
 const Ctx = createContext<PortMirrorValue | null>(null);
 
@@ -40,6 +46,9 @@ export function PortMirrorProvider({ children }: { children: React.ReactNode }) 
   /** a stop WE asked for: its "stopped" report must not turn the user's switch off */
   const selfStop = useRef(false);
   const busy = useRef(false);
+  /** bumped when an apply settles: a change that arrived while it was in flight (the switch
+   * turned off mid-start) was skipped by the `busy` bail, so the plan must be re-read */
+  const [settled, setSettled] = useState(0);
 
   const on = prefs.mirrorPorts && PortMirror !== null;
   const setOn = useCallback(
@@ -63,6 +72,7 @@ export function PortMirrorProvider({ children }: { children: React.ReactNode }) 
       // Stopped from outside: the notification's Stop, or the computer refused the token.
       // Turn the switch off so it is not started straight back up.
       if (s.reason === "stopped" || s.reason === "unauthorized") {
+        diag.info("mirror", "stopped", s.reason);
         setLastStop(s.reason);
         setPrefs({ mirrorPorts: false });
       }
@@ -110,14 +120,19 @@ export function PortMirrorProvider({ children }: { children: React.ReactNode }) 
             });
     run
       .catch((e: unknown) => {
+        diag.error("mirror", plan.kind === "stop" ? "stop.failed" : "start.failed", e);
         applied.current = null;
-        setLastStop(e instanceof Error ? e.message : String(e));
+        // Android refuses to start a foreground service from the background (the app left the
+        // screen mid-apply): a known code, given its own copy rather than the raw message.
+        const code = (e as { code?: unknown } | null)?.code;
+        setLastStop(code === START_REFUSED_CODE ? START_REFUSED : e instanceof Error ? e.message : String(e));
         setPrefs({ mirrorPorts: false });
       })
       .finally(() => {
         busy.current = false;
+        setSettled((n) => n + 1);
       });
-  }, [on, webPorts, address, token, computer, status.running, setPrefs]);
+  }, [on, webPorts, address, token, computer, status.running, setPrefs, settled]);
 
   // A different computer (or a forgotten one): nothing of the old one may stay mirrored.
   const macId = currentMac?.deviceId ?? null;
@@ -128,7 +143,7 @@ export function PortMirrorProvider({ children }: { children: React.ReactNode }) 
     if (PortMirror && (status.running || applied.current)) {
       selfStop.current = true;
       applied.current = null;
-      PortMirror.stop().catch(() => {});
+      PortMirror.stop().catch((e: unknown) => diag.warn("mirror", "stop.failed", e));
     }
   }, [macId, status.running]);
 

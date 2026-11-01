@@ -856,7 +856,7 @@ pub fn start(
             }
         }
         let Some(server) = server else {
-            eprintln!("conduit: no free fleet MCP port in 8475..=8495");
+            crate::diag::error("fleet", "no free fleet MCP port in 8475..=8495");
             return;
         };
 

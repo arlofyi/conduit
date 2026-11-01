@@ -186,6 +186,8 @@ function sessionOf(v: unknown): WireViewSession | null {
     effort: str(s.effort),
     keepRunning: s.keepRunning === true,
     usageKey: str(s.usageKey),
+    // the last turn ended on an error (Claude's StopFailure); only present when it did
+    ...(str(s.failed) ? { failed: str(s.failed) } : {}),
   };
 }
 
@@ -286,6 +288,8 @@ export function statusPatch(event: string, body: HookBody | null | undefined): L
     case "sessionend":
       return { status: "idle", compacting: false, clearActivity: true };
     case "stop":
+    // Claude's StopFailure: the turn ended on an API error, instead of `stop`
+    case "stopfailure":
       return { status: "done", compacting: false, clearActivity: true };
     case "notification":
       return { status: "needsInput" };

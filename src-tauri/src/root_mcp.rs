@@ -158,6 +158,32 @@ pub(crate) fn chat_may_peek(store: &Store, chat_id: &str, session: &Session) -> 
     !(phone && (session.silo || session.local_only))
 }
 
+/// A private (silo / local-only) session: the content a remote phone must never receive.
+fn session_is_private(session: &Session) -> bool {
+    session.silo || session.local_only
+}
+
+/// What `chat_read` of `target` means for the reading chat `me`.
+#[derive(Debug, PartialEq)]
+enum ReadTaint {
+    /// Nothing private involved.
+    Clean,
+    /// The target holds private-session content: the reader now does too.
+    Mark,
+    /// A phone-driven reader may not take private-session content at all (`chat_may_peek`).
+    Refuse,
+}
+
+fn read_taint(me: Option<&crate::store::RootChat>, target: &crate::store::RootChat) -> ReadTaint {
+    if !target.peeked_private {
+        ReadTaint::Clean
+    } else if me.is_some_and(|c| c.phone) {
+        ReadTaint::Refuse
+    } else {
+        ReadTaint::Mark
+    }
+}
+
 /// May chat `me` see chat `other` (`chats_list` / `chat_read`)? An unscoped chat, or one
 /// scoped to every profile, sees all chats; a scoped one sees only chats in the profiles its
 /// scope ATTACHES -- never a chat about projects it cannot see. The profile a chat is merely
@@ -414,7 +440,13 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
                         "agent": s.agent,
                         "role": s.role,
                         "status": st.status,
-                        "activity": st.activity,
+                        // A phone-driven chat never sees a private session's activity
+                        // line, the same rule the phone's own project list follows.
+                        "activity": if chat_may_peek(&ctx.store, &ctx.chat_id, s) {
+                            st.activity
+                        } else {
+                            None
+                        },
                         "branch": s.branch,
                         "hibernated": s.stopped,
                         "sensitive": !chat_may_peek(&ctx.store, &ctx.chat_id, s),
@@ -438,9 +470,16 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
             if !chat_may_peek(&ctx.store, &ctx.chat_id, &session) {
                 return Err("access-denied: the user marked this session sensitive".into());
             }
-            ctx.pty
+            let out = ctx
+                .pty
                 .recent_output(id, PEEK_BYTES)
-                .ok_or_else(|| "session is not running".to_string())
+                .ok_or_else(|| "session is not running".to_string())?;
+            // Marked BEFORE the content goes back to the model, so every item the chat
+            // streams from here on is already hidden from remote phones.
+            if session_is_private(&session) {
+                ctx.store.mark_root_chat_peeked_private(&ctx.chat_id);
+            }
+            Ok(out)
         }
         "chats_list" => {
             let me = ctx.chat_id.clone();
@@ -467,6 +506,18 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
                 .any(|c| c.id == id && chat_visible(mine.as_ref(), c))
             {
                 return Err("unknown chat id".into());
+            }
+            if let Some(target) = ctx.store.root_chat(id) {
+                match read_taint(mine.as_ref(), &target) {
+                    ReadTaint::Refuse => {
+                        return Err(
+                            "access-denied: that chat read a sensitive session, and this chat is                              shown on a phone"
+                                .into(),
+                        )
+                    }
+                    ReadTaint::Mark => ctx.store.mark_root_chat_peeked_private(&ctx.chat_id),
+                    ReadTaint::Clean => {}
+                }
             }
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
             let items = crate::root_chat::history_items(&ctx.store, id);
@@ -521,6 +572,16 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
             let chat = ctx.store.add_root_chat(parent_profile);
             ctx.store.rename_root_chat(&chat.id, title);
             let seed = args.get("seed").and_then(|v| v.as_str()).unwrap_or("");
+            // The seed is written by a chat that may hold private-session content: the
+            // fork inherits the taint, or it would be the way to carry it to a phone.
+            if !seed.is_empty()
+                && ctx
+                    .store
+                    .root_chat(&ctx.chat_id)
+                    .is_some_and(|c| c.peeked_private)
+            {
+                ctx.store.mark_root_chat_peeked_private(&chat.id);
+            }
             // The desktop reconciles its sidebar from this event; without it the new chat
             // only appears on the next reload.
             (ctx.emit)(
@@ -563,7 +624,7 @@ pub fn start(
             }
         }
         let Some(server) = server else {
-            eprintln!("conduit: no free root MCP port in 8496..=8516");
+            crate::diag::error("root-mcp", "no free root MCP port in 8496..=8516");
             return;
         };
         for request in server.incoming_requests() {
@@ -809,6 +870,43 @@ mod tests {
         let proposals = Proposals::default();
         let args = json!({"projectId": other.id, "task": "x"});
         assert!(dispatch_work_inner(&store, &proposals, &chat.id, &args, 1).is_err());
+    }
+
+    #[test]
+    fn reading_a_tainted_chat_taints_the_reader_or_is_refused_to_a_phone_chat() {
+        use crate::store::RootChat;
+        let clean = RootChat::default();
+        let tainted = RootChat {
+            peeked_private: true,
+            ..Default::default()
+        };
+        let desktop = RootChat::default();
+        let phone = RootChat {
+            phone: true,
+            ..Default::default()
+        };
+        assert_eq!(read_taint(Some(&desktop), &clean), ReadTaint::Clean);
+        assert_eq!(read_taint(Some(&phone), &clean), ReadTaint::Clean);
+        assert_eq!(read_taint(Some(&desktop), &tainted), ReadTaint::Mark);
+        assert_eq!(read_taint(None, &tainted), ReadTaint::Mark);
+        assert_eq!(read_taint(Some(&phone), &tainted), ReadTaint::Refuse);
+
+        let dir = temp_dir("taint");
+        let store = Store::for_test(&dir);
+        let chat = store.add_root_chat(None);
+        assert!(!store.root_chat(&chat.id).unwrap().peeked_private);
+        store.mark_root_chat_peeked_private(&chat.id);
+        store.mark_root_chat_peeked_private(&chat.id);
+        assert!(store.root_chat(&chat.id).unwrap().peeked_private, "sticky");
+        assert!(session_is_private(&Session {
+            silo: true,
+            ..Default::default()
+        }));
+        assert!(session_is_private(&Session {
+            local_only: true,
+            ..Default::default()
+        }));
+        assert!(!session_is_private(&Session::default()));
     }
 
     #[test]

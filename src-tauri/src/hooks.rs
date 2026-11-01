@@ -84,7 +84,7 @@ pub fn start(
             }
         }
         let Some(server) = server else {
-            eprintln!("conduit: no free hook port in 8423..=8443");
+            crate::diag::error("hooks", "no free hook port in 8423..=8443");
             return;
         };
 
@@ -156,8 +156,9 @@ pub fn start(
                                         // the wrong window still beats losing the
                                         // invocation outright, which a bare `return` here
                                         // would have done.
-                                        eprintln!(
-                                            "conduit: pending-open window creation failed: {e}"
+                                        crate::diag::error(
+                                            "hooks",
+                                            format!("pending-open window creation failed: {e}"),
                                         );
                                     }
                                 }
@@ -745,7 +746,7 @@ fn permission_decision(
 /// the main turn waits on its question.
 fn turn_moved_on(event: &str, body: &Value) -> bool {
     match event {
-        "stop" | "prompt" | "sessionend" => true,
+        "stop" | "stopfailure" | "prompt" | "sessionend" => true,
         "tooluse" => body
             .get("agent_id")
             .and_then(Value::as_str)
@@ -1182,7 +1183,10 @@ pub fn install_plugin(dir: &str, port: u16, profile: &PluginProfile) {
     // Same reasoning as `install_profile_at`: a plugin dropped at `$HOME` is the agent's
     // user-level plugin dir, so it would run for every session on the machine.
     if is_user_config_root(Path::new(dir), dirs::home_dir().as_deref()) {
-        eprintln!("[hooks] refusing to install a plugin into {dir}: user-level config root");
+        crate::diag::warn(
+            "hooks",
+            format!("refusing to install a plugin into {dir}: user-level config root"),
+        );
         return;
     }
     let path = Path::new(dir).join(profile.config_rel_path);
@@ -1333,7 +1337,7 @@ pub fn write_hook_relays() {
             let _ = fs::create_dir_all(parent);
         }
         if let Err(e) = fs::write(&path, body) {
-            eprintln!("[hooks] could not write {}: {e}", path.display());
+            crate::diag::warn("hooks", format!("could not write {}: {e}", path.display()));
         }
     }
 }
@@ -1442,6 +1446,14 @@ pub fn claude_profile() -> HooksProfile {
                 event: "Stop",
                 matcher: None,
                 verb: "stop",
+            },
+            // Fires INSTEAD of `Stop` when an API error (rate limit, auth, overload) ended the
+            // turn (measured in claude 2.1.316: "Fire-and-forget"). Without it such a turn
+            // never ended in Conduit's eyes; `fleet::apply_event` reads it as a failed turn.
+            HookRow {
+                event: "StopFailure",
+                matcher: None,
+                verb: "stopfailure",
             },
             HookRow {
                 event: "Notification",
@@ -1582,8 +1594,9 @@ fn install_profile_at(dir: &str, port: u16, profile: &HooksProfile, home: Option
         // every agent session anywhere starts firing Conduit's hooks. The receiver drops
         // events for sessions it does not own (see the hook listener), so this is belt and
         // braces -- but the braces are what stop the user's global settings being written.
-        eprintln!(
-            "[hooks] refusing to install into {dir}: that is the agent's user-level settings root"
+        crate::diag::warn(
+            "hooks",
+            format!("refusing to install into {dir}: that is the agent's user-level settings root"),
         );
         return;
     }
@@ -1655,7 +1668,7 @@ pub fn endpoint_file_path() -> std::path::PathBuf {
 pub fn write_endpoint_file(port: u16) {
     let path = endpoint_file_path();
     if let Err(e) = fs::write(&path, format!("CONDUIT_HOOK_PORT={port}\n")) {
-        eprintln!("conduit: could not write hook endpoint file: {e}");
+        crate::diag::error("hooks", format!("could not write hook endpoint file: {e}"));
     }
 }
 
@@ -2435,7 +2448,7 @@ mod tests {
     #[test]
     fn turn_moving_on_cancels_but_its_own_pretool_does_not() {
         let none = json!({});
-        for e in ["stop", "prompt", "sessionend", "tooluse"] {
+        for e in ["stop", "stopfailure", "prompt", "sessionend", "tooluse"] {
             assert!(turn_moved_on(e, &none), "{e}");
         }
         // `pretool` fires for AskUserQuestion ITSELF, beside the blocking row.
@@ -2622,6 +2635,20 @@ mod tests {
         install(dir.to_str().unwrap(), 8424);
         let v = read_settings(&dir);
         assert_eq!(v["hooks"]["PermissionRequest"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn claude_profile_reports_a_turn_that_ended_on_an_error() {
+        let rows = claude_profile().rows;
+        let fail: Vec<_> = rows.iter().filter(|r| r.event == "StopFailure").collect();
+        assert_eq!(fail.len(), 1);
+        assert_eq!(fail[0].verb, "stopfailure");
+        assert_eq!(fail[0].matcher, None);
+        // Command Code fires only its four events.
+        assert!(command_code_profile()
+            .rows
+            .iter()
+            .all(|r| r.event != "StopFailure"));
     }
 
     #[test]

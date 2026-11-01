@@ -1,6 +1,11 @@
 import { registerRootComponent } from 'expo';
 
 import App from './App';
+import { installDiagnostics } from './src/data/diagnostics';
+
+// Local-only logging (src/data/diagnostics.ts): global error + unhandled-rejection hooks, before
+// anything renders.
+installDiagnostics();
 
 // registerRootComponent calls AppRegistry.registerComponent('main', () => App);
 // It also ensures that whether you load the app in Expo Go or in a native build,

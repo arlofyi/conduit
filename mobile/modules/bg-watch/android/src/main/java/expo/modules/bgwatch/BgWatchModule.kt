@@ -14,6 +14,7 @@ import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import expo.modules.kotlin.records.Field
 import expo.modules.kotlin.records.Record
+import java.security.MessageDigest
 
 class StartOptions : Record {
   @Field var addresses: List<String> = emptyList()
@@ -22,6 +23,9 @@ class StartOptions : Record {
   @Field var notifyQuestion: Boolean = true
   @Field var notifyPermission: Boolean = true
   @Field var notifyFinished: Boolean = false
+  @Field var notifyFailed: Boolean = false
+  @Field var notifyStopped: Boolean = false
+  @Field var notifyUnreachable: Boolean = false
   @Field var baseline: String = "{}"
 }
 
@@ -46,7 +50,10 @@ class BgWatchModule : Module() {
     Name("BgWatch")
     Events(EVENT_STATUS, EVENT_OPEN)
 
-    OnCreate { BgWatchState.addListener(onChange) }
+    OnCreate {
+      appContext.reactContext?.let { NativeLog.init(it) }
+      BgWatchState.addListener(onChange)
+    }
     OnDestroy { BgWatchState.removeListener(onChange) }
 
     // A notification tapped while the app was running (MainActivity is singleTask).
@@ -62,7 +69,7 @@ class BgWatchModule : Module() {
         addresses,
         o.token,
         o.computer,
-        WatchPrefs(o.notifyQuestion, o.notifyPermission, o.notifyFinished),
+        WatchPrefs(o.notifyQuestion, o.notifyPermission, o.notifyFinished, o.notifyFailed, o.notifyStopped, o.notifyUnreachable),
         o.baseline,
       )
       BgWatchState.config = cfg
@@ -76,6 +83,7 @@ class BgWatchModule : Module() {
           ContextCompat.startForegroundService(context, Intent(context, BgWatchService::class.java))
         } catch (e: Exception) {
           // Android 12+: refused from the background (we were too late leaving the screen).
+          NativeLog.error("bgwatch", "start.refused", e)
           BgWatchState.config = null
           BgWatchState.updatePhase("stopped")
           throw StartRefused(e)
@@ -93,6 +101,20 @@ class BgWatchModule : Module() {
     }
 
     Function("status") { BgWatchState.snapshot() }
+
+    // Local diagnostics (NativeLog): read for the app's "Share log", never sent anywhere.
+    Function("readNativeLog") {
+      NativeLog.init(context)
+      NativeLog.read()
+    }
+    Function("nativeLogDir") {
+      NativeLog.init(context)
+      NativeLog.path()
+    }
+    Function("clearNativeLog") {
+      NativeLog.init(context)
+      NativeLog.clear()
+    }
 
     Function("takeOpenTarget") {
       // A cold start from a notification: the extras are on the launch intent.
@@ -143,9 +165,21 @@ class BgWatchModule : Module() {
     val pid = intent.getStringExtra(BgWatchService.EXTRA_PROJECT) ?: ""
     val name = intent.getStringExtra(BgWatchService.EXTRA_NAME) ?: ""
     val branch = intent.getStringExtra(BgWatchService.EXTRA_BRANCH)?.ifEmpty { null }
-    for (k in listOf(BgWatchService.EXTRA_SESSION, BgWatchService.EXTRA_PROJECT, BgWatchService.EXTRA_NAME, BgWatchService.EXTRA_BRANCH)) {
+    val nonce = intent.getStringExtra(BgWatchService.EXTRA_NONCE) ?: ""
+    for (
+      k in listOf(
+        BgWatchService.EXTRA_SESSION,
+        BgWatchService.EXTRA_PROJECT,
+        BgWatchService.EXTRA_NAME,
+        BgWatchService.EXTRA_BRANCH,
+        BgWatchService.EXTRA_NONCE,
+      )
+    ) {
       intent.removeExtra(k)
     }
+    // Not from one of our notifications (another app starting the exported launcher activity
+    // with our extra names): ignore it.
+    if (!MessageDigest.isEqual(nonce.toByteArray(), BgWatchState.openNonce.toByteArray())) return false
     if (sid.isEmpty()) return false
     BgWatchState.openTarget = OpenTarget(sid, pid, name, branch)
     return true

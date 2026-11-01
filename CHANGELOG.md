@@ -25,8 +25,10 @@ All notable changes to Conduit are documented here. This project uses
   or to Tailscale. The phone's new Apps tab lists what is running; switch on mirroring and
   tap one to open it in your browser. Pages that call other local ports (a frontend and its
   API) keep working, because every listed port is mirrored. Apps stay private to your
-  computer: each connection goes through Conduit's link and needs the phone's pairing, and
-  debugger ports are never offered. Turn it off under Settings → Mobile.
+  computer's network: each connection goes through Conduit's link and needs the phone's
+  pairing. While mirroring is on, other apps and web pages on the phone can reach the mirrored
+  ports too, so debuggers (Chrome, Node, Electron, on any port), the Docker daemon and Ollama
+  are never offered. Turn it off under Settings → Mobile.
 - **Added — Antigravity chats on the phone.** Antigravity sessions now open on the phone as
   a real conversation (messages, commands it ran, files it read and edited), read from
   Antigravity's own conversation history on your computer, and you can start a new
@@ -46,6 +48,81 @@ All notable changes to Conduit are documented here. This project uses
   when a general chat replies (with the start of the reply). Tapping one opens that chat.
   Finished alerts pop up like the others rather than filing silently. The "Notify me"
   switches in Settings choose which ones you get.
+- **Added — Local error log.** Conduit writes errors, warnings and crashes to a log file on your
+  computer (`<data folder>/logs/conduit.log`, rotated at 2 MB, three files kept), with tokens,
+  prompts and file contents left out. Nothing is sent anywhere.
+- **Added — Diagnostics in Settings → About.** This run's uptime and counts (sessions started,
+  start failures, phone connections, mirrored ports, errors), the latest errors, Open logs folder,
+  and Copy diagnostics for a redacted summary to paste into a bug report.
+- **Changed — A crashing panel no longer blanks the app.** If Settings, a palette, root chat, the
+  task board or the Continuity view hits an error, it shows "Something went wrong in this panel"
+  with Reload panel and Copy details; terminals and the rest of the window keep running.
+- **Added — Diagnostics on the phone.** Settings → Diagnostics shows connection, message and
+  error counts and the latest errors, with Share log and Clear log. The log stays on the phone
+  (out of cloud backups) and keeps tokens, messages and file contents out. If the app hits an
+  unexpected error it shows "Something went wrong" with Try again and Share log instead of a blank
+  screen, and a crash in one mirrored connection ends only that connection.
+- **Added — Read your chats offline.** The sessions list, the chats you've opened and your
+  general chats are kept on the phone, so they open with Tailscale off or no signal, marked
+  "Offline · showing what was saved at …". Private sessions are never kept, and forgetting a
+  computer deletes its copy. Settings → Storage turns this off, shows the space used and clears it.
+- **Added — While you were away.** After being disconnected for a while, Sessions shows once what
+  changed, e.g. "Since 2:05 PM: 2 finished, 1 needs you".
+- **Added — More notifications.** "A turn fails" (on by default: Claude stopped on an API error
+  such as a rate limit, and the session no longer looks busy for 20 minutes), "A running session
+  is stopped" (from the computer, the phone or the idle auto-stop), and on Android "Your computer
+  is out of reach" (once, after 10 minutes without a connection while Tailscale is on; never when
+  you turn Tailscale off yourself). The last two are off by default.
+- **Changed — Reconnects right away.** Bringing Conduit back to the front, or tapping Retry,
+  reconnects at once instead of waiting out the retry delay, and a connection that silently died
+  is noticed within about 35 seconds. Messages can't be sent while offline, and your draft stays.
+- **Fixed — Notifications no longer fire for every message.** "Finished" now means the session
+  really stopped: it waits until a session has been quiet for 20 seconds, so an agent pausing
+  between steps or at a permission prompt no longer reads as finished.
+- **Fixed — An open chat no longer goes blank on reconnect**, and a general chat opened while
+  offline loads once the connection is back.
+- **Added — Stop from the chat header.** While an agent is working, a red stop button in the
+  session's header interrupts the turn in one tap.
+- **Added — Save files from the list.** Each file in the phone's file browser has a "…" button
+  (and a screen-reader action) to save it to the phone; no long-press needed.
+- **Changed — Auto-approve asks first.** Turning on Antigravity auto-approve, on the phone or
+  the computer, asks you to confirm, and sessions with it on show an amber bolt in the sidebar.
+- **Changed — Private sessions say why.** Interrupt, Compact and Clear are greyed out on a
+  private session with "Private: control it on your computer" instead of silently doing nothing.
+- **Changed — Apps tab.** Hidden where mirroring isn't available (iPhone), explains how to turn
+  mirroring on and what "Port busy on phone" means, and refreshes less often. If Android refuses
+  to start mirroring from the background, the switch turns off and says why.
+- **Changed — The phone's Antigravity model list follows the session's account.**
+- **Changed — Notifications stack per computer**, and the background-connection notification
+  has a Stop button (notifications then stay off with the screen off until you turn them back
+  on in Settings).
+- **Fixed — Antigravity permission cards answer the right request.** Only the request on screen
+  gets a card, so allowing one can no longer run a different queued command; a request handed
+  back when your phone disconnects comes back as a card later instead of being lost.
+- **Fixed — Private sessions stay off the phone through general chat.** A general chat that has
+  read a private session is no longer listed, readable or streamed on a phone (it stays fully
+  usable on the computer), and the phone's file browser can no longer open other sessions'
+  worktrees or reach hidden folders by changing letter case or using a Windows short name.
+- **Fixed — MCP credentials are not left on disk.** A general chat's MCP config file (which can
+  hold your servers' tokens) is deleted when each turn ends, when the chat is deleted, and at
+  startup after a crash.
+- **Fixed — A failed general chat notifies.** An Antigravity error or a crash now notifies "The
+  reply failed" instead of nothing.
+- **Fixed — General chat turns no longer hang** when the agent writes a lot of error output, and
+  a phone-started chat no longer stays "running" on the computer when it finishes very quickly.
+- **Fixed — Phone chats cost the computer far less.** An open chat reads only what is new in the
+  transcript instead of the whole file many times a second; very long conversations send only
+  their newest messages; the project list is re-sent only when it changed; idle mirrored
+  connections and the Windows port scan do much less work; and stopping a general chat no
+  longer freezes the window.
+- **Fixed — Slow dev servers appear on the phone.** One that takes a while to answer its first
+  request (Next.js compiling) shows up within about 30 seconds instead of never.
+- **Fixed — Port mirroring switch.** Turning it off while it was starting could leave it on, and
+  a remapped port no longer reports "in use".
+- **Fixed — Readability on the phone.** Code shows in a monospace font on Android, dim info text
+  is easier to read, buttons are easier to tap, line numbers follow your text size, long values
+  no longer squash their titles, lists clear the gesture bar, the usage popover works with
+  screen readers, and closing chat settings with unsaved changes asks first.
 - **Fixed — Compact and Clear from the phone run at once.** They used to land in Claude's
   input box and wait for you to press Enter (the command menu took the Enter); slash commands
   typed in the composer get the same fix. While a compact runs, the chat header now says

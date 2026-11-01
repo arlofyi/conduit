@@ -11,12 +11,20 @@ export interface Prefs {
   notifyPermission: boolean;
   /** banner when a session finishes */
   notifyFinished: boolean;
+  /** a session's turn ended on an error (rate limit, sign-in, API error) */
+  notifyFailed: boolean;
+  /** a session that was running is stopped (desktop, phone, idle auto-stop) */
+  notifyStopped: boolean;
+  /** Android, screen off: the computer has been unreachable for 10 minutes while Tailscale is on */
+  notifyUnreachable: boolean;
   /** mirror the computer's local web apps onto this phone's localhost (Android; Apps tab) */
   mirrorPorts: boolean;
   /** Android: the notification permission was asked for once already (never nag) */
   notifyAsked: boolean;
   /** Android: the "your phone may stop Conduit in the background" hint was dismissed */
   batteryHintDismissed: boolean;
+  /** keep the last sessions list and opened chats on this phone, to read offline */
+  keepChats: boolean;
   theme: ThemeId;
 }
 
@@ -26,9 +34,15 @@ export const DEFAULT_PREFS: Prefs = {
   notifyQuestion: true,
   notifyPermission: true,
   notifyFinished: false,
+  // a failure is something to act on and rare; a stop or a lost connection is often deliberate
+  // (idle auto-stop, Tailscale switched off to save battery), so those are opt-in
+  notifyFailed: true,
+  notifyStopped: false,
+  notifyUnreachable: false,
   mirrorPorts: false,
   notifyAsked: false,
   batteryHintDismissed: false,
+  keepChats: true,
   theme: DEFAULT_THEME,
 };
 
@@ -36,9 +50,13 @@ type BoolKey =
   | "notifyQuestion"
   | "notifyPermission"
   | "notifyFinished"
+  | "notifyFailed"
+  | "notifyStopped"
+  | "notifyUnreachable"
   | "mirrorPorts"
   | "notifyAsked"
-  | "batteryHintDismissed";
+  | "batteryHintDismissed"
+  | "keepChats";
 
 /** Unknown or wrong-typed fields fall back to their defaults one at a time; a corrupt blob
  * is the defaults. */
@@ -61,9 +79,13 @@ export function parsePrefs(raw: string | null): Prefs {
     notifyQuestion: bool("notifyQuestion"),
     notifyPermission: bool("notifyPermission"),
     notifyFinished: bool("notifyFinished"),
+    notifyFailed: bool("notifyFailed"),
+    notifyStopped: bool("notifyStopped"),
+    notifyUnreachable: bool("notifyUnreachable"),
     mirrorPorts: bool("mirrorPorts"),
     notifyAsked: bool("notifyAsked"),
     batteryHintDismissed: bool("batteryHintDismissed"),
+    keepChats: bool("keepChats"),
     theme,
   };
 }

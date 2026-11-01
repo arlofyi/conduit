@@ -20,6 +20,9 @@ pub struct FleetStatus {
     pub todos_total: u32,
     pub todos_done: u32,
     pub updated_at: u64, // unix millis
+    /// The last turn ended on an error (Claude's `StopFailure`): its kind, e.g. `rate_limit`.
+    /// Cleared by the next turn. Never free text -- see [`failure_kind`].
+    pub failed: Option<String>,
 }
 
 impl Default for FleetStatus {
@@ -30,6 +33,7 @@ impl Default for FleetStatus {
             todos_total: 0,
             todos_done: 0,
             updated_at: 0,
+            failed: None,
         }
     }
 }
@@ -52,6 +56,27 @@ pub fn apply_event(s: &mut FleetStatus, event: &str, body: &Value) {
 /// because refreshing the timestamp there would keep resetting the staleness window for a
 /// session nothing is actually happening in.
 pub fn apply_event_at(s: &mut FleetStatus, event: &str, body: &Value, now: u64) {
+    match event {
+        "stopfailure" => {
+            // Claude's `StopFailure`: fires INSTEAD of `Stop` when an API error (rate limit,
+            // auth, overload...) ended the turn. Before this hook was installed nothing ended
+            // such a turn and the session read `running` until the 20-minute stale sweep.
+            // `done` (not `idle`) so the late-tool-hook holdoff covers it and the dot asks to
+            // be looked at; `failed` says why.
+            s.status = "done".into();
+            s.activity = None;
+            s.failed = Some(failure_kind(body));
+            s.updated_at = now;
+            return;
+        }
+        "prompt" | "pretool" | "stop" | "result" | "sessionstart" | "sessionend" => {
+            // Anything that starts or ends a turn normally retires a previous failure. (A
+            // held-off `pretool` returns below before touching status, but by then the turn
+            // that failed is long over or the holdoff would not apply.)
+            s.failed = None;
+        }
+        _ => {}
+    }
     match event {
         "prompt" => {
             // A real new turn. Never held off: the user typed, so whatever the previous
@@ -124,6 +149,22 @@ pub fn apply_event_at(s: &mut FleetStatus, event: &str, body: &Value, now: u64) 
         _ => {}
     }
     s.updated_at = now;
+}
+
+/// The `error` of a `StopFailure` body as a short, safe kind (`rate_limit`, `overloaded`, ...).
+/// It travels to a paired phone, so only `[a-z0-9_]` up to 40 chars passes; anything else
+/// (absent, free text, a future shape) is `unknown`.
+pub fn failure_kind(body: &Value) -> String {
+    body.get("error")
+        .and_then(Value::as_str)
+        .filter(|e| {
+            !e.is_empty()
+                && e.len() <= 40
+                && e.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// System prompt appended (via `--append-system-prompt`) to the Conductor session.
@@ -283,7 +324,10 @@ pub fn write_project_mcp_config(dir: &str, rel_path: &str, mcp_port: u16, sessio
     if let Err(e) = std::fs::write(&path, mcp_config_json(mcp_port, session_id)) {
         // Never fatal: the worker still runs, it just reports through the terminal
         // instead of `fleet_result`. Degrading is the documented Tier-2 behaviour.
-        eprintln!("conduit: failed to write {rel_path} for {session_id}: {e}");
+        crate::diag::warn(
+            "fleet",
+            format!("failed to write {rel_path} for {session_id}: {e}"),
+        );
     }
 }
 
@@ -653,6 +697,42 @@ mod tests {
 
         apply_event(&mut s, "sessionend", &serde_json::json!({}));
         assert_eq!(s.status, "idle");
+    }
+
+    #[test]
+    fn stop_failure_ends_the_turn_as_failed_and_the_next_turn_clears_it() {
+        let mut s = FleetStatus::default();
+        apply_event(&mut s, "prompt", &serde_json::json!({}));
+        apply_event(
+            &mut s,
+            "stopfailure",
+            &serde_json::json!({"error": "rate_limit", "error_details": "429 slow down"}),
+        );
+        assert_eq!(s.status, "done");
+        assert_eq!(s.failed.as_deref(), Some("rate_limit"));
+        // an informational notification after it leaves the failure in place
+        apply_event(
+            &mut s,
+            "notification",
+            &serde_json::json!({"notification_type": "idle_prompt"}),
+        );
+        assert_eq!(s.failed.as_deref(), Some("rate_limit"));
+        apply_event(&mut s, "prompt", &serde_json::json!({}));
+        assert_eq!(s.status, "running");
+        assert!(s.failed.is_none());
+    }
+
+    #[test]
+    fn failure_kind_passes_only_a_short_identifier() {
+        let k = |v: serde_json::Value| failure_kind(&v);
+        assert_eq!(k(serde_json::json!({"error": "overloaded"})), "overloaded");
+        assert_eq!(k(serde_json::json!({})), "unknown");
+        assert_eq!(
+            k(serde_json::json!({"error": "Your key sk-123 is bad"})),
+            "unknown"
+        );
+        assert_eq!(k(serde_json::json!({"error": "x".repeat(41)})), "unknown");
+        assert_eq!(k(serde_json::json!({"error": 42})), "unknown");
     }
 
     #[test]

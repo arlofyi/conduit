@@ -33,6 +33,7 @@ import { rememberedFolder, saveToFolder } from "../data/saveFolder";
 import type { FilesProps, RootStackParamList } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, TYPE } from "../theme/type";
+import { diag } from "../data/diagnostics";
 
 // ---- shared by Files and FileView ----
 
@@ -105,6 +106,7 @@ export function useShareDownload(sessionId: string) {
       }
       await Sharing.shareAsync(uri, { mimeType: mimeOf(name), dialogTitle: name });
     } catch (e) {
+      diag.error("files", "share.failed", e);
       Alert.alert("Couldn't share", e instanceof Error ? e.message : String(e));
     }
   }, []);
@@ -117,6 +119,7 @@ export function useShareDownload(sessionId: string) {
         return;
       }
       if (r.cancelled) return;
+      diag.error("files", "save.failed", undefined, r.error);
       Alert.alert("Couldn't save", r.error, [
         { text: "Cancel", style: "cancel" },
         { text: "Share…", onPress: () => void share(uri, name) },
@@ -152,6 +155,7 @@ export function useShareDownload(sessionId: string) {
           ]);
           return;
         }
+        diag.warn("files", "download.failed", undefined, r.error);
         Alert.alert("Couldn't download", fsErrorText(r.error));
         return;
       }
@@ -246,7 +250,13 @@ export function DownloadStrip({ progress, onCancel }: { progress: DownloadProgre
           {`Downloading ${progress.name}`}
           {progress.total > 0 ? `  ${formatSize(progress.received)} of ${formatSize(progress.total)}` : ""}
         </Text>
-        <Pressable onPress={onCancel} hitSlop={10} accessibilityRole="button" accessibilityLabel="Cancel download">
+        <Pressable
+          onPress={onCancel}
+          hitSlop={10}
+          accessibilityRole="button"
+          accessibilityLabel="Cancel download"
+          style={{ minHeight: MIN_TOUCH, justifyContent: "center", paddingHorizontal: 4 }}
+        >
           <Text style={{ color: p.accent, fontSize: TYPE.footnote, fontWeight: "600" }}>Cancel</Text>
         </Pressable>
       </View>
@@ -273,6 +283,7 @@ function iconFor(e: WireFsEntry): AppSymbol {
 
 export function FilesScreen({ navigation, route }: FilesProps) {
   const { palette: p } = useTheme();
+  const insets = useSafeAreaInsets();
   const { sessionId, path, title } = route.params;
   const { fsList, conn } = useLive();
   const [state, setState] = useState<ListState>({ phase: "loading" });
@@ -369,7 +380,7 @@ export function FilesScreen({ navigation, route }: FilesProps) {
               hitSlop={6}
               accessibilityRole="button"
               accessibilityLabel={last ? `${c.label}, current folder` : `Go to ${c.label}`}
-              style={{ paddingHorizontal: 4, paddingVertical: 4 }}
+              style={{ minHeight: MIN_TOUCH, justifyContent: "center", paddingHorizontal: 6 }}
             >
               <Text style={{ fontSize: TYPE.footnote, color: last ? p.textBright : p.accent, fontWeight: last ? "600" : "400" }} numberOfLines={1}>
                 {c.label}
@@ -405,23 +416,30 @@ export function FilesScreen({ navigation, route }: FilesProps) {
         data={state.entries}
         keyExtractor={(e) => e.name}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={p.textMid} />}
-        contentContainerStyle={{ paddingBottom: 32 }}
+        contentContainerStyle={{ paddingBottom: 32 + insets.bottom }}
         ListEmptyComponent={
           <Text style={{ color: p.textMid, fontSize: TYPE.subhead, textAlign: "center", marginTop: 48 }}>This folder is empty.</Text>
         }
         ListFooterComponent={
           state.truncated > 0 ? (
-            <Text style={{ color: p.textDim, fontSize: TYPE.footnote, textAlign: "center", marginTop: 12 }}>
+            <Text style={{ color: p.textMid, fontSize: TYPE.footnote, textAlign: "center", marginTop: 12 }}>
               {`${state.truncated} more not shown`}
             </Text>
           ) : null
         }
         renderItem={({ item: e, index }) => {
           const tint = e.dir ? p.accent : p.textMid;
+          // a plain file can be saved to the phone: long-press, the trailing "…", or the
+          // screen reader's actions menu (a long-press alone is invisible to most people)
+          const savable = !e.dir && !e.link;
           return (
             <Pressable
               onPress={() => open(e)}
               onLongPress={() => more(e)}
+              accessibilityActions={savable ? [{ name: "longpress", label: "Save to phone" }] : undefined}
+              onAccessibilityAction={(ev) => {
+                if (ev.nativeEvent.actionName === "longpress") more(e);
+              }}
               disabled={!!e.link}
               accessibilityRole="button"
               accessibilityLabel={`${e.name}, ${e.dir ? "folder" : e.link ? "link, can't be opened" : formatSize(e.size)}${e.sensitive ? ", secret" : ""}`}
@@ -446,12 +464,31 @@ export function FilesScreen({ navigation, route }: FilesProps) {
                 <Text style={{ fontSize: TYPE.body, color: p.textBright }} numberOfLines={1}>
                   {e.name}
                 </Text>
-                <Text style={{ fontSize: TYPE.footnote, color: p.textDim, marginTop: 1 }} numberOfLines={1}>
+                <Text style={{ fontSize: TYPE.footnote, color: p.textMid, marginTop: 1 }} numberOfLines={1}>
                   {entryDetail(e, listTime(e.mtimeMs, now))}
                 </Text>
               </View>
               {e.sensitive ? <Icon name="lock" size={15} color={p.amber} /> : null}
               {e.dir ? <Icon name="chevron.right" size={14} color={p.textDim} /> : null}
+              {savable ? (
+                // hidden from screen readers: the row's own "Save to phone" action covers it
+                <Pressable
+                  onPress={() => more(e)}
+                  accessibilityElementsHidden
+                  importantForAccessibility="no-hide-descendants"
+                  style={({ pressed }) => ({
+                    width: MIN_TOUCH,
+                    height: MIN_TOUCH,
+                    marginRight: -12,
+                    alignItems: "center",
+                    justifyContent: "center",
+                    borderRadius: MIN_TOUCH / 2,
+                    backgroundColor: pressed ? p.border : "transparent",
+                  })}
+                >
+                  <Icon name="ellipsis" size={16} color={p.textMid} />
+                </Pressable>
+              ) : null}
             </Pressable>
           );
         }}

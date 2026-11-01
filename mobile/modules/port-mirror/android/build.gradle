@@ -19,4 +19,7 @@ dependencies {
   // React Native's own OkHttp (gradle/libs.versions.toml); declared so this module compiles
   // against it, and resolved to the same artifact the app already ships.
   implementation "com.squareup.okhttp3:okhttp:4.9.2"
+  // NativeLog (the shared, redacting diagnostics log). Both modules are always autolinked
+  // together on Android, so this adds no artifact the app does not already ship.
+  implementation project(":bg-watch")
 }

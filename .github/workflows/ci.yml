@@ -48,6 +48,32 @@ jobs:
       - name: Build
         run: pnpm build
 
+  # The phone app (mobile/) is its own npm project with its own lockfile, typecheck and
+  # jest suite; nothing above touches it. No Android build here: it costs a full Gradle
+  # + NDK run per push, and the pure logic it would exercise is what jest covers.
+  mobile:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Tests
+        run: npx jest
+
   rust:
     # Both shipping platforms, because they compile DIFFERENT programs. Whole modules
     # are cfg-gated (`tmux`, `session_budget`) and the spawn, PTY, path, and

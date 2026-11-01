@@ -5,6 +5,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
+import expo.modules.bgwatch.NativeLog
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -40,7 +41,15 @@ internal class Tunnel(
 
   fun start() {
     ws = MirrorState.http.newWebSocket(Request.Builder().url(cfg.url).build(), this)
-    thread(name = "port-mirror-$remote", isDaemon = true) { pump() }
+    thread(name = "port-mirror-$remote", isDaemon = true) {
+      try {
+        pump()
+      } catch (t: Throwable) {
+        // thread root: pump() handles I/O itself, so this is a bug -- log it, end this tunnel only
+        NativeLog.error("mirror", "tunnel.crashed", t, "port $remote")
+        close()
+      }
+    }
   }
 
   private fun pump() {
@@ -96,7 +105,11 @@ internal class Tunnel(
 
   override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = close()
 
-  override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = close()
+  override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+    // Before tunnelOk this is the bridge being unreachable; afterwards it is an ordinary end.
+    if (!accepted && !closed.get()) NativeLog.warn("mirror", "tunnel.failed", t, "port $remote")
+    close()
+  }
 
   fun close() {
     if (!closed.compareAndSet(false, true)) return

@@ -12,7 +12,7 @@ import org.json.JSONObject
  * `hello` -> `auth` -> `authOk`, then `list` so the computer pushes the projects view on every
  * change, and its `pending` / `pendingAdded` / `resolved` pushes; and `rootchats`, which makes it
  * send every general chat's turn events (`rootChatEvent`). Every callback is moved onto
- * [main], so the state below is single-threaded. Reconnects back off 1 s -> 60 s and walk the
+ * [main], so the state below is single-threaded. Reconnects back off 1 s -> 5 min and walk the
  * address list; a network coming back redials at once.
  *
  * Authenticated as this phone, the socket counts as a phone that can answer: the computer holds
@@ -34,6 +34,8 @@ internal class Link(
   private var backoffMs = BACKOFF_START_MS
   private var authed = false
   private var closed = false
+  /** the last failure logged, so a dead route retrying with backoff writes one line, not hundreds */
+  private var lastLogged: String? = null
   private val redial = Runnable { connect() }
 
   fun start() = connect()
@@ -73,12 +75,18 @@ internal class Link(
       }
 
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-        main.post { if (my == gen) dropped() }
+        main.post {
+          if (my == gen) {
+            noteFailure("link.failed", NativeLogRules.describe(t))
+            dropped()
+          }
+        }
       }
     }
     ws = try {
       BgWatchState.http.newWebSocket(Request.Builder().url(url).build(), listener)
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+      noteFailure("link.dialFailed", NativeLogRules.describe(e))
       dropped()
       return
     }
@@ -91,12 +99,15 @@ internal class Link(
     when (o.optString("type")) {
       "hello" -> {
         if (o.optInt("protocolVersion", -1) != PROTOCOL_VERSION) {
+          NativeLog.warn("bgwatch", "link.protocol", detail = "computer speaks ${o.optInt("protocolVersion", -1)}")
           onFatal("protocol")
           return
         }
         webSocket.send(JSONObject().put("type", "auth").put("token", cfg.token).toString())
       }
       "authOk" -> {
+        if (lastLogged != null) NativeLog.info("bgwatch", "link.recovered")
+        lastLogged = null
         authed = true
         backoffMs = BACKOFF_START_MS
         webSocket.send("""{"type":"list"}""")
@@ -106,7 +117,10 @@ internal class Link(
       }
       "error" -> when {
         authed -> {}
-        o.optString("message") == "unauthorized" -> onFatal("unauthorized")
+        o.optString("message") == "unauthorized" -> {
+          NativeLog.warn("bgwatch", "link.unauthorized")
+          onFatal("unauthorized")
+        }
         // refused before the token was checked (rate limit, access off): retry, same address
         o.optString("message") == "unavailable" -> {
           index -= 1
@@ -115,6 +129,15 @@ internal class Link(
       }
       else -> if (authed) onFrame(o)
     }
+  }
+
+  /** Log a link failure once per distinct message (the address host is kept; never the token,
+   * which is only ever in the auth frame). */
+  private fun noteFailure(event: String, detail: String) {
+    val key = "$event|$detail"
+    if (key == lastLogged) return
+    lastLogged = key
+    NativeLog.warn("bgwatch", event, detail = detail)
   }
 
   private fun dropped() {
@@ -134,7 +157,9 @@ internal class Link(
   private companion object {
     const val PROTOCOL_VERSION = 1
     const val BACKOFF_START_MS = 1_000L
-    const val BACKOFF_MAX_MS = 60_000L
+    // Long, because a dead route costs battery; a network coming back does not wait for it
+    // (BgWatchService's default-network callback calls networkBack()).
+    const val BACKOFF_MAX_MS = 300_000L
     const val HANDSHAKE_MS = 10_000L
   }
 }

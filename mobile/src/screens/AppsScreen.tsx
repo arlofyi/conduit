@@ -5,14 +5,15 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
 import { Icon } from "../components/Glass";
 import { Card, Para, Row, SectionLabel } from "../components/form";
-import { usePortMirror } from "../data/PortMirrorProvider";
+import { START_REFUSED, usePortMirror } from "../data/PortMirrorProvider";
 import { portRows, type PortRow } from "../logic/ports";
 import type { AppsProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
 import { TYPE, tabBarClearance } from "../theme/type";
 
-/** How often the list is re-read while this tab is in front. */
-const FOCUS_POLL_MS = 5_000;
+/** How often the list is re-read while this tab is in front. A dev server started on the
+ * computer shows up within this; pull-free, so it need not be fast. */
+const FOCUS_POLL_MS = 15_000;
 
 /** Android 13+ asks before an app may post notifications; the mirror's ongoing notification is
  * how the user sees (and stops) it, so ask first. A refusal does not block mirroring. */
@@ -28,6 +29,7 @@ async function askForNotifications() {
 const STOP_COPY: Record<string, string> = {
   unauthorized: "Your computer refused this phone. Pair again, or check Settings → Mobile on your computer.",
   stopped: "Stopped from the notification.",
+  [START_REFUSED]: "Couldn't start mirroring from the background; open the app and try again.",
 };
 
 export function AppsScreen(_props: AppsProps) {
@@ -78,7 +80,7 @@ export function AppsScreen(_props: AppsProps) {
           <Row
             first
             title="Mirror to this phone"
-            subtitle={mirror.on ? "Open them at the same localhost address" : undefined}
+            subtitle={mirror.on ? "Open them at the same localhost address" : "Turn on to open these on this phone"}
             accessibilityLabel="Mirror to this phone"
             right={
               <Switch
@@ -110,7 +112,12 @@ export function AppsScreen(_props: AppsProps) {
                 key={r.port}
                 first={i === 0}
                 title={r.title}
-                subtitle={r.subtitle ?? undefined}
+                subtitle={
+                  // "Port busy on phone" alone does not say what to do about it
+                  r.state === "inUse"
+                    ? [r.subtitle, "Another app on this phone is using this port; close it and turn mirroring off and on"].filter(Boolean).join(" · ")
+                    : (r.subtitle ?? undefined)
+                }
                 onPress={r.url ? () => open(r) : undefined}
                 accessibilityLabel={r.url ? `Open ${r.title}` : r.title}
                 right={
@@ -118,7 +125,7 @@ export function AppsScreen(_props: AppsProps) {
                     <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
                       <Text
                         style={{
-                          color: r.state === "ready" ? p.accent : r.state === "inUse" ? p.amber : p.textDim,
+                          color: r.state === "ready" ? p.accent : r.state === "inUse" ? p.amber : p.textMid,
                           fontSize: TYPE.subhead,
                         }}
                       >

@@ -11,10 +11,7 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
@@ -34,10 +31,6 @@ const HEAD_BYTES: u64 = 16 * 1024;
 const DIR_ENTRIES_MAX: usize = 500;
 /// The effort levels `--effort` accepts (verified in `claude --help`; see `Session::effort`).
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-/// How long one `agy models` answer is reused.
-const AGY_MODELS_TTL: Duration = Duration::from_secs(10 * 60);
-/// `agy models` is a network call (~2 s measured); past this it is killed.
-const AGY_MODELS_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandItem {
@@ -77,107 +70,9 @@ pub fn claude_models(current: Option<&str>) -> Vec<(String, String)> {
     out
 }
 
-/// `agy models` output: a "Fetching available models..." line, then `<id>\t<label>` per
-/// model. Lines without a tab are not models.
-pub fn parse_agy_models(out: &str) -> Vec<(String, String)> {
-    out.lines()
-        .filter_map(|l| {
-            let (id, label) = l.trim_end_matches('\r').split_once('\t')?;
-            let (id, label) = (id.trim(), label.trim());
-            (!id.is_empty() && !id.contains(' ')).then(|| {
-                (
-                    id.to_string(),
-                    if label.is_empty() { id } else { label }.to_string(),
-                )
-            })
-        })
-        .collect()
-}
-
-/// (id, label) pairs.
-type ModelList = Vec<(String, String)>;
-static AGY_MODELS: Mutex<Option<(Instant, ModelList)>> = Mutex::new(None);
-static AGY_FETCHING: AtomicBool = AtomicBool::new(false);
-
-/// agy's model list, never blocking the caller: a cached answer (refreshed in the
-/// background once older than [`AGY_MODELS_TTL`]), or nothing yet plus `pending = true`
-/// while the first `agy models` runs on its own thread. The bridge loop serves every phone
-/// on one thread per socket and a ~2 s network call there would freeze that phone's chat
-/// stream, so a short synchronous deadline was rejected: the phone simply asks again.
-pub fn agy_models() -> (Vec<(String, String)>, bool) {
-    let cached = AGY_MODELS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let fresh = cached
-        .as_ref()
-        .is_some_and(|(at, _)| at.elapsed() < AGY_MODELS_TTL);
-    if !fresh && !AGY_FETCHING.swap(true, Ordering::SeqCst) {
-        std::thread::spawn(|| {
-            let models = run_agy_models()
-                .map(|o| parse_agy_models(&o))
-                .unwrap_or_default();
-            if !models.is_empty() {
-                *AGY_MODELS.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((Instant::now(), models));
-            }
-            AGY_FETCHING.store(false, Ordering::SeqCst);
-        });
-    }
-    match cached {
-        Some((_, m)) => (m, false),
-        None => (Vec::new(), true),
-    }
-}
-
-fn agy_binary() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        Some(PathBuf::from("agy"))
-    }
-    #[cfg(not(windows))]
-    {
-        // A Dock-launched app has no login PATH; resolve it the way agent detection does.
-        crate::agent::detect_agents()
-            .into_iter()
-            .find(|a| a.id == AgentId::Antigravity)
-            .and_then(|a| a.path)
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-    }
-}
-
-fn run_agy_models() -> Option<String> {
-    use crate::agent::UserPath;
-    use crate::NoWindow;
-    let mut child = Command::new(agy_binary()?)
-        .arg("models")
-        .user_path()
-        .no_window()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    // Drained on a thread so a full pipe cannot stall the child while we poll for exit.
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if start.elapsed() >= AGY_MODELS_DEADLINE => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None; // the reader is detached, never joined
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => return None,
-        }
-    }
-    reader.join().ok()
-}
+// agy's model list is run, parsed and cached in ONE place (`root_chat_options`): one runner
+// (login-shell PATH, `npm_config_prefix` scrubbed, the account's env, tree-kill on the
+// deadline), one parser, and a cache keyed by the account's config dir.
 
 // ---- commands and skills ------------------------------------------------------------
 
@@ -583,7 +478,7 @@ pub fn discover(
                     &g.join("antigravity-cli").join("builtin").join("skills"),
                 ));
             }
-            let (mut models, pending) = agy_models();
+            let (mut models, pending) = crate::root_chat_options::agy_models_now(account_cfg);
             if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
                 if !models.iter().any(|(id, _)| id == m) {
                     models.push((m.to_string(), m.to_string()));
@@ -880,6 +775,7 @@ mod tests {
 
     #[test]
     fn agy_models_parse_tab_lines_only() {
+        use crate::root_chat_options::parse_agy_models;
         let out = "Fetching available models...\r\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\r\nclaude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n\nnot a model line\n";
         assert_eq!(
             parse_agy_models(out),

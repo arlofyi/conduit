@@ -16,9 +16,9 @@
  * The choices come from the computer (`rootchatoptions`). An older desktop never answers; the
  * phone then starts Claude on its defaults, which is all that desktop can run.
  */
-import { StackActions } from "@react-navigation/native";
+import { StackActions, usePreventRemove } from "@react-navigation/native";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from "react-native";
+import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
 import { AgentMarkGlyph } from "../components/AgentAvatar";
@@ -286,6 +286,17 @@ export function GeneralSettingsScreen({ navigation, route }: GeneralSettingsProp
   const runChanged = patch !== null && !older;
   const canSave = conn.phase === "ready" && !saving && (runChanged || scopeChanged);
 
+  // Closing (the X, a swipe, back) with unsaved changes asks first, as the file editor does.
+  // A successful save leaves on its own, so `leaving` lets that one through.
+  const leaving = useRef(false);
+  usePreventRemove(canSave, ({ data }) => {
+    if (leaving.current) return navigation.dispatch(data.action);
+    Alert.alert("Discard your changes?", "They haven't been saved to your computer.", [
+      { text: "Keep editing", style: "cancel" },
+      { text: "Discard", style: "destructive", onPress: () => navigation.dispatch(data.action) },
+    ]);
+  });
+
   const save = async () => {
     if (!canSave) return;
     setSaving(true);
@@ -307,6 +318,7 @@ export function GeneralSettingsScreen({ navigation, route }: GeneralSettingsProp
       }
     }
     setSaving(false);
+    leaving.current = true;
     navigation.goBack();
   };
 

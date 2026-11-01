@@ -204,13 +204,21 @@ pub fn skill_frontmatter(text: &str) -> (Option<String>, Option<String>) {
     (field("name", 80), field("description", 300))
 }
 
-/// `agy models` output: `<id>\t<label>` lines after a "Fetching available models..." line.
+/// `agy models` output: a "Fetching available models..." line, then `<id>\t<label>` per
+/// model. Lines without a tab, or whose id is not a valid model id, are not models; an empty
+/// label falls back to the id. The ONE parser: the session options and root chat both use it.
 pub fn parse_agy_models(out: &str) -> Vec<(String, String)> {
     out.lines()
         .filter_map(|l| {
-            let (id, label) = l.trim_end().split_once('\t')?;
-            let id = id.trim();
-            valid_model(id).then(|| (id.to_string(), label.trim().to_string()))
+            // Only the line ending: `trim_end` would also eat the tab of an empty label.
+            let (id, label) = l.trim_end_matches(['\r', '\n']).split_once('\t')?;
+            let (id, label) = (id.trim(), label.trim());
+            valid_model(id).then(|| {
+                (
+                    id.to_string(),
+                    if label.is_empty() { id } else { label }.to_string(),
+                )
+            })
         })
         .collect()
 }
@@ -224,54 +232,102 @@ const AGY_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 /// phone gives up on `rootChatOptions` after 6 s.
 pub const AGY_MODELS_WAIT: Duration = Duration::from_secs(3);
 
-/// (fetched at, `(id, label)` list).
-type AgyModelCache = Option<(Instant, Vec<(String, String)>)>;
+/// `(id, label)` pairs.
+type ModelList = Vec<(String, String)>;
 
-static AGY_MODELS: Mutex<AgyModelCache> = Mutex::new(None);
-static AGY_REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `agy models` answers per ACCOUNT -- two agy accounts can be entitled to different models
+/// -- so the cache is keyed by the account's config dir ("" = the ambient agy home), and so
+/// is the in-flight set that keeps one refresh per account running at a time.
+#[derive(Default)]
+struct AgyModels {
+    cache: std::collections::HashMap<String, (Instant, ModelList)>,
+    refreshing: std::collections::HashSet<String>,
+}
 
-fn cached_agy_models() -> Option<(bool, Vec<(String, String)>)> {
-    AGY_MODELS
+fn agy_models_state() -> std::sync::MutexGuard<'static, AgyModels> {
+    static STATE: std::sync::OnceLock<Mutex<AgyModels>> = std::sync::OnceLock::new();
+    STATE
+        .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
+}
+
+/// The cache key for an account's config dir.
+fn agy_models_key(config_dir: Option<&str>) -> String {
+    config_dir
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// (fresh, list) for an account, if anything was ever fetched for it.
+fn cached_agy_models(config_dir: Option<&str>) -> Option<(bool, ModelList)> {
+    agy_models_state()
+        .cache
+        .get(&agy_models_key(config_dir))
         .map(|(at, list)| (at.elapsed() < AGY_MODELS_TTL, list.clone()))
 }
 
-/// Start refreshing agy's model list in the background unless it is fresh or already
-/// refreshing. Never blocks.
+fn agy_models_refreshing(config_dir: Option<&str>) -> bool {
+    agy_models_state()
+        .refreshing
+        .contains(&agy_models_key(config_dir))
+}
+
+/// Start refreshing an account's agy model list in the background unless it is fresh or
+/// already refreshing. Never blocks.
 pub fn prewarm_agy_models(config_dir: Option<String>) {
-    use std::sync::atomic::Ordering;
-    if cached_agy_models().is_some_and(|(fresh, _)| fresh) {
-        return;
-    }
-    if AGY_REFRESHING.swap(true, Ordering::SeqCst) {
-        return;
+    let key = agy_models_key(config_dir.as_deref());
+    {
+        let mut st = agy_models_state();
+        let fresh = st
+            .cache
+            .get(&key)
+            .is_some_and(|(at, _)| at.elapsed() < AGY_MODELS_TTL);
+        if fresh || !st.refreshing.insert(key.clone()) {
+            return;
+        }
     }
     std::thread::spawn(move || {
         let list = run_agy_models(config_dir.as_deref()).unwrap_or_default();
+        let mut st = agy_models_state();
         // A failure is not cached: the next request tries again.
         if !list.is_empty() {
-            *AGY_MODELS.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), list));
+            st.cache.insert(key.clone(), (Instant::now(), list));
         }
-        AGY_REFRESHING.store(false, Ordering::SeqCst);
+        st.refreshing.remove(&key);
     });
 }
 
-/// agy's model list, cached for ten minutes. A stale or missing cache starts a background
-/// refresh and waits at most `wait` for it, then answers with whatever it has (possibly
-/// stale, possibly empty) -- a reply never waits on `agy models` itself.
+/// agy's model list for an account, cached for ten minutes. A stale or missing cache starts
+/// a background refresh and waits at most `wait` for it, then answers with whatever it has
+/// (possibly stale, possibly empty) -- a reply never waits on `agy models` itself.
 pub fn agy_models(config_dir: Option<&str>, wait: Duration) -> Vec<(String, String)> {
-    use std::sync::atomic::Ordering;
-    if let Some((true, list)) = cached_agy_models() {
+    if let Some((true, list)) = cached_agy_models(config_dir) {
         return list;
     }
     prewarm_agy_models(config_dir.map(str::to_string));
     let deadline = Instant::now() + wait;
-    while Instant::now() < deadline && AGY_REFRESHING.load(Ordering::SeqCst) {
+    while Instant::now() < deadline && agy_models_refreshing(config_dir) {
         std::thread::sleep(Duration::from_millis(100));
     }
-    cached_agy_models().map(|(_, l)| l).unwrap_or_default()
+    cached_agy_models(config_dir)
+        .map(|(_, l)| l)
+        .unwrap_or_default()
+}
+
+/// The never-blocking form, for a caller on a bridge socket's own loop: the cached list (a
+/// stale one starts a background refresh), or nothing yet plus `pending = true` while the
+/// first `agy models` for this account runs -- the phone simply asks again.
+pub fn agy_models_now(config_dir: Option<&str>) -> (Vec<(String, String)>, bool) {
+    let cached = cached_agy_models(config_dir);
+    if !cached.as_ref().is_some_and(|(fresh, _)| *fresh) {
+        prewarm_agy_models(config_dir.map(str::to_string));
+    }
+    match cached {
+        Some((_, list)) => (list, false),
+        None => (Vec::new(), true),
+    }
 }
 
 fn run_agy_models(config_dir: Option<&str>) -> Option<Vec<(String, String)>> {
@@ -538,6 +594,26 @@ mod tests {
             ]
         );
         assert!(parse_agy_models("Error: not signed in").is_empty());
+        // An empty label falls back to the id; an id with a space is not a model.
+        assert_eq!(
+            parse_agy_models("m-1\t\nnot a model\tx\n"),
+            vec![("m-1".to_string(), "m-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn agy_models_are_cached_per_account() {
+        assert_eq!(agy_models_key(None), "");
+        assert_eq!(agy_models_key(Some("")), "");
+        assert_eq!(agy_models_key(Some("C:/p/agy-work")), "C:/p/agy-work");
+        let list = vec![("m".to_string(), "M".to_string())];
+        agy_models_state()
+            .cache
+            .insert("test-acct-a".into(), (Instant::now(), list.clone()));
+        assert_eq!(cached_agy_models(Some("test-acct-a")), Some((true, list)));
+        // Another account's answer is never served for this one.
+        assert_eq!(cached_agy_models(Some("test-acct-b")), None);
+        agy_models_state().cache.remove("test-acct-a");
     }
 
     #[test]

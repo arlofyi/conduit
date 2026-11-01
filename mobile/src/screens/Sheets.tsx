@@ -3,7 +3,7 @@
  * to dismiss): the Chats "…" menu and the session sheet (details + preferences in one).
  */
 import { type AppSymbol } from "../components/androidSymbols";
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
@@ -30,7 +30,18 @@ import type { ChatsMenuProps, QuickActionsProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, MONO, TYPE } from "../theme/type";
 
-export function SheetScaffold({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+export function SheetScaffold({
+  title,
+  onClose,
+  children,
+  scrollRef,
+}: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+  /** lets a sheet scroll its body (e.g. back to a note at the top) */
+  scrollRef?: React.RefObject<ScrollView | null>;
+}) {
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
   const { height } = useWindowDimensions();
@@ -49,6 +60,7 @@ export function SheetScaffold({ title, onClose, children }: { title: string; onC
         <GlassCircle symbol="xmark" label="Close" onPress={onClose} size={36} symbolSize={14} />
       </View>
       <ScrollView
+        ref={scrollRef}
         style={{ flexGrow: 0, flexShrink: 1 }}
         contentInsetAdjustmentBehavior="never"
         keyboardShouldPersistTaps="handled"
@@ -119,7 +131,12 @@ export function SheetRow({
           </Text>
         ) : null}
       </View>
-      {trailing ? <Text style={{ fontSize: TYPE.footnote, color: p.textMid, fontVariant: ["tabular-nums"] }}>{trailing}</Text> : null}
+      {trailing ? (
+        // capped and single-line, so a long value (a session name, a model id) never crushes the title
+        <Text style={{ maxWidth: "50%", flexShrink: 1, fontSize: TYPE.footnote, color: p.textMid, fontVariant: ["tabular-nums"] }} numberOfLines={1}>
+          {trailing}
+        </Text>
+      ) : null}
       {selected ? <Icon name="checkmark" size={16} color={p.accent} weight="semibold" /> : null}
     </Pressable>
   );
@@ -225,6 +242,12 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
   const [rename, setRename] = useState("");
   const [query, setQuery] = useState("");
   const [keepRunning, setKeepRunning] = useState<boolean>(session?.keepRunning === true);
+  // The note banner sits near the top, far from the switches and Stop row that set it: bring it
+  // into view whenever one is set, or the outcome lands off screen.
+  const scroll = useRef<ScrollView>(null);
+  useEffect(() => {
+    if (note) scroll.current?.scrollTo({ y: 0, animated: true });
+  }, [note]);
 
   const load = useCallback(() => {
     setLoadError(null);
@@ -338,7 +361,7 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
   const steer = actions.filter((a) => a.id !== "stop");
 
   return (
-    <SheetScaffold title="Session" onClose={() => navigation.goBack()}>
+    <SheetScaffold title="Session" onClose={() => navigation.goBack()} scrollRef={scroll}>
       <View style={{ alignItems: "center", gap: 6, marginBottom: 16, paddingHorizontal: 24 }}>
         <AgentAvatar agent={agentId} projectColor={color} state={avatarState} size={64} ground={p.panelBg} context={ring ? ring.fraction : null} />
         <Text style={{ fontSize: TYPE.title3, fontWeight: "600", color: p.textBright, textAlign: "center" }} numberOfLines={2}>
@@ -410,8 +433,10 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
             first
             symbol="stop.circle"
             title="Interrupt"
-            detail="Stop the current turn (Esc on your computer)"
+            // a private session refuses every control from the phone, silently -- say so instead
+            detail={silo ? PRIVATE_CONTROL : "Stop the current turn (Esc on your computer)"}
             tone="destructive"
+            disabled={silo}
             onPress={() => runAction(interruptAction)}
           />
         ) : null}
@@ -584,10 +609,22 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
                 disabled={busy}
                 accessibilityLabel="Auto-approve"
                 trackColor={{ true: p.amber, false: p.selectionBg }}
-                onValueChange={async (v) => {
-                  setAutoApprove(v);
-                  const ok = await set({ autoApprove: v }, v ? "Auto-approve on: every request is allowed" : "Auto-approve off: requests ask you again");
-                  if (!ok) setAutoApprove(!v);
+                onValueChange={(v) => {
+                  const apply = async () => {
+                    setAutoApprove(v);
+                    const ok = await set({ autoApprove: v }, v ? "Auto-approve on: every request is allowed" : "Auto-approve off: requests ask you again");
+                    if (!ok) setAutoApprove(!v);
+                  };
+                  // Turning it ON hands the agent every command and file edit: confirm. Off is safe.
+                  if (!v) return void apply();
+                  Alert.alert(
+                    "Turn on auto-approve?",
+                    "Every request this session makes is allowed without asking you – commands and file edits included.",
+                    [
+                      { text: "Cancel", style: "cancel" },
+                      { text: "Turn on", style: "destructive", onPress: () => void apply() },
+                    ],
+                  );
                 }}
               />
             </View>
@@ -655,8 +692,9 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
             first={i === 0}
             symbol={a.symbol}
             title={a.title}
-            detail={a.detail}
+            detail={silo ? PRIVATE_CONTROL : a.detail}
             tone={a.destructive ? "destructive" : "plain"}
+            disabled={silo}
             onPress={() => {
               const c = a.confirm;
               if (!c) return runAction(a);
@@ -682,6 +720,7 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
 }
 
 const COMMANDS_SHOWN = 40;
+const PRIVATE_CONTROL = "Private: control it on your computer";
 const CLEAR_CONFIRM = QUICK_ACTIONS.find((a) => a.id === "clear")!.confirm!;
 
 /** One command or skill: tap puts `/name ` in the composer; a no-argument built-in can also run now. */
@@ -708,7 +747,7 @@ function CommandRow({ c, onInsert, onRun }: { c: CommandOption; onInsert?: () =>
           <Text style={{ color: p.accent, fontFamily: MONO, fontSize: 14, flexShrink: 1 }} numberOfLines={1}>
             /{c.name}
           </Text>
-          <Text style={{ color: p.textDim, fontSize: TYPE.micro }}>{kindTag(c.kind)}</Text>
+          <Text style={{ color: p.textMid, fontSize: TYPE.micro }}>{kindTag(c.kind)}</Text>
         </View>
         {c.description ? (
           <Text style={{ color: p.textMid, fontSize: TYPE.footnote, marginTop: 2 }} numberOfLines={2}>

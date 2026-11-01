@@ -39,7 +39,7 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{accept_hdr_with_config, Message, WebSocket};
 
 use crate::asks::{AskGate, AskView, Asks};
-use crate::bridge_view::read_lines;
+use crate::bridge_view::{read_history, TailCursor};
 use crate::broker::{Broker, PermissionView};
 use crate::hookbus::HookBus;
 use crate::mobile_devices::MobileDevices;
@@ -771,7 +771,7 @@ fn attached_now_private(attached: Option<&str>, is_private: impl Fn(&str) -> boo
 /// send. None, with nothing touched, while it is still open.
 fn stop_streaming_if_private<R>(
     attached: &mut Option<(String, u64, R)>,
-    transcript: &mut Option<(PathBuf, usize)>,
+    transcript: &mut Option<(PathBuf, TailCursor)>,
     context_path: &mut Option<PathBuf>,
     tail_conversation: &mut Option<String>,
     attached_claude: &mut bool,
@@ -997,6 +997,44 @@ fn root_chat_settings_reply(
         Some(c) => json!({ "type": "rootChatSettings", "requestId": request_id, "ok": true,
             "chat": root_chat_view(&c, running) }),
         None => refuse("unknown chat".into()),
+    }
+}
+
+/// The chat a root-chat message reads, drives or reconfigures -- the ones a remote phone
+/// is refused for a chat that has read a private session. Stop and scope carry no content
+/// and stay allowed; a list is filtered instead.
+fn root_chat_target(m: &ClientMsg) -> Option<&str> {
+    match m {
+        ClientMsg::RootChatHistory { chat_id }
+        | ClientMsg::RootChatSend { chat_id, .. }
+        | ClientMsg::RootChatSettings { chat_id, .. } => Some(chat_id),
+        _ => None,
+    }
+}
+
+/// Is `chat` off-limits to this peer? Only to a REMOTE phone, and only once the chat has
+/// read a private session. Loopback (the Simulator, the sidecar) and unknown ids pass, so
+/// an unknown chat still gets its usual "unknown chat" answer.
+fn chat_hidden_from(remote: bool, chat: Option<&crate::store::RootChat>) -> bool {
+    remote && chat.is_some_and(|c| c.peeked_private)
+}
+
+/// May a remote phone receive a live event of `chat`? Not one that has read a private
+/// session, and not one whose chat is gone (it can no longer be checked).
+fn remote_may_stream(chat: Option<&crate::store::RootChat>) -> bool {
+    chat.is_some_and(|c| !c.peeked_private)
+}
+
+/// The refusal for a hidden chat, in the shape the phone waits for: `rootChatSettings` for
+/// a settings change (it is matched by request id), otherwise a chat-tagged error event.
+fn hidden_chat_reply(m: &ClientMsg, chat_id: &str) -> serde_json::Value {
+    const NOTE: &str = "This chat read a private session -- open it on your computer";
+    match m {
+        ClientMsg::RootChatSettings { request_id, .. } => json!({
+            "type": "rootChatSettings", "requestId": request_id, "ok": false,
+            "note": NOTE, "chat": serde_json::Value::Null }),
+        _ => json!({ "type": "rootChatEvent", "event": "error", "chatId": chat_id,
+            "message": NOTE }),
     }
 }
 
@@ -1236,12 +1274,13 @@ fn wake_session(app: &AppHandle, session_id: &str) {
 }
 
 /// Build the transcript backfill payload for `session_id` from raw jsonl lines.
+/// Capped to the newest `bridge_view::HISTORY_CAP` items: the phone shows no more.
 fn history_payload(session_id: &str, lines: &[String]) -> serde_json::Value {
     let items: Vec<serde_json::Value> = lines
         .iter()
         .flat_map(|l| crate::transcript::parse_line(l))
         .collect();
-    json!({ "type": "history", "sessionId": session_id, "items": items })
+    crate::bridge_view::history_frame(session_id, items)
 }
 
 /// The generic failure reply. Identical for a wrong token, a revoked device, a bad or
@@ -1640,7 +1679,7 @@ fn pair_flow(
                 }
             }
             Err(e) => {
-                eprintln!("conduit: could not save paired phone: {e}");
+                crate::diag::error("bridge", format!("could not save paired phone: {e}"));
                 let _ = ws.send(Message::Text(pair_result_err("error").to_string()));
                 ("failed", None)
             }
@@ -1837,20 +1876,26 @@ impl BridgeController {
                 }
             });
             let (Some(port), Some(listener)) = (port, bound.into_inner()) else {
-                eprintln!(
-                    "conduit: no free bridge port in {}..={}",
-                    BRIDGE_PORTS.start(),
-                    BRIDGE_PORTS.end()
+                crate::diag::error(
+                    "bridge",
+                    format!(
+                        "no free bridge port in {}..={}",
+                        BRIDGE_PORTS.start(),
+                        BRIDGE_PORTS.end()
+                    ),
                 );
                 return;
             };
             if persisted != Some(port) {
                 if let Err(e) = me.devices.set_port(port) {
-                    eprintln!("conduit: could not persist bridge port {port}: {e}");
+                    crate::diag::warn(
+                        "bridge",
+                        format!("could not persist bridge port {port}: {e}"),
+                    );
                 }
             }
             me.port.store(port, Ordering::SeqCst);
-            eprintln!("conduit: mobile bridge on ws://127.0.0.1:{port}");
+            crate::diag::info("bridge", format!("mobile bridge on ws://127.0.0.1:{port}"));
             {
                 let (me, app) = (me.clone(), app.clone());
                 let never = Arc::new(AtomicBool::new(false));
@@ -1912,11 +1957,18 @@ impl BridgeController {
                     let ctrl = app.state::<Arc<BridgeController>>().inner().clone();
                     let (flag, app) = (stop.clone(), app.clone());
                     thread::spawn(move || accept_loop(listener, flag, app, ctrl));
-                    eprintln!("conduit: mobile bridge on ws://{ip}:{port} (Tailscale)");
+                    crate::diag::info(
+                        "bridge",
+                        format!("mobile bridge on ws://{ip}:{port} (Tailscale)"),
+                    );
                     *slot = Some((ip, stop));
                 }
                 // Left unbound; the next tick retries.
-                Err(e) => eprintln!("conduit: could not bind bridge to {ip}:{port}: {e}"),
+                Err(e) => crate::diag::warn_once(
+                    &format!("bridge-bind-{ip}:{port}"),
+                    "bridge",
+                    format!("could not bind bridge to {ip}:{port}: {e}"),
+                ),
             }
         }
     }
@@ -2036,8 +2088,12 @@ impl BridgeController {
         }
         let id = self.devices.verify(token);
         match (auth_outcome(rate_ok, enabled, id.is_some()), id) {
-            (AuthOutcome::Accepted, Some(id)) => Ok(id),
+            (AuthOutcome::Accepted, Some(id)) => {
+                crate::diag::bump(crate::diag::Counter::PhoneConnections);
+                Ok(id)
+            }
             (outcome, _) => {
+                crate::diag::bump(crate::diag::Counter::PhoneAuthFailures);
                 self.record_auth_failure(peer);
                 Err(outcome)
             }
@@ -2068,7 +2124,7 @@ fn accept_loop(
     ctrl: Arc<BridgeController>,
 ) {
     if listener.set_nonblocking(true).is_err() {
-        eprintln!("conduit: bridge listener could not go nonblocking");
+        crate::diag::error("bridge", "bridge listener could not go nonblocking");
         return;
     }
     while !stop.load(Ordering::SeqCst) {
@@ -2131,8 +2187,8 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut download: Option<(String, crate::phone_fs::Download, u64, Instant)> = None;
     // General-chat events, subscribed on this socket's first general-chat message.
     let mut root_chat_sub: Option<(u64, std::sync::mpsc::Receiver<serde_json::Value>)> = None;
-    // (transcript path, lines already sent) — set on attach, advanced while tailing.
-    let mut transcript: Option<(PathBuf, usize)> = None;
+    // (transcript path, how far it has been sent) — set on attach, advanced while tailing.
+    let mut transcript: Option<(PathBuf, TailCursor)> = None;
     // Transcript of the attached session when it is a Claude one (the only agent with a
     // context meter), and when the next `context` frame is due.
     let mut context_path: Option<PathBuf> = None;
@@ -2162,6 +2218,8 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut want_projects = false;
     let mut projects_gen = 0u64;
     let mut last_projects = Instant::now();
+    // Hash of the last `projects` frame this socket sent: an identical one is skipped.
+    let mut last_projects_hash: Option<u64> = None;
     // The phone's Tailscale user id, from one `whois` the first time it is needed.
     let peer_owner: Arc<OnceLock<Option<u64>>> = Arc::new(OnceLock::new());
     // Ids of the pending questions this socket has pushed (None = `pending` not sent yet),
@@ -2381,13 +2439,14 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             // No transcript yet (a chat opened the moment it was spawned): the
                             // phone still gets an empty history, and the tail tick picks the
                             // transcript up as soon as it appears.
-                            let lines = found.as_deref().map(read_lines).unwrap_or_default();
+                            let (lines, cursor) =
+                                found.as_deref().map(read_history).unwrap_or_default();
                             let history = history_payload(&session_id, &lines);
                             if !send_text(&mut ws, history.to_string()) {
                                 break 'conn;
                             }
                             if let Some(path) = found {
-                                transcript = Some((path.clone(), lines.len()));
+                                transcript = Some((path.clone(), cursor));
                                 if attached_claude {
                                     context_path = Some(path);
                                 }
@@ -2769,7 +2828,15 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                                 ),
                             );
                         }
+                        // A chat that has read a private session is not a remote phone's to
+                        // read, drive or reconfigure (see `RootChat::peeked_private`).
+                        let remote = device.is_some();
+                        let hidden = root_chat_target(m)
+                            .filter(|id| chat_hidden_from(remote, store.root_chat(id).as_ref()));
                         let reply = match m {
+                            _ if hidden.is_some() => {
+                                Some(hidden_chat_reply(m, hidden.unwrap_or_default()))
+                            }
                             ClientMsg::RootChatOptions { request_id } => {
                                 if !listing_chat_options {
                                     listing_chat_options = true;
@@ -2813,6 +2880,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                                 let list: Vec<serde_json::Value> = store
                                     .list_root_chats()
                                     .iter()
+                                    .filter(|c| !chat_hidden_from(remote, Some(c)))
                                     .map(|c| root_chat_view(c, chats.is_running(&c.id)))
                                     .collect();
                                 Some(json!({ "type": "rootChats", "chats": list }))
@@ -3191,7 +3259,13 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                 },
             );
             ctrl.last_messages.sweep();
-            if !send_text(&mut ws, view.to_string()) {
+            let text = view.to_string();
+            // Skipped when byte-identical to the last one this socket sent: most store
+            // saves (and the phone's 10 s poll) change nothing in the phone's view. A new
+            // socket has no hash, so its first `list` is always answered.
+            if crate::bridge_view::frame_changed(&mut last_projects_hash, &text)
+                && !send_text(&mut ws, text)
+            {
                 break;
             }
         }
@@ -3202,6 +3276,18 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             for _ in 0..DRAIN_PER_TICK {
                 match rx.try_recv() {
                     Ok(event) => {
+                        // A remote phone never streams a chat that has read a private
+                        // session -- including the very turn that read it (the mark is
+                        // set before the tool's result reaches the model).
+                        if device.is_some() {
+                            let chat = event
+                                .get("chatId")
+                                .and_then(|c| c.as_str())
+                                .and_then(|id| app.state::<Arc<Store>>().root_chat(id));
+                            if !remote_may_stream(chat.as_ref()) {
+                                continue;
+                            }
+                        }
                         if !send_text(&mut ws, root_chat_event_frame(event).to_string()) {
                             gone = true;
                             break;
@@ -3324,12 +3410,12 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             }
                         }
                         if let Some(path) = resolved.clone() {
-                            let lines = read_lines(&path);
+                            let (lines, cursor) = read_history(&path);
                             let history = history_payload(sid, &lines);
                             if !send_text(&mut ws, history.to_string()) {
                                 break 'conn;
                             }
-                            transcript = Some((path.clone(), lines.len()));
+                            transcript = Some((path.clone(), cursor));
                             context_path = Some(path);
                             next_context = Instant::now();
                         }
@@ -3363,7 +3449,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         .collect(),
                     crate::agy_transcript::Update::Append(items)
                     | crate::agy_transcript::Update::Replace(items) => {
-                        vec![json!({ "type": "history", "sessionId": sid, "items": items })]
+                        vec![crate::bridge_view::history_frame(&sid, items)]
                     }
                     crate::agy_transcript::Update::Nothing => Vec::new(),
                 };
@@ -3457,6 +3543,7 @@ fn serve_tunnel(ctrl: &BridgeController, mut ws: WebSocket<TcpStream>, device: &
         return;
     }
     lift_preauth_cap(&mut ws);
+    crate::diag::bump(crate::diag::Counter::TunnelsOpened);
     let timing = crate::port_tunnel::Timing {
         write_stall: WRITE_STALL,
         ping_every: PING_EVERY,
@@ -3940,6 +4027,69 @@ mod tests {
         assert_eq!(msg["sessionId"], "s1");
         assert_eq!(msg["items"].as_array().unwrap().len(), 2);
         assert_eq!(msg["items"][0]["role"], "user");
+    }
+
+    #[test]
+    fn history_payload_is_capped_to_the_newest_items() {
+        let line = |i: usize| {
+            serde_json::json!({"type":"user","message":{"role":"user","content":format!("m{i}")}})
+                .to_string()
+        };
+        let n = crate::bridge_view::HISTORY_CAP + 5;
+        let lines: Vec<String> = (0..n).map(line).collect();
+        let msg = history_payload("s1", &lines);
+        let items = msg["items"].as_array().unwrap();
+        assert_eq!(items.len(), crate::bridge_view::HISTORY_CAP);
+        assert_eq!(items[0]["text"], "m5", "the oldest are the ones dropped");
+    }
+
+    #[test]
+    fn a_chat_that_read_a_private_session_is_hidden_from_remote_phones_only() {
+        use crate::store::RootChat;
+        let clean = RootChat {
+            id: "c".into(),
+            ..Default::default()
+        };
+        let tainted = RootChat {
+            id: "t".into(),
+            peeked_private: true,
+            ..Default::default()
+        };
+        // Listing / reading / driving.
+        assert!(chat_hidden_from(true, Some(&tainted)));
+        assert!(
+            !chat_hidden_from(false, Some(&tainted)),
+            "loopback keeps it"
+        );
+        assert!(!chat_hidden_from(true, Some(&clean)));
+        assert!(!chat_hidden_from(true, None), "unknown: the usual answer");
+        // Live events (checked for remote peers only).
+        assert!(remote_may_stream(Some(&clean)));
+        assert!(!remote_may_stream(Some(&tainted)));
+        assert!(
+            !remote_may_stream(None),
+            "a vanished chat cannot be checked"
+        );
+
+        // Which messages are gated, and what the refusal looks like.
+        let msg = |t: &str| parse_client_msg(t).unwrap();
+        let hist = msg(r#"{"type":"rootchathistory","chatId":"t"}"#);
+        let send = msg(r#"{"type":"rootchatsend","chatId":"t","text":"hi"}"#);
+        let settings = msg(r#"{"type":"rootchatsettings","chatId":"t","requestId":"r1"}"#);
+        let stop = msg(r#"{"type":"rootchatstop","chatId":"t"}"#);
+        assert_eq!(root_chat_target(&hist), Some("t"));
+        assert_eq!(root_chat_target(&send), Some("t"));
+        assert_eq!(root_chat_target(&settings), Some("t"));
+        assert_eq!(root_chat_target(&stop), None, "stopping leaks nothing");
+        assert_eq!(root_chat_target(&ClientMsg::RootChats), None);
+        let r = hidden_chat_reply(&settings, "t");
+        assert_eq!(r["type"], "rootChatSettings");
+        assert_eq!(r["requestId"], "r1");
+        assert_eq!(r["ok"], false);
+        let r = hidden_chat_reply(&hist, "t");
+        assert_eq!(r["type"], "rootChatEvent");
+        assert_eq!(r["event"], "error");
+        assert_eq!(r["chatId"], "t");
     }
 
     #[test]
@@ -4818,7 +4968,7 @@ b"
         // The whole step: unsubscribe the PTY stream, drop the tail, say why (tagged).
         let (_tx, rx) = std::sync::mpsc::channel::<String>();
         let mut attached = Some(("secret".to_string(), 7u64, rx));
-        let mut transcript = Some((PathBuf::from("/t/a.jsonl"), 3usize));
+        let mut transcript = Some((PathBuf::from("/t/a.jsonl"), TailCursor::default()));
         let mut context_path = Some(PathBuf::from("/t/a.jsonl"));
         let mut tail_conversation = Some("conv".to_string());
         let mut attached_claude = true;
@@ -4843,7 +4993,7 @@ b"
         // A session that is still open is left streaming, untouched.
         let (_tx, rx) = std::sync::mpsc::channel::<String>();
         let mut attached = Some(("open".to_string(), 8u64, rx));
-        let mut transcript = Some((PathBuf::from("/t/b.jsonl"), 1usize));
+        let mut transcript = Some((PathBuf::from("/t/b.jsonl"), TailCursor::default()));
         let mut context_path = Some(PathBuf::from("/t/b.jsonl"));
         let mut tail_conversation = Some("conv".to_string());
         let mut attached_claude = true;

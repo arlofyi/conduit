@@ -24,6 +24,8 @@ class StartOptions : Record {
 
 private class InvalidOptions(message: String) : CodedException("ERR_PORT_MIRROR_OPTIONS", message, null)
 
+private class StartRefused(cause: Throwable) : CodedException("ERR_PORT_MIRROR_START", "the system refused to start the mirror", cause)
+
 /**
  * JS face of the mirror: `start` (also how the port set is updated), `stop`, `status`, and an
  * `onStatus` event whenever a listener comes up, fails, or the service stops.
@@ -57,7 +59,14 @@ class PortMirrorModule : Module() {
         // background (the port list changing while Chrome is in front) is refused on 12+.
         live.apply(cfg)
       } else {
-        ContextCompat.startForegroundService(context, Intent(context, PortMirrorService::class.java))
+        try {
+          ContextCompat.startForegroundService(context, Intent(context, PortMirrorService::class.java))
+        } catch (e: Exception) {
+          // Android 12+: a foreground-service start from the background is refused. Drop the
+          // config (it holds the device token) so nothing is left waiting to use it.
+          MirrorState.config = null
+          throw StartRefused(e)
+        }
       }
       true
     }

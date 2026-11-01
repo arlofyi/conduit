@@ -17,13 +17,16 @@ import type { GeneralProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, TYPE, tabBarClearance } from "../theme/type";
 import { useStartChat } from "./GeneralOptions";
+import { OfflineStrip, useOfflineLine } from "../components/OfflineStrip";
 
 const CLOCK_MS = 30_000;
 
 export function GeneralScreen({ navigation }: GeneralProps) {
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
-  const { view, conn, rootChats, refreshRootChats, rootChatOptions, loadRootChatOptions } = useLive();
+  const { view, conn, rootChats, rootChatsSavedAt, refreshRootChats, rootChatOptions, loadRootChatOptions } = useLive();
+  // Offline the list is this phone's saved copy, and its chats open read-only.
+  const offline = useOfflineLine(rootChatsSavedAt);
   const { profileSel } = useListSelection();
   const ready = conn.phase === "ready";
 
@@ -70,7 +73,9 @@ export function GeneralScreen({ navigation }: GeneralProps) {
 
   const where = view ? (sel === ALL_PROFILES ? "All profiles" : `${profileName(view, sel)} profile`) : null;
   const empty = !ready
-    ? "Not connected to your computer."
+    ? rootChats === null
+      ? "Not connected to your computer. Chats you open while connected are kept on this phone."
+      : "No saved chats here."
     : rootChats === null
       ? "Loading…"
       : "No chats here yet. Tap + to ask something across your projects.";
@@ -91,6 +96,7 @@ export function GeneralScreen({ navigation }: GeneralProps) {
         </View>
         <GlassCircle symbol="plus" primary label={starting ? "Starting a chat" : "New chat"} disabled={!ready || starting} onPress={newChat} />
       </View>
+      {offline ? <OfflineStrip text={offline.text} tone={offline.tone} onRetry={offline.onRetry} onPress={() => navigation.navigate("Settings")} /> : null}
       {startError ? (
         <Text accessibilityLiveRegion="polite" style={{ marginHorizontal: 16, marginBottom: 8, fontSize: TYPE.footnote, color: p.red }}>
           {startError}

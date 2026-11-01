@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { AgentList } from "./AgentList";
 import { McpMatrix } from "./McpMatrix";
 import { TelemetryToggle } from "./TelemetryToggle";
@@ -134,6 +135,9 @@ export function Settings({
               </button>
             </div>
             <div className="settings-body">
+              {/* Keyed by tab: a crashed section recovers by switching away and back, and
+                  never takes the rest of Settings (or the app) down with it. */}
+              <ErrorBoundary key={tab} name={`settings:${tab}`}>
               {tab === "general" && (
                 <>
                   <p className="settings-intro">Startup and session behavior.</p>
@@ -230,6 +234,7 @@ export function Settings({
                 </>
               )}
               {tab === "about" && <AboutPanel />}
+              </ErrorBoundary>
             </div>
           </div>
         </div>

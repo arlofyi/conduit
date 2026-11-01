@@ -12,7 +12,15 @@ import { AppState, Platform } from "react-native";
 import { usePrefs } from "../data/PrefsProvider";
 import { macStore } from "../data/secureBackend";
 import type { ChatItem, ProjectsView, SavedMac, SessionStatus, TodoProgress } from "../data/types";
-import { bannerFromPending, bannerFromStatus, bannersFromView, type Banner, type Signals } from "../logic/banner";
+import {
+  bannerFromPending,
+  bannerFromStatus,
+  bannersFromView,
+  dueBanners,
+  SETTLE_TICK_MS,
+  type Banner,
+  type Signals,
+} from "../logic/banner";
 import type { ContextInfo } from "../logic/chatHeader";
 import { chatUnread, nextUnread } from "../logic/chatList";
 import { connErrorText } from "../logic/connCopy";
@@ -30,7 +38,10 @@ import { loopbackMac, type PairEndpoint } from "../logic/macs";
 import { addressesFor, confirmCode, makeNonce, type QrPayload } from "../logic/pairing";
 import { emptyPending, fromWire, pendingReducer, type Mine, type PendingEvent, type PendingState } from "../logic/pending";
 import { BridgeClient } from "./BridgeClient";
-import { initialConn, lifecycleAction, type ConnError, type ConnState } from "./connection";
+import { initialConn, isStale, lifecycleAction, type ConnError, type ConnState } from "./connection";
+import { offlineStore } from "../data/offlineFs";
+import { mayCacheSession, rootKey, sessionKey } from "../logic/offlineCache";
+import { awaySummary, type AwaySummary } from "../logic/catchUp";
 import { appendWire, mapHistory, mapProjectsView, sameView, statusPatch, type LivePatch } from "./live";
 import { probeLoopback as probeLoopbackWith, type LoopbackFound, type ProbeSocket } from "./probe";
 import { answerMsg, approveMsg, discoverMsg, pairMsg, portsMsg, sessionActionMsg, spawnMsg, uploadMsg, type ClientMsg, type WireMac } from "./protocol";
@@ -63,6 +74,7 @@ import { rootChatCreateMsg, rootChatHistoryMsg, rootChatOptionsMsg, rootChatScop
 import { sessionOptionsMsg, sessionSetMsg, usageMsg, type SessionSetPatch } from "./protocol";
 import { parseSessionOptions, type SessionOptions } from "../logic/sessionOptions";
 import { parseUsageFrame, type UsageRow } from "../logic/usage";
+import { diag } from "../data/diagnostics";
 
 /** Simulator/dev build: also try loopback, and offer "This computer (simulator)". */
 export const IS_SIMULATOR_OR_DEV = __DEV__;
@@ -120,9 +132,22 @@ export interface SessionLive {
   todos?: TodoProgress;
   /** the Mac refused this chat: a private (silo'd / local-only) session */
   refused?: "private";
+  /** the computer's `history` has arrived on this socket (until then the feed may be a saved copy) */
+  loaded?: boolean;
+  /** the feed is this phone's saved copy, written at this time (ms); cleared by `history` */
+  cachedAt?: number;
 }
 
 const EMPTY_LIVE: SessionLive = { feed: [], status: "idle", statusAt: 0 };
+
+/** How often a ready, foreground link is checked for silence (see `isStale`). */
+const STALE_CHECK_MS = 5_000;
+
+/** A saved general-chat feed, shown until the computer's own history arrives. */
+export interface CachedFeed {
+  items: ChatItem[];
+  savedAt: number;
+}
 
 /** A new-chat request from the phone: the Mac answers `spawned` (or `error`). */
 export type SpawnState =
@@ -225,8 +250,25 @@ export interface LiveValue {
   /** Simulator/dev: every Conduit answering on 127.0.0.1:8455..=8474 (never auto-picked) */
   probeLoopback: () => Promise<LoopbackFound[]>;
   addLoopback: (found: LoopbackFound) => Promise<void>;
-  /** the current Mac's projects view; kept while offline, null until the first one arrives */
+  /** the current Mac's projects view; kept while offline, null until the first one arrives
+   * (or this phone's saved copy, see `viewSavedAt`) */
   view: ProjectsView | null;
+  /** non-null while `view` is this phone's saved copy (no live list yet): when it was saved */
+  viewSavedAt: number | null;
+  /** "While you were away": what changed, said once after a long gap; null otherwise */
+  catchUp: AwaySummary | null;
+  dismissCatchUp: () => void;
+  /** dial now rather than wait out the reconnect backoff */
+  retryNow: () => void;
+  /** saved general-chat feeds, by chat id (shown until a chat's live history arrives) */
+  rootCache: Record<string, CachedFeed>;
+  /** non-null while `rootChats` is the saved copy: when it was saved */
+  rootChatsSavedAt: number | null;
+  /** bytes the saved chats take on this phone (null until measured) */
+  storageBytes: number | null;
+  refreshStorage: () => void;
+  /** delete every saved chat and list on this phone */
+  clearSavedChats: () => void;
   /** when `view` last arrived (ms); a pull-to-refresh waits for this to move */
   viewAt: number;
   /** ask the Mac for a fresh view now */
@@ -349,6 +391,19 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [pairing, setPairing] = useState<PairingState | null>(null);
   const [view, setView] = useState<ProjectsView | null>(null);
   const [viewAt, setViewAt] = useState(0);
+  // ---- offline copy + catch-up (logic/offlineStore.ts, logic/catchUp.ts) ----
+  const [viewSavedAt, setViewSavedAt] = useState<number | null>(null);
+  const [catchUp, setCatchUp] = useState<AwaySummary | null>(null);
+  const [rootCache, setRootCache] = useState<Record<string, CachedFeed>>({});
+  const [rootChatsSavedAt, setRootChatsSavedAt] = useState<number | null>(null);
+  const [storageBytes, setStorageBytes] = useState<number | null>(null);
+  /** the current computer's device id, for saves made outside the socket callbacks */
+  const macIdRef = useRef<string | null>(null);
+  /** the last list the phone had and when it last heard from the computer, set when the link
+   * drops (or from the saved copy at launch); the first fresh list is compared with it once */
+  const awayRef = useRef<{ at: number; view: ProjectsView | null } | null>(null);
+  /** last frame, or the moment a socket became ready / the app came back: the silence watchdog's clock */
+  const aliveRef = useRef(0);
   const [unread, setUnread] = useState<Record<string, number>>({});
   const [lastSeen, setLastSeen] = useState<number | null>(null);
   /** the last view, for diffing the next one into unread counts */
@@ -390,6 +445,20 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   const [foreground, setForeground] = useState(AppState.currentState === "active");
   const clientRef = useRef<BridgeClient | null>(null);
   const attachedRef = useRef<string | null>(null);
+  // A finished turn banners only once it has settled (logic/banner.ts FINISH_SETTLE_MS), and no
+  // frame arrives while nothing changes: re-check on a timer while the app is in front.
+  useEffect(() => {
+    if (!foreground) return;
+    const t = setInterval(() => {
+      const r = dueBanners(signalsRef.current, viewRef.current, attachedRef.current, prefsRef.current, Date.now());
+      signalsRef.current = r.signals;
+      if (r.banners.length > 0) {
+        setBanner(r.banners[0]);
+        diag.count("notificationsPosted");
+      }
+    }, SETTLE_TICK_MS);
+    return () => clearInterval(t);
+  }, [foreground]);
   const pairClientRef = useRef<BridgeClient | null>(null);
   /** bumps on every pair()/cancel so a stale attempt's async callbacks are ignored */
   const pairGen = useRef(0);
@@ -490,6 +559,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           }
           if (r.data) file.write(r.data, { encoding: "base64", append: true });
         } catch (e) {
+          diag.error("files", "download.saveFailed", e);
           return fail(`Couldn't save on this phone: ${e instanceof Error ? e.message : String(e)}`);
         }
         received += decodedBytes(r.data);
@@ -512,6 +582,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
   /** this socket has sent a rootchat* frame, so the computer pushes events to it; a new
    * socket (reconnect) re-subscribes and re-loads the open chat */
   const rootSubscribedRef = useRef(false);
+  /** a live chats list arrived for the current computer (a saved one must not replace it) */
+  const rootLiveRef = useRef(false);
   const rootOpenRef = useRef<string | null>(null);
   /** answers waited on: `create:<requestId>` and `scope:<chatId>` */
   const rootWaitersRef = useRef(new Map<string, (m: ServerMsg | null) => void>());
@@ -549,6 +621,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       switch (m.type) {
         case "rootChats":
           setRootChats((m.chats ?? []).map(chatOf).filter((c): c is RootChat => c !== null));
+          setRootChatsSavedAt(null);
+          rootLiveRef.current = true;
           return true;
         case "rootChatCreated": {
           const chat = chatOf(m.chat);
@@ -597,6 +671,12 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     (chatId: string) => {
       rootOpenRef.current = chatId;
       rootSend(rootChatHistoryMsg(chatId));
+      // The saved copy reads while the computer's history is on its way (or out of reach).
+      const macId = macIdRef.current;
+      if (!macId || !prefsRef.current.keepChats) return;
+      void offlineStore.loadChat(macId, rootKey(chatId)).then((c) => {
+        if (c && macIdRef.current === macId) setRootCache((all) => ({ ...all, [chatId]: c }));
+      });
     },
     [rootSend],
   );
@@ -618,6 +698,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       const trimmed = text.trim();
       if (!trimmed) return false;
       if (!rootSend(rootChatSendMsg(chatId, trimmed))) return false;
+      diag.count("messagesSent");
       patchRootFeed(chatId, { t: "send", text: trimmed });
       return true;
     },
@@ -757,8 +838,16 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
         if (!live) return;
         setMacs(list);
         setCurrentMac(cur);
-      } catch {
+        // Saved copies of computers this phone is no longer paired with go (a forget that
+        // happened while the store could not be reached, a re-pair under a new device id).
+        try {
+          offlineStore.pruneMacs(list.map((m) => m.deviceId));
+        } catch {
+          // keep them for next time
+        }
+      } catch (e) {
         // Keychain unreadable (e.g. before first unlock): start at Connect, delete nothing.
+        diag.warn("store", "macs.loadFailed", e);
       } finally {
         if (live) setLoaded(true);
       }
@@ -798,7 +887,36 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     rootOpenRef.current = null;
     pendingRef.current = emptyPending;
     setPending(emptyPending);
+    macIdRef.current = mac.deviceId;
+    setViewSavedAt(null);
+    setCatchUp(null);
+    setRootCache({});
+    setRootChatsSavedAt(null);
+    rootLiveRef.current = false;
+    awayRef.current = null;
+    aliveRef.current = 0;
+    // The saved copy renders at once (offline, or while the first answer is on its way); a
+    // live list or chats list that already arrived is never replaced by it.
+    let current = true;
+    if (prefsRef.current.keepChats) {
+      void offlineStore.loadProjects(mac.deviceId).then((c) => {
+        if (!current || !c || viewRef.current) return;
+        setView(c.view);
+        setViewSavedAt(c.savedAt);
+        awayRef.current ??= { at: c.savedAt, view: c.view };
+      });
+      void offlineStore.loadRootChats(mac.deviceId).then((c) => {
+        if (!current || !c || rootLiveRef.current) return;
+        setRootChats(c.chats);
+        setRootChatsSavedAt(c.savedAt);
+      });
+    }
     let wasReady = false;
+    /** this client has been ready before: a later ready is a reconnect (diagnostics) */
+    let everReady = false;
+    let lastFailed: string | null = null;
+    /** the first projects frame on a fresh socket is compared with `awayRef` */
+    let catchUpDue = false;
     const client = new BridgeClient(
       { addresses: addressesFor(mac, { simulator: IS_SIMULATOR_OR_DEV, ipFirst: Platform.OS === "android" }), mac },
       {
@@ -806,19 +924,47 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           setConn(c);
           const ready = c.phase === "ready";
           const justReady = ready && !wasReady;
-          if (wasReady && !ready) setLastSeen(lastFrameAt.current ?? Date.now());
+          // Local diagnostics: transitions only, never the token or the address list.
+          if (justReady) {
+            diag.count("connects");
+            if (everReady) diag.count("reconnects");
+            diag.info("bridge", everReady ? "conn.reconnected" : "conn.ready", `address ${c.addressIndex + 1}/${c.addresses.length}`);
+            everReady = true;
+            lastFailed = null;
+          } else if (wasReady && !ready) {
+            diag.info("bridge", "conn.dropped", c.suspended ? "suspended (app in background)" : `phase ${c.phase}`);
+          }
+          if (c.phase === "failed" && c.error && lastFailed !== c.error.kind) {
+            lastFailed = c.error.kind;
+            diag.count("connectionFailures");
+            diag.warn("bridge", "conn.failed", undefined, c.error.kind);
+          } else if (c.phase !== "failed") {
+            lastFailed = null;
+          }
+          if (wasReady && !ready) {
+            const at = lastFrameAt.current ?? Date.now();
+            setLastSeen(at);
+            // Remember what the phone knew, for "While you were away" once the link is back.
+            awayRef.current = { at, view: viewRef.current };
+            void offlineStore.flush();
+          }
           wasReady = ready;
           if (justReady) {
+            aliveRef.current = Date.now();
+            catchUpDue = true;
             client.list();
             // A new socket streams nothing until attached. Re-attach the open chat (desktop is
-            // the source of truth); a chat closed earlier is no longer streamed.
+            // the source of truth); a chat closed earlier is no longer streamed. The feed on
+            // screen stays until the computer's `history` replaces it (no blank flash).
             streamingRef.current = attachedRef.current;
             if (attachedRef.current) {
-              setSessionLive(EMPTY_LIVE);
+              setSessionLive((prev) => ({ ...EMPTY_LIVE, feed: prev.feed, cachedAt: prev.cachedAt }));
               client.attach(attachedRef.current);
             }
-            // General-chat events are per socket: subscribe again, and catch the open chat up.
-            if (rootSubscribedRef.current) {
+            // General-chat events are per socket: subscribe again, and catch the open chat up --
+            // also a chat opened while offline, whose own request never went out.
+            if (rootSubscribedRef.current || rootOpenRef.current) {
+              rootSubscribedRef.current = true;
               client.send(rootChatsMsg());
               if (rootOpenRef.current) client.send(rootChatHistoryMsg(rootOpenRef.current));
             }
@@ -828,6 +974,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           if (e.k !== "forgetMac") return;
           // The Mac revoked this phone: forget it and go back to Connect with a message.
           setNotice({ kind: "revoked", macName: mac.macName });
+          offlineStore.clearMac(e.deviceId);
           macStore
             .forget(e.deviceId)
             .catch(() => undefined)
@@ -836,6 +983,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
         },
         onMessage: (m) => {
           lastFrameAt.current = Date.now();
+          aliveRef.current = lastFrameAt.current;
           if (fsRoute(m)) return;
           if (rootRoute(m)) return;
           if (ctlRoute(m)) return;
@@ -870,6 +1018,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                 if (refusesOpenChat(m.message, m.sessionId, attachedRef.current)) {
                   setSessionLive({ ...EMPTY_LIVE, refused: "private" });
                 }
+                // Never keep a private session's chat on the phone (it may have turned private).
+                if (m.sessionId) offlineStore.dropChat(mac.deviceId, sessionKey(m.sessionId));
               } else if (stall) {
                 // Say so in that chat rather than leave it reading "working…". The Mac re-sends
                 // `history` once Claude does start, which replaces this notice with the real feed.
@@ -906,7 +1056,10 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               // Banner now, not at the next 10 s poll (same toggles / open-chat / silo rules).
               const b = bannerFromPending(signalsRef.current, viewRef.current, item, attachedRef.current, prefsRef.current);
               signalsRef.current = b.signals;
-              if (b.banner) setBanner(b.banner);
+              if (b.banner) {
+                setBanner(b.banner);
+                diag.count("notificationsPosted");
+              }
               break;
             }
             case "resolved":
@@ -946,9 +1099,22 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               setUnread((u) => nextUnread(u, prev, next, open));
               const b = bannersFromView(signalsRef.current, next, open, prefsRef.current);
               signalsRef.current = b.signals;
-              if (b.banners.length > 0) setBanner(b.banners[0]);
+              if (b.banners.length > 0) {
+                setBanner(b.banners[0]);
+                diag.count("notificationsPosted");
+              }
               setView(next);
+              setViewSavedAt(null);
               setViewAt(Date.now());
+              // The first list on a fresh socket after a long gap says what changed, once.
+              if (catchUpDue) {
+                catchUpDue = false;
+                const away = awayRef.current;
+                awayRef.current = null;
+                const summary = away ? awaySummary(away.view, away.at, next, Date.now()) : null;
+                if (summary) setCatchUp(summary);
+              }
+              if (next !== prev && prefsRef.current.keepChats) offlineStore.saveProjects(mac.deviceId, next);
               break;
             }
             case "context":
@@ -957,7 +1123,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
             case "history":
               // Also re-sent when the Mac follows the session onto a new transcript (/clear).
               if (attachedRef.current && acceptsFrame(m.sessionId, attachedRef.current)) {
-                setSessionLive((prev) => ({ ...prev, feed: capFeed(mapHistory(m.items)) }));
+                // The computer's history wins outright over a saved copy.
+                setSessionLive((prev) => ({ ...prev, feed: capFeed(mapHistory(m.items)), loaded: true, cachedAt: undefined }));
               }
               break;
             case "chat": {
@@ -985,7 +1152,10 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
                   prefsRef.current,
                 );
                 signalsRef.current = r.signals;
-                if (r.banner) setBanner(r.banner);
+                if (r.banner) {
+                  setBanner(r.banner);
+                  diag.count("notificationsPosted");
+                }
               }
               break;
             }
@@ -996,6 +1166,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     );
     clientRef.current = client;
     return () => {
+      current = false;
+      void offlineStore.flush();
       client.close();
       if (clientRef.current === client) clientRef.current = null;
     };
@@ -1019,6 +1191,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     async (deviceId?: string) => {
       const id = deviceId ?? currentMac?.deviceId;
       if (!id) return;
+      offlineStore.clearMac(id);
       await macStore.forget(id).catch(() => undefined);
       await refreshMacs();
       setCurrentMac((cur) => (cur?.deviceId === id ? null : cur));
@@ -1082,6 +1255,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               );
               patch({ phase: "waiting" });
             } else if (c.phase === "failed") {
+              // the kind only: a pairFailed reason is the computer's short code, never the secret
+              diag.warn("pair", "pair.failed", undefined, c.error ? (c.error.kind === "pairFailed" ? `pairFailed ${c.error.reason}` : c.error.kind) : "unknown");
               patch({ phase: "failed", error: c.error ? connErrorText(c.error, macName) : "Couldn't pair" });
             }
           },
@@ -1111,7 +1286,8 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               try {
                 await macStore.save(mac);
                 await macStore.setCurrent(mac.deviceId);
-              } catch {
+              } catch (e) {
+                diag.error("pair", "pair.saveFailed", e);
                 patch({ phase: "failed", error: "Couldn't save the pairing on this phone" });
                 client.close();
                 return;
@@ -1166,6 +1342,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       const active = s === "active";
       const action = lifecycleAction(prev, s);
       if (action === "suspend") {
+        void offlineStore.flush();
         const waitFor = backgroundHandover?.() ?? null;
         const suspend = () => {
           // back in front meanwhile: the socket stays (resume below was a no-op for it)
@@ -1175,7 +1352,11 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
         else clientRef.current?.suspend();
       }
       if (action === "resume") {
-        clientRef.current?.resume();
+        // The silence watchdog counts from now: nothing was asked while in the background.
+        aliveRef.current = Date.now();
+        // Redial if suspended; if it was still retrying (e.g. the background hand-over kept the
+        // socket), skip the rest of the backoff wait rather than sit out up to 8 s more.
+        clientRef.current?.kick();
         // back in front: ask at once rather than wait out the interval (a no-op while the
         // socket is redialling; `ready` lists then)
         clientRef.current?.list();
@@ -1193,6 +1374,61 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     const t = setInterval(() => clientRef.current?.list(), LIST_POLL_MS);
     return () => clearInterval(t);
   }, [ready, foreground, macKey]);
+
+  // A ready socket that went silent in front of the reader is dead (a vanished route): drop it
+  // and reconnect, rather than wait minutes for TCP to give up.
+  useEffect(() => {
+    if (!ready || !foreground) return;
+    const t = setInterval(() => {
+      if (isStale("ready", aliveRef.current || null, Date.now())) clientRef.current?.restart();
+    }, STALE_CHECK_MS);
+    return () => clearInterval(t);
+  }, [ready, foreground, macKey]);
+
+  // ---- offline copy: what is saved, and when ----
+  // Turning "Keep chats on this phone" off deletes every saved copy; on, the next frames save.
+  useEffect(() => {
+    offlineStore.setEnabled(prefs.keepChats);
+    if (!prefs.keepChats) {
+      setRootCache({});
+      setStorageBytes(0);
+    }
+  }, [prefs.keepChats]);
+  // The open session chat, once it is the computer's own (never a saved copy, never private).
+  useEffect(() => {
+    const id = attachedRef.current;
+    const macId = macIdRef.current;
+    if (!id || !macId || !prefs.keepChats || sessionLive.cachedAt !== undefined || !sessionLive.loaded) return;
+    if (sessionLive.refused || !mayCacheSession(viewRef.current, id)) return;
+    offlineStore.saveChat(macId, sessionKey(id), sessionLive.feed);
+  }, [sessionLive.feed, sessionLive.loaded, sessionLive.cachedAt, sessionLive.refused, prefs.keepChats]);
+  // General chats: every opened chat whose feed changed, and the chats list once it is live.
+  const savedRootFeeds = useRef<Record<string, RootFeed>>({});
+  useEffect(() => {
+    const macId = macIdRef.current;
+    const before = savedRootFeeds.current;
+    savedRootFeeds.current = rootFeeds;
+    if (!macId || !prefs.keepChats) return;
+    for (const [chatId, f] of Object.entries(rootFeeds)) {
+      if (f.loaded && f !== before[chatId]) offlineStore.saveChat(macId, rootKey(chatId), f.feed);
+    }
+  }, [rootFeeds, prefs.keepChats]);
+  useEffect(() => {
+    const macId = macIdRef.current;
+    if (!macId || !prefs.keepChats || !rootChats || rootChatsSavedAt !== null || !rootLiveRef.current) return;
+    offlineStore.saveRootChats(macId, rootChats);
+  }, [rootChats, rootChatsSavedAt, prefs.keepChats]);
+
+  const refreshStorage = useCallback(() => {
+    void offlineStore.flush().then(() => setStorageBytes(offlineStore.bytes()));
+  }, []);
+  const clearSavedChats = useCallback(() => {
+    offlineStore.clearAll();
+    setRootCache({});
+    setStorageBytes(0);
+  }, []);
+  const dismissCatchUp = useCallback(() => setCatchUp(null), []);
+  const retryNow = useCallback(() => clientRef.current?.kick(), []);
 
   const refreshPorts = useCallback(() => {
     clientRef.current?.send(portsMsg());
@@ -1215,6 +1451,13 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     });
     setBanner((b) => (b?.sessionId === sessionId ? null : b));
     clientRef.current?.attach(sessionId);
+    // The saved copy shows until the computer's history arrives (offline: until it can).
+    const macId = macIdRef.current;
+    if (!macId || !prefsRef.current.keepChats) return;
+    void offlineStore.loadChat(macId, sessionKey(sessionId)).then((c) => {
+      if (!c || macIdRef.current !== macId || attachedRef.current !== sessionId) return;
+      setSessionLive((prev) => (prev.loaded || prev.refused || prev.feed.length > 0 ? prev : { ...prev, feed: c.items, cachedAt: c.savedAt }));
+    });
   }, []);
 
   const detach = useCallback((sessionId?: string) => {
@@ -1329,6 +1572,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       const run = async (): Promise<UploadOutcome> => {
         const first = await attempt();
         const r = first.lost ? await attempt() : first;
+        if (!r.ok) diag.warn("upload", "upload.failed", undefined, r.error);
         return r.ok ? { ok: true, path: r.path } : { ok: false, error: r.error };
       };
       const next = uploadQueue.current.then(run, run);
@@ -1365,6 +1609,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     // No optimistic echo: claude logs the injected prompt to its transcript, which
     // the bridge tails back as a `chat` frame — avoids a duplicate user bubble.
     clientRef.current?.prompt(sessionId, trimmed);
+    if (clientRef.current) diag.count("messagesSent");
   }, []);
 
   /** Raw frames for the quick-actions sheet (its table, logic/quickActions.ts, builds them). */
@@ -1436,6 +1681,15 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       addLoopback,
       view,
       viewAt,
+      viewSavedAt,
+      catchUp,
+      dismissCatchUp,
+      retryNow,
+      rootCache,
+      rootChatsSavedAt,
+      storageBytes,
+      refreshStorage,
+      clearSavedChats,
       refreshProjects,
       unread,
       lastSeen,
@@ -1528,6 +1782,15 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       addLoopback,
       view,
       viewAt,
+      viewSavedAt,
+      catchUp,
+      dismissCatchUp,
+      retryNow,
+      rootCache,
+      rootChatsSavedAt,
+      storageBytes,
+      refreshStorage,
+      clearSavedChats,
       refreshProjects,
       unread,
       lastSeen,

@@ -239,7 +239,7 @@ pub fn conf_path() -> PathBuf {
 pub fn ensure_conf(tmux: &Path, scrollback: u32) -> Option<PathBuf> {
     let path = conf_path();
     if let Err(e) = std::fs::write(&path, conf_body(scrollback)) {
-        eprintln!("conduit: could not write tmux config: {e}");
+        crate::diag::warn("tmux", format!("could not write tmux config: {e}"));
         return None;
     }
     let _ = Command::new(tmux)

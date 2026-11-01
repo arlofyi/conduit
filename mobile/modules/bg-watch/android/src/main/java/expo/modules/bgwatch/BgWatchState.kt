@@ -1,5 +1,6 @@
 package expo.modules.bgwatch
 
+import java.security.SecureRandom
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import okhttp3.OkHttpClient
@@ -29,12 +30,23 @@ object BgWatchState {
   /** "connecting" | "watching" | "retrying" | "stopped" */
   @Volatile var phase: String = "stopped"
     private set
-  /** why the service last stopped by itself ("unauthorized", "protocol") */
+  /** why the service last stopped by itself ("unauthorized", "protocol"), or "stopped" when the
+   * user tapped Stop on its ongoing notification */
   @Volatile var reason: String? = null
   @Volatile var service: BgWatchService? = null
   @Volatile var openTarget: OpenTarget? = null
 
   private val listeners = CopyOnWriteArrayList<() -> Unit>()
+
+  /** Random per process, put on every notification's open intent. The launcher activity is
+   * exported, so any app can start it with our extras; only an intent carrying this value came
+   * from one of our PendingIntents. (A notification left by a previous process opens the app
+   * but no longer jumps to a chat -- acceptable, and the service clears those on start.) */
+  val openNonce: String by lazy {
+    val b = ByteArray(16)
+    SecureRandom().nextBytes(b)
+    b.joinToString("") { "%02x".format(it) }
+  }
 
   /** No read timeout: a quiet socket is normal. The computer pings every 15 s (OkHttp answers
    * those by itself); this ping notices a dead link from our side. */

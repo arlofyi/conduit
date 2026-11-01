@@ -16,6 +16,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { LiveProvider, useLive } from "./src/bridge/LiveProvider";
 import { Banner } from "./src/components/Banner";
+import { ErrorBoundary } from "./src/components/ErrorBoundary";
 import { ReduceMotionProvider } from "./src/components/ReduceMotion";
 import type { Banner as BannerData } from "./src/logic/banner";
 import { PrefsProvider, usePrefs } from "./src/data/PrefsProvider";
@@ -26,7 +27,7 @@ import { PairScreen } from "./src/screens/PairScreen";
 import { ChatsScreen } from "./src/screens/ChatsScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
 import { AppsScreen } from "./src/screens/AppsScreen";
-import { PortMirrorProvider } from "./src/data/PortMirrorProvider";
+import { PortMirrorProvider, usePortMirror } from "./src/data/PortMirrorProvider";
 import { BgWatchProvider, useBgWatch } from "./src/data/BgWatchProvider";
 import { NewChatScreen } from "./src/screens/NewChatScreen";
 import { FilesScreen } from "./src/screens/FilesScreen";
@@ -103,6 +104,8 @@ function Tabs() {
   const generalIcon = useTabIcon("sparkles");
   const appsIcon = useTabIcon("globe");
   const settingsIcon = useTabIcon("gearshape");
+  // iOS has no port mirror yet, and a tab that can only say "not available" is noise.
+  const { available: mirrorAvailable } = usePortMirror();
   return (
     <Tab.Navigator
       screenOptions={{
@@ -124,7 +127,7 @@ function Tabs() {
         }}
       />
       <Tab.Screen name="General" component={GeneralScreen} options={{ title: "Chats", tabBarIcon: generalIcon }} />
-      <Tab.Screen name="Apps" component={AppsScreen} options={{ tabBarIcon: appsIcon }} />
+      {mirrorAvailable && <Tab.Screen name="Apps" component={AppsScreen} options={{ tabBarIcon: appsIcon }} />}
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: settingsIcon }} />
     </Tab.Navigator>
   );
@@ -169,17 +172,22 @@ function Inner() {
     }
     openChat(openTarget);
   }, [openTarget, currentMac, navReady, consumeOpenTarget]);
-  const navTheme: Theme = {
-    ...base,
-    colors: {
-      ...base.colors,
-      background: palette.panelBg,
-      card: palette.sidebarBg,
-      text: palette.textBright,
-      border: palette.border,
-      primary: palette.accent,
-    },
-  };
+  // Memoized: Inner re-renders on every LiveProvider frame, and a fresh theme object makes the
+  // whole navigation tree re-render with it.
+  const navTheme: Theme = useMemo(
+    () => ({
+      ...base,
+      colors: {
+        ...base.colors,
+        background: palette.panelBg,
+        card: palette.sidebarBg,
+        text: palette.textBright,
+        border: palette.border,
+        primary: palette.accent,
+      },
+    }),
+    [base, palette.panelBg, palette.sidebarBg, palette.textBright, palette.border, palette.accent],
+  );
 
   // Hold the first frame until we know which Mac (if any) to open on and which theme.
   if (!loaded || !prefsLoaded) return <View style={{ flex: 1, backgroundColor: palette.panelBg }} />;
@@ -227,24 +235,26 @@ function Inner() {
 
 export default function App() {
   return (
-    <GestureHandlerRootView style={{ flex: 1 }}>
-      <SafeAreaProvider>
-        <PrefsProvider>
-          <ThemeProvider>
-            <ReduceMotionProvider>
-              <LiveProvider>
-                <PortMirrorProvider>
-                  <BgWatchProvider>
-                    <ListSelectionProvider>
-                      <Inner />
-                    </ListSelectionProvider>
-                  </BgWatchProvider>
-                </PortMirrorProvider>
-              </LiveProvider>
-            </ReduceMotionProvider>
-          </ThemeProvider>
-        </PrefsProvider>
-      </SafeAreaProvider>
-    </GestureHandlerRootView>
+    <ErrorBoundary>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <SafeAreaProvider>
+          <PrefsProvider>
+            <ThemeProvider>
+              <ReduceMotionProvider>
+                <LiveProvider>
+                  <PortMirrorProvider>
+                    <BgWatchProvider>
+                      <ListSelectionProvider>
+                        <Inner />
+                      </ListSelectionProvider>
+                    </BgWatchProvider>
+                  </PortMirrorProvider>
+                </LiveProvider>
+              </ReduceMotionProvider>
+            </ThemeProvider>
+          </PrefsProvider>
+        </SafeAreaProvider>
+      </GestureHandlerRootView>
+    </ErrorBoundary>
   );
 }

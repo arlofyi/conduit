@@ -27,6 +27,7 @@ import {
   type WatchTarget,
 } from "../logic/watch";
 import { usePrefs } from "./PrefsProvider";
+import { diag } from "./diagnostics";
 
 export interface BgWatchValue {
   /** this platform has a background watcher (Android) */
@@ -39,6 +40,11 @@ export interface BgWatchValue {
    * will no longer ask); resolves with whether notifications are allowed now */
   requestNotifications: () => Promise<boolean>;
   openBatterySettings: () => void;
+  /** the user pressed Stop on the watcher's notification: it stays off on the next background
+   * until a Notify switch is changed (in memory; a fresh app start watches again) */
+  stoppedByUser: boolean;
+  /** clear `stoppedByUser`: the watcher takes over again on the next background */
+  resumeWatching: () => void;
   /** a tapped notification's chat, until `consumeOpenTarget` */
   openTarget: WatchTarget | null;
   consumeOpenTarget: () => void;
@@ -55,6 +61,13 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
   const [notificationsAllowed, setNotificationsAllowed] = useState(() => native?.notificationsEnabled() ?? false);
   const [batteryRestricted, setBatteryRestricted] = useState(() => native?.batteryRestricted() ?? false);
   const [openTarget, setOpenTarget] = useState<WatchTarget | null>(null);
+  // Only the notification's Stop reports reason "stopped" (our own stop leaves it null).
+  const [stoppedByUser, setStoppedByUser] = useState(() => {
+    const st = native?.status();
+    return !!st && !st.running && st.reason === "stopped";
+  });
+  const stoppedByUserRef = useRef(stoppedByUser);
+  stoppedByUserRef.current = stoppedByUser;
   const [foreground, setForeground] = useState(AppState.currentState === "active");
   const foregroundAt = useRef(Date.now());
   /** a permission dialog we opened is in front: that background is not a real one */
@@ -73,7 +86,13 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!native) return;
-    const s1 = native.addListener("onStatus", setStatus);
+    const s1 = native.addListener("onStatus", (st) => {
+      setStatus(st);
+      // stopped by itself: the computer refused the token, a protocol mismatch, or the
+      // notification's Stop (only the first two are problems)
+      if (!st.running && st.reason) diag.info("bgwatch", "stopped", st.reason);
+      if (!st.running && st.reason === "stopped") setStoppedByUser(true);
+    });
     const s2 = native.addListener("onOpen", takeTarget);
     takeTarget(); // a cold start from a notification
     return () => {
@@ -99,9 +118,27 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
   const latest = useRef({ prefs, currentMac, conn, address, hello, view, pending });
   latest.current = { prefs, currentMac, conn, address, hello, view, pending };
 
+  // Changing any Notify switch is the user asking for notifications again.
+  const notifyKey = [
+    prefs.notifyQuestion,
+    prefs.notifyPermission,
+    prefs.notifyFinished,
+    prefs.notifyFailed,
+    prefs.notifyStopped,
+    prefs.notifyUnreachable,
+  ].join("|");
+  const prevNotifyKey = useRef(notifyKey);
+  useEffect(() => {
+    if (prevNotifyKey.current === notifyKey) return;
+    prevNotifyKey.current = notifyKey;
+    setStoppedByUser(false);
+  }, [notifyKey]);
+
   useEffect(() => {
     if (!native) return;
     setBackgroundHandover(() => {
+      // Stopped from its notification: do not start it straight back up on the next background.
+      if (stoppedByUserRef.current) return null;
       const s = latest.current;
       const token = s.currentMac?.token || null;
       const addresses = watchAddresses(s.address, s.conn.addresses);
@@ -133,12 +170,22 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
             notifyQuestion: s.prefs.notifyQuestion,
             notifyPermission: s.prefs.notifyPermission,
             notifyFinished: s.prefs.notifyFinished,
+            notifyFailed: s.prefs.notifyFailed,
+            notifyStopped: s.prefs.notifyStopped,
+            notifyUnreachable: s.prefs.notifyUnreachable,
             baseline: JSON.stringify(watchBaseline(s.view, s.pending)),
           })
-          .then(() => {
-            // already running and connected (an update): nothing to wait for
-            if (handoverSettled(native.status().phase)) finish();
-          }, finish);
+          .then(
+            () => {
+              // already running and connected (an update): nothing to wait for
+              if (handoverSettled(native.status().phase)) finish();
+            },
+            (e: unknown) => {
+              // e.g. ERR_BG_WATCH_START: Android refused a foreground start from the background
+              diag.error("bgwatch", "start.refused", e);
+              finish();
+            },
+          );
       });
     });
     return () => setBackgroundHandover(null);
@@ -147,7 +194,7 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
   // Back in front: stop the watcher once the app's own socket is up (or the wait ran out).
   const token = currentMac?.token || null;
   const wanted = anyNotify(prefs) && !!token;
-  const [, setTick] = useState(0);
+  const [tick, setTick] = useState(0);
   useEffect(() => {
     if (!native) return;
     const since = Date.now() - foregroundAt.current;
@@ -159,14 +206,16 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
       sinceForegroundMs: since,
     });
     if (stop) {
-      native.stop().catch(() => {});
+      native.stop().catch((e: unknown) => diag.warn("bgwatch", "stop.failed", e));
       return;
     }
     if (foreground && status.running) {
       const t = setTimeout(() => setTick((n) => n + 1), Math.max(0, HANDBACK_MAX_MS - since) + 50);
       return () => clearTimeout(t);
     }
-  }, [native, foreground, wanted, status.running, conn.phase]);
+    // `tick` re-runs this once the hand-back wait has run out, so the watcher is stopped even
+    // when the app's own socket never came up.
+  }, [native, foreground, wanted, status.running, conn.phase, tick]);
 
   // A different computer (or a forgotten one): the watcher must not stay on the old one.
   const macId = currentMac?.deviceId ?? null;
@@ -174,7 +223,7 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (prevMac.current === macId) return;
     prevMac.current = macId;
-    if (native && status.running) native.stop().catch(() => {});
+    if (native && status.running) native.stop().catch((e: unknown) => diag.warn("bgwatch", "stop.failed", e));
   }, [native, macId, status.running]);
 
   const requestNotifications = useCallback(async (): Promise<boolean> => {
@@ -188,7 +237,8 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
       asking.current = true;
       try {
         answer = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
-      } catch {
+      } catch (e) {
+        diag.warn("bgwatch", "permission.requestFailed", e);
         answer = null;
       } finally {
         asking.current = false;
@@ -215,6 +265,7 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
     native?.openBatterySettings();
   }, [native]);
   const consumeOpenTarget = useCallback(() => setOpenTarget(null), []);
+  const resumeWatching = useCallback(() => setStoppedByUser(false), []);
 
   const value = useMemo<BgWatchValue>(
     () => ({
@@ -223,10 +274,12 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
       batteryRestricted,
       requestNotifications,
       openBatterySettings,
+      stoppedByUser,
+      resumeWatching,
       openTarget,
       consumeOpenTarget,
     }),
-    [native, notificationsAllowed, batteryRestricted, requestNotifications, openBatterySettings, openTarget, consumeOpenTarget],
+    [native, notificationsAllowed, batteryRestricted, requestNotifications, openBatterySettings, stoppedByUser, resumeWatching, openTarget, consumeOpenTarget],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

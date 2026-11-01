@@ -2,7 +2,22 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { useStore } from "../store";
-import { Button } from "./ui";
+import { Button, ButtonRow, SettingsSection } from "./ui";
+import { COUNTER_LABELS, formatUptime } from "../diagnostics";
+
+/** `diag::diagnostics` (diag.rs). Everything here is local; `report` is pre-redacted. */
+interface DiagnosticsView {
+  version: string;
+  os: string;
+  arch: string;
+  logDir: string;
+  logFile: string;
+  uptimeSecs: number;
+  counters: { key: string; value: number }[];
+  summary: string;
+  recent: string[];
+  report: string;
+}
 
 const REPO_URL = "https://github.com/uziiuzair/conduit";
 const SITE_URL = "https://arlo.fyi";
@@ -84,6 +99,89 @@ export function AboutPanel() {
           <span className="about-val">MIT</span>
         </div>
       </div>
+      <DiagnosticsSection />
     </div>
+  );
+}
+
+/** Local-only health: this run's counters, the latest errors, and the log folder. */
+function DiagnosticsSection() {
+  const [view, setView] = useState<DiagnosticsView | null>(null);
+  const [note, setNote] = useState("");
+
+  const refresh = () => {
+    void invoke<DiagnosticsView>("diagnostics")
+      .then(setView)
+      .catch(() => setNote("Diagnostics are unavailable."));
+  };
+  useEffect(refresh, []);
+
+  const openLogs = () => {
+    if (!view) return;
+    // Reveal the live log file (selects it in Finder/Explorer); before the first line is
+    // written there is no file yet, so fall back to the folder.
+    void invoke("reveal_path", { path: view.logFile })
+      .catch(() => invoke("reveal_path", { path: view.logDir }))
+      .catch(() => setNote(`Logs are in ${view.logDir}`));
+  };
+
+  const copy = () => {
+    void invoke<DiagnosticsView>("diagnostics")
+      .then((v) => {
+        setView(v);
+        return navigator.clipboard.writeText(v.report);
+      })
+      .then(() => setNote("Copied. Paths under your home folder and anything that looks like a secret are redacted."))
+      .catch(() => setNote("Could not copy."));
+  };
+
+  const shown = view?.counters.filter(
+    (c) => c.value > 0 || ["sessions_spawned", "errors", "panics"].includes(c.key),
+  );
+
+  return (
+    <SettingsSection
+      title="Diagnostics"
+      description="Errors and crashes are written to a log file on this computer. Nothing is sent anywhere."
+      actions={
+        <Button variant="ghost" size="sm" onClick={refresh}>
+          Refresh
+        </Button>
+      }
+    >
+      <div className="about-rows">
+        <div className="about-row">
+          <span className="about-key">This run</span>
+          <span className="about-val">{view ? `up ${formatUptime(view.uptimeSecs)}` : "..."}</span>
+        </div>
+        {shown?.map((c) => (
+          <div className="about-row" key={c.key}>
+            <span className="about-key">{COUNTER_LABELS[c.key] ?? c.key}</span>
+            <span className="about-val">{c.value}</span>
+          </div>
+        ))}
+        <div className="about-row">
+          <span className="about-key">Log folder</span>
+          <span className="about-val diag-path" title={view?.logDir}>
+            {view?.logDir ?? "..."}
+          </span>
+        </div>
+      </div>
+      {view && view.recent.length > 0 && (
+        <details className="diag-recent">
+          <summary>Recent errors and warnings ({view.recent.length})</summary>
+          <pre>{view.recent.map((l) => l.trimEnd()).join(String.fromCharCode(10))}</pre>
+        </details>
+      )}
+      <ButtonRow align="start">
+        <Button variant="secondary" size="sm" onClick={openLogs} disabled={!view}>
+          Open logs folder
+        </Button>
+        <Button variant="secondary" size="sm" onClick={copy}>
+          Copy diagnostics
+        </Button>
+      </ButtonRow>
+      {note && <p className="about-update-status">{note}</p>}
+    </SettingsSection>
   );
 }

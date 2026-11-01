@@ -12,13 +12,18 @@
  * and cancels. So a resolved question, a session that runs again, or a switch turned off simply
  * stops being "desired" and its notification goes away.
  *
+ * Time matters in two places, so the state is also stepped by `tick` (the service schedules one
+ * at `nextWakeAt`): a finished turn is announced only once it has stayed finished for
+ * FINISH_SETTLE_MS (see banner.ts for why -- without it every chat bubble of an agy session
+ * read as "finished"), and a link down for UNREACHABLE_MS becomes "can't reach your computer".
+ *
  * The JS side (data/BgWatchProvider.tsx) uses the rest: when to run the watcher, what to hand
  * it, when the hand-over is complete, and where a tapped notification leads.
  */
 import type { WireProjectsView, WireViewSession } from "../bridge/protocol";
 import type { Prefs } from "../data/prefs";
 import type { SessionStatus } from "../data/types";
-import { signalOf, transition, type Signal, type Signals } from "./banner";
+import { FINISH_SETTLE_MS, failedText, nextSignal, settled, signalOf, transition, withoutFinish, type Signal, type Signals } from "./banner";
 import type { PendingItem, PendingState } from "./pending";
 
 // ---------------------------------------------------------------- state machine (ported) ----
@@ -36,6 +41,12 @@ export interface WatchSession {
   needs: "question" | "permission" | null;
   /** the question, when the view carries it */
   needsText: string | null;
+  /** its agent process is up */
+  running: boolean;
+  /** hibernated */
+  stopped: boolean;
+  /** the last turn ended on an error: its kind (null = it did not) */
+  failed: string | null;
 }
 
 /** One held question or permission, reduced to what a notification can say. */
@@ -50,10 +61,18 @@ export interface WatchItem {
   summary: string;
 }
 
+/** The background link to the computer, as the rules see it. */
+export interface WatchLink {
+  /** when the link went down (ms), null while it is up */
+  lostSince: number | null;
+  /** down for UNREACHABLE_MS: announced (once) until it comes back */
+  unreachable: boolean;
+}
+
 export interface WatchState {
   /** null until the first `projects` frame: nothing is posted before names are known */
   sessions: Record<string, WatchSession> | null;
-  /** each session's last signal, seeded from what the app last saw */
+  /** each session's last signal, seeded from what the app last saw; a settling finish lives here */
   signals: Signals;
   /** open items; `silent` = the app had already shown it before the hand-over */
   items: Record<string, WatchItem & { silent: boolean }>;
@@ -61,24 +80,56 @@ export interface WatchState {
   seen: string[];
   /** sessions that NEWLY need you per the view, with no held item to say what (other agents) */
   alerts: Record<string, "question" | "permission">;
-  /** sessions whose turn ended while watching */
+  /** sessions whose turn ended, and stayed ended for FINISH_SETTLE_MS, while watching */
   finished: Record<string, true>;
+  /** sessions whose turn ended on an error while watching: the error's kind */
+  failed: Record<string, string>;
+  /** sessions that were live and were stopped while watching */
+  stopped: Record<string, true>;
   /** general chats' titles, from `rootChats` */
   chatTitles: Record<string, string>;
   /** general chats whose reply finished while watching: a preview of it ("" = none) */
   chatsDone: Record<string, string>;
+  link: WatchLink;
+  /** the phone has a VPN (Tailscale) up: only then is an unreachable computer news */
+  tunnel: boolean;
 }
 
 export type WatchEvent =
-  | { t: "projects"; sessions: WatchSession[] }
+  | { t: "projects"; sessions: WatchSession[]; now: number }
   | { t: "snapshot"; items: WatchItem[] }
   | { t: "added"; item: WatchItem }
   | { t: "resolved"; id: string }
   | { t: "chats"; chats: { id: string; title: string }[] }
-  | { t: "chatEvent"; event: string; chatId: string; result?: string | null; isError?: boolean };
+  | { t: "chatEvent"; event: string; chatId: string; result?: string | null; isError?: boolean }
+  /** time passed: a settling finish may be due, a lost link may now be news */
+  | { t: "tick"; now: number }
+  /** the watcher's link phase ("watching" = up; "connecting" / "retrying" = down) */
+  | { t: "link"; phase: string; now: number }
+  | { t: "network"; tunnel: boolean };
+
+/**
+ * How long the link may be down before "can't reach your computer" is posted. Ten minutes is
+ * past a laptop lid closed for a coffee or a Wi-Fi hand-over, so it means the computer is
+ * asleep, off, or off the tailnet. Kept identical to WatchRules.kt.
+ */
+export const UNREACHABLE_MS = 10 * 60_000;
 
 export function initialWatch(seen: string[], signals: Signals): WatchState {
-  return { sessions: null, signals, items: {}, seen, alerts: {}, finished: {}, chatTitles: {}, chatsDone: {} };
+  return {
+    sessions: null,
+    signals,
+    items: {},
+    seen,
+    alerts: {},
+    finished: {},
+    failed: {},
+    stopped: {},
+    chatTitles: {},
+    chatsDone: {},
+    link: { lostSince: null, unreachable: false },
+    tunnel: true,
+  };
 }
 
 const without = <T>(r: Record<string, T>, k: string): Record<string, T> => {
@@ -94,9 +145,40 @@ function addItem(s: WatchState, item: WatchItem): WatchState {
   return {
     ...s,
     items: { ...s.items, [item.id]: { ...item, silent: s.seen.includes(item.id) } },
-    // The view that later shows this session asking is then not a second, generic alert.
-    signals: { ...s.signals, [item.sessionId]: { needs: prev?.needs ?? kind, status: "needsInput" } },
+    // The view that later shows this session asking is then not a second, generic alert; and a
+    // session holding a question has not finished (agy reads `idle` at its permission menu).
+    signals: { ...s.signals, [item.sessionId]: { ...(prev ? withoutFinish(prev) : {}), needs: prev?.needs ?? kind, status: "needsInput" } },
   };
+}
+
+/** Promote settled finishes and a long-lost link. The same `s` when nothing is due. */
+function settle(s: WatchState, now: number): WatchState {
+  let next = s;
+  if (s.link.lostSince === null && s.sessions) {
+    // A finish only settles on a live link: with the computer out of reach "still quiet" is a guess.
+    for (const [sid, sig] of Object.entries(s.signals)) {
+      if (!s.sessions[sid] || !settled(sig, now)) continue;
+      if (next === s) next = { ...s, signals: { ...s.signals }, finished: { ...s.finished } };
+      next.signals[sid] = withoutFinish(sig);
+      next.finished[sid] = true;
+    }
+  }
+  if (s.link.lostSince !== null && !s.link.unreachable && now - s.link.lostSince >= UNREACHABLE_MS) {
+    next = { ...next, link: { ...next.link, unreachable: true } };
+  }
+  return next;
+}
+
+/** When the state next needs a `tick` (ms), or null: the service schedules its re-check from this. */
+export function nextWakeAt(s: WatchState): number | null {
+  let at: number | null = null;
+  const take = (t: number) => {
+    if (at === null || t < at) at = t;
+  };
+  if (s.link.lostSince === null) {
+    if (s.sessions) for (const sig of Object.values(s.signals)) if (sig.finishAt !== undefined) take(sig.finishAt + FINISH_SETTLE_MS);
+  } else if (!s.link.unreachable) take(s.link.lostSince + UNREACHABLE_MS);
+  return at;
 }
 
 export function watchStep(s: WatchState, ev: WatchEvent): WatchState {
@@ -104,20 +186,30 @@ export function watchStep(s: WatchState, ev: WatchEvent): WatchState {
     case "projects": {
       const sessions: Record<string, WatchSession> = {};
       const signals: Signals = {};
+      const withItem = new Set(Object.values(s.items).map((i) => i.sessionId));
       let alerts: WatchState["alerts"] = {};
-      let finished: WatchState["finished"] = {};
+      const finished: WatchState["finished"] = {};
+      const failed: WatchState["failed"] = {};
+      const stopped: WatchState["stopped"] = {};
       for (const x of ev.sessions) {
         sessions[x.id] = x;
-        const sig: Signal = { needs: x.needs, status: x.status };
+        const prev = s.signals[x.id];
+        const raw: Signal = { needs: x.needs, status: x.status, running: x.running, stopped: x.stopped, failed: x.failed };
+        let sig = nextSignal(prev, raw, ev.now);
+        if (withItem.has(x.id)) sig = withoutFinish(sig);
         signals[x.id] = sig;
-        const kind = transition(s.signals[x.id], sig);
-        // carried over only for sessions still listed
+        const kind = transition(prev, sig);
+        // carried over only for sessions still listed, and only while still true
         if (s.alerts[x.id] && sig.needs) alerts[x.id] = s.alerts[x.id];
         if (s.finished[x.id] && !sig.needs && sig.status !== "running") finished[x.id] = true;
+        if (s.failed[x.id] !== undefined && sig.failed) failed[x.id] = s.failed[x.id];
+        if (s.stopped[x.id] && sig.stopped) stopped[x.id] = true;
         if (kind === "question" || kind === "permission") alerts = { ...alerts, [x.id]: kind };
-        if (kind === "finished") finished = { ...finished, [x.id]: true };
+        if (kind === "failed") failed[x.id] = x.failed ?? "";
+        if (kind === "stopped") stopped[x.id] = true;
+        // "finished" only starts settling here (sig.finishAt); `settle` announces it
       }
-      return { ...s, sessions, signals, alerts, finished };
+      return settle({ ...s, sessions, signals, alerts, finished, failed, stopped }, ev.now);
     }
     case "snapshot": {
       const ids = new Set(ev.items.map((i) => i.id));
@@ -136,14 +228,33 @@ export function watchStep(s: WatchState, ev: WatchEvent): WatchState {
       return { ...s, chatTitles };
     }
     case "chatEvent":
-      // A reply finished: announce it. A new message from anyone starts a new turn.
+      // A reply finished: announce it -- once per TURN; `item` events (every bubble) never
+      // notify. A new message from anyone starts a new turn.
       if (ev.event === "done") return { ...s, chatsDone: { ...s.chatsDone, [ev.chatId]: chatPreview(ev.result, ev.isError) } };
+      // root_chat publishes `error` (no `done`) when the turn itself failed -- an Antigravity
+      // failure or a crashed child. It is a finished turn too, and it failed. Kept identical
+      // to WatchRules.kt.
+      if (ev.event === "error") return { ...s, chatsDone: { ...s.chatsDone, [ev.chatId]: CHAT_FAILED } };
       if (ev.event === "user") return { ...s, chatsDone: without(s.chatsDone, ev.chatId) };
       return s;
+    case "tick":
+      return settle(s, ev.now);
+    case "link": {
+      if (ev.phase === "watching") {
+        if (s.link.lostSince === null && !s.link.unreachable) return s;
+        return { ...s, link: { lostSince: null, unreachable: false } };
+      }
+      const lost = s.link.lostSince === null ? { ...s, link: { lostSince: ev.now, unreachable: false } } : s;
+      return settle(lost, ev.now);
+    }
+    case "network":
+      return s.tunnel === ev.tunnel ? s : { ...s, tunnel: ev.tunnel };
   }
 }
 
-export type WatchChannel = "needs" | "finished";
+/** `needs`: wants you (incl. a failed turn). `finished`: a turn or reply ended. `status`: a
+ * session stopped, or the computer is out of reach. */
+export type WatchChannel = "needs" | "finished" | "status";
 
 /** What the bg-watch module needs to open a chat from a notification. */
 export interface WatchTarget {
@@ -154,7 +265,8 @@ export interface WatchTarget {
 }
 
 export interface WatchNotification {
-  /** stable per thing announced: `item:<id>`, `needs:<session>`, `done:<session>` */
+  /** stable per thing announced: `item:<id>`, `needs:<s>`, `failed:<s>`, `stopped:<s>`,
+   * `done:<s>`, `chat:<id>`, `unreachable` */
   key: string;
   channel: WatchChannel;
   title: string;
@@ -165,14 +277,23 @@ export interface WatchNotification {
   target: WatchTarget | null;
 }
 
-export type WatchPrefs = Pick<Prefs, "notifyQuestion" | "notifyPermission" | "notifyFinished">;
+export type WatchPrefs = Pick<
+  Prefs,
+  "notifyQuestion" | "notifyPermission" | "notifyFinished" | "notifyFailed" | "notifyStopped" | "notifyUnreachable"
+>;
 
 export const APP_TITLE = "Conduit";
 export const PRIVATE_NEEDS = "A private session needs you";
 export const PRIVATE_FINISHED = "A private session finished";
+export const PRIVATE_FAILED = "A private session failed";
+export const PRIVATE_STOPPED = "A private session stopped";
 /** what the lock screen shows when the reader hides sensitive content */
 export const PUBLIC_NEEDS = "An agent needs you";
 export const PUBLIC_FINISHED = "An agent finished";
+export const PUBLIC_STATUS = "An update from your computer";
+export const STOPPED_BODY = "Stopped";
+export const UNREACHABLE_KEY = "unreachable";
+export const UNREACHABLE_BODY = "Can't reach your computer for 10 minutes. Nothing from it will arrive until it's back.";
 
 const SHELL_TOOLS = /^(bash|powershell|shell|run_command|run_shell_command|exec|command)$/i;
 
@@ -191,12 +312,12 @@ function made(
   session: WatchSession | undefined,
   isPrivate: boolean,
   body: string,
+  privateBody: string,
 ): WatchNotification {
-  if (isPrivate || !session) {
-    // An item whose session is not listed (deleted meanwhile) still says something, and opens the app.
-    if (isPrivate) return { key, channel, title: APP_TITLE, subtitle: null, body: channel === "needs" ? PRIVATE_NEEDS : PRIVATE_FINISHED, target: null };
-    return { key, channel, title: APP_TITLE, subtitle: null, body, target: null };
-  }
+  // A private session says only that something happened, and opens the app.
+  if (isPrivate) return { key, channel, title: APP_TITLE, subtitle: null, body: privateBody, target: null };
+  // An item whose session is not listed (deleted meanwhile) still says something, and opens the app.
+  if (!session) return { key, channel, title: APP_TITLE, subtitle: null, body, target: null };
   return {
     key,
     channel,
@@ -221,7 +342,7 @@ export function desiredNotifications(s: WatchState, prefs: WatchPrefs): WatchNot
     const session = sessions[it.sessionId];
     const priv = it.private || !!session?.silo;
     const body = isAsk ? it.question.trim() || "Asks you a question" : permissionBody(it.toolName, it.summary);
-    out.push(made(`item:${it.id}`, "needs", session, priv, body));
+    out.push(made(`item:${it.id}`, "needs", session, priv, body, PRIVATE_NEEDS));
   }
   for (const [sid, kind] of Object.entries(s.alerts)) {
     // A held item says it better; the generic alert is for agents that hold nothing.
@@ -229,24 +350,42 @@ export function desiredNotifications(s: WatchState, prefs: WatchPrefs): WatchNot
     if (kind === "question" ? !prefs.notifyQuestion : !prefs.notifyPermission) continue;
     const session = sessions[sid];
     const body = kind === "question" ? session?.needsText?.trim() || "Asks you a question" : "Needs your input";
-    out.push(made(`needs:${sid}`, "needs", session, !!session?.silo, body));
+    out.push(made(`needs:${sid}`, "needs", session, !!session?.silo, body, PRIVATE_NEEDS));
+  }
+  if (prefs.notifyFailed) {
+    for (const [sid, kind] of Object.entries(s.failed)) {
+      const session = sessions[sid];
+      out.push(made(`failed:${sid}`, "needs", session, !!session?.silo, failedText(kind), PRIVATE_FAILED));
+    }
+  }
+  if (prefs.notifyStopped) {
+    for (const sid of Object.keys(s.stopped)) {
+      const session = sessions[sid];
+      out.push(made(`stopped:${sid}`, "status", session, !!session?.silo, STOPPED_BODY, PRIVATE_STOPPED));
+    }
   }
   if (prefs.notifyFinished) {
     for (const sid of Object.keys(s.finished)) {
       const session = sessions[sid];
-      out.push(made(`done:${sid}`, "finished", session, !!session?.silo, "Finished"));
+      out.push(made(`done:${sid}`, "finished", session, !!session?.silo, "Finished", PRIVATE_FINISHED));
     }
-    for (const [chatId, body] of Object.entries(s.chatsDone)) {
-      const title = s.chatTitles[chatId]?.trim() || CHAT_DEFAULT_TITLE;
-      out.push({
-        key: `chat:${chatId}`,
-        channel: "finished",
-        title,
-        subtitle: "Chats",
-        body: body || CHAT_REPLIED,
-        target: { sessionId: `${CHAT_TARGET_PREFIX}${chatId}`, projectId: "", name: title, branch: null },
-      });
-    }
+  }
+  for (const [chatId, body] of Object.entries(s.chatsDone)) {
+    // a failed reply is a failure (its own switch); a good one is a finish
+    if (body === CHAT_FAILED ? !prefs.notifyFailed : !prefs.notifyFinished) continue;
+    const title = s.chatTitles[chatId]?.trim() || CHAT_DEFAULT_TITLE;
+    out.push({
+      key: `chat:${chatId}`,
+      channel: "finished",
+      title,
+      subtitle: "Chats",
+      body: body || CHAT_REPLIED,
+      target: { sessionId: `${CHAT_TARGET_PREFIX}${chatId}`, projectId: "", name: title, branch: null },
+    });
+  }
+  // Only with a tunnel up: with Tailscale switched off on purpose the computer is unreachable by design.
+  if (prefs.notifyUnreachable && s.link.unreachable && s.tunnel) {
+    out.push({ key: UNREACHABLE_KEY, channel: "status", title: APP_TITLE, subtitle: null, body: UNREACHABLE_BODY, target: null });
   }
   return out;
 }
@@ -302,6 +441,9 @@ export function watchSessionsOf(view: WireProjectsView): WatchSession[] {
         status: x.status,
         needs: sig.needs,
         needsText: x.needs?.kind === "ask" ? x.needs.text : null,
+        running: x.running,
+        stopped: x.stopped,
+        failed: x.failed ?? null,
       };
     }),
   );
@@ -316,7 +458,8 @@ export function watchItemOf(i: PendingItem): WatchItem {
 
 // ---------------------------------------------------------------- JS side: hand-over ----
 
-export const anyNotify = (p: WatchPrefs): boolean => p.notifyQuestion || p.notifyPermission || p.notifyFinished;
+export const anyNotify = (p: WatchPrefs): boolean =>
+  p.notifyQuestion || p.notifyPermission || p.notifyFinished || p.notifyFailed || p.notifyStopped || p.notifyUnreachable;
 
 /** Should the app hand over to the watcher as it goes to the background? */
 export function shouldWatch(o: {

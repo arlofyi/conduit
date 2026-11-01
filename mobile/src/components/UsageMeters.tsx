@@ -140,14 +140,13 @@ export function HeaderUsageGauge({ badge, size = 38, onPress }: { badge: UsageBa
             />
           ) : null}
         </Svg>
+        {/* The percent alone, at the 11pt floor: the window's name ("5h") used to sit under it at
+            7.5pt, too small to read. It stays in the button's label and in the popover. */}
         <Text
           allowFontScaling={false}
-          style={{ fontSize: badge && badge.percent >= 100 ? 9 : 10.5, lineHeight: 12, fontWeight: "700", color: p.textBright, fontVariant: ["tabular-nums"] }}
+          style={{ fontSize: TYPE.micro, lineHeight: 13, fontWeight: "700", color: p.textBright, fontVariant: ["tabular-nums"], letterSpacing: -0.3 }}
         >
           {badge ? `${badge.percent}%` : "--"}
-        </Text>
-        <Text allowFontScaling={false} style={{ fontSize: 7.5, lineHeight: 9, fontWeight: "600", color: p.textMid, letterSpacing: 0.3 }}>
-          {badge ? badge.caption : "use"}
         </Text>
       </GlassSurface>
     </Pressable>
@@ -162,10 +161,15 @@ export function UsagePopover({ row, top, onClose, now }: { row: UsageRow | null;
   const windows = [fiveHour, week].filter((w): w is NonNullable<typeof w> => w !== null);
   const note = row ? sourceNote(row.source) : null;
   return (
-    <Pressable accessibilityRole="button" accessibilityLabel="Close usage" onPress={onClose} style={StyleSheet.absoluteFill}>
-      <View
+    // The backdrop is a SIBLING of the card, not its parent: a card inside a full-screen button
+    // was hidden from VoiceOver/TalkBack, which read only "Close usage".
+    <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+      <Pressable accessibilityRole="button" accessibilityLabel="Close usage" onPress={onClose} style={StyleSheet.absoluteFill} />
+      <Pressable
         accessible
         accessibilityLiveRegion="polite"
+        accessibilityHint="Tap to close"
+        onPress={onClose}
         style={{
           position: "absolute",
           top,
@@ -199,14 +203,14 @@ export function UsagePopover({ row, top, onClose, now }: { row: UsageRow | null;
                   <Text style={{ fontSize: TYPE.footnote, color: p.textMid, fontVariant: ["tabular-nums"] }}>{usedLabel(w)}</Text>
                 </View>
                 <UsageBar fraction={w.used} height={5} />
-                {reset ? <Text style={{ fontSize: TYPE.micro, color: p.textDim }}>{reset}</Text> : null}
+                {reset ? <Text style={{ fontSize: TYPE.micro, color: p.textMid }}>{reset}</Text> : null}
               </View>
             );
           })
         )}
-        {note ? <Text style={{ fontSize: TYPE.micro, color: p.textDim }}>{note}</Text> : null}
-      </View>
-    </Pressable>
+        {note ? <Text style={{ fontSize: TYPE.micro, color: p.textMid }}>{note}</Text> : null}
+      </Pressable>
+    </View>
   );
 }
 

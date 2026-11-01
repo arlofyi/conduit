@@ -21,9 +21,29 @@ const CHUNK: usize = 64 * 1024;
 const QUEUE: usize = 32;
 /// Frames sent per loop pass, so a fast download cannot starve the read side.
 const SEND_PER_PASS: usize = 32;
-/// How long one WebSocket read waits. Short, because the same thread also drains the app
-/// side; idle tunnels (browser keep-alives) cost one wake per poll.
-const WS_POLL: Duration = Duration::from_millis(10);
+/// How long one WebSocket read waits while the tunnel is busy. Short, because the same thread
+/// also drains the app side: this is the latency an app->phone chunk can see.
+const WS_POLL_BUSY: Duration = Duration::from_millis(10);
+/// The read wait once the tunnel has been quiet a while. A browser keeps idle keep-alive
+/// sockets open by the handful, and at the busy poll each one woke 100 times a second.
+const WS_POLL_IDLE: Duration = Duration::from_millis(200);
+/// How long after the last byte (either way) the tunnel stays on the busy poll. A request
+/// arriving from the phone wakes the read at once whatever the poll; this window covers the
+/// app's answer to it. Only bytes the app sends unprompted after a quiet spell (a dev
+/// server's hot-reload push) can wait up to one idle poll.
+const BUSY_FOR: Duration = Duration::from_secs(1);
+
+/// Pure: the WebSocket read wait for a tunnel last active `quiet` ago. Steps down through a
+/// middle rung so a chatty-then-paused page does not bounce straight to the slow poll.
+pub fn poll_for(quiet: Duration) -> Duration {
+    if quiet < BUSY_FOR {
+        WS_POLL_BUSY
+    } else if quiet < BUSY_FOR * 5 {
+        Duration::from_millis(50)
+    } else {
+        WS_POLL_IDLE
+    }
+}
 
 /// The relay's timing, injected so tests need not wait the production minutes.
 #[derive(Clone, Copy, Debug)]
@@ -65,7 +85,7 @@ pub fn relay(
 fn pump(ws: &mut WebSocket<TcpStream>, app: &TcpStream, stop: &AtomicBool, t: Timing) -> End {
     let _ = app.set_nodelay(true);
     if app.set_write_timeout(Some(t.write_stall)).is_err()
-        || ws.get_ref().set_read_timeout(Some(WS_POLL)).is_err()
+        || ws.get_ref().set_read_timeout(Some(WS_POLL_BUSY)).is_err()
         || ws.get_ref().set_write_timeout(Some(t.write_stall)).is_err()
     {
         return End::Phone;
@@ -95,6 +115,9 @@ fn pump(ws: &mut WebSocket<TcpStream>, app: &TcpStream, stop: &AtomicBool, t: Ti
 
     let mut last_heard = Instant::now();
     let mut last_ping = Instant::now();
+    // Bytes moved either way (pings excluded), for the adaptive read wait.
+    let mut last_traffic = Instant::now();
+    let mut poll = WS_POLL_BUSY;
     loop {
         if stop.load(Ordering::SeqCst) {
             return End::Stopped;
@@ -102,6 +125,7 @@ fn pump(ws: &mut WebSocket<TcpStream>, app: &TcpStream, stop: &AtomicBool, t: Ti
         match ws.read() {
             Ok(Message::Binary(bytes)) => {
                 last_heard = Instant::now();
+                last_traffic = last_heard;
                 if writer.write_all(&bytes).is_err() {
                     return End::App;
                 }
@@ -125,6 +149,7 @@ fn pump(ws: &mut WebSocket<TcpStream>, app: &TcpStream, stop: &AtomicBool, t: Ti
                     if ws.send(Message::Binary(chunk)).is_err() {
                         return End::Phone;
                     }
+                    last_traffic = Instant::now();
                 }
                 Ok(None) | Err(TryRecvError::Disconnected) => return End::App,
                 Err(TryRecvError::Empty) => break,
@@ -140,6 +165,14 @@ fn pump(ws: &mut WebSocket<TcpStream>, app: &TcpStream, stop: &AtomicBool, t: Ti
             if ws.send(Message::Ping(Vec::new())).is_err() {
                 return End::Phone;
             }
+        }
+        // Only touch the socket option when the rung changes.
+        let want = poll_for(now.duration_since(last_traffic));
+        if want != poll {
+            if ws.get_ref().set_read_timeout(Some(want)).is_err() {
+                return End::Phone;
+            }
+            poll = want;
         }
     }
 }
@@ -221,6 +254,28 @@ mod tests {
             None,
             "the app closed, so the phone is closed"
         );
+        assert_eq!(server.join().unwrap(), End::App);
+    }
+
+    #[test]
+    fn an_idle_tunnel_backs_off_and_traffic_brings_the_fast_poll_back() {
+        assert_eq!(poll_for(Duration::ZERO), WS_POLL_BUSY);
+        assert_eq!(poll_for(Duration::from_millis(900)), WS_POLL_BUSY);
+        assert_eq!(poll_for(Duration::from_secs(2)), Duration::from_millis(50));
+        assert_eq!(poll_for(Duration::from_secs(30)), WS_POLL_IDLE);
+        assert!(WS_POLL_IDLE <= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn bytes_still_flow_after_the_tunnel_has_gone_idle() {
+        let (mut ws, server) = tunnel(echo_app(), Arc::new(AtomicBool::new(false)), T);
+        // Past BUSY_FOR: the relay is on a slower rung; a request still gets its answer.
+        thread::sleep(BUSY_FOR + Duration::from_millis(300));
+        ws.send(Message::Binary(b"late".to_vec())).unwrap();
+        assert_eq!(read_binary(&mut ws).as_deref(), Some(&b"LATE"[..]));
+        ws.send(Message::Binary(b"bye".to_vec())).unwrap();
+        assert_eq!(read_binary(&mut ws).as_deref(), Some(&b"BYE"[..]));
+        assert_eq!(read_binary(&mut ws), None);
         assert_eq!(server.join().unwrap(), End::App);
     }
 

@@ -71,8 +71,6 @@ impl RootChatState {
         }
     }
 
-    /// True if any turn is mid-stream. Reaps exited children first so a finished child
-    /// can't hold the quit guard open.
     /// End every streaming turn. Called on app exit: these children live outside the PTY
     /// manager, so `kill_all` never reached them and a mid-turn chat outlived the app.
     pub fn kill_all(&self) {
@@ -82,6 +80,8 @@ impl RootChatState {
         }
     }
 
+    /// True if any turn is mid-stream. Reaps exited children first so a finished child
+    /// can't hold the quit guard open.
     pub fn any_running(&self) -> bool {
         let mut map = self.children.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, c| matches!(c.try_wait(), Ok(None)));
@@ -198,6 +198,8 @@ pub fn send_turn(
         cap_index(&std::fs::read_to_string(dirs.memory.join("MEMORY.md")).unwrap_or_default());
     let agy = chat.agent == crate::agent::AgentId::Antigravity;
     let effort = crate::root_chat_options::effective_effort(chat.effort.as_deref(), chat.research);
+    // This turn's `--mcp-config`, deleted once its child is gone.
+    let mut mcp_file: Option<PathBuf> = None;
     let (cmd, run_dir, stdin_text) = if agy {
         // agy has no system-prompt flag, but it follows an `AGENTS.md` in its working
         // directory (measured), and an Antigravity chat runs IN its own scratchpad.
@@ -258,8 +260,9 @@ pub fn send_turn(
         };
         let user_mcps: Vec<String> = user.keys().cloned().collect();
         let mcp_config = crate::root_chat_options::merged_mcp_config(root, &user).and_then(|doc| {
-            let path = crate::store::data_dir().join(format!("rootchat-mcp-{chat_id}.json"));
+            let path = mcp_config_path(&chat_id, &uuid::Uuid::new_v4().to_string());
             write_private(&path, &doc).ok()?;
+            mcp_file = Some(path.clone());
             Some(path.to_string_lossy().into_owned())
         });
         let mut charter = build_charter(
@@ -346,9 +349,14 @@ pub fn send_turn(
         }
     }
 
-    let mut child = builder
-        .spawn()
-        .map_err(|e| format!("spawn {agent_name}: {e}"))?;
+    let mut child = match builder.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            remove_file_opt(mcp_file.as_deref());
+            crate::diag::error("root-chat", format!("spawn {agent_name} failed: {e}"));
+            return Err(format!("spawn {agent_name}: {e}"));
+        }
+    };
     if from_phone {
         store.mark_root_chat_phone(&chat_id);
         if chat.title == "New Chat" {
@@ -365,12 +373,22 @@ pub fn send_turn(
         // Dropped here -> EOF, so `claude -p` reads the full prompt (titler pattern) and
         // agy's stream-json input ends after this one turn.
     }
-    let stdout = child.stdout.take().ok_or("child stdout unavailable")?;
-    let stderr = child.stderr.take();
+    let Some(stdout) = child.stdout.take() else {
+        crate::pty::kill_process_tree(&mut child);
+        remove_file_opt(mcp_file.as_deref());
+        return Err("child stdout unavailable".into());
+    };
+    // Drained on its own thread from the start: read only after stdout's EOF, a chatty
+    // stderr filled the pipe, the child blocked writing it, and the turn hung forever.
+    let stderr_tail = child
+        .stderr
+        .take()
+        .map(|err| std::thread::spawn(move || drain_tail(err, STDERR_TAIL_BYTES)));
 
     let state_arc = Arc::clone(state.inner());
     let store_arc = Arc::clone(store.inner());
     let app = app.clone();
+    let pid = child.id();
     state_arc
         .children
         .lock()
@@ -439,31 +457,47 @@ pub fn send_turn(
         }
         // Stream over: reap the child and surface silent failures (spawn errors land in
         // stderr with no `result` line — e.g. claude not on PATH, bad --resume).
-        let status = state_arc
-            .children
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&chat_id)
-            .and_then(|mut c| c.wait().ok());
-        if !saw_done {
-            let mut tail = String::new();
-            if let Some(mut err) = stderr {
-                let mut buf = String::new();
-                let _ = err.read_to_string(&mut buf);
-                let trimmed = buf.trim();
-                let cut = trimmed
-                    .char_indices()
-                    .rev()
-                    .nth(499)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                tail = trimmed[cut..].to_string();
+        // Only OUR child: once it has exited, `send_turn`'s reap lets the next turn in, and
+        // removing by chat id alone would take that turn's child out of the map.
+        let ours = {
+            let mut map = state_arc.children.lock().unwrap_or_else(|e| e.into_inner());
+            if map.get(&chat_id).is_some_and(|c| c.id() == pid) {
+                map.remove(&chat_id)
+            } else {
+                None
             }
+        };
+        let status = ours.and_then(|mut c| c.wait().ok());
+        // The child is gone: its MCP config (which may carry a user server's tokens) has
+        // no reader left, so it does not outlive the turn. Per-turn file name, so this
+        // never deletes the config of a turn that started after ours ended.
+        remove_file_opt(mcp_file.as_deref());
+        if !saw_done {
+            // Joined only when the message needs it: a grandchild still holding stderr
+            // open would otherwise park this thread after a turn that went fine. Left
+            // unjoined, the drain thread simply ends at that EOF.
+            let stderr_text = stderr_tail.and_then(|h| h.join().ok()).unwrap_or_default();
+            let trimmed = stderr_text.trim();
+            let cut = trimmed
+                .char_indices()
+                .rev()
+                .nth(499)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let tail = trimmed[cut..].to_string();
             let message = match status {
                 Some(s) if s.success() => format!("{agent_name} exited without a result"),
                 Some(s) => format!("{agent_name} exited with {s}: {tail}"),
                 None => format!("{agent_name} terminated: {tail}"),
             };
+            // The status only: the stderr tail can echo the conversation, and chat text
+            // never goes to the log.
+            let outcome = match status {
+                Some(s) if s.success() => "exited without a result".to_string(),
+                Some(s) => format!("exited with {s}"),
+                None => "terminated".to_string(),
+            };
+            crate::diag::warn("root-chat", format!("turn failed: {agent_name} {outcome}"));
             state_arc.publish(json!({ "event": "error", "chatId": chat_id, "message": message }));
             let _ = app.emit(
                 "root-chat-error",
@@ -483,6 +517,84 @@ enum TurnOut {
     /// agy's conversation id (its `init` line): stored so the next turn resumes it.
     Conversation(String),
     Nothing,
+}
+
+/// How much of a turn's stderr is kept for its error message (the tail; the rest is read
+/// and dropped so the pipe never fills).
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
+
+/// Read `r` to EOF keeping only its last `max` bytes, as lossy UTF-8 (a cut that lands
+/// inside a character costs that character, nothing else).
+pub(crate) fn drain_tail(mut r: impl Read, max: usize) -> String {
+    let mut tail: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > max {
+                    let excess = tail.len() - max;
+                    tail.drain(..excess);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
+}
+
+/// Where one turn of a Claude chat writes its `--mcp-config`. It may carry a user MCP
+/// server's env/headers, so it lives only while that turn's child does.
+fn mcp_config_path(chat_id: &str, turn: &str) -> PathBuf {
+    crate::store::data_dir().join(format!("rootchat-mcp-{chat_id}-{turn}.json"))
+}
+
+fn remove_file_opt(path: Option<&std::path::Path>) {
+    if let Some(p) = path {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Is `name` one of `chat_id`'s MCP config files: a per-turn one, or the single
+/// `rootchat-mcp-<id>.json` older builds wrote and never deleted?
+fn is_mcp_config_of(name: &str, chat_id: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix("rootchat-mcp-")
+        .and_then(|r| r.strip_prefix(chat_id))
+    else {
+        return false;
+    };
+    rest == ".json" || (rest.starts_with('-') && rest.ends_with(".json"))
+}
+
+/// Delete every MCP config file a chat left behind (the chat was deleted).
+pub fn remove_mcp_configs(chat_id: &str) {
+    remove_mcp_configs_in(&crate::store::data_dir(), chat_id);
+}
+
+/// Delete every chat's leftover MCP config. Called at startup, before any turn can run:
+/// a crash or End task mid-turn skips the reader thread's cleanup.
+pub fn remove_all_mcp_configs() {
+    remove_matching(&crate::store::data_dir(), |n| {
+        n.starts_with("rootchat-mcp-") && n.ends_with(".json")
+    });
+}
+
+fn remove_mcp_configs_in(dir: &std::path::Path, chat_id: &str) {
+    remove_matching(dir, |n| is_mcp_config_of(n, chat_id));
+}
+
+fn remove_matching(dir: &std::path::Path, matches: impl Fn(&str) -> bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if matches(&entry.file_name().to_string_lossy()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Write a file only its owner can read where the platform allows it (the MCP config may
@@ -505,7 +617,9 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     f.write_all(text.as_bytes())
 }
 
-#[tauri::command]
+// Async: a tree kill runs `taskkill` and waits for it under the children lock, which must
+// never happen on the UI thread (see "Architecture gotchas" in CLAUDE.md).
+#[tauri::command(async)]
 pub fn root_chat_stop(chat_id: String, state: State<Arc<RootChatState>>) {
     // A tree kill: the child is the `cmd.exe /C` wrapper, and killing only it on Windows
     // left the real `claude -p` running the turn to the end.
@@ -1297,6 +1411,45 @@ mod tests {
         for must in ["WebFetch", "cite", "uncertain"] {
             assert!(RESEARCH_BRIEF.contains(must), "{must}");
         }
+    }
+
+    #[test]
+    fn stderr_is_drained_whole_and_only_its_tail_kept() {
+        // Far past a pipe buffer: the reader must keep consuming, holding only the tail.
+        let mut input = vec![b'x'; 1 << 20];
+        input.extend_from_slice(b"the real error");
+        let tail = drain_tail(std::io::Cursor::new(input), 64);
+        assert_eq!(tail.len(), 64);
+        assert!(tail.ends_with("the real error"));
+        assert_eq!(
+            drain_tail(std::io::Cursor::new(b"short".to_vec()), 64),
+            "short"
+        );
+        assert_eq!(drain_tail(std::io::empty(), 64), "");
+    }
+
+    #[test]
+    fn a_deleted_chat_takes_its_mcp_configs_and_only_its_own() {
+        let dir = std::env::temp_dir().join(format!("conduit-rcmcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = ["rootchat-mcp-abc.json", "rootchat-mcp-abc-t1.json"];
+        let others = [
+            "rootchat-mcp-abcd.json",
+            "rootchat-mcp-abcd-t1.json",
+            "rootchat-mcp-xyz-t1.json",
+            "state.json",
+        ];
+        for n in mine.iter().chain(others.iter()) {
+            std::fs::write(dir.join(n), "{}").unwrap();
+        }
+        remove_mcp_configs_in(&dir, "abc");
+        for n in mine {
+            assert!(!dir.join(n).exists(), "{n} removed");
+        }
+        for n in others {
+            assert!(dir.join(n).exists(), "{n} kept");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

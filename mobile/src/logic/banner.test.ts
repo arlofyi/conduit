@@ -1,6 +1,6 @@
 import type { WireProjectsView, WireViewSession } from "../bridge/protocol";
 import { DEFAULT_PREFS } from "../data/prefs";
-import { bannerFromPending, bannerFromStatus, bannersFromView, type Signals } from "./banner";
+import { bannerFromPending, bannerFromStatus, bannersFromView, dueBanners, failedText, FINISH_SETTLE_MS, type Signals } from "./banner";
 
 function sess(over: Partial<WireViewSession> & { id: string }): WireViewSession {
   return {
@@ -26,17 +26,20 @@ const view = (...sessions: WireViewSession[]): WireProjectsView => ({
   projects: [{ id: "p", name: "conduit", profileId: null, color: null, sessions }],
 });
 
-const ALL_ON = { notifyQuestion: true, notifyPermission: true, notifyFinished: true };
+const ALL_ON = { notifyQuestion: true, notifyPermission: true, notifyFinished: true, notifyFailed: true, notifyStopped: true };
 
-/** Feed a sequence of views through, returning every banner raised. */
+/** Feed a sequence of views through (one per second), then let any finish settle; every banner raised. */
 function run(views: WireProjectsView[], openId: string | null, prefs = ALL_ON) {
   let signals: Signals = {};
   const out = [];
+  let now = 0;
   for (const v of views) {
-    const r = bannersFromView(signals, v, openId, prefs);
+    now += 1000;
+    const r = bannersFromView(signals, v, openId, prefs, now);
     signals = r.signals;
     out.push(...r.banners);
   }
+  out.push(...dueBanners(signals, views[views.length - 1] ?? null, openId, prefs, now + FINISH_SETTLE_MS).banners);
   return out;
 }
 
@@ -111,6 +114,7 @@ describe("banners", () => {
     const r1 = sess({ id: "r", name: "r", status: "running" });
     const r2 = sess({ id: "r", name: "r", status: "done" });
     const b = run([view(r1, idle), view(r2, asks)], null);
+    // the question at once; the finish once it has settled
     expect(b.map((x) => x.kind)).toEqual(["question", "finished"]);
   });
 });
@@ -157,5 +161,68 @@ describe("banner from a pushed question or permission", () => {
     const sig = bannersFromView({}, view(siloIdle), null, ALL_ON).signals;
     const b = bannerFromPending(sig, view(siloIdle), { kind: "ask", id: "ask-2", sessionId: "s", private: true }, null, ALL_ON).banner;
     expect(b).toMatchObject({ openable: false, text: "Private session — open it on your computer" });
+  });
+});
+
+describe("finished banners settle", () => {
+  const running = sess({ id: "a", name: "publish", status: "running" });
+  const done = sess({ id: "a", name: "publish", status: "done" });
+
+  it("a_finish_is_raised_only_after_FINISH_SETTLE_MS_quiet_and_only_once", () => {
+    let signals = bannersFromView({}, view(running), null, ALL_ON, 0).signals;
+    const r = bannersFromView(signals, view(done), null, ALL_ON, 1000);
+    expect(r.banners).toEqual([]);
+    signals = r.signals;
+    const early = dueBanners(signals, view(done), null, ALL_ON, 1000 + FINISH_SETTLE_MS - 1);
+    expect(early.banners).toEqual([]);
+    expect(early.signals).toBe(signals); // nothing settled: same object
+    const due = dueBanners(signals, view(done), null, ALL_ON, 1000 + FINISH_SETTLE_MS);
+    expect(due.banners).toEqual([expect.objectContaining({ kind: "finished", text: "Finished" })]);
+    expect(dueBanners(due.signals, view(done), null, ALL_ON, 1_000_000).banners).toEqual([]);
+  });
+
+  it("running_again_or_a_question_cancels_a_settling_finish", () => {
+    expect(run([view(running), view(done), view(running)], null)).toEqual([]);
+    expect(run([view(running), view(done), view(running), view(done), view(running)], null)).toEqual([]);
+    // a status frame (the streamed session) running again cancels too
+    let signals = bannersFromView({}, view(running), null, ALL_ON, 0).signals;
+    signals = bannersFromView(signals, view(done), null, ALL_ON, 1000).signals;
+    signals = bannerFromStatus(signals, view(done), "a", "running", null, ALL_ON, 2000).signals;
+    expect(dueBanners(signals, view(done), null, ALL_ON, 1_000_000).banners).toEqual([]);
+    // so does a pushed permission
+    let s2 = bannersFromView({}, view(running), null, ALL_ON, 0).signals;
+    s2 = bannersFromView(s2, view(done), null, ALL_ON, 1000).signals;
+    s2 = bannerFromPending(s2, view(done), { kind: "permission", id: "p", sessionId: "a", private: false, toolName: "Bash", summary: "x", createdMs: 1 }, null, ALL_ON).signals;
+    expect(dueBanners(s2, view(done), null, ALL_ON, 1_000_000).banners).toEqual([]);
+  });
+
+  it("a_status_frame_done_settles_rather_than_raising", () => {
+    const signals = bannersFromView({}, view(running), null, ALL_ON, 0).signals;
+    const r = bannerFromStatus(signals, view(running), "a", "done", null, ALL_ON, 1000);
+    expect(r.banner).toBeNull();
+    expect(dueBanners(r.signals, view(done), null, ALL_ON, 1000 + FINISH_SETTLE_MS).banners).toHaveLength(1);
+  });
+
+  it("failed_and_stopped_banner_at_once_behind_their_switches", () => {
+    const failed = sess({ id: "a", name: "publish", status: "done", failed: "overloaded" });
+    expect(run([view(running), view(failed)], null)).toEqual([
+      expect.objectContaining({ kind: "failed", text: "Stopped on an error: the API is overloaded" }),
+    ]);
+    expect(run([view(running), view(failed)], null, { ...ALL_ON, notifyFailed: false })).toEqual([]);
+    const live = sess({ id: "a", name: "publish", running: true });
+    const stopped = sess({ id: "a", name: "publish", running: false, stopped: true });
+    expect(run([view(live), view(stopped)], null)).toEqual([expect.objectContaining({ kind: "stopped", text: "Stopped" })]);
+    expect(run([view(live), view(stopped)], null, { ...ALL_ON, notifyStopped: false })).toEqual([]);
+    // never seen live: not a stop worth saying
+    expect(run([view(sess({ id: "a", running: false })), view(stopped)], null)).toEqual([]);
+    const silo = run([view({ ...live, silo: true }), view({ ...stopped, silo: true })], null);
+    expect(silo[0]).toMatchObject({ text: "Private session stopped", openable: false });
+  });
+
+  it("failedText_names_the_error", () => {
+    expect(failedText("rate_limit")).toBe("Stopped on an error: rate limit");
+    expect(failedText("some_new_kind")).toBe("Stopped on an error: some new kind");
+    expect(failedText("unknown")).toBe("Stopped on an error");
+    expect(failedText(null)).toBe("Stopped on an error");
   });
 });

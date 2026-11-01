@@ -586,6 +586,17 @@ function SessionRow({
         </span>
       )}
       {!editing && <TrustChip session={session} />}
+      {!editing && session.agent === "antigravity" && session.autoApprove && (
+        // The phone shows the same amber bolt. U+FE0E keeps it a text glyph so it takes the
+        // colour instead of rendering as a fixed-colour emoji.
+        <span
+          className="trust-chip"
+          style={{ color: "var(--amber)" }}
+          title="Auto-approve is on: Conduit answers Allow to every request from this session"
+        >
+          {"⚡︎"}
+        </span>
+      )}
       {!editing && session.stopped ? (
         // A stopped session has no agent, so there is no live status to show — the chip
         // replaces the accessory rather than sitting next to a misleading idle dot.
@@ -1142,10 +1153,21 @@ function SessionContextMenu() {
       {menuSession?.agent === "antigravity" && (
         <button
           onClick={() => {
+            // Turning it ON hands every command and file edit a blanket yes, so it asks first;
+            // turning it off only restores the prompts and needs no confirmation.
+            if (
+              !menuSession.autoApprove &&
+              !confirm(
+                `Auto-approve every request from "${menuSession.name}"?\n\nConduit will answer Allow to each command and file edit this Antigravity session asks for, without showing you the request.`,
+              )
+            ) {
+              closeMenu();
+              return;
+            }
             toggleAutoApprove(menuSession.id);
             closeMenu();
           }}
-          title="Conduit answers every permission request from this Antigravity session with Allow -- commands and file edits included. Antigravity's own auto mode still asks, so Conduit answers for it."
+          title="Conduit answers every permission request from this Antigravity session with Allow, commands and file edits included. Antigravity's own auto mode still asks, so Conduit answers for it."
         >
           {menuSession.autoApprove ? "✓ Auto-approve requests" : "Auto-approve requests"}
         </button>

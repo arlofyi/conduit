@@ -1,3 +1,5 @@
+import { Platform } from "react-native";
+
 /**
  * Type scale aligned to Apple's Human Interface Guidelines text styles (points).
  * React Native font sizes are density-independent and map ~1:1 to iOS points.
@@ -20,7 +22,7 @@ export const TYPE = {
 export const MIN_TOUCH = 44;
 
 /** System monospace face for code/paths. */
-export const MONO = "Menlo";
+export const MONO = Platform.select({ ios: "Menlo", default: "monospace" });
 
 /**
  * Bottom padding for a scroll view inside a TAB screen, so its last rows clear the tab bar.

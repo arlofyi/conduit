@@ -189,6 +189,31 @@ export class BridgeClient {
     this.apply({ t: "resume" });
   }
 
+  /**
+   * Dial now instead of waiting out a backoff (the app came to the front, the reader tapped
+   * Retry). A no-op mid-handshake or while connected; a suspended client resumes.
+   */
+  kick() {
+    if (this.closedByUser) return;
+    if (this.state.suspended) {
+      this.resume();
+      return;
+    }
+    const waiting = this.timer !== null && this.ws === null;
+    const retrying = this.state.phase === "failed" && this.state.error?.kind === "unavailable";
+    if (!waiting && !retrying) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.apply({ t: "kick" });
+  }
+
+  /** A ready socket went silent (see `isStale`): drop it and take the normal reconnect path. */
+  restart() {
+    if (this.closedByUser || this.state.phase !== "ready") return;
+    this.dropSocket();
+    this.apply({ t: "close" });
+  }
+
   close() {
     this.closedByUser = true;
     if (this.timer) clearTimeout(this.timer);

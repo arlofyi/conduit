@@ -114,6 +114,10 @@ export interface WireViewSession {
   // ---- auto-approve (2026-11-01 spec section 5, Round 4); absent from older desktops ----
   /** Conduit answers this session's permission prompts itself */
   autoApprove?: boolean;
+  // ---- failure (StopFailure); absent from older desktops ----
+  /** the last turn ended on an error: its kind ("rate_limit", ...; "error" for a private
+   * session); null when the last turn did not fail */
+  failed?: string | null;
 }
 
 export interface WireViewProject {

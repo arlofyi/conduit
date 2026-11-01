@@ -483,6 +483,12 @@ pub struct RootChat {
     /// event and replayed as `--conversation`. Claude chats resume by `id` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agy_conversation_id: Option<String>,
+    /// This chat has read a private (silo / local-only) session through root MCP -- or a
+    /// chat that had. Sticky: the content is in its transcript for good, so a REMOTE phone
+    /// never lists, reads, drives or streams it again (the phone link refuses private
+    /// sessions everywhere, and a desktop chat must not be the way around that).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub peeked_private: bool,
 }
 
 fn is_claude(a: &AgentId) -> bool {
@@ -851,9 +857,9 @@ fn load_state(save_path: &std::path::Path) -> PersistState {
             let bak = backup_path(save_path);
             let restored = fs::read(&bak).ok().and_then(|data| parse_state(&data));
             if restored.is_some() {
-                eprintln!(
-                    "conduit: state.json is unreadable; restored from {}",
-                    bak.display()
+                crate::diag::warn(
+                    "store",
+                    format!("state.json is unreadable; restored from {}", bak.display()),
                 );
             }
             restored
@@ -892,7 +898,7 @@ fn rotate_backup(save_path: &std::path::Path) {
         return;
     }
     if let Err(e) = write_synced(&bak, &current) {
-        eprintln!("conduit: failed to refresh state backup: {e}");
+        crate::diag::warn("store", format!("failed to refresh state backup: {e}"));
     }
 }
 
@@ -1115,7 +1121,7 @@ impl Store {
         let data = match serde_json::to_vec_pretty(&state) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("conduit: failed to serialize state: {e}");
+                crate::diag::error("store", format!("failed to serialize state: {e}"));
                 return false;
             }
         };
@@ -1123,7 +1129,7 @@ impl Store {
         // Flushed to disk BEFORE the rename: without the fsync a kernel panic or power loss
         // can land the rename ahead of the data and leave a zero-length state.json.
         if let Err(e) = write_synced(&tmp, &data) {
-            eprintln!("conduit: failed to write state: {e}");
+            crate::diag::error("store", format!("failed to write state: {e}"));
             return false;
         }
         rotate_backup(&self.save_path);
@@ -1143,7 +1149,10 @@ impl Store {
                     Err(e) => {
                         if attempt == 9 {
                             let _ = fs::remove_file(&tmp);
-                            eprintln!("conduit: failed to persist state after retries: {e}");
+                            crate::diag::error(
+                                "store",
+                                format!("failed to persist state after retries: {e}"),
+                            );
                         } else {
                             std::thread::sleep(std::time::Duration::from_millis(20));
                         }
@@ -1154,7 +1163,7 @@ impl Store {
         #[cfg(not(windows))]
         {
             if let Err(e) = fs::rename(&tmp, &self.save_path) {
-                eprintln!("conduit: failed to persist state: {e}");
+                crate::diag::error("store", format!("failed to persist state: {e}"));
             } else {
                 success = true;
             }
@@ -1316,6 +1325,7 @@ impl Store {
             research: opts.research,
             mcps: opts.mcps,
             agy_conversation_id: None,
+            peeked_private: false,
         };
         self.root_chats
             .lock()
@@ -1368,6 +1378,12 @@ impl Store {
     /// Mark a chat as driven from a phone (sticky; see `RootChat::phone`).
     pub fn mark_root_chat_phone(&self, id: &str) {
         self.update_root_chat(id, |c| c.phone = true);
+    }
+
+    /// Record that a chat has read private-session content (see `RootChat::peeked_private`).
+    /// Saves only on the first mark: `update_root_chat` skips an unchanged chat.
+    pub fn mark_root_chat_peeked_private(&self, id: &str) {
+        self.update_root_chat(id, |c| c.peeked_private = true);
     }
 
     /// Change a chat's model / effort / research / MCP choices (each `None` = unchanged;
@@ -4968,6 +4984,29 @@ mod tests {
         let back: PersistState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.root_chats.len(), 1);
         assert_eq!(back.root_chats[0].title, "Roadmap");
+    }
+
+    #[test]
+    fn peeked_private_is_sticky_and_absent_until_set() {
+        let chat = RootChat {
+            id: "c1".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&chat).unwrap();
+        assert!(
+            !json.contains("peekedPrivate"),
+            "omitted while false: {json}"
+        );
+        let back: RootChat = serde_json::from_str(r#"{"id":"c1","title":"t"}"#).unwrap();
+        assert!(!back.peeked_private, "an old chat has not peeked");
+        let marked = RootChat {
+            peeked_private: true,
+            ..chat
+        };
+        let json = serde_json::to_string(&marked).unwrap();
+        assert!(json.contains("\"peekedPrivate\":true"), "{json}");
+        let back: RootChat = serde_json::from_str(&json).unwrap();
+        assert!(back.peeked_private, "survives a round trip");
     }
 
     #[test]

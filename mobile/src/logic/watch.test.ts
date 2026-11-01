@@ -2,17 +2,23 @@ import type { WireProjectsView, WireViewSession } from "../bridge/protocol";
 import { emptyPending, pendingReducer } from "./pending";
 import {
   chatPreview,
+  CHAT_FAILED,
   desiredNotifications,
   diffNotifications,
   handoverSettled,
   HANDBACK_MAX_MS,
   initialWatch,
+  nextWakeAt,
   openTargetOf,
   permissionBody,
+  PRIVATE_FAILED,
   PRIVATE_FINISHED,
   PRIVATE_NEEDS,
+  PRIVATE_STOPPED,
   shouldStopWatching,
   shouldWatch,
+  UNREACHABLE_BODY,
+  UNREACHABLE_MS,
   watchAddresses,
   watchBaseline,
   watchItemOf,
@@ -23,6 +29,7 @@ import {
   type WatchPrefs,
   type WatchState,
 } from "./watch";
+import { FINISH_SETTLE_MS } from "./banner";
 
 function sess(over: Partial<WireViewSession> & { id: string }): WireViewSession {
   return {
@@ -48,9 +55,28 @@ const view = (...sessions: WireViewSession[]): WireProjectsView => ({
   projects: [{ id: "p", name: "conduit", profileId: null, color: null, sessions }],
 });
 
-const projects = (...sessions: WireViewSession[]): WatchEvent => ({ t: "projects", sessions: watchSessionsOf(view(...sessions)) });
+const projects = (...sessions: WireViewSession[]): WatchEvent => ({ t: "projects", sessions: watchSessionsOf(view(...sessions)), now: 0 });
+const projectsAt = (now: number, ...sessions: WireViewSession[]): WatchEvent => ({ t: "projects", sessions: watchSessionsOf(view(...sessions)), now });
+/** time enough for a finish seen at 0 to settle */
+const settleTick: WatchEvent = { t: "tick", now: FINISH_SETTLE_MS };
+const RUNNING = { needs: null, status: "running" as const, running: true, stopped: false, live: true };
 
-const ALL: WatchPrefs = { notifyQuestion: true, notifyPermission: true, notifyFinished: true };
+const ALL: WatchPrefs = {
+  notifyQuestion: true,
+  notifyPermission: true,
+  notifyFinished: true,
+  notifyFailed: true,
+  notifyStopped: true,
+  notifyUnreachable: true,
+};
+const NONE: WatchPrefs = {
+  notifyQuestion: false,
+  notifyPermission: false,
+  notifyFinished: false,
+  notifyFailed: false,
+  notifyStopped: false,
+  notifyUnreachable: false,
+};
 
 const ask = (id: string, sessionId: string, question = "Which db?"): WatchItem => ({
   id,
@@ -118,7 +144,7 @@ describe("watch rules", () => {
     // a silo session's item, even one carrying detail, is redacted too
     s = run(initialWatch([], {}), projects(sess({ id: "a", silo: true })), { t: "added", item: perm("1", "a") });
     expect(desiredNotifications(s, ALL)[0].body).toBe(PRIVATE_NEEDS);
-    s = run(initialWatch([], { a: { needs: null, status: "running" } }), projects(sess({ id: "a", silo: true, status: "done" })));
+    s = run(initialWatch([], { a: RUNNING }), projects(sess({ id: "a", silo: true, status: "done" })), settleTick);
     expect(desiredNotifications(s, ALL)[0]).toMatchObject({ key: "done:a", body: PRIVATE_FINISHED, target: null });
   });
 
@@ -126,7 +152,7 @@ describe("watch rules", () => {
     // first sight is not a transition
     let s = run(initialWatch([], {}), projects(sess({ id: "a", status: "done" })));
     expect(keys(s)).toEqual([]);
-    s = run(s, projects(sess({ id: "a", status: "running" })), projects(sess({ id: "a", status: "done" })));
+    s = run(s, projects(sess({ id: "a", status: "running" })), projects(sess({ id: "a", status: "done" })), settleTick);
     expect(desiredNotifications(s, ALL)[0]).toMatchObject({ key: "done:a", channel: "finished", body: "Finished" });
     // a later identical view keeps it; running again drops it
     s = run(s, projects(sess({ id: "a", status: "idle" })));
@@ -136,13 +162,13 @@ describe("watch rules", () => {
   });
 
   it("the_baseline_from_the_app_catches_a_turn_that_ended_during_the_hand_over", () => {
-    const s = run(initialWatch([], { a: { needs: null, status: "running" } }), projects(sess({ id: "a", status: "done" })));
+    const s = run(initialWatch([], { a: RUNNING }), projects(sess({ id: "a", status: "done" })), settleTick);
     expect(keys(s)).toEqual(["done:a"]);
   });
 
   it("a_view_only_needs_alert_is_for_agents_that_hold_nothing", () => {
     let s = run(
-      initialWatch([], { a: { needs: null, status: "running" } }),
+      initialWatch([], { a: RUNNING }),
       projects(sess({ id: "a", status: "needsInput", needs: { kind: "input", text: null } })),
     );
     expect(desiredNotifications(s, ALL)[0]).toMatchObject({ key: "needs:a", body: "Needs your input" });
@@ -156,7 +182,7 @@ describe("watch rules", () => {
 
   it("an_item_first_then_the_view_showing_it_raises_one_notification", () => {
     const s = run(
-      initialWatch([], { a: { needs: null, status: "running" } }),
+      initialWatch([], { a: RUNNING }),
       projects(sess({ id: "a", status: "running" })),
       { t: "added", item: ask("1", "a") },
       projects(sess({ id: "a", status: "needsInput", needs: { kind: "ask", text: "Which db?" } })),
@@ -168,10 +194,11 @@ describe("watch rules", () => {
 
   it("switches_gate_each_kind", () => {
     const s = run(
-      initialWatch([], { c: { needs: null, status: "running" } }),
+      initialWatch([], { c: RUNNING }),
       projects(sess({ id: "a" }), sess({ id: "b" }), sess({ id: "c", status: "done" })),
       { t: "added", item: ask("1", "a") },
       { t: "added", item: perm("2", "b") },
+      settleTick,
     );
     expect(keys(s)).toEqual(["item:1", "item:2", "done:c"]);
     expect(keys(s, { ...ALL, notifyQuestion: false })).toEqual(["item:2", "done:c"]);
@@ -179,7 +206,7 @@ describe("watch rules", () => {
   });
 
   it("a_session_gone_from_the_view_drops_its_alerts", () => {
-    let s = run(initialWatch([], { a: { needs: null, status: "running" } }), projects(sess({ id: "a", status: "done" })));
+    let s = run(initialWatch([], { a: RUNNING }), projects(sess({ id: "a", status: "done" })), settleTick);
     expect(keys(s)).toEqual(["done:a"]);
     s = run(s, projects());
     expect(keys(s)).toEqual([]);
@@ -224,7 +251,10 @@ describe("hand-over", () => {
   it("watches_only_with_a_switch_a_token_and_permission", () => {
     expect(shouldWatch(base)).toBe(true);
     expect(shouldWatch({ ...base, available: false })).toBe(false);
-    expect(shouldWatch({ ...base, prefs: { notifyQuestion: false, notifyPermission: false, notifyFinished: false } })).toBe(false);
+    expect(shouldWatch({ ...base, prefs: NONE })).toBe(false);
+    // any one switch is enough, the new kinds included
+    expect(shouldWatch({ ...base, prefs: { ...NONE, notifyFailed: true } })).toBe(true);
+    expect(shouldWatch({ ...base, prefs: { ...NONE, notifyUnreachable: true } })).toBe(true);
     expect(shouldWatch({ ...base, token: null })).toBe(false);
     expect(shouldWatch({ ...base, addresses: [] })).toBe(false);
     expect(shouldWatch({ ...base, notificationsAllowed: false })).toBe(false);
@@ -248,7 +278,7 @@ describe("hand-over", () => {
     pending = pendingReducer(pending, { t: "resolved", id: "2", by: "desktop", now: 1 });
     const b = watchBaseline(view(sess({ id: "a", status: "running" })), pending);
     expect(b.seen).toEqual(["1"]);
-    expect(b.signals).toEqual({ a: { needs: null, status: "running" } });
+    expect(b.signals).toEqual({ a: { needs: null, status: "running", running: true, stopped: false, failed: null, live: true } });
   });
 
   it("the_app_socket_waits_for_the_watcher_to_connect_or_fail_once", () => {
@@ -321,9 +351,153 @@ describe("general chats", () => {
     expect(desiredNotifications(watchStep(done, { t: "chatEvent", event: "user", chatId: "c9" }), ALL)).toEqual([]);
   });
 
+  it("announces a failed turn (`error`, no `done`) as failed, and clears it on the next message", () => {
+    const failed = run(projects(), { t: "chats", chats: [{ id: "c2", title: "Agy" }] }, { t: "chatEvent", event: "error", chatId: "c2", result: "boom" });
+    expect(desiredNotifications(failed, ALL)).toEqual([expect.objectContaining({ key: "chat:c2", title: "Agy", body: "The reply failed" })]);
+    expect(desiredNotifications(watchStep(failed, { t: "chatEvent", event: "user", chatId: "c2" }), ALL)).toEqual([]);
+  });
+
   it("previews: trimmed, capped, and an error says so", () => {
     expect(chatPreview("x".repeat(200))).toHaveLength(140);
     expect(chatPreview(null)).toBe("Replied");
     expect(chatPreview("ok", true)).toBe("The reply failed");
+  });
+});
+
+describe("finished settles (one notification per finished piece of work, not per bubble)", () => {
+  const run2 = (...evs: WatchEvent[]) => evs.reduce(watchStep, initialWatch([], { a: RUNNING }));
+
+  it("a_finish_waits_FINISH_SETTLE_MS_then_posts_once", () => {
+    let s = run2(projectsAt(1000, sess({ id: "a", status: "done" })));
+    expect(keys(s)).toEqual([]);
+    expect(nextWakeAt(s)).toBe(1000 + FINISH_SETTLE_MS);
+    s = watchStep(s, { t: "tick", now: 1000 + FINISH_SETTLE_MS - 1 });
+    expect(keys(s)).toEqual([]);
+    s = watchStep(s, { t: "tick", now: 1000 + FINISH_SETTLE_MS });
+    expect(keys(s)).toEqual(["done:a"]);
+    expect(nextWakeAt(s)).toBeNull();
+    // later frames and ticks keep the one notification (same signature: never re-posted)
+    const d = diffNotifications({}, desiredNotifications(s, ALL));
+    s = run(s, projectsAt(60_000, sess({ id: "a", status: "done" })), { t: "tick", now: 90_000 });
+    expect(diffNotifications(d.posted, desiredNotifications(s, ALL)).post).toEqual([]);
+  });
+
+  it("running_again_inside_the_window_cancels_it_so_a_flapping_turn_posts_nothing", () => {
+    // agy: idle at every step / permission menu, running again a second later
+    let s = run2(
+      projectsAt(0, sess({ id: "a", status: "idle" })),
+      projectsAt(1_000, sess({ id: "a", status: "running" })),
+      projectsAt(5_000, sess({ id: "a", status: "idle" })),
+      projectsAt(6_000, sess({ id: "a", status: "running" })),
+      projectsAt(10_000, sess({ id: "a", status: "done" })),
+      projectsAt(12_000, sess({ id: "a", status: "running" })),
+      { t: "tick", now: 40_000 },
+    );
+    expect(keys(s)).toEqual([]);
+    // the real end: quiet for the whole window
+    s = run(s, projectsAt(50_000, sess({ id: "a", status: "done" })), { t: "tick", now: 50_000 + FINISH_SETTLE_MS });
+    expect(keys(s)).toEqual(["done:a"]);
+  });
+
+  it("the_window_counts_from_the_first_quiet_frame_not_the_last", () => {
+    const s = run2(
+      projectsAt(0, sess({ id: "a", status: "done" })),
+      projectsAt(10_000, sess({ id: "a", status: "idle" })),
+      projectsAt(FINISH_SETTLE_MS, sess({ id: "a", status: "idle" })),
+    );
+    expect(keys(s)).toEqual(["done:a"]);
+  });
+
+  it("a_held_question_or_permission_is_not_a_finish", () => {
+    // agy at its permission menu reads `idle`; its card arrives as a held item
+    let s = run2(projectsAt(0, sess({ id: "a", status: "idle" })), { t: "added", item: perm("p1", "a") }, settleTick);
+    expect(keys(s)).toEqual(["item:p1"]);
+    // the view arriving after the item does not restart the settle either
+    s = run(s, projectsAt(1_000, sess({ id: "a", status: "idle" })), { t: "tick", now: 1_000 + FINISH_SETTLE_MS });
+    expect(keys(s)).toEqual(["item:p1"]);
+  });
+
+  it("a_finish_does_not_settle_while_the_link_is_down", () => {
+    let s = run2(projectsAt(0, sess({ id: "a", status: "done" })), { t: "link", phase: "retrying", now: 1_000 }, settleTick);
+    expect(keys(s)).toEqual([]);
+    // back up: the next frame still quiet settles it at once
+    s = run(s, { t: "link", phase: "watching", now: 30_000 }, projectsAt(30_000, sess({ id: "a", status: "done" })));
+    expect(keys(s)).toEqual(["done:a"]);
+  });
+
+  it("general_chat_bubbles_never_notify_only_the_turn_end", () => {
+    let s = run2(projects(sess({ id: "a" })), { t: "chats", chats: [{ id: "c1", title: "T" }] });
+    for (let i = 0; i < 5; i++) s = watchStep(s, { t: "chatEvent", event: "item", chatId: "c1" });
+    expect(keys(s)).toEqual([]);
+    s = watchStep(s, { t: "chatEvent", event: "done", chatId: "c1", result: "ok" });
+    expect(keys(s)).toEqual(["chat:c1"]);
+  });
+});
+
+describe("failed, stopped and unreachable", () => {
+  it("a_turn_that_ends_on_an_error_is_failed_not_finished", () => {
+    let s = run(initialWatch([], { a: RUNNING }), projects(sess({ id: "a", status: "done", failed: "rate_limit" })), settleTick);
+    expect(desiredNotifications(s, ALL)).toEqual([
+      expect.objectContaining({ key: "failed:a", channel: "needs", body: "Stopped on an error: rate limit", title: "name-a" }),
+    ]);
+    expect(keys(s, { ...ALL, notifyFailed: false })).toEqual([]);
+    // a new turn clears it
+    s = run(s, projects(sess({ id: "a", status: "running" })));
+    expect(keys(s)).toEqual([]);
+  });
+
+  it("a_failure_already_in_place_is_not_news_and_a_private_one_says_nothing", () => {
+    expect(keys(run(initialWatch([], {}), projects(sess({ id: "a", status: "done", failed: "x" }))))).toEqual([]);
+    const s = run(initialWatch([], { a: RUNNING }), projects(sess({ id: "a", silo: true, status: "done", failed: "error" })));
+    expect(desiredNotifications(s, ALL)[0]).toMatchObject({ key: "failed:a", body: PRIVATE_FAILED, target: null, subtitle: null });
+  });
+
+  it("a_live_session_that_is_stopped_posts_stopped_and_clears_when_started", () => {
+    let s = run(
+      initialWatch([], { a: RUNNING }),
+      // stop_session saves the idle status a moment before the stopped flag: two frames
+      projects(sess({ id: "a", status: "idle", running: false, stopped: false })),
+      projects(sess({ id: "a", status: "idle", running: false, stopped: true })),
+      settleTick,
+    );
+    expect(desiredNotifications(s, ALL)).toEqual([expect.objectContaining({ key: "stopped:a", channel: "status", body: "Stopped" })]);
+    expect(keys(s, { ...ALL, notifyStopped: false })).toEqual([]);
+    s = run(s, projects(sess({ id: "a", status: "idle", running: true, stopped: false })));
+    expect(keys(s)).toEqual([]);
+  });
+
+  it("a_session_never_live_is_not_announced_as_stopped_and_private_wording_holds", () => {
+    const parked = run(
+      initialWatch([], {}),
+      projects(sess({ id: "a", running: false, stopped: false })),
+      projects(sess({ id: "a", running: false, stopped: true })),
+    );
+    expect(keys(parked)).toEqual([]);
+    const priv = run(initialWatch([], { a: RUNNING }), projects(sess({ id: "a", silo: true, running: false, stopped: true })));
+    expect(desiredNotifications(priv, ALL)[0]).toMatchObject({ key: "stopped:a", body: PRIVATE_STOPPED, target: null });
+  });
+
+  it("unreachable_after_UNREACHABLE_MS_down_with_a_tunnel_once_and_cleared_on_reconnect", () => {
+    let s = run(initialWatch([], {}), projects(), { t: "link", phase: "retrying", now: 0 });
+    expect(nextWakeAt(s)).toBe(UNREACHABLE_MS);
+    s = watchStep(s, { t: "tick", now: UNREACHABLE_MS - 1 });
+    expect(keys(s)).toEqual([]);
+    // further drops do not restart the clock
+    s = run(s, { t: "link", phase: "connecting", now: UNREACHABLE_MS - 1 }, { t: "tick", now: UNREACHABLE_MS });
+    expect(desiredNotifications(s, ALL)).toEqual([
+      { key: "unreachable", channel: "status", title: "Conduit", subtitle: null, body: UNREACHABLE_BODY, target: null },
+    ]);
+    expect(nextWakeAt(s)).toBeNull();
+    expect(keys(s, { ...ALL, notifyUnreachable: false })).toEqual([]);
+    // Tailscale switched off on the phone: unreachable by design, nothing to say
+    expect(keys(watchStep(s, { t: "network", tunnel: false }))).toEqual([]);
+    s = watchStep(s, { t: "link", phase: "watching", now: UNREACHABLE_MS + 5 });
+    expect(keys(s)).toEqual([]);
+  });
+
+  it("a_failed_general_chat_reply_follows_the_failed_switch", () => {
+    const s = run(initialWatch([], {}), projects(), { t: "chatEvent", event: "error", chatId: "c" });
+    expect(desiredNotifications(s, { ...ALL, notifyFinished: false })[0]).toMatchObject({ key: "chat:c", body: CHAT_FAILED });
+    expect(keys(s, { ...ALL, notifyFailed: false })).toEqual([]);
   });
 });

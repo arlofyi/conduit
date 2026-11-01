@@ -22,13 +22,11 @@ import {
   FALLBACK_OPTIONS,
   agentLabel,
   chatBadge,
-  createSettings,
   defaultSettings,
   emptyChatInfo,
   insertSkill,
   modelName,
   optionsOf,
-  pickAgent,
   settingsPatch,
   skillSuggestions,
   toggleMcp,
@@ -269,16 +267,9 @@ describe("chat options", () => {
     expect(defaultSettings(optionsOf({ agents: [{ id: "antigravity" }] })!).agent).toBe("antigravity");
   });
 
-  it("switching agent drops a model or effort the new agent does not offer", () => {
-    const s = { agent: "claude", model: "opus", effort: "high", research: true, mcps: ["github"] };
-    expect(pickAgent(s, opts, "antigravity")).toEqual({ agent: "antigravity", model: null, effort: null, research: true, mcps: ["github"] });
-    expect(pickAgent(s, opts, "claude")).toEqual(s);
-  });
-
-  it("create sends only what differs from the defaults", () => {
-    expect(createSettings(defaultSettings(opts))).toEqual({ agent: "claude" });
+  it("toggles an MCP server on and off", () => {
     const s = toggleMcp({ agent: "claude", model: "opus", effort: "high", research: true, mcps: [] }, "github");
-    expect(createSettings(s)).toEqual({ agent: "claude", model: "opus", effort: "high", research: true, mcps: ["github"] });
+    expect(s.mcps).toEqual(["github"]);
     expect(toggleMcp(s, "github").mcps).toEqual([]);
   });
 
