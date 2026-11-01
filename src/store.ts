@@ -124,6 +124,8 @@ export interface Session {
   /** Pinned "keep running": the idle auto-stop skips it. Persisted in the Rust store
    *  (absent = false) so a paired phone reads and sets the same pin. */
   keepRunning?: boolean;
+  /** Conduit answers this session's permission prompts with Allow (agy only). */
+  autoApprove?: boolean;
 }
 
 /** A registered agent account (mirrors the Rust serde struct, camelCase). */
@@ -1487,6 +1489,8 @@ interface AppState {
    *  store): exempt from the idle auto-stop, for work the process tree cannot reveal (an
    *  agent waiting on a remote job). */
   toggleKeepRunning: (sessionId: string) => void;
+  /** Flip auto-approve in the Rust store (agy only) and mirror the value it returns. */
+  toggleAutoApprove: (sessionId: string) => void;
   /** Persisted. When true (default), Claude sessions announce Conduit as their IDE:
    *  diff review lands in a Monaco overlay, editor selections reach the session. */
   announceAsIde: boolean;
@@ -3935,6 +3939,20 @@ export const useStore = create<AppState>((set, get) => {
         })),
       }));
       void invoke("set_session_keep_running", { sessionId, keep }).catch(() => {});
+    },
+
+    toggleAutoApprove: (sessionId) => {
+      void invoke<boolean | null>("toggle_session_auto_approve", { sessionId })
+        .then((on) => {
+          if (on === null || on === undefined) return;
+          set((s) => ({
+            projects: s.projects.map((p) => ({
+              ...p,
+              sessions: p.sessions.map((x) => (x.id === sessionId ? { ...x, autoApprove: on } : x)),
+            })),
+          }));
+        })
+        .catch(() => {});
     },
 
     unparkSession: (sessionId) => {

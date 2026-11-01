@@ -40,9 +40,10 @@ import type {
 import { chatOnPhone, glyphStateFor, NO_PHONE_CHAT_TEXT } from "../logic/agents";
 import { PRIVATE_SESSION_TEXT } from "../logic/frames";
 import { chatHeader } from "../logic/chatHeader";
-import { composerSuggestions, effortLevel, effortName, type CommandOption } from "../logic/sessionOptions";
-import { headerGauge, pct, rowForSession } from "../logic/usage";
-import { EffortBars, UsageRing } from "../components/UsageMeters";
+import { composerSuggestions, type CommandOption } from "../logic/sessionOptions";
+import { rowForSession } from "../logic/usage";
+import { contextRing, headerMeta, usageBadge } from "../logic/sessionHeader";
+import { EffortBars, HeaderUsageGauge, UsagePopover } from "../components/UsageMeters";
 import { outputPreview } from "../logic/chatView";
 import { mix, readableInk } from "../logic/color";
 import { callVerb, groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
@@ -114,8 +115,24 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     };
   }, [sessionId, ready, silo, sessionOptions]);
   const suggest = useCallback((d: string) => composerSuggestions(d, commands), [commands]);
-  const effort = effortLevel(header.effort, efforts);
-  const gauge = headerGauge(rowForSession(usage?.rows ?? null, header.usageKey, header.agent));
+  // Header: line 1 the name; line 2 project · status · model · effort bars [· auto-approve].
+  // The context window is the ring around the avatar; usage is the gauge left of preferences.
+  const ctxRing = contextRing(context ? context.fraction : null);
+  const meta = headerMeta({
+    name: header.name,
+    projectName: projectName,
+    state: header.state,
+    model: header.model,
+    effort: header.effort,
+    efforts,
+    autoApprove: session?.session.autoApprove === true,
+    context: ctxRing,
+  });
+  // An agent with no effort ladder (and none reported) gets no bars: "default" would be a guess.
+  const showEffort = header.effort !== null || efforts.length > 0;
+  const usageRow = rowForSession(usage?.rows ?? null, header.usageKey, header.agent);
+  const badge = usageBadge(usageRow);
+  const [usageOpen, setUsageOpen] = useState(false);
   // The Mac follows the session onto a new transcript itself (/clear, a just-spawned chat) and
   // re-sends `history`, so the chat never has to re-attach to catch up.
 
@@ -352,6 +369,11 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     session?.session.running ?? false,
   );
   const accent = readableInk(session ? (header.color ?? p.accent) : p.accent, p.textBright, p.panelBg);
+  // ONE session sheet: the title tap and the preferences button both open it.
+  const openSheet = () => {
+    setUsageOpen(false);
+    navigation.navigate("QuickActions", { sessionId, running, agent, projectId, name: route.params.name, branch: route.params.branch });
+  };
 
   return (
     <View style={{ flex: 1, backgroundColor: p.panelBg }}>
@@ -451,67 +473,78 @@ export function ChatScreen({ route, navigation }: ChatProps) {
       <MaterialBar style={{ position: "absolute", top: 0, left: 0, right: 0 }}>
         <View
           onLayout={(e) => setHeaderH(e.nativeEvent.layout.height)}
-          style={{ paddingTop: insets.top + 4, paddingBottom: 8, paddingHorizontal: 10, flexDirection: "row", alignItems: "center", gap: 10 }}
+          style={{ paddingTop: insets.top + 4, paddingBottom: 8, paddingHorizontal: 10, flexDirection: "row", alignItems: "center", gap: 8 }}
         >
           <GlassCircle symbol="chevron.left" label="Back to sessions" onPress={() => navigation.goBack()} size={38} symbolSize={16} />
           <Pressable
-            onPress={() => navigation.navigate("SessionInfo", { sessionId, projectId })}
+            onPress={openSheet}
             accessibilityRole="button"
-            accessibilityLabel={`${header.name}, ${projectName ?? ""} ${header.subline}. Session details`}
-            style={({ pressed }) => ({ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 9, opacity: pressed ? 0.7 : 1 })}
+            accessibilityLabel={meta.a11y}
+            style={({ pressed }) => ({ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 8, opacity: pressed ? 0.7 : 1 })}
           >
-            <AgentAvatar agent={session?.session.agent ?? ""} projectColor={header.color} state={ringState} size={34} />
+            <AgentAvatar
+              agent={session?.session.agent ?? ""}
+              projectColor={header.color}
+              state={ringState}
+              size={34}
+              context={ctxRing ? ctxRing.fraction : null}
+            />
             <View style={{ flex: 1, minWidth: 0 }}>
               <Text style={{ fontWeight: "600", fontSize: TYPE.callout, color: p.textBright }} numberOfLines={1}>
                 {header.name}
               </Text>
-              <Text style={{ fontSize: TYPE.caption, marginTop: 1 }} numberOfLines={1}>
-                {projectName ? <Text style={{ color: accent, fontWeight: "600" }}>{projectName}</Text> : null}
-                {projectName ? <Text style={{ color: p.textDim }}>{"  ·  "}</Text> : null}
-                <Text style={{ color: stateColor }}>{header.subline}</Text>
-              </Text>
-              {header.model || effort || gauge ? (
-                <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginTop: 3, minWidth: 0 }}>
-                  {header.model ? (
-                    <View
-                      accessible
-                      accessibilityLabel={`Model ${header.model}`}
-                      style={{ flexShrink: 1, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 6, backgroundColor: p.selectionBg }}
+              {/* line 2: project · status · model · effort bars [· auto-approve]; the project and
+                  model give way first, the status never does */}
+              <View style={{ flexDirection: "row", alignItems: "center", marginTop: 2, minWidth: 0 }}>
+                {meta.project ? (
+                  <>
+                    <Text maxFontSizeMultiplier={1.3} style={{ flexShrink: 1, color: accent, fontWeight: "600", fontSize: TYPE.caption }} numberOfLines={1}>
+                      {meta.project}
+                    </Text>
+                    <MetaDot />
+                  </>
+                ) : null}
+                <Text maxFontSizeMultiplier={1.3} style={{ flexShrink: 0, color: stateColor, fontSize: TYPE.caption }} numberOfLines={1}>
+                  {meta.status}
+                </Text>
+                {meta.model ? (
+                  <>
+                    <MetaDot />
+                    <Text
+                      maxFontSizeMultiplier={1.3}
+                      style={{ flexShrink: 1, maxWidth: 104, color: p.textMid, fontWeight: "600", fontSize: TYPE.caption }}
+                      numberOfLines={1}
                     >
-                      <Text maxFontSizeMultiplier={1.4} style={{ color: p.textMid, fontSize: TYPE.micro, fontWeight: "600" }} numberOfLines={1}>
-                        {header.model}
-                      </Text>
-                    </View>
-                  ) : null}
-                  {effort && header.effort ? (
-                    <View accessible accessibilityLabel={`Effort ${effortName(header.effort)}`} style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-                      <EffortBars filled={effort.filled} steps={effort.steps} height={11} color={p.textMid} />
-                    </View>
-                  ) : null}
-                  {gauge ? (
-                    <View accessible accessibilityLabel={gauge.a11y} style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-                      <UsageRing used={gauge.window.used} size={14} stroke={2.5} />
-                      <Text maxFontSizeMultiplier={1.4} style={{ color: p.textMid, fontSize: TYPE.micro, fontVariant: ["tabular-nums"] }}>
-                        {pct(gauge.window.used)}%
-                      </Text>
-                    </View>
-                  ) : null}
-                </View>
-              ) : null}
+                      {meta.model}
+                    </Text>
+                  </>
+                ) : null}
+                {showEffort ? (
+                  <View style={{ flexShrink: 0, marginLeft: 6 }}>
+                    <EffortBars filled={meta.effort.filled} steps={meta.effort.steps} height={10} color={p.textMid} outlined={meta.effort.isDefault} />
+                  </View>
+                ) : null}
+                {meta.autoApprove ? (
+                  <View style={{ flexShrink: 0, marginLeft: 5 }}>
+                    <Icon name="bolt" size={12} color={p.amber} />
+                  </View>
+                ) : null}
+              </View>
             </View>
           </Pressable>
+          <HeaderUsageGauge badge={badge} size={38} onPress={() => setUsageOpen((o) => !o)} />
           <GlassCircle
             symbol="slider.horizontal.3"
-            label={running ? "Session options: interrupt, files, model, commands" : "Session options: files, model, commands, compact or stop"}
-            onPress={() =>
-              navigation.navigate("QuickActions", { sessionId, running, agent, projectId, name: route.params.name, branch: route.params.branch })
-            }
+            label={running ? "Session details and options: interrupt, files, model, commands" : "Session details and options: files, model, commands, compact or stop"}
+            onPress={openSheet}
             size={38}
             symbolSize={17}
           />
         </View>
         <View style={{ height: 1, backgroundColor: header.color ? mix(header.color, p.panelBg, 0.55) : h.hairline }} />
       </MaterialBar>
+
+      {usageOpen ? <UsagePopover row={usageRow} top={headerH + 6} now={Date.now()} onClose={() => setUsageOpen(false)} /> : null}
 
       <CopiedToast at={copiedAt} top={headerH + 10} />
     </View>
@@ -525,6 +558,16 @@ type DisplayRow =
 
 const NO_ROWS: DisplayRow[] = [];
 const NO_COMMANDS: readonly CommandOption[] = [];
+
+/** The separator between the header's line-2 parts. */
+function MetaDot() {
+  const { palette: p } = useTheme();
+  return (
+    <Text maxFontSizeMultiplier={1.3} style={{ flexShrink: 0, color: p.textDim, fontSize: TYPE.caption }}>
+      {" · "}
+    </Text>
+  );
+}
 
 function threadKey(t: DisplayRow): string {
   return t.key;

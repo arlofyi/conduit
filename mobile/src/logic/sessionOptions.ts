@@ -29,6 +29,10 @@ export interface SessionOptions {
   efforts: string[];
   commands: CommandOption[];
   mcps: McpOption[];
+  /** Conduit answers every permission itself (Round 4); only meaningful when supported */
+  autoApprove: boolean;
+  /** the agent has an auto-approve switch (Antigravity for now) */
+  autoApproveSupported: boolean;
 }
 
 const str = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
@@ -75,6 +79,8 @@ export function parseSessionOptions(m: unknown): SessionOptions | null {
     efforts: arr(f.efforts).filter((e): e is string => typeof e === "string" && e.length > 0),
     commands,
     mcps,
+    autoApprove: f.autoApprove === true,
+    autoApproveSupported: f.autoApproveSupported === true,
   };
 }
 

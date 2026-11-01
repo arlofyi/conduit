@@ -1,6 +1,7 @@
 /**
  * One general chat (the computer's root chat): the same feed rendering as a session chat, a
- * composer, Stop while a turn runs, and a scope chip naming which projects it may see.
+ * composer, Stop while a turn runs, and an "attached" chip naming what it knows about ("No
+ * projects attached" for a new chat); tapping it opens the settings at the attach picker.
  * Proposed work is approved on the computer, so this screen never shows approval cards. The
  * header names the chat's agent + model and opens its settings; `/` in the composer offers the
  * computer's skills.
@@ -12,7 +13,7 @@ import { useLive } from "../bridge/LiveProvider";
 import { Composer, type ComposerSuggestion } from "../components/Composer";
 import { GlassCircle, GlassSurface, Icon, MaterialBar } from "../components/Glass";
 import { groupFeed } from "../logic/feed";
-import { chatBadge, emptyChatInfo, EMPTY_FEED, insertSkill, scopeSummary, skillSuggestions } from "../logic/general";
+import { attachedSummary, chatBadge, emptyChatInfo, EMPTY_FEED, insertSkill, isUnattached, skillSuggestions } from "../logic/general";
 import { layoutThread, type ThreadRow } from "../logic/thread";
 import type { GeneralChatProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
@@ -38,7 +39,8 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
   const title = chat?.title ?? route.params.title ?? "Chat";
   const state = rootFeeds[chatId] ?? EMPTY_FEED;
   const running = state.running;
-  const scope = chat ? scopeSummary(chat.scope, view) : null;
+  const scope = chat ? attachedSummary(chat.scope, view) : null;
+  const unattached = isUnattached(chat?.scope);
   const badge = chat ? chatBadge(chat, rootChatOptions) : null;
 
   // Skills for `/` in the composer, and agent/model names for the header.
@@ -105,7 +107,7 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
     : !state.loaded
       ? "Loading…"
       : state.feed.length === 0 && !running
-        ? emptyChatInfo(chat?.agent)
+        ? emptyChatInfo(chat?.agent, chat?.scope)
         : null;
 
   return (
@@ -181,12 +183,13 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
             ) : null}
             {scope ? (
               <Pressable
-                onPress={() => navigation.navigate("GeneralScope", { chatId })}
+                onPress={() => navigation.navigate("GeneralSettings", { chatId, attach: true })}
                 accessibilityRole="button"
-                accessibilityLabel={`Sees: ${scope}. Change which projects this chat can see`}
+                accessibilityLabel={`${scope}. Attach profiles or projects to this chat`}
                 hitSlop={6}
                 style={({ pressed }) => ({
                   alignSelf: "flex-start",
+                  maxWidth: "100%",
                   flexDirection: "row",
                   alignItems: "center",
                   gap: 4,
@@ -198,8 +201,8 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
                   borderColor: p.border,
                 })}
               >
-                <Icon name="square.stack" size={10} color={p.accent} />
-                <Text style={{ fontSize: TYPE.caption, color: p.accent, fontWeight: "600" }} numberOfLines={1}>
+                <Icon name={unattached ? "paperclip" : "square.stack"} size={10} color={unattached ? p.textMid : p.accent} />
+                <Text style={{ flexShrink: 1, fontSize: TYPE.caption, color: unattached ? p.textMid : p.accent, fontWeight: "600" }} numberOfLines={1}>
                   {scope}
                 </Text>
                 <Icon name="chevron.down" size={8} color={p.textMid} />
@@ -218,7 +221,7 @@ export function GeneralChatScreen({ route, navigation }: GeneralChatProps) {
           ) : chat ? (
             <GlassCircle
               symbol="slider.horizontal.3"
-              label="Chat settings: model, effort, deep research, MCP servers"
+              label="Chat settings: attached projects, model, effort, deep research, MCP servers"
               onPress={() => navigation.navigate("GeneralSettings", { chatId })}
               size={36}
               symbolSize={15}

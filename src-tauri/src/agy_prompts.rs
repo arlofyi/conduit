@@ -233,6 +233,29 @@ fn tick(app: &AppHandle, watches: &mut HashMap<String, Watch>) {
         for idx in &plan.unsettle {
             w.settled.remove(idx);
         }
+        // Auto-approve: Conduit presses Allow itself, no card. An open card is approved too
+        // (the switch was flipped while it was showing). ONE step per tick: parallel calls
+        // show their menus one after another, and a second key sent before the next menu
+        // has drawn would land in agy's input box as text.
+        if store.session_auto_approve(&sid) {
+            if !w.open.is_empty() {
+                // The oldest card's waiter presses its key; one key per tick, as below.
+                if let Some(o) = w.open.first() {
+                    broker.resolve(&o.perm_id, Decision::Allow, By::Desktop);
+                }
+                continue;
+            }
+            if let Some(&idx) = plan.raise.iter().min() {
+                if agy_transcript::step_status(&db, idx) == Some(agy_transcript::STATUS_WAITING) {
+                    match pty.write(&sid, keys_for(&Decision::Allow).unwrap_or("1")) {
+                        Ok(()) => eprintln!("[agy-prompts] {sid}: auto-approved step {idx}"),
+                        Err(e) => eprintln!("[agy-prompts] {sid}: auto-approve failed: {e}"),
+                    }
+                }
+                w.settled.insert(idx);
+            }
+            continue;
+        }
         for idx in plan.raise {
             let Some(step) = w.waiting.iter().find(|s| s.idx == idx) else {
                 continue;
@@ -306,6 +329,18 @@ mod tests {
             tool: tool.into(),
             args,
         }
+    }
+
+    #[test]
+    fn auto_approve_is_offered_for_antigravity_only() {
+        use crate::agent::AgentId;
+        assert!(crate::session_options::auto_approve_supported(
+            AgentId::Antigravity
+        ));
+        // Claude has its own permission modes; nothing else is read by this watcher.
+        assert!(!crate::session_options::auto_approve_supported(
+            AgentId::Claude
+        ));
     }
 
     #[test]

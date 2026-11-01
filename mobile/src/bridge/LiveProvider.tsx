@@ -308,6 +308,20 @@ export interface LiveValue {
 
 const Ctx = createContext<LiveValue | null>(null);
 
+// ---- background hand-over (data/BgWatchProvider.tsx) ----
+/**
+ * Called as the app goes to the background. It may start something that takes over the socket's
+ * job (Android's background watcher) and return a promise that settles once that is connected
+ * (or has failed once); the app's own socket closes only then, so the computer never sees the
+ * phone leave in between -- which would hand every held question back to the terminal. null =
+ * nothing takes over: close at once, as before. Must never reject.
+ */
+type BackgroundHandover = () => Promise<void> | null;
+let backgroundHandover: BackgroundHandover | null = null;
+export function setBackgroundHandover(h: BackgroundHandover | null): void {
+  backgroundHandover = h;
+}
+
 function applyPatch(prev: SessionLive, patch: LivePatch): SessionLive {
   return {
     ...prev,
@@ -1151,7 +1165,15 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     const sub = AppState.addEventListener("change", (s) => {
       const active = s === "active";
       const action = lifecycleAction(prev, s);
-      if (action === "suspend") clientRef.current?.suspend();
+      if (action === "suspend") {
+        const waitFor = backgroundHandover?.() ?? null;
+        const suspend = () => {
+          // back in front meanwhile: the socket stays (resume below was a no-op for it)
+          if (AppState.currentState !== "active") clientRef.current?.suspend();
+        };
+        if (waitFor) waitFor.then(suspend, suspend);
+        else clientRef.current?.suspend();
+      }
       if (action === "resume") {
         clientRef.current?.resume();
         // back in front: ask at once rather than wait out the interval (a no-op while the

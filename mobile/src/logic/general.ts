@@ -16,13 +16,23 @@ import { capFeed, genId } from "./feed";
 export type Scope = WireScope;
 export type RootChat = WireRootChat;
 
-export const SCOPE_EXPLAINER = "The chat can only see and read the projects you pick here.";
+export const SCOPE_EXPLAINER = "The chat can only see and read the projects you attach here.";
 export const EMPTY_CHAT_INFO = "Ask anything across your projects. Proposed work still needs your approval on your computer.";
 /** Antigravity chats have no Conduit tools: nothing to propose, so nothing to approve. */
 export const EMPTY_CHAT_INFO_AGY = "Ask anything across your projects. This chat can read them, but it can't start work on your computer.";
 
-/** The empty-chat note for a chat's agent. */
-export function emptyChatInfo(agent: string | undefined): string {
+/** A chat with nothing attached (every new chat): it knows none of the user's projects yet. */
+export const EMPTY_CHAT_INFO_UNATTACHED =
+  "Ask anything. This chat doesn't know about your projects yet: attach a profile or projects from the line under its title.";
+
+/** Nothing attached: not every project (null / all), and no profile or project named. */
+export function isUnattached(scope: Scope | null | undefined): boolean {
+  return !!scope && !scope.allProfiles && scope.profiles.length === 0 && scope.projects.length === 0;
+}
+
+/** The empty-chat note for a chat's agent (and, when given, what it has attached). */
+export function emptyChatInfo(agent: string | undefined, scope?: Scope | null): string {
+  if (isUnattached(scope)) return EMPTY_CHAT_INFO_UNATTACHED;
   return agent === "antigravity" ? EMPTY_CHAT_INFO_AGY : EMPTY_CHAT_INFO;
 }
 
@@ -68,7 +78,7 @@ export function scopeSummary(scope: Scope | null, view: WireProjectsView | null)
   if (!scope || scope.allProfiles) return "All projects";
   const profiles = unique(scope.profiles);
   const projects = unique(scope.projects);
-  if (profiles.length === 0 && projects.length === 0) return "No projects";
+  if (profiles.length === 0 && projects.length === 0) return "No projects attached";
   if (profiles.length === 1 && projects.length === 0) return `${profileLabel(view, profiles[0])} profile`;
   if (profiles.length === 0 && projects.length === 1) {
     return view?.projects.find((p) => p.id === projects[0])?.name ?? "1 project";
@@ -396,22 +406,94 @@ export function chatBadge(chat: RootChat, opts: RootChatOptions | null): string 
   return parts.join(" · ");
 }
 
-// ---- new chat: profile + scope ----
+// ---- new chat: agent only; attach projects later ----
 
-export type ScopeMode = "profile" | "all" | "custom";
+/** What a new chat sees: nothing. The user attaches profiles or projects from its settings,
+ * and the chat knows about them from the next message on. */
+export const NEW_CHAT_SCOPE: Scope = { allProfiles: false, profiles: [], projects: [] };
 
-/** The scope a new chat gets for `mode`: everything in its profile, everything, or the picked set. */
-export function newChatScope(mode: ScopeMode, profileId: string | null, custom: Scope): Scope {
-  if (mode === "all") return { allProfiles: true, profiles: [], projects: [] };
-  if (mode === "profile") return { allProfiles: false, profiles: [profileId], projects: [] };
-  return custom;
+export const ATTACH_EXPLAINER = "The chat only knows about what you attach. Changes apply from your next message.";
+
+/** The agents "+" offers, in the computer's order; Claude alone when the options never came. */
+export function startAgents(opts: RootChatOptions | null): AgentOption[] {
+  return opts && opts.agents.length > 0 ? opts.agents : FALLBACK_OPTIONS.agents;
 }
 
-/** The profiles a new chat can be listed under: the computer's, Default first if missing. */
-export function profileChoices(view: WireProjectsView | null): { id: string | null; name: string }[] {
-  const list = (view?.profiles ?? []).map((p) => ({ id: p.id, name: p.name }));
-  if (!list.some((p) => p.id === null)) list.unshift({ id: null, name: "Default" });
-  return list;
+/** The agent pre-selected in the chooser: the one picked last time if still offered, else
+ * Claude when offered, else the first. */
+export function preferredAgent(opts: RootChatOptions | null, remembered: string | null): string {
+  const agents = startAgents(opts);
+  if (remembered && agents.some((a) => a.id === remembered)) return remembered;
+  return agents.find((a) => a.id === "claude")?.id ?? agents[0].id;
+}
+
+/** "+" skips the chooser when there is nothing to choose. */
+export function needsAgentChoice(opts: RootChatOptions | null): boolean {
+  return startAgents(opts).length > 1;
+}
+
+/** The `rootchatcreate` options for a chat started on `agent` (computer defaults for the rest);
+ * undefined for an older desktop, which takes no options. */
+export function startSettings(opts: RootChatOptions | null, agent: string): WireRootChatSettings | undefined {
+  return opts?.live ? { agent } : undefined;
+}
+
+// ---- attached profiles / projects ----
+
+/** One thing attached to a chat, as a removable chip. */
+export type AttachedItem =
+  | { kind: "all"; key: string; label: string }
+  | { kind: "profile"; key: string; label: string; profileId: string | null }
+  | { kind: "project"; key: string; label: string; projectId: string };
+
+/** The chips of the Attached section: everything, each whole profile, each single project. */
+export function attachedItems(scope: Scope | null, view: WireProjectsView | null): AttachedItem[] {
+  if (!scope || scope.allProfiles) return [{ kind: "all", key: "all", label: "All projects" }];
+  const items: AttachedItem[] = [];
+  for (const id of unique(scope.profiles)) {
+    items.push({ kind: "profile", key: `profile:${id ?? ""}`, label: `${profileLabel(view, id)} profile`, profileId: id });
+  }
+  for (const id of unique(scope.projects)) {
+    items.push({ kind: "project", key: `project:${id}`, label: view?.projects.find((p) => p.id === id)?.name ?? "Removed project", projectId: id });
+  }
+  return items;
+}
+
+/** The scope with one chip removed. Detaching "All projects" leaves nothing attached. */
+export function detach(scope: Scope | null, item: AttachedItem): Scope {
+  const s = editableScope(scope);
+  switch (item.kind) {
+    case "all":
+      return { ...NEW_CHAT_SCOPE };
+    case "profile":
+      return { ...s, profiles: s.profiles.filter((p) => p !== item.profileId) };
+    case "project":
+      return { ...s, projects: s.projects.filter((p) => p !== item.projectId) };
+  }
+}
+
+/** How many of the computer's projects the scope covers. */
+export function attachedCount(scope: Scope | null, view: WireProjectsView | null): number {
+  if (!view) return 0;
+  const s = editableScope(scope);
+  return view.projects.filter((p) => projectCover(s, p.id, p.profileId ?? null, view) !== null).length;
+}
+
+/** The header's at-a-glance line: "No projects attached", "Arlo · 3 projects", "Home",
+ * "2 profiles · 5 projects", "All projects". */
+export function attachedSummary(scope: Scope | null, view: WireProjectsView | null): string {
+  if (!scope || scope.allProfiles) return "All projects";
+  const profiles = unique(scope.profiles);
+  const projects = unique(scope.projects);
+  if (profiles.length === 0 && projects.length === 0) return "No projects attached";
+  if (profiles.length === 0 && projects.length === 1) {
+    return view?.projects.find((p) => p.id === projects[0])?.name ?? "1 project";
+  }
+  const n = view ? attachedCount(scope, view) : projects.length;
+  const count = plural(n, "project");
+  if (profiles.length === 1) return `${profileLabel(view, profiles[0])} · ${count}`;
+  if (profiles.length > 1) return `${plural(profiles.length, "profile")} · ${count}`;
+  return count;
 }
 
 // ---- skills in the composer ----

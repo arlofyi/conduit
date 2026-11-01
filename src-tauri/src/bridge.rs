@@ -178,6 +178,8 @@ pub enum ClientMsg {
         name: Option<String>,
         #[serde(default)]
         keep_running: Option<bool>,
+        #[serde(default)]
+        auto_approve: Option<bool>,
     },
     /// Every agent account's usage, from cached reads only (`phone_usage.rs`). Answered
     /// with `usage`.
@@ -532,6 +534,7 @@ impl std::fmt::Debug for ClientMsg {
                 effort,
                 name,
                 keep_running,
+                auto_approve,
             } => f
                 .debug_struct("SessionSet")
                 .field("session_id", session_id)
@@ -540,6 +543,7 @@ impl std::fmt::Debug for ClientMsg {
                 .field("effort", effort)
                 .field("name", name)
                 .field("keep_running", keep_running)
+                .field("auto_approve", auto_approve)
                 .finish(),
             Self::Usage { request_id } => f
                 .debug_struct("Usage")
@@ -2996,6 +3000,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         effort,
                         name,
                         keep_running,
+                        auto_approve,
                     }) => {
                         let reply = crate::session_options::apply_set(
                             &app,
@@ -3005,6 +3010,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             effort,
                             name,
                             keep_running,
+                            auto_approve,
                         );
                         if !send_text(&mut ws, reply.to_string()) {
                             break 'conn;

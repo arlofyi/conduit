@@ -319,6 +319,7 @@ pub fn projects_view(
                         "model": s.model,
                         "effort": s.effort,
                         "keepRunning": s.keep_running,
+                        "autoApprove": s.auto_approve,
                         // Opaque (a hash of agent + account), never the account id.
                         "usageKey": usage_key(p, s),
                         "stopped": s.stopped,
@@ -654,6 +655,7 @@ mod tests {
             [
                 "activity",
                 "agent",
+                "autoApprove",
                 "branch",
                 "effort",
                 "id",

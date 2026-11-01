@@ -56,6 +56,14 @@ describe("parseSessionOptions", () => {
     expect(parseSessionOptions({ type: "sessionOptions" })).toBeNull();
     const o = parseSessionOptions({ type: "sessionOptions", sessionId: "s" })!;
     expect(o).toMatchObject({ model: null, effort: null, keepRunning: false, modelLive: false, models: [], commands: [] });
+    expect(o.autoApprove).toBe(false);
+    expect(o.autoApproveSupported).toBe(false);
+  });
+  it("reads auto-approve and whether the agent supports it", () => {
+    const o = parseSessionOptions({ type: "sessionOptions", sessionId: "s", autoApprove: true, autoApproveSupported: true })!;
+    expect(o.autoApprove).toBe(true);
+    expect(o.autoApproveSupported).toBe(true);
+    expect(parseSessionOptions({ type: "sessionOptions", sessionId: "s", autoApprove: "yes" })!.autoApprove).toBe(false);
   });
 });
 

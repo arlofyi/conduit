@@ -35,6 +35,11 @@ All notable changes to Conduit are documented here. This project uses
   session stops to ask "Run this command?", the phone (and the desktop's permission cards)
   now show the request with Allow and Deny, like Claude's. Allow runs it; Deny cancels the
   step and Antigravity asks what to do instead. Answering in the terminal clears the card.
+- **Added — Auto-approve for Antigravity sessions.** Switch it on in a session's sheet on
+  the phone, or from the session's right-click menu on the computer, and Conduit answers
+  every permission request from that session with Allow (commands and file edits
+  included). Antigravity's own auto mode still asks for every command, so Conduit answers
+  for it.
 - **Added — Project files on the phone.** Browse a session's folder from its info sheet or
   the folder button in the chat, read files (Markdown rendered), view images, edit and save
   text files, and save any file to a folder you choose on the phone (or share it). A file changed
@@ -42,14 +47,18 @@ All notable changes to Conduit are documented here. This project uses
   never followed, and secrets such as `.env` or key files ask before they open and can't be
   edited from the phone. Private sessions stay closed.
 - **Added — General chat on the phone.** The new Chats tab (the old Chats tab, your sessions, is now Sessions) is the root chat from your
-  computer: ask questions across your projects without a coding session. A new chat covers
-  every project in the profile you're viewing; widen it to all profiles, or pick profiles
-  and projects. A chat only sees, and can only read the files of, the projects in its scope,
-  and a chat used from the phone never reads a private session.
-- **Added — Choose the agent, model and effort for a general chat.** A new chat on the phone
-  can run on Claude or Antigravity (fixed for that chat), with a model and reasoning effort
-  you pick; model and effort can be changed mid-chat from the chat's header. The desktop
-  chat header shows a chat's non-default choices.
+  computer: ask questions across your projects without a coding session. "+" starts a chat
+  at once: it only asks which agent to use (Claude or Antigravity, remembering your last
+  pick), and skips even that when your computer offers just one. A new chat starts with
+  nothing attached and knows none of your projects; like attaching a folder, attach whole
+  profiles or single projects from the chat's settings (the line under its title shows what
+  is attached, e.g. "No projects attached" or "Work · 3 projects"), and detach them the same
+  way. A chat only sees, and can only read the files of, what is attached, and a chat used
+  from the phone never reads a private session.
+- **Added — Choose the model and effort for a general chat.** A chat runs on the agent it was
+  started with; its model, reasoning effort, deep research and MCP servers are set from the
+  chat's settings and apply from the next message. The settings sheet scrolls, with Save
+  always in reach. The desktop chat header shows a chat's non-default choices.
 - **Added — Deep research in general chat.** Switch it on and the chat works harder: it
   searches widely, reads the sources themselves, cross-checks, cites its links and says what
   it could not verify.

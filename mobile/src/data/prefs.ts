@@ -13,6 +13,10 @@ export interface Prefs {
   notifyFinished: boolean;
   /** mirror the computer's local web apps onto this phone's localhost (Android; Apps tab) */
   mirrorPorts: boolean;
+  /** Android: the notification permission was asked for once already (never nag) */
+  notifyAsked: boolean;
+  /** Android: the "your phone may stop Conduit in the background" hint was dismissed */
+  batteryHintDismissed: boolean;
   theme: ThemeId;
 }
 
@@ -23,10 +27,18 @@ export const DEFAULT_PREFS: Prefs = {
   notifyPermission: true,
   notifyFinished: false,
   mirrorPorts: false,
+  notifyAsked: false,
+  batteryHintDismissed: false,
   theme: DEFAULT_THEME,
 };
 
-type BoolKey = "notifyQuestion" | "notifyPermission" | "notifyFinished" | "mirrorPorts";
+type BoolKey =
+  | "notifyQuestion"
+  | "notifyPermission"
+  | "notifyFinished"
+  | "mirrorPorts"
+  | "notifyAsked"
+  | "batteryHintDismissed";
 
 /** Unknown or wrong-typed fields fall back to their defaults one at a time; a corrupt blob
  * is the defaults. */
@@ -50,6 +62,8 @@ export function parsePrefs(raw: string | null): Prefs {
     notifyPermission: bool("notifyPermission"),
     notifyFinished: bool("notifyFinished"),
     mirrorPorts: bool("mirrorPorts"),
+    notifyAsked: bool("notifyAsked"),
+    batteryHintDismissed: bool("batteryHintDismissed"),
     theme,
   };
 }

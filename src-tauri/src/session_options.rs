@@ -627,6 +627,7 @@ pub fn options_json(
     model: Option<&str>,
     effort: Option<&str>,
     keep_running: bool,
+    auto_approve: bool,
     o: &Options,
 ) -> Value {
     json!({
@@ -637,6 +638,8 @@ pub fn options_json(
         "model": model,
         "effort": effort,
         "keepRunning": keep_running,
+        "autoApprove": auto_approve,
+        "autoApproveSupported": auto_approve_supported(agent),
         "modelLive": o.model_live,
         "models": o.models.iter().map(|(id, label)| json!({ "id": id, "label": label })).collect::<Vec<_>>(),
         "modelsPending": o.models_pending,
@@ -673,8 +676,15 @@ pub fn options_frame(app: &AppHandle, session_id: &str, request_id: &str) -> Val
         s.model.as_deref(),
         s.effort.as_deref(),
         s.keep_running,
+        s.auto_approve,
         &o,
     )
+}
+
+/// Agents whose permission prompts Conduit can answer itself. agy only: its prompts are read
+/// from its conversation db (`agy_prompts.rs`). Claude has its own `--permission-mode`.
+pub fn auto_approve_supported(agent: AgentId) -> bool {
+    agent == AgentId::Antigravity
 }
 
 /// A model id a phone may send: what `/model <id>` and `--model <id>` take (aliases, full
@@ -716,6 +726,7 @@ pub fn set_result(request_id: &str, ok: bool, note: &str) -> Value {
 
 /// Apply a `sessionset`. Each named field is applied in turn; `ok` is false if any was
 /// refused, and `note` says what happened in short user-facing copy.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_set(
     app: &AppHandle,
     session_id: &str,
@@ -724,6 +735,7 @@ pub fn apply_set(
     effort: Option<String>,
     name: Option<String>,
     keep_running: Option<bool>,
+    auto_approve: Option<bool>,
 ) -> Value {
     let store = app.state::<Arc<Store>>();
     let pty = app.state::<Arc<crate::pty::PtyManager>>();
@@ -815,6 +827,20 @@ pub fn apply_set(
         } else {
             "It can auto-stop when idle again.".into()
         });
+    }
+
+    if let Some(on) = auto_approve {
+        if auto_approve_supported(s.agent) {
+            store.set_session_auto_approve(session_id, on);
+            notes.push(if on {
+                "Auto-approve is on: every request is allowed.".into()
+            } else {
+                "Auto-approve is off: requests ask you again.".into()
+            });
+        } else {
+            ok = false;
+            notes.push("Auto-approve isn't available for this agent yet.".into());
+        }
     }
 
     if want_restart {
@@ -978,7 +1004,16 @@ mod tests {
             mcps,
             [("github", "user", true), ("repo-db", "project", true)]
         );
-        let frame = options_json("r", "s", AgentId::Claude, Some("opus"), None, true, &o);
+        let frame = options_json(
+            "r",
+            "s",
+            AgentId::Claude,
+            Some("opus"),
+            None,
+            true,
+            false,
+            &o,
+        );
         assert!(!frame.to_string().contains("SECRET"), "MCP config leaked");
 
         let many: Vec<CommandItem> = (0..300)

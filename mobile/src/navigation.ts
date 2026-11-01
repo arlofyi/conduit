@@ -30,11 +30,10 @@ export type RootStackParamList = {
   NewChat: undefined;
   /** "…" on Chats: profile + Switch computer */
   ChatsMenu: undefined;
-  /** the chat header's preferences button: files, session options, commands, MCP servers,
-   * compact / clear / stop. `projectId`/`name`/`branch` let it hand a command back to the chat. */
+  /** the ONE session sheet (the chat header's title tap and its preferences button): details,
+   * files, session options, commands, MCP servers, compact / clear / stop.
+   * `projectId`/`name`/`branch` let it hand a command back to the chat. */
   QuickActions: { sessionId: string; running: boolean; agent: string; projectId?: string; name?: string; branch?: string | null };
-  /** tap the chat header */
-  SessionInfo: { sessionId: string; projectId: string };
   /** one folder of a session's directory ("" = its root), pushed per folder; `title` names the root */
   Files: { sessionId: string; path: string; title?: string };
   /** one file of a session's directory */
@@ -43,10 +42,11 @@ export type RootStackParamList = {
   GeneralChat: { chatId: string; title?: string };
   /** the scope chip on a general chat: which projects it may see */
   GeneralScope: { chatId: string };
-  /** "+" on the Chats (general) tab: profile, scope, agent, model, effort, research, MCP servers */
+  /** "+" on the Chats (general) tab when there is an agent to choose: which agent, then the chat */
   GeneralNew: undefined;
-  /** a general chat's settings button: model, effort, research, MCP servers (agent read-only) */
-  GeneralSettings: { chatId: string };
+  /** a general chat's settings: attached profiles/projects, model, effort, research, MCP
+   * servers (agent read-only). `attach` opens with the attach picker expanded. */
+  GeneralSettings: { chatId: string; attach?: boolean };
 };
 
 export type ChatsProps = CompositeScreenProps<
@@ -67,7 +67,6 @@ export type PairProps = NativeStackScreenProps<RootStackParamList, "Pair">;
 export type NewChatProps = NativeStackScreenProps<RootStackParamList, "NewChat">;
 export type ChatsMenuProps = NativeStackScreenProps<RootStackParamList, "ChatsMenu">;
 export type QuickActionsProps = NativeStackScreenProps<RootStackParamList, "QuickActions">;
-export type SessionInfoProps = NativeStackScreenProps<RootStackParamList, "SessionInfo">;
 export type FilesProps = NativeStackScreenProps<RootStackParamList, "Files">;
 export type FileViewProps = NativeStackScreenProps<RootStackParamList, "FileView">;
 export type GeneralProps = CompositeScreenProps<

@@ -1,6 +1,6 @@
 /**
  * The small native sheets (iOS form sheets, fitted to their content, grabber visible, swipe
- * to dismiss): the Chats "…" menu, the chat header's session preferences, and session details.
+ * to dismiss): the Chats "…" menu and the session sheet (details + preferences in one).
  */
 import { type AppSymbol } from "../components/androidSymbols";
 import React, { useCallback, useEffect, useState } from "react";
@@ -12,7 +12,7 @@ import { GlassCircle, Icon } from "../components/Glass";
 import { useListSelection } from "../data/ListSelection";
 import { agentInfo } from "../logic/agents";
 import { accentFor } from "../logic/accent";
-import { modelLabel } from "../logic/chatHeader";
+import { activeModel, contextRing, effortText } from "../logic/sessionHeader";
 import { ALL_PROFILES, profileSheet, profileSummary, resolveProfile, isNeeds } from "../logic/chatList";
 import { QUICK_ACTIONS, quickActionMsgs, quickActionsFor, type QuickAction } from "../logic/quickActions";
 import type { SessionSetPatch } from "../bridge/protocol";
@@ -26,7 +26,7 @@ import {
   type CommandOption,
   type SessionOptions,
 } from "../logic/sessionOptions";
-import type { ChatsMenuProps, QuickActionsProps, SessionInfoProps } from "../navigation";
+import type { ChatsMenuProps, QuickActionsProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, MONO, TYPE } from "../theme/type";
 
@@ -192,22 +192,27 @@ export function ChatsMenuScreen({ navigation }: ChatsMenuProps) {
   );
 }
 
-// ---- the chat header's preferences button ----
+// ---- the session sheet: the chat header's title tap AND its preferences button ----
 
 type Expanded = "model" | "effort" | "rename" | null;
 
 /**
- * Everything about a session that is not a message: its files; its model, effort, name and
- * keep-running pin; its slash commands and skills (tap one to put it in the composer); its MCP
- * servers; and Interrupt / Compact / Clear / Stop. The options come from `sessionoptions`; an
- * older computer that never answers still gets files and the actions.
+ * ONE sheet for a session (Round 4: the title tap and the preferences button used to open two
+ * overlapping sheets). On top, what it is: the avatar ringed with its context use, its name,
+ * project and status, and Project / Agent / Branch / Context rows. Below, everything about it
+ * that is not a message: Interrupt and Files; its model, effort, name, keep-running pin and
+ * auto-approve; its slash commands and skills (tap one to put it in the composer); its MCP
+ * servers; and Compact / Clear / Stop. The options come from `sessionoptions`; an older computer
+ * that never answers still gets the details, files and the actions.
  */
 export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
   const { palette: p } = useTheme();
-  const { sendFrames, interrupt, prompt, view, sessionOptions, sessionSet, sessionAction } = useLive();
+  const { sendFrames, interrupt, prompt, view, sessionOptions, sessionSet, sessionAction, context, sessionLive } = useLive();
   const { sessionId, running, agent, projectId, name, branch } = route.params;
-  const session = view?.projects.flatMap((x) => x.sessions).find((s) => s.id === sessionId) ?? null;
+  const project = view?.projects.find((x) => x.sessions.some((s) => s.id === sessionId)) ?? view?.projects.find((x) => x.id === projectId) ?? null;
+  const session = project?.sessions.find((s) => s.id === sessionId) ?? null;
   const silo = !!session?.silo;
+  const [autoApprove, setAutoApprove] = useState<boolean>(session?.autoApprove === true);
   const [opts, setOpts] = useState<SessionOptions | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Expanded>(null);
@@ -223,6 +228,7 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
       if (r.ok) {
         setOpts(r.options);
         setKeepRunning(r.options.keepRunning);
+        setAutoApprove(r.options.autoApprove);
       } else setLoadError(r.error);
     });
   }, [sessionId, sessionOptions]);
@@ -237,7 +243,15 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
     setNote({ text: r.note ?? (r.ok ? fallback : "Your computer didn't make that change."), ok: r.ok });
     if (r.ok) {
       setOpts((o) =>
-        o ? { ...o, model: patch.model ?? o.model, effort: patch.effort ?? o.effort, keepRunning: patch.keepRunning ?? o.keepRunning } : o,
+        o
+          ? {
+              ...o,
+              model: patch.model ?? o.model,
+              effort: patch.effort ?? o.effort,
+              keepRunning: patch.keepRunning ?? o.keepRunning,
+              autoApprove: patch.autoApprove ?? o.autoApprove,
+            }
+          : o,
       );
       setExpanded(null);
     }
@@ -245,9 +259,26 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
   };
 
   const sessionName = session?.name ?? name ?? "Session";
-  const model = opts?.model ?? session?.model ?? null;
+  // `opts.model`/`effort` are PINS (null when unpinned): the sheet shows what is ACTIVE -- the
+  // pin, else the model the session reports (transcript, then view); an unpinned effort is
+  // "Default". Never a dash.
+  const active = activeModel({ pinned: opts?.model, live: context?.model ?? session?.model ?? null, models: opts?.models });
+  const model = active.id;
   const effort = opts?.effort ?? session?.effort ?? null;
-  const modelText = (id: string | null) => (id ? (opts?.models.find((m) => m.id === id)?.label ?? modelLabel(id) ?? id) : "—");
+  const agentId = session?.agent ?? agent;
+  const color = project ? accentFor(project) : null;
+  const ring = contextRing(context ? context.fraction : null);
+  const needs = session ? isNeeds(session) : false;
+  const working = !needs && (running || sessionLive.status === "running" || session?.status === "running");
+  const status = needs ? "Needs you" : working ? "Working" : session?.stopped ? "Stopped" : "Idle";
+  const statusColor = needs ? p.amber : working ? p.green : p.textMid;
+  const avatarState = needs ? "needsInput" : working ? "running" : session?.stopped ? undefined : "idle";
+  const infoRows: { symbol: AppSymbol; title: string; value: string; mono?: boolean; tint?: string }[] = [
+    { symbol: "folder", title: "Project", value: project?.name ?? "—", tint: color ?? undefined },
+    { symbol: "cpu", title: "Agent", value: agentInfo(agentId).label },
+    ...(session?.branch ? [{ symbol: "arrow.triangle.branch" as const, title: "Branch", value: session.branch, mono: true }] : []),
+    ...(ring ? [{ symbol: "gauge.with.dots.needle.33percent" as const, title: "Context", value: `${ring.percent}% used` }] : []),
+  ];
   const commands = opts ? filterCommands(opts.commands, query) : [];
   const shown = commands.slice(0, COMMANDS_SHOWN);
   const renamed = renameValue(rename, sessionName);
@@ -301,7 +332,53 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
   const steer = actions.filter((a) => a.id !== "stop");
 
   return (
-    <SheetScaffold title={sessionName} onClose={() => navigation.goBack()}>
+    <SheetScaffold title="Session" onClose={() => navigation.goBack()}>
+      <View style={{ alignItems: "center", gap: 6, marginBottom: 16, paddingHorizontal: 24 }}>
+        <AgentAvatar agent={agentId} projectColor={color} state={avatarState} size={64} ground={p.panelBg} context={ring ? ring.fraction : null} />
+        <Text style={{ fontSize: TYPE.title3, fontWeight: "600", color: p.textBright, textAlign: "center" }} numberOfLines={2}>
+          {sessionName}
+        </Text>
+        <Text style={{ fontSize: TYPE.footnote, textAlign: "center" }} numberOfLines={1}>
+          {project ? <Text style={{ color: color ?? p.textMid, fontWeight: "600" }}>{project.name}</Text> : null}
+          {project ? <Text style={{ color: p.textDim }}>{"  ·  "}</Text> : null}
+          <Text style={{ color: statusColor }}>{status}</Text>
+          {autoApprove ? <Text style={{ color: p.amber }}>{"  ·  auto-approve on"}</Text> : null}
+        </Text>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 2 }}>
+          <InfoChip symbol="sparkles" text={active.label} label={`Model ${active.label}`} />
+          <InfoChip symbol="gauge.with.dots.needle.33percent" text={effortText(effort)} label={`Effort ${effortText(effort)}`} />
+        </View>
+      </View>
+
+      <Group>
+        {infoRows.map((r, i) => (
+          <View
+            key={r.title}
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 12,
+              minHeight: MIN_TOUCH,
+              paddingHorizontal: 16,
+              paddingVertical: 10,
+              borderTopWidth: i === 0 ? 0 : StyleSheet.hairlineWidth,
+              borderTopColor: p.border,
+            }}
+          >
+            <View style={{ width: 24, alignItems: "center" }}>
+              <Icon name={r.symbol} size={17} color={r.tint ?? p.textMid} />
+            </View>
+            <Text style={{ flex: 1, fontSize: TYPE.body, color: p.textBright }}>{r.title}</Text>
+            <Text
+              style={{ maxWidth: "58%", fontSize: r.mono ? TYPE.footnote : TYPE.subhead, color: p.textMid, fontFamily: r.mono ? MONO : undefined }}
+              numberOfLines={1}
+            >
+              {r.value}
+            </Text>
+          </View>
+        ))}
+      </Group>
+
       {note ? (
         <View
           accessibilityLiveRegion="polite"
@@ -357,7 +434,7 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
             first
             symbol="sparkles"
             title="Model"
-            trailing={modelText(model)}
+            trailing={active.label}
             detail={opts && !opts.modelLive ? "Applies at the next start" : undefined}
             disabled={!opts || opts.models.length === 0 || busy}
             onPress={() => setExpanded((e) => (e === "model" ? null : "model"))}
@@ -379,9 +456,9 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
               ))
             : null}
           <SheetRow
-            symbol="bolt"
+            symbol="gauge.with.dots.needle.33percent"
             title="Effort"
-            trailing={effort ? effortName(effort) : "—"}
+            trailing={effortText(effort)}
             detail={opts && opts.efforts.length > 0 ? "Applies at the next start" : undefined}
             disabled={!opts || opts.efforts.length === 0 || busy}
             onPress={() => setExpanded((e) => (e === "effort" ? null : "effort"))}
@@ -476,6 +553,39 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
               }}
             />
           </View>
+          {opts?.autoApproveSupported ? (
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 12,
+                minHeight: MIN_TOUCH + 6,
+                paddingHorizontal: 16,
+                paddingVertical: 8,
+                borderTopWidth: StyleSheet.hairlineWidth,
+                borderTopColor: p.border,
+              }}
+            >
+              <View style={{ width: 24, alignItems: "center" }}>
+                <Icon name="bolt" size={19} color={autoApprove ? p.amber : p.textBright} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontSize: TYPE.body, color: p.textBright }}>Auto-approve</Text>
+                <Text style={{ fontSize: TYPE.footnote, color: p.textMid }}>Allow every request automatically – commands and file edits included.</Text>
+              </View>
+              <Switch
+                value={autoApprove}
+                disabled={busy}
+                accessibilityLabel="Auto-approve"
+                trackColor={{ true: p.amber, false: p.selectionBg }}
+                onValueChange={async (v) => {
+                  setAutoApprove(v);
+                  const ok = await set({ autoApprove: v }, v ? "Auto-approve on: every request is allowed" : "Auto-approve off: requests ask you again");
+                  if (!ok) setAutoApprove(!v);
+                }}
+              />
+            </View>
+          ) : null}
         </Group>
       )}
 
@@ -622,92 +732,19 @@ function CommandRow({ c, onInsert, onRun }: { c: CommandOption; onInsert?: () =>
   );
 }
 
-// ---- tap the chat header ----
-
-export function SessionInfoScreen({ navigation, route }: SessionInfoProps) {
+/** A small labelled chip under the sheet's title: the active model, the effort. */
+function InfoChip({ symbol, text, label }: { symbol: AppSymbol; text: string; label: string }) {
   const { palette: p } = useTheme();
-  const { view, context, sessionLive } = useLive();
-  const { sessionId, projectId } = route.params;
-  const project = view?.projects.find((x) => x.sessions.some((s) => s.id === sessionId)) ?? view?.projects.find((x) => x.id === projectId);
-  const session = project?.sessions.find((s) => s.id === sessionId) ?? null;
-  const agent = agentInfo(session?.agent ?? "");
-  const color = project ? accentFor(project) : null;
-  const model = modelLabel(context?.model ?? session?.model ?? null);
-  const pct = context ? Math.round(Math.min(1, Math.max(0, context.fraction)) * 100) : null;
-  const state = session && isNeeds(session) ? "Needs you" : sessionLive.status === "running" || session?.status === "running" ? "Working" : session?.stopped ? "Stopped" : "Idle";
-  const rows: { symbol: AppSymbol; title: string; value: string; mono?: boolean }[] = [
-    { symbol: "folder", title: "Project", value: project?.name ?? "—" },
-    { symbol: "cpu", title: "Agent", value: agent.label },
-    { symbol: "sparkles", title: "Model", value: model ?? "—" },
-    { symbol: "gauge.with.dots.needle.33percent", title: "Context", value: pct === null ? "—" : `${pct}% used` },
-    { symbol: "arrow.triangle.branch", title: "Branch", value: session?.branch ?? "—", mono: true },
-    { symbol: "circle.dotted", title: "Status", value: state },
-  ];
-  return (
-    <SheetScaffold title="Session" onClose={() => navigation.goBack()}>
-      <View style={{ alignItems: "center", gap: 8, marginBottom: 16 }}>
-        <AgentAvatar agent={session?.agent ?? ""} projectColor={color} size={64} ground={p.panelBg} />
-        <Text style={{ fontSize: TYPE.title3, fontWeight: "600", color: p.textBright }} numberOfLines={1}>
-          {session?.name ?? "Session"}
-        </Text>
-        {pct !== null && <ContextMeter fraction={pct / 100} />}
-      </View>
-      <Group>
-        {rows.map((r, i) => (
-          <View
-            key={r.title}
-            style={{
-              flexDirection: "row",
-              alignItems: "center",
-              gap: 12,
-              minHeight: MIN_TOUCH,
-              paddingHorizontal: 16,
-              paddingVertical: 10,
-              borderTopWidth: i === 0 ? 0 : StyleSheet.hairlineWidth,
-              borderTopColor: p.border,
-            }}
-          >
-            <View style={{ width: 24, alignItems: "center" }}>
-              <Icon name={r.symbol} size={17} color={r.title === "Project" && color ? color : p.textMid} />
-            </View>
-            <Text style={{ flex: 1, fontSize: TYPE.body, color: p.textBright }}>{r.title}</Text>
-            <Text
-              style={{ maxWidth: "58%", fontSize: r.mono ? TYPE.footnote : TYPE.subhead, color: p.textMid, fontFamily: r.mono ? MONO : undefined }}
-              numberOfLines={1}
-            >
-              {r.value}
-            </Text>
-          </View>
-        ))}
-      </Group>
-      <Group>
-        <SheetRow
-          first
-          symbol="folder"
-          title="Files"
-          detail={session?.silo ? "Private: its files stay on your computer" : "Browse, read and edit this session's files"}
-          tone="accent"
-          disabled={!!session?.silo}
-          onPress={() => {
-            navigation.goBack();
-            navigation.navigate("Files", { sessionId, path: "", title: session?.name ?? project?.name });
-          }}
-        />
-      </Group>
-    </SheetScaffold>
-  );
-}
-
-function ContextMeter({ fraction }: { fraction: number }) {
-  const { palette: p } = useTheme();
-  const color = fraction >= 0.85 ? p.red : fraction >= 0.6 ? p.amber : p.green;
   return (
     <View
       accessible
-      accessibilityLabel={`${Math.round(fraction * 100)} percent of the context window used`}
-      style={{ width: 120, height: 4, borderRadius: 2, backgroundColor: p.selectionBg, overflow: "hidden" }}
+      accessibilityLabel={label}
+      style={{ flexDirection: "row", alignItems: "center", gap: 5, maxWidth: 180, paddingHorizontal: 9, paddingVertical: 4, borderRadius: 12, backgroundColor: p.selectionBg }}
     >
-      <View style={{ width: `${Math.round(fraction * 100)}%`, height: 4, backgroundColor: color }} />
+      <Icon name={symbol} size={12} color={p.textMid} />
+      <Text style={{ flexShrink: 1, fontSize: TYPE.footnote, fontWeight: "600", color: p.textBright }} numberOfLines={1}>
+        {text}
+      </Text>
     </View>
   );
 }

@@ -159,8 +159,9 @@ pub(crate) fn chat_may_peek(store: &Store, chat_id: &str, session: &Session) -> 
 }
 
 /// May chat `me` see chat `other` (`chats_list` / `chat_read`)? An unscoped chat, or one
-/// scoped to every profile, sees all chats; a scoped one sees chats in its own profile and
-/// in the profiles its scope names -- never a chat about projects it cannot see.
+/// scoped to every profile, sees all chats; a scoped one sees only chats in the profiles its
+/// scope ATTACHES -- never a chat about projects it cannot see. The profile a chat is merely
+/// listed under is not attached: a new chat (empty scope) sees no other chat at all.
 fn chat_visible(me: Option<&crate::store::RootChat>, other: &crate::store::RootChat) -> bool {
     let Some(me) = me else {
         return true;
@@ -168,9 +169,7 @@ fn chat_visible(me: Option<&crate::store::RootChat>, other: &crate::store::RootC
     match &me.scope {
         None => true,
         Some(scope) if scope.all_profiles => true,
-        Some(scope) => {
-            other.profile_id == me.profile_id || scope.profiles.contains(&other.profile_id)
-        }
+        Some(scope) => scope.profiles.contains(&other.profile_id),
     }
 }
 
@@ -810,6 +809,35 @@ mod tests {
         let proposals = Proposals::default();
         let args = json!({"projectId": other.id, "task": "x"});
         assert!(dispatch_work_inner(&store, &proposals, &chat.id, &args, 1).is_err());
+    }
+
+    #[test]
+    fn a_chat_with_nothing_attached_sees_no_project_session_or_chat() {
+        let dir = temp_dir("empty-scope");
+        let store = Store::for_test(&dir);
+        let p = store.add_project("/repo".into(), store.active_profile());
+        let me = store.add_root_chat_with(
+            store.active_profile(),
+            Some(crate::store::ChatScope::default()),
+            true,
+        );
+        let other = store.add_root_chat_with(store.active_profile(), None, false);
+        assert!(store.projects_for_chat(&me.id).is_empty());
+        // Same profile, but the profile is only where it is LISTED, not attached.
+        assert!(!chat_visible(Some(&me), &other));
+        let args = json!({"projectId": p.id, "task": "x"});
+        assert!(dispatch_work_inner(&store, &Proposals::default(), &me.id, &args, 1).is_err());
+        // Attaching the profile shows its chats; an unscoped chat sees everything.
+        store.set_root_chat_scope(
+            &me.id,
+            Some(crate::store::ChatScope {
+                profiles: vec![store.active_profile()],
+                ..Default::default()
+            }),
+        );
+        let me = store.root_chat(&me.id).unwrap();
+        assert!(chat_visible(Some(&me), &other));
+        assert!(chat_visible(Some(&other), &me));
     }
 
     #[test]

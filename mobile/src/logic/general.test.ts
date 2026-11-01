@@ -27,13 +27,21 @@ import {
   emptyChatInfo,
   insertSkill,
   modelName,
-  newChatScope,
   optionsOf,
   pickAgent,
-  profileChoices,
   settingsPatch,
   skillSuggestions,
   toggleMcp,
+  NEW_CHAT_SCOPE,
+  EMPTY_CHAT_INFO_UNATTACHED,
+  attachedItems,
+  attachedSummary,
+  detach,
+  isUnattached,
+  needsAgentChoice,
+  preferredAgent,
+  startAgents,
+  startSettings,
 } from "./general";
 
 const view: WireProjectsView = {
@@ -97,7 +105,7 @@ describe("scope summary", () => {
     expect(scopeSummary({ allProfiles: false, profiles: [], projects: ["p3"] }, view)).toBe("Home");
     expect(scopeSummary({ allProfiles: false, profiles: [null, "work"], projects: ["p1"] }, view)).toBe("2 profiles, 1 project");
     expect(scopeSummary({ allProfiles: false, profiles: [], projects: ["p1", "p2"] }, view)).toBe("2 projects");
-    expect(scopeSummary({ allProfiles: false, profiles: [], projects: [] }, view)).toBe("No projects");
+    expect(scopeSummary({ allProfiles: false, profiles: [], projects: [] }, view)).toBe("No projects attached");
   });
 });
 
@@ -297,19 +305,66 @@ describe("chat options", () => {
   });
 });
 
-describe("new chat profile + scope", () => {
-  it("scope modes", () => {
-    const custom = { allProfiles: false, profiles: [], projects: ["p1"] };
-    expect(newChatScope("profile", "work", custom)).toEqual({ allProfiles: false, profiles: ["work"], projects: [] });
-    expect(newChatScope("profile", null, custom)).toEqual({ allProfiles: false, profiles: [null], projects: [] });
-    expect(newChatScope("all", "work", custom)).toEqual({ allProfiles: true, profiles: [], projects: [] });
-    expect(newChatScope("custom", "work", custom)).toBe(custom);
+describe("new chat: agent only, nothing attached", () => {
+  const two = optionsOf({ agents: [{ id: "claude", label: "Claude" }, { id: "antigravity", label: "Antigravity" }] })!;
+  const one = optionsOf({ agents: [{ id: "antigravity" }] })!;
+
+  it("a new chat sees nothing", () => {
+    expect(NEW_CHAT_SCOPE).toEqual({ allProfiles: false, profiles: [], projects: [] });
+    expect(isUnattached(NEW_CHAT_SCOPE)).toBe(true);
+    // null (a chat from before scopes) is everything, never "unattached"
+    expect(isUnattached(null)).toBe(false);
+    expect(isUnattached({ allProfiles: true, profiles: [], projects: [] })).toBe(false);
+    expect(emptyChatInfo("claude", NEW_CHAT_SCOPE)).toBe(EMPTY_CHAT_INFO_UNATTACHED);
+    expect(emptyChatInfo("claude", { allProfiles: false, profiles: ["work"], projects: [] })).toBe(EMPTY_CHAT_INFO);
   });
 
-  it("profile choices always include Default", () => {
-    expect(profileChoices(view).map((p) => p.id)).toEqual([null, "work"]);
-    expect(profileChoices({ ...view, profiles: [{ id: "work", name: "Work" }] }).map((p) => p.id)).toEqual([null, "work"]);
-    expect(profileChoices(null)).toEqual([{ id: null, name: "Default" }]);
+  it("the chooser appears only when there is a choice; Claude when options never came", () => {
+    expect(needsAgentChoice(two)).toBe(true);
+    expect(needsAgentChoice(one)).toBe(false);
+    expect(needsAgentChoice(null)).toBe(false);
+    expect(needsAgentChoice(FALLBACK_OPTIONS)).toBe(false);
+    expect(startAgents(null).map((a) => a.id)).toEqual(["claude"]);
+  });
+
+  it("pre-selects the last-picked agent while it is still offered", () => {
+    expect(preferredAgent(two, "antigravity")).toBe("antigravity");
+    expect(preferredAgent(two, null)).toBe("claude");
+    expect(preferredAgent(two, "codex")).toBe("claude");
+    expect(preferredAgent(one, "claude")).toBe("antigravity");
+    expect(preferredAgent(null, "antigravity")).toBe("claude");
+  });
+
+  it("an older desktop gets no options in the create frame", () => {
+    expect(startSettings(two, "antigravity")).toEqual({ agent: "antigravity" });
+    expect(startSettings(FALLBACK_OPTIONS, "claude")).toBeUndefined();
+    expect(startSettings(null, "claude")).toBeUndefined();
+  });
+});
+
+describe("attached profiles and projects", () => {
+  it("summarizes what is attached at a glance", () => {
+    expect(attachedSummary(NEW_CHAT_SCOPE, view)).toBe("No projects attached");
+    expect(attachedSummary(null, view)).toBe("All projects");
+    expect(attachedSummary({ allProfiles: false, profiles: ["work"], projects: [] }, view)).toBe("Work · 2 projects");
+    // a project on a deleted profile counts as Default
+    expect(attachedSummary({ allProfiles: false, profiles: [null], projects: [] }, view)).toBe("Default · 2 projects");
+    expect(attachedSummary({ allProfiles: false, profiles: [], projects: ["p3"] }, view)).toBe("Home");
+    expect(attachedSummary({ allProfiles: false, profiles: [], projects: ["p1", "p3"] }, view)).toBe("2 projects");
+    expect(attachedSummary({ allProfiles: false, profiles: ["work"], projects: ["p3"] }, view)).toBe("Work · 3 projects");
+    expect(attachedSummary({ allProfiles: false, profiles: [null, "work"], projects: [] }, view)).toBe("2 profiles · 4 projects");
+  });
+
+  it("lists chips and detaches one at a time", () => {
+    const s = { allProfiles: false, profiles: ["work"], projects: ["p3", "gone"] };
+    const items = attachedItems(s, view);
+    expect(items.map((i) => i.label)).toEqual(["Work profile", "Home", "Removed project"]);
+    expect(detach(s, items[0])).toEqual({ allProfiles: false, profiles: [], projects: ["p3", "gone"] });
+    expect(detach(s, items[1])).toEqual({ allProfiles: false, profiles: ["work"], projects: ["gone"] });
+    expect(attachedItems(NEW_CHAT_SCOPE, view)).toEqual([]);
+    const all = attachedItems(null, view);
+    expect(all.map((i) => i.kind)).toEqual(["all"]);
+    expect(detach(null, all[0])).toEqual(NEW_CHAT_SCOPE);
   });
 });
 

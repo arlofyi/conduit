@@ -844,6 +844,7 @@ function SessionContextMenu() {
   const setSessionAccount = useStore((s) => s.setSessionAccount);
   const stopSession = useStore((s) => s.stopSession);
   const toggleKeepRunning = useStore((s) => s.toggleKeepRunning);
+  const toggleAutoApprove = useStore((s) => s.toggleAutoApprove);
   const startSession = useStore((s) => s.startSession);
   const stopIdleSessions = useStore((s) => s.stopIdleSessions);
   const pushToast = useStore((s) => s.pushToast);
@@ -1136,6 +1137,17 @@ function SessionContextMenu() {
           title="Never stop this session automatically after its agent finishes. Use it for an agent waiting on something Conduit cannot see, like a remote job."
         >
           {menuSession.keepRunning ? "✓ Keep running (no auto-stop)" : "Keep running (no auto-stop)"}
+        </button>
+      )}
+      {menuSession?.agent === "antigravity" && (
+        <button
+          onClick={() => {
+            toggleAutoApprove(menuSession.id);
+            closeMenu();
+          }}
+          title="Conduit answers every permission request from this Antigravity session with Allow -- commands and file edits included. Antigravity's own auto mode still asks, so Conduit answers for it."
+        >
+          {menuSession.autoApprove ? "✓ Auto-approve requests" : "Auto-approve requests"}
         </button>
       )}
       <button onClick={toggleSensitive} title="Silo this session: no other agent can read it">

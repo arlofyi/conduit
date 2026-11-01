@@ -27,6 +27,7 @@ import { ChatsScreen } from "./src/screens/ChatsScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
 import { AppsScreen } from "./src/screens/AppsScreen";
 import { PortMirrorProvider } from "./src/data/PortMirrorProvider";
+import { BgWatchProvider, useBgWatch } from "./src/data/BgWatchProvider";
 import { NewChatScreen } from "./src/screens/NewChatScreen";
 import { FilesScreen } from "./src/screens/FilesScreen";
 import { FileViewScreen } from "./src/screens/FileViewScreen";
@@ -34,7 +35,7 @@ import { GeneralScreen } from "./src/screens/GeneralScreen";
 import { GeneralChatScreen } from "./src/screens/GeneralChatScreen";
 import { GeneralNewScreen, GeneralSettingsScreen } from "./src/screens/GeneralOptions";
 import { GeneralScopeScreen } from "./src/screens/GeneralScopeScreen";
-import { ChatsMenuScreen, QuickActionsScreen, SessionInfoScreen } from "./src/screens/Sheets";
+import { ChatsMenuScreen, QuickActionsScreen } from "./src/screens/Sheets";
 import { ListSelectionProvider, useListSelection } from "./src/data/ListSelection";
 import { needsCount, resolveProfile } from "./src/logic/chatList";
 import { openBySession } from "./src/logic/pending";
@@ -74,8 +75,12 @@ const navigationRef = createNavigationContainerRef<RootStackParamList>();
 /** A banner tap opens its chat. Over another chat it REPLACES it (one chat streams at a time,
  * and a stack of chats would leave the one below detached); elsewhere it pushes as usual. */
 function openFromBanner(b: BannerData) {
+  openChat({ sessionId: b.sessionId, projectId: b.projectId, name: b.name, branch: b.branch });
+}
+
+/** Shared by the in-app banner and a tapped system notification (BgWatchProvider). */
+function openChat(params: RootStackParamList["Chat"]) {
   if (!navigationRef.isReady()) return;
-  const params = { sessionId: b.sessionId, projectId: b.projectId, name: b.name, branch: b.branch };
   if (navigationRef.getCurrentRoute()?.name === "Chat") navigationRef.dispatch(StackActions.replace("Chat", params));
   else navigationRef.navigate("Chat", params);
 }
@@ -149,6 +154,14 @@ function Inner() {
   const { loaded, currentMac } = useLive();
   const base = palette.appearance === "dark" ? DarkTheme : DefaultTheme;
   const sheet = useMemo(() => sheetOptions(palette.sidebarBg), [palette.sidebarBg]);
+  // A tapped system notification (Android, screen off) opens its chat once navigation is up.
+  const { openTarget, consumeOpenTarget } = useBgWatch();
+  const [navReady, setNavReady] = useState(false);
+  useEffect(() => {
+    if (!openTarget || !currentMac || !navReady) return;
+    consumeOpenTarget();
+    openChat(openTarget);
+  }, [openTarget, currentMac, navReady, consumeOpenTarget]);
   const navTheme: Theme = {
     ...base,
     colors: {
@@ -165,7 +178,7 @@ function Inner() {
   if (!loaded || !prefsLoaded) return <View style={{ flex: 1, backgroundColor: palette.panelBg }} />;
 
   return (
-    <NavigationContainer ref={navigationRef} theme={navTheme}>
+    <NavigationContainer ref={navigationRef} theme={navTheme} onReady={() => setNavReady(true)}>
       <StatusBar style={palette.appearance === "dark" ? "light" : "dark"} />
       <Stack.Navigator
         screenOptions={{
@@ -192,7 +205,6 @@ function Inner() {
             <Stack.Screen name="NewChat" component={NewChatScreen} options={sheet} />
             <Stack.Screen name="ChatsMenu" component={ChatsMenuScreen} options={sheet} />
             <Stack.Screen name="QuickActions" component={QuickActionsScreen} options={sheet} />
-            <Stack.Screen name="SessionInfo" component={SessionInfoScreen} options={sheet} />
           </Stack.Group>
         ) : (
           <Stack.Group navigationKey="no-mac">
@@ -215,9 +227,11 @@ export default function App() {
             <ReduceMotionProvider>
               <LiveProvider>
                 <PortMirrorProvider>
-                  <ListSelectionProvider>
-                    <Inner />
-                  </ListSelectionProvider>
+                  <BgWatchProvider>
+                    <ListSelectionProvider>
+                      <Inner />
+                    </ListSelectionProvider>
+                  </BgWatchProvider>
                 </PortMirrorProvider>
               </LiveProvider>
             </ReduceMotionProvider>

@@ -754,7 +754,10 @@ Design: `docs/superpowers/specs/2026-10-31-phone-sessions-files-general-chat-des
   agy case. Answers are KEYSTROKES, measured: Allow = `1`, Deny = Esc. Never send a digit for
   "No" -- option counts differ per tool and a digit can land on "Yes, always". The step is
   re-read before sending; a step that leaves 9 by itself was answered in the TUI (`by:
-  terminal`). Measuring agy from a Claude session needs the REAL `HOME`/`USERPROFILE`: a
+  terminal`). **Auto-approve** (`Session.auto_approve`, agy only) presses Allow itself, ONE
+  step per tick: parallel calls show their menus one after another, and a key sent before the
+  next menu draws lands in agy's input box as text. agy's own `--mode auto` still prompts
+  for every command (measured), which is why Conduit answers instead. Measuring agy from a Claude session needs the REAL `HOME`/`USERPROFILE`: a
   redirected home shows agy's first-run onboarding (ToS with data sharing pre-ticked).
 - **The project list is pushed**: `Store::save_generation` moves on every persisted write
   and the bridge re-sends `projects` (step 2d). Don't add a second builder for that frame.

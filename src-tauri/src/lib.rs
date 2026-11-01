@@ -2560,6 +2560,20 @@ fn set_session_keep_running(session_id: String, keep: bool, store: State<Arc<Sto
     store.set_session_keep_running(&session_id, keep)
 }
 
+/// Flip auto-approve (Conduit answers the session's permission prompts with Allow; agy
+/// only, see `agy_prompts.rs`) and return the NEW value. Flipped in Rust, not from the
+/// window's copy, because a phone may have changed it since the window last loaded.
+#[tauri::command]
+fn toggle_session_auto_approve(session_id: String, store: State<Arc<Store>>) -> Option<bool> {
+    if store.session_agent(&session_id) != agent::AgentId::Antigravity {
+        return None;
+    }
+    let on = !store.session_auto_approve(&session_id);
+    store
+        .set_session_auto_approve(&session_id, on)
+        .then_some(on)
+}
+
 /// Stop every idle session in one project. Returns the ids actually stopped, so the UI can
 /// report a count instead of guessing.
 #[tauri::command]
@@ -3626,6 +3640,7 @@ pub fn run() {
             stop_session,
             start_session,
             set_session_keep_running,
+            toggle_session_auto_approve,
             stop_idle_sessions,
             ide_diff_verdict,
             ide_editor_context,

@@ -150,4 +150,9 @@ describe("session controls + usage frames (2026-11-01 spec)", () => {
     expect(sessionOptionsMsg("s1", "r3")).toEqual({ type: "sessionoptions", sessionId: "s1", requestId: "r3" });
     expect(usageMsg("r4")).toEqual({ type: "usage", requestId: "r4" });
   });
+  it("sessionset carries autoApprove (Round 4), false included", () => {
+    const { sessionSetMsg } = jest.requireActual("./protocol") as typeof import("./protocol");
+    expect(sessionSetMsg("s1", "r5", { autoApprove: true })).toEqual({ type: "sessionset", sessionId: "s1", requestId: "r5", autoApprove: true });
+    expect(sessionSetMsg("s1", "r6", { autoApprove: false })).toEqual({ type: "sessionset", sessionId: "s1", requestId: "r6", autoApprove: false });
+  });
 });

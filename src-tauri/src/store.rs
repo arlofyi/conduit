@@ -212,6 +212,11 @@ pub struct Session {
     /// byte-identical.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_running: bool,
+    /// Auto-approve: Conduit answers this session's permission prompts with Allow itself
+    /// (`agy_prompts.rs`; agy only for now -- its own `--mode auto` still prompts, measured).
+    /// Skipped when false so older state.json files stay byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_approve: bool,
 }
 
 /// Directed READ policy: may `caller` read `target`'s output? The single source of truth for
@@ -2246,6 +2251,34 @@ impl Store {
         true
     }
 
+    /// Turn auto-approve on or off (see `Session::auto_approve`). Saves only on a change.
+    /// False when the session is unknown.
+    pub fn set_session_auto_approve(&self, session_id: &str, on: bool) -> bool {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = projects
+            .iter_mut()
+            .flat_map(|p| &mut p.sessions)
+            .find(|s| s.id == session_id)
+        else {
+            return false;
+        };
+        if s.auto_approve != on {
+            s.auto_approve = on;
+            self.save(&projects);
+        }
+        true
+    }
+
+    /// Whether the session auto-approves its permission prompts.
+    pub fn session_auto_approve(&self, session_id: &str) -> bool {
+        self.projects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|p| &p.sessions)
+            .any(|s| s.id == session_id && s.auto_approve)
+    }
+
     /// Record the agent's latest activity (see `Session::agent_state`). Saves only on an
     /// actual change: tool hooks repeat `running` many times a turn, and each save rewrites
     /// and fsyncs state.json.
@@ -3871,6 +3904,20 @@ mod tests {
     }
 
     #[test]
+    fn auto_approve_is_absent_when_false_and_round_trips() {
+        let mut s: Session = serde_json::from_value(serde_json::json!({
+            "id": "s", "name": "n", "createdAt": 1
+        }))
+        .unwrap();
+        assert!(!s.auto_approve);
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("autoApprove").is_none(), "{v}");
+        s.auto_approve = true;
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["autoApprove"], true);
+    }
+
+    #[test]
     fn keep_running_is_absent_when_false_and_round_trips() {
         let v = serde_json::to_value(mk("plain")).unwrap();
         assert!(v.get("keepRunning").is_none(), "{v}");
@@ -4746,6 +4793,47 @@ mod tests {
             ..Default::default()
         };
         assert!(project_in_scope(Some(&all), &work, &known));
+    }
+
+    #[test]
+    fn an_empty_scope_means_nothing_attached_and_none_means_everything() {
+        let dir = temp_dir("empty-scope");
+        let store = Store::for_test(&dir);
+        let a = store.add_project("/a".into(), store.active_profile());
+        store.add_project("/b".into(), store.active_profile());
+        // What the phone sends for a new chat: nothing attached, so nothing visible.
+        let empty = store.add_root_chat_with(None, Some(ChatScope::default()), true);
+        assert!(store.projects_for_chat(&empty.id).is_empty());
+        // The chat's own profile is NOT implied by an empty scope.
+        let listed =
+            store.add_root_chat_with(store.active_profile(), Some(ChatScope::default()), true);
+        assert!(store.projects_for_chat(&listed.id).is_empty());
+        // A chat from before scopes (None) still sees every project.
+        let legacy = store.add_root_chat_with(None, None, false);
+        assert_eq!(store.projects_for_chat(&legacy.id).len(), 2);
+        // Attaching one project later (`rootchatscope`) makes exactly that one visible.
+        assert!(store.set_root_chat_scope(
+            &empty.id,
+            Some(ChatScope {
+                projects: vec![a.id.clone()],
+                ..Default::default()
+            })
+        ));
+        let seen: Vec<String> = store
+            .projects_for_chat(&empty.id)
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(seen, vec![a.id]);
+        // ...and detaching everything goes back to nothing.
+        assert!(store.set_root_chat_scope(&empty.id, Some(ChatScope::default())));
+        assert!(store.projects_for_chat(&empty.id).is_empty());
+        // The wire form of an empty scope parses as Some(empty), never as None.
+        let wire: Option<ChatScope> = serde_json::from_value(
+            serde_json::json!({"allProfiles": false, "profiles": [], "projects": []}),
+        )
+        .unwrap();
+        assert_eq!(wire, Some(ChatScope::default()));
     }
 
     #[test]

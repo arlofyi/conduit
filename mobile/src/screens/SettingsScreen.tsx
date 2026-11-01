@@ -6,6 +6,8 @@ import { useLive, useUsagePolling } from "../bridge/LiveProvider";
 import { Card, Row, SectionLabel } from "../components/form";
 import { UsageSection } from "../components/UsageSection";
 import { usePrefs } from "../data/PrefsProvider";
+import { useBgWatch } from "../data/BgWatchProvider";
+import { anyNotify } from "../logic/watch";
 import type { Prefs } from "../data/prefs";
 import { connStatus } from "../logic/connCopy";
 import { isLoopbackMac } from "../logic/macs";
@@ -23,6 +25,9 @@ export function SettingsScreen({ navigation }: SettingsProps) {
   // Usage first: polled while this tab is showing (at most once a minute).
   useUsagePolling(useIsFocused());
   const { prefs, setPrefs } = usePrefs();
+  // Android: these switches also reach the lock screen (modules/bg-watch).
+  const bg = useBgWatch();
+  const notifyKeys: (keyof Prefs)[] = ["notifyQuestion", "notifyPermission", "notifyFinished"];
 
   const macName = hello?.macName ?? currentMac?.macName ?? "—";
   const status = connStatus(conn, macName);
@@ -52,7 +57,11 @@ export function SettingsScreen({ navigation }: SettingsProps) {
       right={
         <Switch
           value={prefs[key]}
-          onValueChange={(v) => setPrefs({ [key]: v })}
+          onValueChange={(v) => {
+            setPrefs({ [key]: v });
+            // turning one on is when notifications are worth asking for
+            if (v && bg.available && notifyKeys.includes(key) && !bg.notificationsAllowed) bg.requestNotifications().catch(() => {});
+          }}
           trackColor={{ true: p.accent, false: p.selectionBg }}
           accessibilityLabel={title}
         />
@@ -74,6 +83,29 @@ export function SettingsScreen({ navigation }: SettingsProps) {
           {toggle("notifyQuestion", "A session asks a question", true)}
           {toggle("notifyPermission", "A permission is needed")}
           {toggle("notifyFinished", "A session finishes")}
+          {bg.available && anyNotify(prefs) && !bg.notificationsAllowed && (
+            <Row
+              title="Notifications are off for Conduit"
+              subtitle="You'll only see these while the app is open. Turn them on to get them on your lock screen."
+              value="Turn on"
+              tone="accent"
+              onPress={() => {
+                bg.requestNotifications().catch(() => {});
+              }}
+            />
+          )}
+          {bg.available && anyNotify(prefs) && bg.notificationsAllowed && bg.batteryRestricted && !prefs.batteryHintDismissed && (
+            <>
+              <Row
+                title="Let Conduit run in the background"
+                subtitle="Your phone may stop Conduit while the screen is off, and then nothing reaches you. Allow background activity under Battery."
+                value="Open"
+                tone="accent"
+                onPress={bg.openBatterySettings}
+              />
+              <Row title="Not now" tone="dim" onPress={() => setPrefs({ batteryHintDismissed: true })} />
+            </>
+          )}
         </Card>
 
         <SectionLabel>Appearance</SectionLabel>

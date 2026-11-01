@@ -1,7 +1,8 @@
 /**
  * The Chats tab (route `General`): the computer's root chats (HQ), listed under the profile the
- * Sessions tab has selected (every chat under "All profiles"), newest first. "+" opens the
- * new-chat sheet (GeneralOptions.tsx): profile, scope, agent, model, effort, research, MCP.
+ * Sessions tab has selected (every chat under "All profiles"), newest first. "+" starts a chat
+ * at once with nothing attached: it asks only for the agent (GeneralNew), and not even that
+ * when the computer offers one. Everything else is set from inside the chat.
  */
 import { useFocusEffect } from "@react-navigation/native";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
@@ -11,17 +12,18 @@ import { useLive } from "../bridge/LiveProvider";
 import { GlassCircle, Icon } from "../components/Glass";
 import { useListSelection } from "../data/ListSelection";
 import { ALL_PROFILES, profileName, relativeTime, resolveProfile } from "../logic/chatList";
-import { agentLabel, chatsForProfile, scopeSummary, type RootChat } from "../logic/general";
+import { agentLabel, chatsForProfile, needsAgentChoice, scopeSummary, startAgents, type RootChat } from "../logic/general";
 import type { GeneralProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, TYPE } from "../theme/type";
+import { useStartChat } from "./GeneralOptions";
 
 const CLOCK_MS = 30_000;
 
 export function GeneralScreen({ navigation }: GeneralProps) {
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
-  const { view, conn, rootChats, refreshRootChats, rootChatOptions } = useLive();
+  const { view, conn, rootChats, refreshRootChats, rootChatOptions, loadRootChatOptions } = useLive();
   const { profileSel } = useListSelection();
   const ready = conn.phase === "ready";
 
@@ -34,6 +36,20 @@ export function GeneralScreen({ navigation }: GeneralProps) {
   useEffect(() => {
     if (ready) refreshRootChats();
   }, [ready, refreshRootChats]);
+
+  // Ask which agents a chat can run on before "+" is tapped, so starting one waits on nothing.
+  const optionsLive = rootChatOptions?.live === true;
+  useEffect(() => {
+    if (ready && !optionsLive) void loadRootChatOptions();
+  }, [ready, optionsLive, loadRootChatOptions]);
+
+  // "+": one agent (or an older desktop) starts the chat right here; a choice opens the chooser.
+  const onStarted = useCallback((chat: RootChat) => navigation.navigate("GeneralChat", { chatId: chat.id, title: chat.title }), [navigation]);
+  const { start, starting, error: startError } = useStartChat(onStarted);
+  const newChat = () => {
+    if (rootChatOptions && !needsAgentChoice(rootChatOptions)) void start(startAgents(rootChatOptions)[0].id);
+    else navigation.navigate("GeneralNew");
+  };
 
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -73,8 +89,13 @@ export function GeneralScreen({ navigation }: GeneralProps) {
             </Text>
           ) : null}
         </View>
-        <GlassCircle symbol="plus" primary label="New chat" disabled={!ready} onPress={() => navigation.navigate("GeneralNew")} />
+        <GlassCircle symbol="plus" primary label={starting ? "Starting a chat" : "New chat"} disabled={!ready || starting} onPress={newChat} />
       </View>
+      {startError ? (
+        <Text accessibilityLiveRegion="polite" style={{ marginHorizontal: 16, marginBottom: 8, fontSize: TYPE.footnote, color: p.red }}>
+          {startError}
+        </Text>
+      ) : null}
       <FlatList
         data={rows}
         keyExtractor={(c) => c.id}

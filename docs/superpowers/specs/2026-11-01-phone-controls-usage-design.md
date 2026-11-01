@@ -78,3 +78,31 @@ test updated). `Session.keep_running` moves from desktop localStorage into `stat
   A chat's header opens the same settings mid-chat.
 - Download: "Save to folder" (Android Storage Access Framework, last folder remembered) is the
   primary action; the share sheet stays as "Share".
+
+## 5. Round 4 (user testing feedback, 2026-11-01)
+
+- **One session sheet.** The title tap (session info) and the preferences button open the
+  SAME sheet: the info view's look on top, the preferences' detail below. The sheet shows the
+  ACTIVE model and effort: `sessionOptions.model`/`effort` are the PINNED values (null when
+  unpinned), so the sheet falls back to the session view's live `model` and reads an unpinned
+  effort as "Default".
+- **Two-line header.** Line 1: name. Line 2: project · status · model · effort as signal bars.
+  Right: a usage gauge the size of the preferences button, unmistakably usage (e.g. ring +
+  "5h" caption), then the preferences button. Context usage becomes a coloured ring around the
+  agent avatar.
+- **Chats start fast.** "+" asks only for the agent; the chat opens at once with NO projects
+  attached (`scope: {allProfiles:false, profiles:[], projects:[]}` = sees nothing). Model,
+  effort, deep research, MCP servers and "Attach" (profiles / projects, like attaching a
+  folder) live in the chat's settings sheet and apply from the next message.
+- **Auto-approve (agy).** agy's own `--mode auto` still prompts for every command (measured:
+  `echo` prompted under `--mode auto`), so Conduit answers instead. `Session.auto_approve`
+  (`#[serde(default)]`); while on, `agy_prompts.rs` presses Allow for every waiting step
+  itself (same keys, same re-read) and raises no card. Wire: projects view session
+  `autoApprove`; `sessionOptions.autoApprove` + `autoApproveSupported` (agy only for now);
+  `sessionset {autoApprove: bool}`. Session-scoped, so private sessions are refused by the
+  existing gate.
+- **Notifications with the screen off.** The phone closes its socket when backgrounded, and
+  "Notify me" only ever drove in-app banners, so nothing reached a locked phone. An Android
+  foreground service keeps a light authenticated socket while the app is in the background
+  and posts system notifications for questions, permissions and finished turns (per the
+  Notify me switches); tapping one opens that chat.

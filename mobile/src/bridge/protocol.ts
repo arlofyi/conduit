@@ -111,6 +111,9 @@ export interface WireViewSession {
   keepRunning?: boolean;
   /** the `usage` row (`key`) this session's agent account draws from */
   usageKey?: string | null;
+  // ---- auto-approve (2026-11-01 spec section 5, Round 4); absent from older desktops ----
+  /** Conduit answers this session's permission prompts itself */
+  autoApprove?: boolean;
 }
 
 export interface WireViewProject {
@@ -564,6 +567,10 @@ export interface WireSessionOptionsMsg {
   efforts: string[];
   commands: WireCommandOption[];
   mcps: WireMcpOption[];
+  // ---- auto-approve (Round 4); absent from older desktops ----
+  autoApprove?: boolean;
+  /** the agent has an auto-approve switch (Antigravity for now) */
+  autoApproveSupported?: boolean;
 }
 
 /** Only the keys present are changed. */
@@ -572,6 +579,8 @@ export interface SessionSetPatch {
   effort?: string;
   name?: string;
   keepRunning?: boolean;
+  /** Round 4: Conduit allows every request of this session itself */
+  autoApprove?: boolean;
 }
 
 export interface WireSessionSetResult {
@@ -622,6 +631,7 @@ export const sessionSetMsg = (sessionId: string, requestId: string, patch: Sessi
   ...(patch.effort !== undefined ? { effort: patch.effort } : {}),
   ...(patch.name !== undefined ? { name: patch.name } : {}),
   ...(patch.keepRunning !== undefined ? { keepRunning: patch.keepRunning } : {}),
+  ...(patch.autoApprove !== undefined ? { autoApprove: patch.autoApprove } : {}),
 });
 /** Ask for every agent account's cached usage; answered by `usage`. */
 export const usageMsg = (requestId: string): ClientMsg => ({ type: "usage", requestId });

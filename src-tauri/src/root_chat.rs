@@ -183,17 +183,11 @@ pub fn send_turn(
     // rule that holds: Read/Glob/Grep need no permission, so an allow list cannot narrow
     // them (measured: a scoped allow still read an out-of-scope file). Never deny a folder
     // that CONTAINS an in-scope project -- a deny would win over it too.
-    let denied_paths: Vec<String> = if chat.scope.is_some() {
-        let inside: Vec<&str> = in_scope.iter().map(|p| p.path.as_str()).collect();
-        store
-            .list()
-            .iter()
-            .map(|p| p.path.clone())
-            .filter(|path| !inside.iter().any(|i| contains_path(path, i)))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // An EMPTY scope (every new chat: nothing attached yet) denies every registered project.
+    let scoped = chat.scope.is_some();
+    let all_paths: Vec<String> = store.list().into_iter().map(|p| p.path).collect();
+    let inside: Vec<String> = in_scope.iter().map(|p| p.path.clone()).collect();
+    let denied_paths = out_of_scope_paths(scoped, &all_paths, &inside);
     // Scratch + shared memory exist before the child looks for them; the memory index
     // is injected fresh each spawn, so a write from any chat is visible to all on
     // their very next turn.
@@ -211,6 +205,7 @@ pub fn send_turn(
             true,
             &cwd.to_string_lossy(),
             &roster,
+            scoped,
             &dirs,
             &memory_index,
             false,
@@ -270,6 +265,7 @@ pub fn send_turn(
         let mut charter = build_charter(
             &cwd.to_string_lossy(),
             &roster,
+            scoped,
             &dirs,
             &memory_index,
             root.is_some() && mcp_config.is_some(),
@@ -649,6 +645,7 @@ pub fn cap_index(s: &str) -> String {
 pub fn build_charter(
     workspace_root: &str,
     projects: &[(String, String)],
+    scoped: bool,
     dirs: &Dirs,
     memory_index: &str,
     has_tools: bool,
@@ -657,6 +654,7 @@ pub fn build_charter(
         false,
         workspace_root,
         projects,
+        scoped,
         dirs,
         memory_index,
         has_tools,
@@ -690,18 +688,47 @@ pub const RESEARCH_BRIEF: &str = "\n\nDeep research mode: the user wants a thoro
      links you relied on next to the claims they support, and say plainly what is \
      uncertain, disputed or could not be verified.";
 
+/// What a scoped chat with nothing attached is told instead of a roster. Every chat the phone
+/// starts begins this way, so a question about a project must lead the user to attach it,
+/// never to a guess.
+pub const NOTHING_ATTACHED: &str = "No projects are attached to this chat; if the user asks \
+     about a project, tell them to attach it from the chat's settings.";
+
+/// The registered project paths a SCOPED chat may not read (Read/Glob/Grep denies for
+/// Claude, `read_file` denies for agy): every one outside the scope, but never a folder that
+/// CONTAINS an in-scope project -- a deny would win over it too. An unscoped chat (None: a
+/// chat from before scopes) denies nothing; an EMPTY scope denies every registered project.
+pub fn out_of_scope_paths(scoped: bool, all: &[String], in_scope: &[String]) -> Vec<String> {
+    if !scoped {
+        return Vec::new();
+    }
+    all.iter()
+        .filter(|path| !in_scope.iter().any(|i| contains_path(path, i)))
+        .cloned()
+        .collect()
+}
+
 /// The charter, for a Claude chat (`agy == false`) or the shared base of an Antigravity
 /// chat's (`root_chat_agy::charter` adds what differs there): the Claude-only tool policy,
-/// GitHub powers and writable dirs are left out of the latter.
+/// GitHub powers and writable dirs are left out of the latter. `scoped` = the chat has a
+/// scope, so `projects` is what is ATTACHED to it rather than everything registered.
 pub fn build_charter_for(
     agy: bool,
     workspace_root: &str,
     projects: &[(String, String)],
+    scoped: bool,
     dirs: &Dirs,
     memory_index: &str,
     has_tools: bool,
 ) -> String {
-    let roster = if projects.is_empty() {
+    let heading = if scoped {
+        "Projects attached to this chat (the only ones you know about or may read)"
+    } else {
+        "Registered Conduit projects"
+    };
+    let roster = if projects.is_empty() && scoped {
+        NOTHING_ATTACHED.to_string()
+    } else if projects.is_empty() {
         "(none registered yet)".to_string()
     } else {
         projects
@@ -727,7 +754,7 @@ pub fn build_charter_for(
              Shared memory (written by the user's other chats; read it when useful):\n\
              {memory}\nThe current index:\n{index}\n\n\
              Workspace root: {workspace_root}\n\n\
-             Registered Conduit projects:\n{roster}"
+             {heading}:\n{roster}"
         );
     }
     let orchestration = if has_tools {
@@ -765,7 +792,7 @@ pub fn build_charter_for(
          {index}\n\
          {orchestration}\n\n\
          Workspace root: {workspace_root}\n\n\
-         Registered Conduit projects:\n{roster}"
+         {heading}:\n{roster}"
     )
 }
 
@@ -1024,6 +1051,7 @@ mod tests {
         let c = build_charter(
             "/Users/u/ooozzy",
             &[("conduit".into(), "/Users/u/ooozzy/conduit".into())],
+            false,
             &d,
             "- [Release cadence](cadence.md) — weekly",
             false,
@@ -1044,21 +1072,46 @@ mod tests {
             c.contains("never modify project files"),
             "write boundary must be stated: {c}"
         );
-        let empty = build_charter("/Users/u", &[], &d, "", false);
+        let empty = build_charter("/Users/u", &[], false, &d, "", false);
         assert!(empty.contains("(none registered yet)"));
         assert!(empty.contains("(empty — no memories yet)"));
     }
 
     #[test]
+    fn an_empty_scope_attaches_nothing_and_denies_every_project() {
+        let all = vec!["/w/a".to_string(), "/w/b".to_string(), "/w".to_string()];
+        // None (a chat from before scopes) = everything: no denies.
+        assert!(out_of_scope_paths(false, &all, &[]).is_empty());
+        // An empty scope (every new phone chat) = nothing: every registered project denied.
+        assert_eq!(out_of_scope_paths(true, &all, &[]), all);
+        // Attaching one keeps it and the folder holding it readable.
+        assert_eq!(
+            out_of_scope_paths(true, &all, &["/w/a".to_string()]),
+            vec!["/w/b".to_string()]
+        );
+        // The charter says plainly that nothing is attached, for both agents.
+        let d = tdirs();
+        for agy in [false, true] {
+            let c = build_charter_for(agy, "/w", &[], true, &d, "", false);
+            assert!(c.contains(NOTHING_ATTACHED), "{c}");
+            assert!(!c.contains("(none registered yet)"));
+        }
+        let attached = build_charter("/w", &[("a".into(), "/w/a".into())], true, &d, "", false);
+        assert!(attached.contains("Projects attached to this chat"));
+        assert!(attached.contains("- a: /w/a"));
+        assert!(!attached.contains(NOTHING_ATTACHED));
+    }
+
+    #[test]
     fn charter_explains_the_orchestration_tools_only_when_they_exist() {
         let d = tdirs();
-        let with = build_charter("/w", &[], &d, "", true);
+        let with = build_charter("/w", &[], false, &d, "", true);
         assert!(with.contains("dispatch_work"));
         assert!(
             with.contains("approve"),
             "the charter must say the user approves: {with}"
         );
-        let without = build_charter("/w", &[], &d, "", false);
+        let without = build_charter("/w", &[], false, &d, "", false);
         assert!(!without.contains("dispatch_work"));
     }
 
@@ -1144,7 +1197,7 @@ mod tests {
 
     #[test]
     fn charter_states_exactly_what_the_chat_can_run() {
-        let c = build_charter("/w", &[], &tdirs(), "", true);
+        let c = build_charter("/w", &[], false, &tdirs(), "", true);
         assert!(
             c.contains(TOOL_POLICY),
             "the tool policy must be in every Claude charter"
@@ -1180,7 +1233,7 @@ mod tests {
             );
         }
         // An Antigravity chat gets neither the Claude tool policy nor the writable dirs.
-        let agy = build_charter_for(true, "/w", &[], &tdirs(), "", false);
+        let agy = build_charter_for(true, "/w", &[], false, &tdirs(), "", false);
         assert!(!agy.contains(TOOL_POLICY));
         assert!(!agy.contains("Bash"));
         assert!(agy.contains("never modify project files"));
