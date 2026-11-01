@@ -410,6 +410,17 @@ fn dispatch_status_inner(proposals: &Proposals, args: &Value, now: u64) -> Resul
     Ok(body.to_string())
 }
 
+/// The activity line `sessions_list` reports for `s`: never a private (`silo || local_only`)
+/// session's, from ANY chat -- the same rule the phone's project list follows
+/// (`bridge_view::projects_view`) -- and never one this chat may not peek at.
+fn listed_activity(s: &Session, may_peek: bool, activity: Option<String>) -> Option<String> {
+    if s.silo || s.local_only || !may_peek {
+        None
+    } else {
+        activity
+    }
+}
+
 fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> {
     match name {
         "sessions_list" => {
@@ -440,13 +451,11 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
                         "agent": s.agent,
                         "role": s.role,
                         "status": st.status,
-                        // A phone-driven chat never sees a private session's activity
-                        // line, the same rule the phone's own project list follows.
-                        "activity": if chat_may_peek(&ctx.store, &ctx.chat_id, s) {
+                        "activity": listed_activity(
+                            s,
+                            chat_may_peek(&ctx.store, &ctx.chat_id, s),
                             st.activity
-                        } else {
-                            None
-                        },
+                        ),
                         "branch": s.branch,
                         "hibernated": s.stopped,
                         "sensitive": !chat_may_peek(&ctx.store, &ctx.chat_id, s),
@@ -733,6 +742,26 @@ fn handle_request(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_private_sessions_activity_is_never_listed() {
+        let act = || Some("editing lib.rs".to_string());
+        let open = Session::default();
+        assert_eq!(super::listed_activity(&open, true, act()), act());
+        assert_eq!(super::listed_activity(&open, false, act()), None);
+        for s in [
+            Session {
+                silo: true,
+                ..Default::default()
+            },
+            Session {
+                local_only: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(super::listed_activity(&s, true, act()), None, "{s:?}");
+        }
+    }
+
     use super::*;
     use crate::store::{Clearance, SessionTrust, Store};
     use std::sync::Mutex;

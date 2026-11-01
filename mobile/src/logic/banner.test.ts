@@ -1,6 +1,6 @@
 import type { WireProjectsView, WireViewSession } from "../bridge/protocol";
 import { DEFAULT_PREFS } from "../data/prefs";
-import { bannerFromPending, bannerFromStatus, bannersFromView, dueBanners, failedText, FINISH_SETTLE_MS, type Signals } from "./banner";
+import { bannerFromPending, bannerFromStatus, bannersFromView, dueBanners, failedText, FINISH_SETTLE_MS, withoutFinishes, type Signals } from "./banner";
 
 function sess(over: Partial<WireViewSession> & { id: string }): WireViewSession {
   return {
@@ -224,5 +224,18 @@ describe("finished banners settle", () => {
     expect(failedText("some_new_kind")).toBe("Stopped on an error: some new kind");
     expect(failedText("unknown")).toBe("Stopped on an error");
     expect(failedText(null)).toBe("Stopped on an error");
+  });
+});
+
+describe("withoutFinishes", () => {
+  it("drops_every_settling_finish_and_keeps_the_rest", () => {
+    const signals: Signals = {
+      a: { needs: null, status: "done", live: true, finishAt: 10 },
+      b: { needs: null, status: "running", live: true },
+    };
+    const out = withoutFinishes(signals);
+    expect(out.a).toEqual({ needs: null, status: "done", live: true });
+    expect(out.b).toBe(signals.b);
+    expect(withoutFinishes(out)).toBe(out);
   });
 });

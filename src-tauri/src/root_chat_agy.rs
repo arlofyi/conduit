@@ -55,7 +55,9 @@ pub fn stdin_line(text: &str) -> String {
 /// but the user's OWN `permissions.allow` still applies there (measured: theirs allows
 /// `git commit`, `npx`, ...), so the chat's read-only policy is enforced with DENY rules,
 /// which win: no shell, no file writes, no browser actions, no MCP tools, and no reads of a
-/// registered project outside the chat's scope. `read_file(<dir>)` matches the whole tree.
+/// registered project outside the chat's scope, of a private session's worktree, or of the
+/// transcript stores (`root_chat::private_read_denies`). `read_file(<dir>)` matches the whole
+/// tree.
 pub fn settings_json(denied_read_paths: &[String]) -> String {
     let mut deny: Vec<String> = ["command(*)", "write_file(*)", "execute_url(*)", "mcp(*)"]
         .iter()
@@ -279,6 +281,8 @@ mod tests {
         let v: Value = serde_json::from_str(&settings_json(&[
             "C:\\work\\other\\".to_string(),
             " ".into(),
+            "C:\\Users\\me\\.gemini\\antigravity-cli\\conversations".to_string(),
+            "C:\\Users\\me\\.claude\\history.jsonl".to_string(),
         ]))
         .unwrap();
         let deny: Vec<&str> = v["permissions"]["deny"]
@@ -291,6 +295,9 @@ mod tests {
             assert!(deny.contains(&rule), "{rule}");
         }
         assert!(deny.contains(&"read_file(C:/work/other)"));
+        // The transcript stores every chat is kept out of, with forward slashes.
+        assert!(deny.contains(&"read_file(C:/Users/me/.gemini/antigravity-cli/conversations)"));
+        assert!(deny.contains(&"read_file(C:/Users/me/.claude/history.jsonl)"));
         assert!(!deny
             .iter()
             .any(|d| *d == "read_file()" || d.ends_with("( )")));

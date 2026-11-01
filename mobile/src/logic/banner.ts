@@ -129,6 +129,18 @@ export function withoutFinish(s: Signal): Signal {
   return rest;
 }
 
+/** Every settling finish dropped: the background watcher took them over (LiveProvider hand-over).
+ * The same object when there was none. */
+export function withoutFinishes(signals: Signals): Signals {
+  let out: Signals | null = null;
+  for (const [id, sig] of Object.entries(signals)) {
+    if (sig.finishAt === undefined) continue;
+    if (!out) out = { ...signals };
+    out[id] = withoutFinish(sig);
+  }
+  return out ?? signals;
+}
+
 function allowed(kind: BannerKind, prefs: NotifyPrefs): boolean {
   switch (kind) {
     case "question":

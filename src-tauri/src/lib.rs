@@ -335,8 +335,9 @@ fn pty_spawn(
     // Graceful skip: board-enabled Claude session, but no usable Node -- the board still
     // works, just without continuity's MCP tools/presence hooks. Never errors the spawn.
     if continuity_precheck && continuity_node.is_none() {
-        eprintln!(
-            "conduit: continuity coordination needs Node >=22.5; skipping -- the board still works."
+        crate::diag::warn(
+            "continuity",
+            "continuity coordination needs Node >=22.5; skipping -- the board still works.",
         );
     }
 

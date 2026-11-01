@@ -136,7 +136,7 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!native) return;
-    setBackgroundHandover(() => {
+    setBackgroundHandover((appSignals) => {
       // Stopped from its notification: do not start it straight back up on the next background.
       if (stoppedByUserRef.current) return null;
       const s = latest.current;
@@ -151,16 +151,17 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
         asking: asking.current,
       });
       if (!ok || !token) return null;
-      return new Promise<void>((resolve) => {
+      return new Promise<boolean>((resolve) => {
         let done = false;
-        const finish = () => {
+        // tookOver: the watcher is up (or retrying on its own) and now owns what the app was settling
+        const finish = (tookOver: boolean) => {
           if (done) return;
           done = true;
           sub.remove();
-          resolve();
+          resolve(tookOver);
         };
         const sub = native.addListener("onStatus", (st) => {
-          if (handoverSettled(st.phase)) finish();
+          if (handoverSettled(st.phase)) finish(st.phase !== "stopped");
         });
         native
           .start({
@@ -173,17 +174,18 @@ export function BgWatchProvider({ children }: { children: React.ReactNode }) {
             notifyFailed: s.prefs.notifyFailed,
             notifyStopped: s.prefs.notifyStopped,
             notifyUnreachable: s.prefs.notifyUnreachable,
-            baseline: JSON.stringify(watchBaseline(s.view, s.pending)),
+            baseline: JSON.stringify(watchBaseline(s.view, s.pending, appSignals)),
           })
           .then(
             () => {
               // already running and connected (an update): nothing to wait for
-              if (handoverSettled(native.status().phase)) finish();
+              const phase = native.status().phase;
+              if (handoverSettled(phase)) finish(phase !== "stopped");
             },
             (e: unknown) => {
               // e.g. ERR_BG_WATCH_START: Android refused a foreground start from the background
               diag.error("bgwatch", "start.refused", e);
-              finish();
+              finish(false);
             },
           );
       });

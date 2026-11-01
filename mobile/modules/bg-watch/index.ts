@@ -56,8 +56,8 @@ interface BgWatchNative {
   batteryRestricted(): boolean;
   openBatterySettings(): boolean;
   openNotificationSettings(): boolean;
-  /** the background services' own diagnostics log (cache/conduit-logs/native.log + mirror.log,
-   * oldest first, redacted at write); optional so an older build without it still type-checks */
+  /** the background services' own diagnostics log (cache/conduit-logs/native.log, shared by
+   * bg-watch and port-mirror, oldest first, redacted at write); optional so an older build without it still type-checks */
   readNativeLog?(): string;
   /** the folder those logs live in */
   nativeLogDir?(): string;

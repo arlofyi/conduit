@@ -67,7 +67,8 @@ export const BACKOFF_MAX_MS = 8000;
 
 /**
  * A `ready` socket that has heard nothing for this long is dead, not quiet: while the app is in
- * front the list is asked for every 10 s and always answered. A route that vanished (Tailscale
+ * front the list is asked for every 10 s and always answered -- with the view, or with
+ * `listed` when the view is unchanged (the computer does not resend an identical one). A route that vanished (Tailscale
  * turned off, the phone changed network) leaves the socket "open" until TCP gives up, which can
  * take minutes; this is what notices it sooner.
  */

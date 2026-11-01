@@ -2216,6 +2216,8 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     // The project list (2d): `listed` once this socket asked for it, then pushed on change.
     let mut listed = false;
     let mut want_projects = false;
+    // The phone asked (`list`) rather than a store save pushing: always answered.
+    let mut list_requested = false;
     let mut projects_gen = 0u64;
     let mut last_projects = Instant::now();
     // Hash of the last `projects` frame this socket sent: an identical one is skipped.
@@ -2392,6 +2394,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         // Sent below (2d), where store changes are pushed too.
                         listed = true;
                         want_projects = true;
+                        list_requested = true;
                     }
                     Some(ClientMsg::Attach { session_id }) => {
                         // Auto-wake: an idle session has no live PTY (Conduit spawns it
@@ -3260,13 +3263,17 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             );
             ctrl.last_messages.sweep();
             let text = view.to_string();
-            // Skipped when byte-identical to the last one this socket sent: most store
-            // saves (and the phone's 10 s poll) change nothing in the phone's view. A new
-            // socket has no hash, so its first `list` is always answered.
-            if crate::bridge_view::frame_changed(&mut last_projects_hash, &text)
-                && !send_text(&mut ws, text)
+            // A push byte-identical to the last one this socket sent is skipped: most store
+            // saves change nothing in the phone's view. A `list` the phone asked for is
+            // always answered (whole, or as a tiny `listed` ack) so an idle computer never
+            // goes silent long enough for the phone's watchdog to redial.
+            let requested = std::mem::take(&mut list_requested);
+            if let Some(frame) =
+                crate::bridge_view::projects_reply(&mut last_projects_hash, text, requested)
             {
-                break;
+                if !send_text(&mut ws, frame) {
+                    break;
+                }
             }
         }
 

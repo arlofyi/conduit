@@ -23,7 +23,7 @@
 import type { WireProjectsView, WireViewSession } from "../bridge/protocol";
 import type { Prefs } from "../data/prefs";
 import type { SessionStatus } from "../data/types";
-import { FINISH_SETTLE_MS, failedText, nextSignal, settled, signalOf, transition, withoutFinish, type Signal, type Signals } from "./banner";
+import { FINISH_SETTLE_MS, failedText, nextSignal, quiet, settled, signalOf, transition, withoutFinish, type Signal, type Signals } from "./banner";
 import type { PendingItem, PendingState } from "./pending";
 
 // ---------------------------------------------------------------- state machine (ported) ----
@@ -479,17 +479,50 @@ export function watchAddresses(working: string | null, all: string[]): string[] 
   return [...new Set([...(working ? [working] : []), ...all])];
 }
 
-/** What the app had already shown when it handed over: never announced again by the watcher. */
+/**
+ * A baseline entry as it crosses to the watcher. A settling finish travels as its AGE
+ * (`finishAgoMs`, whole ms >= 0), never as `finishAt`: the app's clock (Date.now) and the
+ * service's (elapsedRealtime) do not share an origin.
+ */
+export type BaselineSignal = Omit<Signal, "finishAt"> & { finishAgoMs?: number };
+
+/**
+ * What the app had already shown when it handed over: never announced again by the watcher.
+ * `appSignals` are the app's own banner signals: a finish the app was still settling goes across
+ * with its age, so a turn that ends just before the phone is put away is still announced -- by
+ * the watcher, once (the app drops its copy after the hand-over, LiveProvider).
+ */
 export function watchBaseline(
   view: WireProjectsView | null,
   pending: PendingState,
-): { seen: string[]; signals: Record<string, Signal> } {
-  const signals: Record<string, Signal> = {};
-  for (const p of view?.projects ?? []) for (const x of p.sessions) signals[x.id] = signalOf(x);
+  appSignals?: Signals,
+  now: number = Date.now(),
+): { seen: string[]; signals: Record<string, BaselineSignal> } {
+  const signals: Record<string, BaselineSignal> = {};
+  for (const p of view?.projects ?? []) {
+    for (const x of p.sessions) {
+      const sig: BaselineSignal = signalOf(x);
+      const held = appSignals?.[x.id]?.finishAt;
+      if (held !== undefined && quiet(sig as Signal)) sig.finishAgoMs = Math.max(0, Math.round(now - held));
+      signals[x.id] = sig;
+    }
+  }
   const seen = Object.values(pending.entries)
     .filter((e) => e.by === undefined)
     .map((e) => e.item.id);
   return { seen, signals };
+}
+
+/** The watcher's side of the baseline (WatchRules.kt `baselineOf`): ages back into `finishAt` on
+ * its own clock, and only for a session that is quiet. */
+export function baselineSignals(signals: Record<string, BaselineSignal>, now: number): Signals {
+  const out: Signals = {};
+  for (const [id, b] of Object.entries(signals)) {
+    const { finishAgoMs, ...rest } = b;
+    const sig: Signal = rest;
+    out[id] = finishAgoMs !== undefined && finishAgoMs >= 0 && quiet(sig) ? { ...sig, finishAt: now - finishAgoMs } : sig;
+  }
+  return out;
 }
 
 /** The watcher's own report (`onStatus`). */

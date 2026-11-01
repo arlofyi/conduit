@@ -157,7 +157,7 @@ class WatchRulesTest {
 
   @Test
   fun the_baseline_from_the_app_catches_a_turn_that_ended_during_the_hand_over() {
-    val (seen, signals) = WatchRules.baselineOf("""{"seen":[],"signals":{"a":{"needs":null,"status":"running"}}}""")
+    val (seen, signals) = WatchRules.baselineOf("""{"seen":[],"signals":{"a":{"needs":null,"status":"running"}}}""", 0L)
     val r = WatchRules(seen, signals)
     r.onProjects(projects(sess("a", status = "done")))
     r.settle()
@@ -491,7 +491,36 @@ class WatchRulesTest {
   fun the_baseline_carries_live_stopped_and_failed() {
     val (_, signals) = WatchRules.baselineOf(
       """{"seen":[],"signals":{"a":{"needs":null,"status":"running","running":true,"stopped":false,"failed":null,"live":true}}}""",
+      0L,
     )
     assertEquals(Signal(null, "running", running = true, stopped = false, failed = null, live = true), signals["a"])
+  }
+
+  @Test
+  fun a_finish_the_app_was_settling_goes_across_with_its_age() {
+    // watch.test.ts builds this JSON with watchBaseline (app saw the turn end 5 s earlier)
+    val (seen, signals) = WatchRules.baselineOf(
+      """{"seen":[],"signals":{"a":{"needs":null,"status":"done","running":true,"stopped":false,"failed":null,"live":true,"finishAgoMs":5000},""" +
+        """"r":{"needs":null,"status":"running","running":true,"stopped":false,"failed":null,"live":true}}}""",
+      100_000L,
+    )
+    assertEquals(95_000L, signals["a"]?.finishAt)
+    assertNull(signals["r"]?.finishAt)
+    val r = WatchRules(seen, signals)
+    r.onProjects(projects(sess("a", status = "done")), 100_000L)
+    r.onTick(95_000L + FINISH_SETTLE_MS - 1)
+    assertEquals(emptyList<String>(), r.keys())
+    assertEquals(95_000L + FINISH_SETTLE_MS, r.nextWakeAt())
+    r.onTick(95_000L + FINISH_SETTLE_MS)
+    assertEquals(listOf("done:a"), r.keys())
+  }
+
+  @Test
+  fun a_baseline_age_on_a_session_no_longer_quiet_is_dropped() {
+    val (_, signals) = WatchRules.baselineOf(
+      """{"seen":[],"signals":{"a":{"needs":"question","status":"needsInput","finishAgoMs":3000}}}""",
+      50_000L,
+    )
+    assertNull(signals["a"]?.finishAt)
   }
 }

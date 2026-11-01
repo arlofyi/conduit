@@ -452,7 +452,12 @@ class WatchRules(private val seen: Set<String>, initialSignals: Map<String, Sign
 
     /** The app's baseline (`watchBaseline` as JSON):
      * `{seen: string[], signals: {id: {needs, status, running?, stopped?, failed?, live?}}}`. */
-    fun baselineOf(json: String): Pair<Set<String>, Map<String, Signal>> {
+    /**
+     * watch.ts `watchBaseline` + `baselineSignals`. A finish the app was still settling arrives
+     * as its age (`finishAgoMs`), because the app's clock and [now]'s (elapsedRealtime) do not
+     * share an origin; it lands as `finishAt = now - age`, and only on a session that is quiet.
+     */
+    fun baselineOf(json: String, now: Long): Pair<Set<String>, Map<String, Signal>> {
       val o = runCatching { JSONObject(json) }.getOrNull() ?: return emptySet<String>() to emptyMap()
       val seen = HashSet<String>()
       o.optJSONArray("seen")?.let { a -> for (i in 0 until a.length()) a.optString(i, "").takeIf { it.isNotEmpty() }?.let(seen::add) }
@@ -460,7 +465,7 @@ class WatchRules(private val seen: Set<String>, initialSignals: Map<String, Sign
       o.optJSONObject("signals")?.let { m ->
         for (k in m.keys()) {
           val s = m.optJSONObject(k) ?: continue
-          signals[k] = Signal(
+          val sig = Signal(
             needs = s.str("needs"),
             status = s.str("status") ?: "idle",
             running = s.boolOrNull("running"),
@@ -468,6 +473,8 @@ class WatchRules(private val seen: Set<String>, initialSignals: Map<String, Sign
             failed = s.str("failed")?.ifEmpty { null },
             live = s.optBoolean("live", false),
           )
+          val ago = if (s.has("finishAgoMs") && !s.isNull("finishAgoMs")) s.optLong("finishAgoMs", -1L) else -1L
+          signals[k] = if (ago >= 0 && quiet(sig)) sig.copy(finishAt = now - ago) else sig
         }
       }
       return seen to signals

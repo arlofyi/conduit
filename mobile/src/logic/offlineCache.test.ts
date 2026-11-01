@@ -21,6 +21,8 @@ import {
   slimItem,
   staleKeys,
   touchIndex,
+  feedSignature,
+  utf8Bytes,
 } from "./offlineCache";
 
 const bubbles = (n: number, from = 0): ChatItem[] =>
@@ -90,6 +92,21 @@ describe("feed bounding", () => {
 });
 
 describe("serialization", () => {
+  it("writes the same JSON as one stringify of the bounded feed", () => {
+    const items = bubbles(7);
+    expect(serializeChat(sessionKey("abc"), items, 99)).toBe(JSON.stringify({ v: 1, key: "s:abc", savedAt: 99, items: boundFeed(items) }));
+  });
+
+  it("measures UTF-8 bytes and signs a feed by length and newest item", () => {
+    expect(utf8Bytes("abc")).toBe(3);
+    expect(utf8Bytes("é")).toBe(2);
+    expect(utf8Bytes("—")).toBe(3);
+    expect(utf8Bytes("😀")).toBe(4);
+    expect(feedSignature(bubbles(3))).toBe(feedSignature(bubbles(3)));
+    expect(feedSignature(bubbles(3))).not.toBe(feedSignature(bubbles(4)));
+    expect(feedSignature([])).toBe("0|");
+  });
+
   it("round-trips a chat", () => {
     const items = bubbles(3);
     const c = parseChat(serializeChat(sessionKey("abc"), items, 1234));

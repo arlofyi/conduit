@@ -592,6 +592,8 @@ function SessionRow({
         <span
           className="trust-chip"
           style={{ color: "var(--amber)" }}
+          role="img"
+          aria-label="Auto-approve is on"
           title="Auto-approve is on: Conduit answers Allow to every request from this session"
         >
           {"⚡︎"}

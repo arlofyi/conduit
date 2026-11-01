@@ -1,5 +1,6 @@
 package expo.modules.bgwatch
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -54,6 +55,10 @@ class BgWatchService : Service() {
     }
   }
   private var listening = false
+  /** when the backstop alarm is set for (elapsedRealtime ms); null: none set */
+  private var alarmAt: Long? = null
+  /** the last VPN state the rules were told (networkChanged skips a repeat) */
+  private var lastTunnel: Boolean? = null
 
   override fun onBind(intent: Intent?): IBinder? = null
 
@@ -62,6 +67,7 @@ class BgWatchService : Service() {
     NativeLog.init(this)
     // A previous process may have left notifications nobody can cancel any more.
     cancelAllOurs(this)
+    (getSystemService(NOTIFICATION_SERVICE) as? NotificationManager)?.let { ensureChannels(it) }
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -83,6 +89,17 @@ class BgWatchService : Service() {
       stopSelf()
       return START_NOT_STICKY
     }
+    if (intent?.action == ACTION_WAKE) {
+      // The backstop alarm: the Handler's clock stood still while the CPU slept, so do now
+      // what its wake (and the link's redial) would have done.
+      alarmAt = null // it has fired: the next render sets a fresh one if one is still due
+      rules?.let { r ->
+        r.onTick(now())
+        render()
+        link?.nudge()
+        return START_NOT_STICKY
+      }
+    }
     BgWatchState.service = this
     BgWatchState.running = true
     BgWatchState.reason = null
@@ -101,8 +118,10 @@ class BgWatchService : Service() {
     main.post {
       if (!cfg.sameEndpoint(applied)) {
         link?.close()
-        val (seen, signals) = WatchRules.baselineOf(cfg.baseline)
-        rules = WatchRules(seen, signals).also { it.onNetwork(tunnelUp()) }
+        val (seen, signals) = WatchRules.baselineOf(cfg.baseline, now())
+        val tunnel = tunnelUp()
+        lastTunnel = tunnel
+        rules = WatchRules(seen, signals).also { it.onNetwork(tunnel) }
         BgWatchState.updatePhase("connecting")
         link = Link(main, cfg, ::onFrame, ::fatal).also { it.start() }
         // the phase may already have been "connecting" (no change event): the clock starts now
@@ -144,11 +163,42 @@ class BgWatchService : Service() {
     }.getOrDefault(true)
   }
 
-  /** Re-check when the rules next need time to pass; one pending wake at a time. */
+  /** Re-check when the rules next need time to pass; one pending wake at a time.
+   * The Handler's delay counts uptime, which stands still while the CPU sleeps (screen off), so
+   * an inexact alarm backs it up: it lands at most a few minutes late (Doze batches it), wakes
+   * the CPU, and arrives as ACTION_WAKE. No wakelock and no exact-alarm permission. */
   private fun scheduleWake(r: WatchRules) {
     main.removeCallbacks(wake)
-    val at = r.nextWakeAt() ?: return
+    val at = r.nextWakeAt()
+    if (at == null) {
+      cancelAlarm()
+      return
+    }
     main.postDelayed(wake, (at - now()).coerceAtLeast(0) + WAKE_SLACK_MS)
+    setAlarm(at + ALARM_SLACK_MS)
+  }
+
+  private fun wakeIntent(): PendingIntent = PendingIntent.getService(
+    this,
+    2,
+    Intent(this, BgWatchService::class.java).setAction(ACTION_WAKE),
+    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+  )
+
+  /** Replace the backstop alarm (the same PendingIntent, so one at a time); unchanged: left alone. */
+  private fun setAlarm(at: Long) {
+    if (alarmAt == at) return
+    val am = getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+    runCatching { am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, wakeIntent()) }
+      .onSuccess { alarmAt = at }
+      .onFailure { NativeLog.warn("bgwatch", "alarm.failed", it) }
+  }
+
+  private fun cancelAlarm() {
+    if (alarmAt == null) return
+    alarmAt = null
+    val am = getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+    runCatching { am.cancel(wakeIntent()) }
   }
 
   /** watch.ts diffNotifications: post what is new or changed, cancel what is no longer wanted.
@@ -159,7 +209,6 @@ class BgWatchService : Service() {
     val r = rules ?: return
     scheduleWake(r)
     val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-    ensureChannels(nm)
     val desired = r.desired(cfg.prefs)
     val group = groupKey(cfg)
     val keep = HashSet<String>()
@@ -309,15 +358,21 @@ class BgWatchService : Service() {
     if (runCatching { cm.registerDefaultNetworkCallback(cb) }.isSuccess) netCallback = cb
   }
 
-  /** A VPN coming or going decides whether "can't reach your computer" is news. */
+  /** A VPN coming or going decides whether "can't reach your computer" is news. The callback
+   * fires on every capability change (signal strength too), so an unchanged VPN state is skipped. */
   private fun networkChanged() {
     val r = rules ?: return
-    r.onNetwork(tunnelUp())
+    val tunnel = tunnelUp()
+    if (tunnel == lastTunnel) return
+    lastTunnel = tunnel
+    r.onNetwork(tunnel)
     render()
   }
 
   override fun onDestroy() {
     main.removeCallbacksAndMessages(null)
+    cancelAlarm()
+    lastTunnel = null
     if (listening) {
       BgWatchState.removeListener(phaseListener)
       listening = false
@@ -351,8 +406,6 @@ class BgWatchService : Service() {
   }
 
   private fun ongoingNotification(cfg: WatchConfig?): Notification {
-    val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-    ensureChannels(nm)
     val from = cfg?.computer?.takeIf { it.isNotBlank() } ?: "your computer"
     val needsOn = cfg == null || cfg.prefs.question || cfg.prefs.permission || cfg.prefs.failed
     val finishedOn = cfg?.prefs?.finished == true || cfg?.prefs?.stopped == true
@@ -425,6 +478,8 @@ class BgWatchService : Service() {
     const val EXTRA_BRANCH = "expo.modules.bgwatch.BRANCH"
     const val EXTRA_NONCE = "expo.modules.bgwatch.NONCE"
     const val ACTION_STOP = "expo.modules.bgwatch.STOP"
+    /** the backstop alarm (scheduleWake) */
+    const val ACTION_WAKE = "expo.modules.bgwatch.WAKE"
     /** BgWatchState.reason after the ongoing notification's Stop */
     const val REASON_STOPPED = "stopped"
     private const val CHANNEL_NEEDS = "agent_needs_you"
@@ -434,6 +489,8 @@ class BgWatchService : Service() {
     private const val CHANNEL_STATUS = "agent_status"
     /** a wake lands just after its deadline, never just before */
     private const val WAKE_SLACK_MS = 50L
+    /** the alarm is only a backstop: it lands after the Handler's wake would have, when awake */
+    private const val ALARM_SLACK_MS = 1_000L
     private const val CHANNEL_WATCH = "bg_watch"
     private const val TAG_PREFIX = "bgwatch:"
     // under TAG_PREFIX, so cancelAllOurs takes the summary down too

@@ -5,173 +5,116 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
-- **Added — Session options on the phone.** A chat's options sheet on a paired phone
-  switches its model (live, through the agent's own `/model`, where the agent has one), sets
-  its reasoning effort (an idle session restarts to apply it, keeping its conversation),
-  renames it, and pins it "keep running" so the idle auto-stop leaves it alone. The pin is
-  now stored with the session rather than per computer, so the phone and the sidebar's
-  "Keep running" always agree; existing pins carry over on first launch.
-- **Added — Commands and skills on the phone.** The options sheet lists the session's slash
-  commands with a one-line description: Claude's useful built-ins, your own custom commands
-  and skills (yours and the project's), and Antigravity's skills, plus which MCP servers the
-  session loads.
-- **Added — Usage on the phone.** The phone shows each agent account's plan usage (the
-  5-hour and weekly windows, Antigravity's per-model pools, OpenRouter spend) with the same
-  names and "used" direction as the desktop meter. It reuses what the computer last read, so
-  checking from the phone never adds a request to a rate-limited usage service.
-- **Added — Your computer's web apps on your phone.** Anything running on your computer's
-  `localhost` (a dev server, a Docker container, an agent's preview) opens on a paired
-  Android phone at the same address, `http://localhost:<port>`, with no change to the app
-  or to Tailscale. The phone's new Apps tab lists what is running; switch on mirroring and
-  tap one to open it in your browser. Pages that call other local ports (a frontend and its
-  API) keep working, because every listed port is mirrored. Apps stay private to your
-  computer's network: each connection goes through Conduit's link and needs the phone's
-  pairing. While mirroring is on, other apps and web pages on the phone can reach the mirrored
-  ports too, so debuggers (Chrome, Node, Electron, on any port), the Docker daemon and Ollama
-  are never offered. Turn it off under Settings → Mobile.
-- **Added — Antigravity chats on the phone.** Antigravity sessions now open on the phone as
-  a real conversation (messages, commands it ran, files it read and edited), read from
-  Antigravity's own conversation history on your computer, and you can start a new
-  Antigravity session from the phone's "+" as well as Claude.
-- **Added — Answer Antigravity's permission prompts from the phone.** When an Antigravity
-  session stops to ask "Run this command?", the phone (and the desktop's permission cards)
-  now show the request with Allow and Deny, like Claude's. Allow runs it; Deny cancels the
-  step and Antigravity asks what to do instead. Answering in the terminal clears the card.
-- **Added — Auto-approve for Antigravity sessions.** Switch it on in a session's sheet on
-  the phone, or from the session's right-click menu on the computer, and Conduit answers
-  every permission request from that session with Allow (commands and file edits
-  included). Antigravity's own auto mode still asks for every command, so Conduit answers
-  for it.
-- **Added — Notifications on Android with the app closed or the screen off.** While the app
-  is in the background, the phone keeps a light connection to your computer and posts a
-  system notification when a session asks a question, needs a permission or finishes, and
-  when a general chat replies (with the start of the reply). Tapping one opens that chat.
-  Finished alerts pop up like the others rather than filing silently. The "Notify me"
-  switches in Settings choose which ones you get.
-- **Added — Local error log.** Conduit writes errors, warnings and crashes to a log file on your
-  computer (`<data folder>/logs/conduit.log`, rotated at 2 MB, three files kept), with tokens,
-  prompts and file contents left out. Nothing is sent anywhere.
-- **Added — Diagnostics in Settings → About.** This run's uptime and counts (sessions started,
-  start failures, phone connections, mirrored ports, errors), the latest errors, Open logs folder,
-  and Copy diagnostics for a redacted summary to paste into a bug report.
-- **Changed — A crashing panel no longer blanks the app.** If Settings, a palette, root chat, the
-  task board or the Continuity view hits an error, it shows "Something went wrong in this panel"
-  with Reload panel and Copy details; terminals and the rest of the window keep running.
-- **Added — Diagnostics on the phone.** Settings → Diagnostics shows connection, message and
-  error counts and the latest errors, with Share log and Clear log. The log stays on the phone
-  (out of cloud backups) and keeps tokens, messages and file contents out. If the app hits an
-  unexpected error it shows "Something went wrong" with Try again and Share log instead of a blank
-  screen, and a crash in one mirrored connection ends only that connection.
-- **Added — Read your chats offline.** The sessions list, the chats you've opened and your
-  general chats are kept on the phone, so they open with Tailscale off or no signal, marked
-  "Offline · showing what was saved at …". Private sessions are never kept, and forgetting a
-  computer deletes its copy. Settings → Storage turns this off, shows the space used and clears it.
-- **Added — While you were away.** After being disconnected for a while, Sessions shows once what
-  changed, e.g. "Since 2:05 PM: 2 finished, 1 needs you".
-- **Added — More notifications.** "A turn fails" (on by default: Claude stopped on an API error
-  such as a rate limit, and the session no longer looks busy for 20 minutes), "A running session
-  is stopped" (from the computer, the phone or the idle auto-stop), and on Android "Your computer
-  is out of reach" (once, after 10 minutes without a connection while Tailscale is on; never when
-  you turn Tailscale off yourself). The last two are off by default.
-- **Changed — Reconnects right away.** Bringing Conduit back to the front, or tapping Retry,
-  reconnects at once instead of waiting out the retry delay, and a connection that silently died
-  is noticed within about 35 seconds. Messages can't be sent while offline, and your draft stays.
-- **Fixed — Notifications no longer fire for every message.** "Finished" now means the session
-  really stopped: it waits until a session has been quiet for 20 seconds, so an agent pausing
-  between steps or at a permission prompt no longer reads as finished.
-- **Fixed — An open chat no longer goes blank on reconnect**, and a general chat opened while
-  offline loads once the connection is back.
+- **Added — Session controls on the phone.** One sheet (the tune button in a chat's header)
+  holds every session action: interrupt, switch the model (live, through the agent's own
+  `/model`, where it has one), set the reasoning effort (an idle session restarts to apply it,
+  keeping its conversation), rename, pin "keep running" so the idle auto-stop leaves it alone,
+  Compact and Clear, open its files, and stop it. The "keep running" pin is now stored with the
+  session, so the phone and the sidebar always agree (existing pins carry over). On a private
+  session the controls the computer refuses are greyed out with "Private: control it on your
+  computer". Antigravity's model list follows the session's account.
 - **Added — Stop from the chat header.** While an agent is working, a red stop button in the
   session's header interrupts the turn in one tap.
-- **Added — Save files from the list.** Each file in the phone's file browser has a "…" button
-  (and a screen-reader action) to save it to the phone; no long-press needed.
-- **Changed — Auto-approve asks first.** Turning on Antigravity auto-approve, on the phone or
-  the computer, asks you to confirm, and sessions with it on show an amber bolt in the sidebar.
-- **Changed — Private sessions say why.** Interrupt, Compact and Clear are greyed out on a
-  private session with "Private: control it on your computer" instead of silently doing nothing.
-- **Changed — Apps tab.** Hidden where mirroring isn't available (iPhone), explains how to turn
-  mirroring on and what "Port busy on phone" means, and refreshes less often. If Android refuses
-  to start mirroring from the background, the switch turns off and says why.
-- **Changed — The phone's Antigravity model list follows the session's account.**
-- **Changed — Notifications stack per computer**, and the background-connection notification
-  has a Stop button (notifications then stay off with the screen off until you turn them back
-  on in Settings).
-- **Fixed — Antigravity permission cards answer the right request.** Only the request on screen
-  gets a card, so allowing one can no longer run a different queued command; a request handed
-  back when your phone disconnects comes back as a card later instead of being lost.
-- **Fixed — Private sessions stay off the phone through general chat.** A general chat that has
-  read a private session is no longer listed, readable or streamed on a phone (it stays fully
-  usable on the computer), and the phone's file browser can no longer open other sessions'
-  worktrees or reach hidden folders by changing letter case or using a Windows short name.
-- **Fixed — MCP credentials are not left on disk.** A general chat's MCP config file (which can
-  hold your servers' tokens) is deleted when each turn ends, when the chat is deleted, and at
-  startup after a crash.
-- **Fixed — A failed general chat notifies.** An Antigravity error or a crash now notifies "The
-  reply failed" instead of nothing.
-- **Fixed — General chat turns no longer hang** when the agent writes a lot of error output, and
-  a phone-started chat no longer stays "running" on the computer when it finishes very quickly.
-- **Fixed — Phone chats cost the computer far less.** An open chat reads only what is new in the
-  transcript instead of the whole file many times a second; very long conversations send only
-  their newest messages; the project list is re-sent only when it changed; idle mirrored
-  connections and the Windows port scan do much less work; and stopping a general chat no
-  longer freezes the window.
-- **Fixed — Slow dev servers appear on the phone.** One that takes a while to answer its first
-  request (Next.js compiling) shows up within about 30 seconds instead of never.
-- **Fixed — Port mirroring switch.** Turning it off while it was starting could leave it on, and
-  a remapped port no longer reports "in use".
-- **Fixed — Readability on the phone.** Code shows in a monospace font on Android, dim info text
-  is easier to read, buttons are easier to tap, line numbers follow your text size, long values
-  no longer squash their titles, lists clear the gesture bar, the usage popover works with
-  screen readers, and closing chat settings with unsaved changes asks first.
-- **Fixed — Compact and Clear from the phone run at once.** They used to land in Claude's
-  input box and wait for you to press Enter (the command menu took the Enter); slash commands
-  typed in the composer get the same fix. While a compact runs, the chat header now says
-  "compacting…" instead of "idle".
-- **Fixed — Long sheets on the phone scroll.** The session sheet's last rows (Compact, Clear,
-  Stop) could not be reached on Android; every sheet now scrolls within the screen.
-- **Fixed — Nothing hides behind the phone's tab bar.** On Android the last rows of Settings,
-  Apps and the session and chat lists sat under the bottom bar.
-- **Changed — Usage in the phone's Settings names the account.** Each row is titled with the
-  account (Arlo, Personal) beside the agent's icon, and the 5-hour and weekly meters are rings
-  captioned "used", so it is clear they show what has been spent.
+- **Added — Commands and skills on the phone.** The session sheet lists its slash commands with
+  a one-line description: Claude's useful built-ins, your own commands and skills (yours and
+  the project's) and Antigravity's skills, plus which MCP servers the session loads.
+- **Added — Usage on the phone.** Settings shows each account's plan usage, titled by account
+  (Arlo, Personal) beside the agent's icon: the 5-hour and weekly windows as rings captioned
+  "used", Antigravity's per-model pools and OpenRouter spend, named the same way as the desktop
+  meter. It reuses what the computer last read, so checking never adds a request to a
+  rate-limited usage service.
+- **Added — Project files on the phone.** Browse a session's folder from its sheet or the folder
+  button in the chat, read files (Markdown rendered), view images, edit and save text files, and
+  save any file to a folder on the phone (each file has a "…" button) or share it. A file changed
+  on your computer since you opened it is never overwritten. `.git` and other sessions' worktrees
+  are hidden, links are never followed, and secrets such as `.env` or key files ask before they
+  open and can't be edited from the phone. Private sessions stay closed.
+- **Added — Antigravity chats on the phone.** Antigravity sessions open on the phone as a real
+  conversation (messages, commands it ran, files it read and edited), read from Antigravity's own
+  history on your computer, and "+" starts Antigravity sessions as well as Claude.
+- **Added — Answer Antigravity's permission prompts.** When an Antigravity session asks "Run this
+  command?", the phone and the desktop's permission cards show it with Allow and Deny, like
+  Claude's. Only the request on screen gets a card, so an answer always goes to the command it
+  names; answering in the terminal clears the card, and a request handed back when your phone
+  drops comes back as a card later.
+- **Added — Auto-approve for Antigravity sessions.** Switch it on in a session's sheet on the phone
+  or from its right-click menu on the computer (both ask you to confirm) and Conduit answers every
+  permission request from that session with Allow, commands and file edits included. Sessions
+  with it on show an amber bolt. Antigravity's own auto mode still asks for every command, so
+  Conduit answers for it.
+- **Added — General chat on the phone.** The new Chats tab (your sessions are now under Sessions)
+  is your computer's general chat: ask across your projects without a coding session. "+" starts
+  a chat at once on Claude or Antigravity (remembering your pick). A new chat knows none of your
+  projects until you attach profiles or projects from its settings, and it only sees and reads
+  what is attached. Private sessions never reach the phone through a chat: no general chat can
+  read a private session's files or the agents' transcripts, a chat used from the phone never
+  peeks at one, and a chat on the computer that has peeked at one is not shown on the phone.
+- **Added — Model, effort, deep research and MCP servers for a general chat.** Set from the
+  chat's settings, applied from the next message; the desktop header shows non-default choices.
+  Deep research makes the chat search widely, read its sources, cross-check, cite links and say
+  what it could not verify. A Claude chat can load the MCP servers you set up for Claude Code,
+  chosen per chat; the config file that carries their credentials is deleted after every turn.
+- **Added — Antigravity general chats.** A general chat on Antigravity reads your projects and the
+  web, keeps its conversation between messages, and shows its history on the phone and the
+  computer. It cannot run commands or write files, and it has no Conduit tools.
+- **Added — Your computer's web apps on your phone.** Anything running on your computer's
+  `localhost` (a dev server, a container, an agent's preview) opens on a paired Android phone at
+  the same `http://localhost:<port>`, with no change to the app or to Tailscale. The Apps tab
+  lists what is running (a slow-starting dev server appears within about 30 seconds); switch on
+  mirroring and tap one. Pages that call other local ports keep working, because every listed
+  port is mirrored. Each connection goes through Conduit's link and needs the phone's pairing;
+  while mirroring is on, other apps and web pages on the phone can reach the mirrored ports too,
+  so debuggers (Chrome, Node, Electron, on any port), the Docker daemon and Ollama are never
+  offered. The tab is hidden on iPhone, where mirroring isn't available. Turn it off under
+  Settings → Mobile.
+- **Added — Notifications on Android with the app closed or the screen off.** The phone keeps a
+  light connection to your computer and notifies you when a session asks a question, needs a
+  permission, finishes (once it has been quiet for 20 seconds, so pauses between steps don't
+  count) or fails (Claude stopped on an API error such as a rate limit), and when a general chat
+  replies or fails. Optional: when a running session is stopped, and when your computer has been
+  out of reach for 10 minutes while Tailscale is on (never when you turn Tailscale off yourself).
+  Notifications pop up, stack per computer, and open the chat when tapped; the "Notify me"
+  switches in Settings choose which you get. The ongoing notification's Stop pauses them until
+  you change a switch, resume in Settings, or restart the app.
+- **Added — Read your chats offline.** The sessions list, the chats you've opened and your general
+  chats are kept on the phone, so they open with Tailscale off or no signal, marked "Offline ·
+  showing what was saved at …". Private sessions are never kept, the copy stays out of cloud
+  backups, and forgetting a computer deletes it. Settings → Storage turns this off, shows the
+  space used and clears it.
+- **Added — Connect when you want.** Bringing Conduit back to the front, or tapping Retry,
+  reconnects at once, a connection that silently died is noticed within about 35 seconds, and
+  after a while away Sessions shows once what changed ("Since 2:05 PM: 2 finished, 1 needs you").
+  Messages can't be sent while offline, and your draft stays.
+- **Added — Diagnostics, kept local.** The computer writes errors, warnings and crashes to a log
+  (`<data folder>/logs/conduit.log`, rotated at 2 MB) and Settings → About → Diagnostics shows
+  this run's counts and latest errors, opens the logs folder and copies a redacted summary for a
+  bug report. The phone has the same under Settings → Diagnostics, with Share log. Tokens,
+  prompts, messages and file contents are kept out, and nothing is sent anywhere.
+- **Changed — A crashing panel no longer blanks the app.** On the computer, an error in Settings,
+  a palette, general chat, the task board or the Continuity view shows "Something went wrong in
+  this panel" with Reload panel and Copy details while terminals keep running; the phone shows a
+  recoverable "Something went wrong" screen instead of a blank one.
+- **Changed — Name a new session from the phone, with or without a first message.** The "+" screen
+  has a Title field, and the first message is optional: leave it empty and the agent waits for you.
 - **Changed — Android reaches your computer by its Tailscale address first.** A Tailscale DNS
   hiccup no longer delays every reconnect; the computer's name is still tried as a fallback.
-- **Added — Project files on the phone.** Browse a session's folder from its info sheet or
-  the folder button in the chat, read files (Markdown rendered), view images, edit and save
-  text files, and save any file to a folder you choose on the phone (or share it). A file changed
-  on your computer since you opened it is never overwritten. `.git` is hidden, links are
-  never followed, and secrets such as `.env` or key files ask before they open and can't be
-  edited from the phone. Private sessions stay closed.
-- **Added — General chat on the phone.** The new Chats tab (the old Chats tab, your sessions, is now Sessions) is the root chat from your
-  computer: ask questions across your projects without a coding session. "+" starts a chat
-  at once: it only asks which agent to use (Claude or Antigravity, remembering your last
-  pick), and skips even that when your computer offers just one. A new chat starts with
-  nothing attached and knows none of your projects; like attaching a folder, attach whole
-  profiles or single projects from the chat's settings (the line under its title shows what
-  is attached, e.g. "No projects attached" or "Work · 3 projects"), and detach them the same
-  way. A chat only sees, and can only read the files of, what is attached, and a chat used
-  from the phone never reads a private session.
-- **Added — Choose the model and effort for a general chat.** A chat runs on the agent it was
-  started with; its model, reasoning effort, deep research and MCP servers are set from the
-  chat's settings and apply from the next message. The settings sheet scrolls, with Save
-  always in reach. The desktop chat header shows a chat's non-default choices.
-- **Added — Deep research in general chat.** Switch it on and the chat works harder: it
-  searches widely, reads the sources themselves, cross-checks, cites its links and says what
-  it could not verify.
-- **Added — Your MCP servers in general chat.** A Claude general chat can load MCP servers
-  you have set up for Claude Code (user scope), chosen per chat, alongside Conduit's own.
-- **Added — Antigravity general chats.** A general chat on Antigravity reads your projects
-  and the web, keeps its conversation between messages, and shows its history on the phone
-  and the computer. It cannot run commands or write files, and it has no Conduit tools.
-- **Fixed — General chat no longer tries shell commands it is not allowed to run.** The chat
-  is now told exactly what it can use (files, the web, `gh`, its own notes), so it stops
-  attempting PowerShell or shell scripts that were always refused and showed up as failed
-  tool calls.
-- **Changed — Name a new session from the phone, with or without a first message.** The
-  "+" screen has a Title field, and the first message is optional: leave it empty and the
-  agent starts and waits for you.
-- **Fixed — A session deleted from the phone disappears at once.** The phone's list now
-  updates the moment anything changes on your computer, instead of waiting for a refresh.
+- **Changed — A failed turn wakes the Conductor**, so a worker that stops on a rate limit or sign-in
+  error is noticed instead of sitting idle.
+- **Fixed — Compact and Clear from the phone run at once.** They used to land in Claude's input box
+  and wait for Enter (the command menu took it); slash commands typed in the composer get the same
+  fix, and while a compact runs the header says "compacting…" instead of "idle".
+- **Fixed — Phone chats cost the computer far less.** An open chat reads only what is new in the
+  transcript instead of the whole file many times a second, very long conversations send only
+  their newest messages, and the project list is re-sent only when it changed.
+- **Fixed — General chat.** Turns no longer hang when the agent writes a lot of error output,
+  stopping a chat no longer freezes the window, a chat started from the phone no longer stays
+  "running" on the computer, and the chat is told exactly what it can use (files, the web, `gh`,
+  its own notes) so it stops attempting shell commands that were always refused.
+- **Fixed — The phone's lists and sheets.** A session deleted from the phone disappears at once
+  (the list updates the moment anything changes on your computer), long sheets scroll, nothing
+  hides behind the tab bar on Android, an open chat no longer goes blank on reconnect, code shows
+  in a monospace font on Android, dim text is easier to read, buttons are easier to tap, line
+  numbers follow your text size, and closing chat settings with unsaved changes asks first.
 
 ## 0.49.0 — 2026-10-31
 

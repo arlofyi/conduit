@@ -1,14 +1,18 @@
 import type { WireProjectsView, WireViewSession } from "../bridge/protocol";
 import type { ChatItem } from "../data/types";
-import { rootKey, sessionKey } from "./offlineCache";
-import { OfflineStore, type CacheFs, type StoreTimers } from "./offlineStore";
+import { rootKey, sessionKey, utf8Bytes } from "./offlineCache";
+import { LIST_MIN_INTERVAL_MS, OPEN_CHAT_MAX_WAIT_MS, OfflineStore, SAVE_MAX_WAIT_MS, type CacheFs, type StoreTimers } from "./offlineStore";
 
 /** An in-memory file system: path -> text. */
 function memFs() {
   const files = new Map<string, string>();
+  const writes: string[] = [];
   const fs: CacheFs = {
     read: async (p) => files.get(p) ?? null,
-    write: (p, t) => void files.set(p, t),
+    write: (p, t) => {
+      writes.push(p);
+      files.set(p, t);
+    },
     remove: (p) => void files.delete(p),
     removeDir: (d) => {
       for (const k of [...files.keys()]) if (k.startsWith(`${d}/`)) files.delete(k);
@@ -16,7 +20,7 @@ function memFs() {
     listDirs: () => [...new Set([...files.keys()].map((k) => k.split("/")[0]))],
     size: () => [...files.values()].reduce((n, t) => n + t.length, 0),
   };
-  return { fs, files };
+  return { fs, files, writes };
 }
 
 /** Manual timers: `tick` runs what is due. */
@@ -61,7 +65,7 @@ describe("OfflineStore", () => {
   it("debounces: many saves, one write after things go quiet", async () => {
     const { fs, files } = memFs();
     const { t, tick } = fakeTimers();
-    const store = new OfflineStore(fs, t, 1000, 10_000);
+    const store = new OfflineStore(fs, t, { debounceMs: 1000, maxWaitMs: 10_000 });
     for (let i = 1; i <= 5; i++) {
       store.saveChat("mac", sessionKey("s1"), items(i));
       tick(500);
@@ -77,7 +81,7 @@ describe("OfflineStore", () => {
   it("a steady stream still writes by the max wait", async () => {
     const { fs, files } = memFs();
     const { t, tick } = fakeTimers();
-    const store = new OfflineStore(fs, t, 1000, 3000);
+    const store = new OfflineStore(fs, t, { debounceMs: 1000, maxWaitMs: 3000 });
     for (let i = 0; i < 8; i++) {
       store.saveChat("mac", sessionKey("s1"), items(i + 1));
       tick(500);
@@ -97,7 +101,7 @@ describe("OfflineStore", () => {
   it("evicts the least recently saved chats past the count, deleting their files", async () => {
     const { fs, files } = memFs();
     const { t, tick } = fakeTimers();
-    const store = new OfflineStore(fs, t, 10, 10);
+    const store = new OfflineStore(fs, t, { debounceMs: 10, maxWaitMs: 10 });
     // MAX_CHATS is 50: save 52, one flush each so the save times differ.
     for (let i = 0; i < 52; i++) {
       store.saveChat("mac", sessionKey(`s${i}`), items(1));
@@ -192,5 +196,113 @@ describe("OfflineStore", () => {
     await store.flush();
     expect((await store.loadProjects("a"))?.view.projects[0].sessions[0].id).toBe("x");
     expect(store.bytes()).toBeGreaterThan(0);
+  });
+
+  it("the open chat is not written on the 15 s max-wait, only at the 60 s safety net", async () => {
+    const { fs, files } = memFs();
+    const { t, tick } = fakeTimers();
+    const store = new OfflineStore(fs, t);
+    store.openChat("mac", sessionKey("s1"));
+    for (let i = 1; i <= 40; i++) {
+      store.saveChat("mac", sessionKey("s1"), items(i));
+      tick(1000);
+      await flushPromises();
+    }
+    expect(SAVE_MAX_WAIT_MS).toBeLessThan(40_000);
+    expect(files.has("mac/s-s1.json")).toBe(false);
+    for (let i = 41; i <= 61; i++) {
+      store.saveChat("mac", sessionKey("s1"), items(i));
+      tick(1000);
+      await flushPromises();
+    }
+    expect(OPEN_CHAT_MAX_WAIT_MS).toBe(60_000);
+    expect(files.has("mac/s-s1.json")).toBe(true);
+  });
+
+  it("the open chat is written when its turn ends and when it closes", async () => {
+    const { fs, files } = memFs();
+    const { t } = fakeTimers();
+    const store = new OfflineStore(fs, t);
+    store.openChat("mac", sessionKey("s1"));
+    store.saveChat("mac", sessionKey("s1"), items(3));
+    await store.flushChat("mac", sessionKey("s1"));
+    expect((await store.loadChat("mac", sessionKey("s1")))?.items).toHaveLength(3);
+    files.clear();
+    store.saveChat("mac", sessionKey("s1"), items(4));
+    await store.closeChat("mac", sessionKey("s1"));
+    expect(files.has("mac/s-s1.json")).toBe(true);
+  });
+
+  it("a feed whose newest item and length did not change is not written again", async () => {
+    const { fs, writes } = memFs();
+    const { t } = fakeTimers();
+    const store = new OfflineStore(fs, t);
+    store.saveChat("mac", sessionKey("s1"), items(3));
+    await store.flush();
+    const n = writes.length;
+    store.saveChat("mac", sessionKey("s1"), items(3));
+    await store.flush();
+    expect(writes.length).toBe(n);
+    store.saveChat("mac", sessionKey("s1"), items(4));
+    await store.flush();
+    expect(writes.length).toBeGreaterThan(n);
+  });
+
+  it("the lists are written at most every 5 minutes, and at once on a flush", async () => {
+    const { fs, writes } = memFs();
+    const { t, tick } = fakeTimers();
+    const store = new OfflineStore(fs, t);
+    const projectWrites = () => writes.filter((w) => w === "mac/projects.json").length;
+    store.saveProjects("mac", view([sess("a")]));
+    tick(3000);
+    await flushPromises();
+    expect(projectWrites()).toBe(1);
+    store.saveProjects("mac", view([sess("a"), sess("b")]));
+    tick(60_000);
+    await flushPromises();
+    expect(projectWrites()).toBe(1);
+    tick(LIST_MIN_INTERVAL_MS);
+    await flushPromises();
+    expect(projectWrites()).toBe(2);
+    // background / disconnect: written now, interval or not
+    store.saveProjects("mac", view([sess("c")]));
+    await store.flush();
+    expect(projectWrites()).toBe(3);
+  });
+
+  it("the index records the file's real size in UTF-8 bytes", async () => {
+    const { fs, files } = memFs();
+    const { t } = fakeTimers();
+    const store = new OfflineStore(fs, t);
+    store.saveChat("mac", sessionKey("s1"), [{ kind: "bubble", id: "b0", role: "user", text: "héllo wörld — 😀" }]);
+    await store.flush();
+    const text = files.get("mac/s-s1.json") ?? "";
+    expect(store.indexOf("mac").chats["s:s1"].bytes).toBe(utf8Bytes(text));
+    expect(utf8Bytes(text)).toBeGreaterThan(text.length);
+  });
+
+  it("clearing a computer with nothing saved does not abort another computer's flush", async () => {
+    const { fs, files } = memFs();
+    const { t } = fakeTimers();
+    const store = new OfflineStore(fs, t);
+    store.saveChat("a", sessionKey("s1"), items(1));
+    const flushing = store.flush();
+    store.clearMac("nobody");
+    store.pruneMacs(["a"]);
+    await flushing;
+    expect(files.has("a/s-s1.json")).toBe(true);
+  });
+
+  it("removing one computer mid-flush keeps the other computer's writes", async () => {
+    const { fs, files } = memFs();
+    const { t } = fakeTimers();
+    const store = new OfflineStore(fs, t);
+    store.saveChat("a", sessionKey("s1"), items(1));
+    store.saveChat("b", sessionKey("s1"), items(1));
+    const flushing = store.flush();
+    store.clearMac("a");
+    await flushing;
+    expect([...files.keys()].some((k) => k.startsWith("a/"))).toBe(false);
+    expect(files.has("b/s-s1.json")).toBe(true);
   });
 });

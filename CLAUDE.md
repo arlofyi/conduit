@@ -790,6 +790,14 @@ Design: `docs/superpowers/specs/2026-10-31-phone-sessions-files-general-chat-des
   fork seeded from one) it is marked for good and a REMOTE peer never sees it -- not listed
   in `rootchats`, refused for history/send/settings, its live events dropped. Loopback is
   unchanged. Without it every desktop chat's transcript was a way round `session_is_private`.
+- **Every root chat, scoped or not, also carries `root_chat::private_read_denies`**:
+  private (`silo || local_only`) session worktrees, `<cfg>/{projects,file-history,todos}/**`
+  and `Read(<cfg>/history.jsonl)` for every Claude config root (ambient, `~/.claude`, each
+  account), and each agy home's `.gemini/antigravity-cli/conversations`. Without them Read/
+  Glob/Grep (allowed with no path limit) read private work straight from disk, bypassing both
+  `chat_may_peek` and `peeked_private`. It never denies a config root itself (skills live
+  there) or a path that contains an in-scope project. A private session with NO worktree runs
+  in the shared project root and cannot be denied without breaking the project.
 - **A chat's `--mcp-config` file is per TURN** (`rootchat-mcp-<chat>-<uuid>.json`) and is
   deleted when the child exits, with the chat, and at startup: it carries the user's MCP
   env/headers. stderr is drained on its own thread from spawn -- read after stdout's EOF, a
@@ -839,7 +847,7 @@ system notifications. iOS has in-app banners only.
   why finished alerts are `agent_finished_alert`). Notifications group per computer with a
   silent summary; lock-screen versions are content-free; private sessions use fixed wording.
 - **The watcher counts as a phone** (it is in `live`), so questions keep waiting for the phone
-  while it runs. Its ongoing notification's Stop ends it until the user turns it back on.
+  while it runs. Its ongoing notification's Stop pauses it (in memory) until a Notify switch changes, the user resumes it in Settings, or the app restarts.
 - **Opening a chat from a notification carries a per-process nonce** (`EXTRA_NONCE`): the
   launcher activity is exported, and without it any app could open Conduit on a session of its
   choosing with a spoofed header.
@@ -848,7 +856,7 @@ system notifications. iOS has in-app banners only.
 
 `mobile/src/logic/offlineCache.ts` (pure rules), `offlineStore.ts` (debounced writer, takes the
 file system as a parameter so jest runs it), `data/offlineFs.ts` (expo-file-system backend):
-`conduit-offline/<computer>/` holds the projects list, root chats and per-chat feeds as versioned
+`conduit-offline/<computer>/` (Android: the document dir, kept out of Google backup only because expo-secure-store's backup rules include just sharedprefs; iOS: the CACHE dir, because Documents goes to iCloud and expo-file-system cannot exclude it) holds the projects list, root chats and per-chat feeds as versioned
 JSON. Bounded (500 items and 1 MB per chat, 50 chats, 12 MB per computer, LRU), written at most
 every 2.5-15 s and on background/disconnect, never per frame. **The computer's `history` always
 replaces the saved copy**; saved data is shown only until live data arrives. Private sessions are

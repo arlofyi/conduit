@@ -1766,8 +1766,9 @@ impl Store {
             let s = project.sessions.iter_mut().find(|s| s.id == session_id)?;
             if s.worktree_path.is_some() {
                 if taken {
-                    eprintln!(
-                        "conduit: worktree slug {slug} is already used by another session; keeping the derived one"
+                    crate::diag::warn(
+                        "store",
+                        format!("worktree slug {slug} is already used by another session; keeping the derived one"),
                     );
                 } else {
                     s.worktree_path = Some(path);

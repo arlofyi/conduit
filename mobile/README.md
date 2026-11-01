@@ -31,7 +31,13 @@ the computer since you opened it is never overwritten), and save any file to the
 **Offline.** The sessions list, opened chats and general chats are saved on the phone
 (`src/logic/offlineCache.ts`, bounded, never private sessions) and shown read-only while the
 computer is unreachable. Coming back to the app reconnects at once, and Sessions shows a one-time
-"Since 2:05 PM: ..." summary of what changed.
+"Since 2:05 PM: ..." summary of what changed. The copy is never part of a phone backup: on iOS it
+lives in the cache folder (the document folder goes to iCloud, and expo-file-system cannot exclude
+a file from that), so iOS may clear it when storage runs low; on Android it lives in the app's
+files folder, which stays out of Auto Backup only because expo-secure-store's backup rules include
+nothing but its own preferences (`src/data/offlineFs.ts` says so too). Writes are spaced out: the
+chat on screen is saved when it closes, when its turn ends, on background or disconnect (and at
+least every minute), the lists at most every 5 minutes outside those.
 
 **Answering from the phone.** When a session asks a question (AskUserQuestion) or needs
 permission to run a tool (Claude, or Antigravity's "Run this command?"), the computer pushes
@@ -169,8 +175,10 @@ npm run typecheck # tsc --noEmit (strict)
 ```
 
 CI runs both on every PR (the `mobile` job in `.github/workflows/ci.yml`). The Kotlin
-watcher's rules have JVM unit tests in `modules/bg-watch/android/src/test`, run through the
-Android build (`./gradlew :bg-watch:testDebugUnitTest` after `expo prebuild`).
+watcher's rules have JVM unit tests in `modules/bg-watch/android/src/test`. CI's `kotlin-rules`
+job compiles `WatchRules.kt` + `NativeLogRules.kt` and their tests with plain `kotlinc` (they use
+nothing Android, only `org.json`) and runs them with JUnit, no Android SDK needed. Locally they
+also run through the Android build (`./gradlew :bg-watch:testDebugUnitTest` after `expo prebuild`).
 
 ## Layout
 

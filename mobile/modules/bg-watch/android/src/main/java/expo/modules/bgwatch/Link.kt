@@ -56,6 +56,14 @@ internal class Link(
     connect()
   }
 
+  /** The backstop alarm fired (BgWatchService ACTION_WAKE): a redial waiting out its backoff may
+   * have been frozen by CPU sleep (Handler delays count uptime), so a link that is down and not
+   * mid-dial dials now. The backoff is kept, so a dead route still backs off. */
+  fun nudge() {
+    if (closed || authed || ws != null) return
+    connect()
+  }
+
   private fun connect() {
     if (closed) return
     main.removeCallbacks(redial)

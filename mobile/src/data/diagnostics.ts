@@ -3,8 +3,8 @@
  * Native module (expo-file-system): never imported by anything under jest.
  *
  * Where: `<cache>/conduit-logs/` -- `app.log` (+ `app.1.log`, `app.2.log`, 1 MB each) and
- * `counters.json`; on Android the native services write `native.log` / `mirror.log` into the same
- * folder (modules/bg-watch NativeLog). The CACHE folder on purpose: iCloud backup and Android
+ * `counters.json`; on Android the native services (bg-watch and port-mirror) write `native.log`
+ * into the same folder (modules/bg-watch NativeLog). The CACHE folder on purpose: iCloud backup and Android
  * Auto Backup both skip it, so a log never leaves the phone that way either. The OS may purge it
  * when storage runs low, which costs a diagnostic, not data.
  *

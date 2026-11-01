@@ -637,6 +637,21 @@ pub fn frame_changed(last: &mut Option<u64>, text: &str) -> bool {
     true
 }
 
+/// What to send for a project-list pass. A store-save PUSH whose view is unchanged sends
+/// nothing (the dedupe). A phone's explicit `list` REQUEST always gets a reply: the full
+/// view when it changed, else `{"type":"listed","unchanged":true}` -- silence there let the
+/// phone's 35 s watchdog read an idle computer as dead and redial, and every drop could
+/// hand held questions back to the terminal.
+pub fn projects_reply(last: &mut Option<u64>, text: String, requested: bool) -> Option<String> {
+    if frame_changed(last, &text) {
+        Some(text)
+    } else if requested {
+        Some(json!({ "type": "listed", "unchanged": true }).to_string())
+    } else {
+        None
+    }
+}
+
 /// A `chat` frame: one transcript item of `session_id`. The id lets the phone drop a frame
 /// that belongs to a chat it has already left.
 pub fn chat_frame(session_id: &str, item: &Value) -> Value {
@@ -1358,6 +1373,28 @@ mod tests {
         assert!(!frame_changed(&mut last, "a"));
         assert!(frame_changed(&mut last, "b"));
         assert!(frame_changed(&mut last, "a"), "a change back is a change");
+    }
+
+    #[test]
+    fn an_explicit_list_is_always_answered() {
+        let mut last = None;
+        let full = projects_reply(&mut last, "v1".into(), true);
+        assert_eq!(full.as_deref(), Some("v1"), "first view is sent whole");
+        assert_eq!(
+            projects_reply(&mut last, "v1".into(), false),
+            None,
+            "unchanged push is silent"
+        );
+        let ack = projects_reply(&mut last, "v1".into(), true).expect("request answered");
+        assert_eq!(ack, r#"{"type":"listed","unchanged":true}"#);
+        assert_eq!(
+            projects_reply(&mut last, "v2".into(), false).as_deref(),
+            Some("v2")
+        );
+        assert_eq!(
+            projects_reply(&mut last, "v3".into(), true).as_deref(),
+            Some("v3")
+        );
     }
 
     #[test]

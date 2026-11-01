@@ -76,6 +76,16 @@ const earlier = (): ChatItem => ({ kind: "divider", id: CACHED_EARLIER_ID, label
  * dropped, and shrunk further (oldest first) until it serializes under `maxBytes`.
  */
 export function boundFeed(feed: readonly ChatItem[], maxItems = MAX_ITEMS_PER_CHAT, maxBytes = MAX_CHAT_BYTES): ChatItem[] {
+  return boundFeedJson(feed, maxItems, maxBytes).items;
+}
+
+/** `boundFeed`, plus the items' JSON it measured on the way -- so a write serializes the feed
+ * once, not twice (a 1 MB chat stringified again on every save was most of the cost). */
+export function boundFeedJson(
+  feed: readonly ChatItem[],
+  maxItems = MAX_ITEMS_PER_CHAT,
+  maxBytes = MAX_CHAT_BYTES,
+): { items: ChatItem[]; json: string } {
   const rest = feed[0]?.id === CACHED_EARLIER_ID ? feed.slice(1) : feed.slice();
   let dropped = rest.length < feed.length;
   let keep = rest.map(slimItem);
@@ -84,13 +94,30 @@ export function boundFeed(feed: readonly ChatItem[], maxItems = MAX_ITEMS_PER_CH
     dropped = true;
   }
   let out = dropped ? [earlier(), ...keep] : keep;
-  while (out.length > 1 && JSON.stringify(out).length > maxBytes) {
+  let json = JSON.stringify(out);
+  while (out.length > 1 && json.length > maxBytes) {
     const body = out[0]?.id === CACHED_EARLIER_ID ? out.slice(1) : out;
     const half = body.slice(Math.ceil(body.length / 2));
     out = [earlier(), ...half];
+    json = JSON.stringify(out);
     if (half.length === 0) break;
   }
-  return out;
+  return { items: out, json };
+}
+
+/** A string's size in UTF-8 bytes (what it takes on disk), without allocating an encoding. */
+export function utf8Bytes(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      n += 4; // a surrogate pair: one 4-byte code point
+      i++;
+    } else n += 3;
+  }
+  return n;
 }
 
 // ---- files ----
@@ -191,8 +218,18 @@ export const serializeProjects = (view: WireProjectsView, savedAt: number): stri
 export const serializeRootChats = (chats: readonly WireRootChat[], savedAt: number): string =>
   JSON.stringify({ v: CACHE_VERSION, savedAt, chats: [...chats] } satisfies CachedRootChats);
 
-export const serializeChat = (key: ChatKey, items: readonly ChatItem[], savedAt: number): string =>
-  JSON.stringify({ v: CACHE_VERSION, key, savedAt, items: boundFeed(items) } satisfies CachedChat);
+/** The same JSON as `JSON.stringify({v, key, savedAt, items: boundFeed(items)})`, with the feed
+ * stringified once (boundFeedJson already did it while measuring). */
+export function serializeChat(key: ChatKey, items: readonly ChatItem[], savedAt: number): string {
+  const head = JSON.stringify({ v: CACHE_VERSION, key, savedAt } satisfies Omit<CachedChat, "items">);
+  return `${head.slice(0, -1)},"items":${boundFeedJson(items).json}}`;
+}
+
+/** What says a chat changed since it was last written: its newest item and its length. A save
+ * with the same signature is skipped (offlineStore). */
+export function feedSignature(items: readonly ChatItem[]): string {
+  return `${items.length}|${items[items.length - 1]?.id ?? ""}`;
+}
 
 // ---- eviction ----
 

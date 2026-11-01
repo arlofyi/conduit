@@ -187,7 +187,23 @@ pub fn send_turn(
     let scoped = chat.scope.is_some();
     let all_paths: Vec<String> = store.list().into_iter().map(|p| p.path).collect();
     let inside: Vec<String> = in_scope.iter().map(|p| p.path.clone()).collect();
-    let denied_paths = out_of_scope_paths(scoped, &all_paths, &inside);
+    let mut denied_paths = out_of_scope_paths(scoped, &all_paths, &inside);
+    // EVERY chat, scoped or not, is also kept out of private sessions' worktrees and the
+    // transcript stores (Claude's per config root, agy's per home): either would hand a
+    // chat -- and a phone streaming it -- the output of a session marked private.
+    let account_dirs: Vec<String> = store
+        .list_accounts()
+        .into_iter()
+        .map(|a| a.config_dir)
+        .collect();
+    let private = private_read_denies(
+        &store.list(),
+        &claude_config_roots(&account_dirs),
+        &agy_homes(&account_dirs),
+        &inside,
+    );
+    denied_paths.extend(private.dirs);
+    let denied_files = private.files;
     // Scratch + shared memory exist before the child looks for them; the memory index
     // is injected fresh each spawn, so a write from any chat is visible to all on
     // their very next turn.
@@ -221,7 +237,7 @@ pub fn send_turn(
         let settings_path = dirs.scratch.join("agy-settings.json");
         std::fs::write(
             &settings_path,
-            crate::root_chat_agy::settings_json(&denied_paths),
+            crate::root_chat_agy::settings_json(&[denied_paths.clone(), denied_files].concat()),
         )
         .map_err(|e| format!("write agy settings: {e}"))?;
         // Resume only a conversation that still exists: replaying a vanished id would fail
@@ -304,6 +320,7 @@ pub fn send_turn(
                 } else {
                     &no_mcps
                 },
+                denied_files: &denied_files,
             },
         );
         (cmd, cwd.clone(), text.to_string())
@@ -822,6 +839,90 @@ pub fn out_of_scope_paths(scoped: bool, all: &[String], in_scope: &[String]) -> 
         .collect()
 }
 
+/// Read denies every chat carries, scoped or not: `dirs` are trees, `files` single files.
+#[derive(Debug, Default, PartialEq)]
+pub struct PrivateDenies {
+    pub dirs: Vec<String>,
+    pub files: Vec<String>,
+}
+
+/// What no chat may read: the worktree of every private (`silo || local_only`) session, and
+/// the transcript stores -- under each Claude config root `projects/`, `file-history/`,
+/// `todos/` and `history.jsonl`; under each agy home its `conversations/`. Never all of a
+/// config root (skills live there), never a path that CONTAINS an in-scope project (a deny
+/// would win over it too), never an empty path, and each path once.
+pub fn private_read_denies(
+    projects: &[crate::store::Project],
+    claude_roots: &[PathBuf],
+    agy_homes: &[PathBuf],
+    in_scope: &[String],
+) -> PrivateDenies {
+    let mut dirs: Vec<String> = projects
+        .iter()
+        .flat_map(|p| p.sessions.iter())
+        .filter(|s| s.silo || s.local_only)
+        .filter_map(|s| s.worktree_path.clone())
+        .collect();
+    let mut files = Vec::new();
+    for root in claude_roots {
+        for sub in ["projects", "file-history", "todos"] {
+            dirs.push(root.join(sub).to_string_lossy().into_owned());
+        }
+        files.push(root.join("history.jsonl").to_string_lossy().into_owned());
+    }
+    for home in agy_homes {
+        let conv = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("conversations");
+        dirs.push(conv.to_string_lossy().into_owned());
+    }
+    let keep = |list: Vec<String>| -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        list.into_iter()
+            .filter(|p| !p.trim().is_empty())
+            .filter(|p| !in_scope.iter().any(|i| contains_path(p, i)))
+            .filter(|p| seen.insert(p.replace('\\', "/").trim_end_matches('/').to_lowercase()))
+            .collect()
+    };
+    PrivateDenies {
+        dirs: keep(dirs),
+        files: keep(files),
+    }
+}
+
+/// Every Claude config root a chat could read transcripts under: the ambient one
+/// (`CLAUDE_CONFIG_DIR`, else `~/.claude`), `~/.claude` itself, and each account's.
+pub fn claude_config_roots(account_dirs: &[String]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = crate::pty::claude_projects_dir()
+        .and_then(|p| p.parent().map(|r| r.to_path_buf()))
+        .into_iter()
+        .collect();
+    roots.extend(dirs::home_dir().map(|h| h.join(".claude")));
+    roots.extend(
+        account_dirs
+            .iter()
+            .filter(|d| !d.trim().is_empty())
+            .map(PathBuf::from),
+    );
+    roots
+}
+
+/// Every agy home a chat could read conversations under: the ambient one and each account's,
+/// resolved exactly as a spawn resolves it (`agy_usage::resolve_agy_home`).
+pub fn agy_homes(account_dirs: &[String]) -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> = crate::agy_usage::resolve_agy_home(None)
+        .into_iter()
+        .collect();
+    homes.extend(
+        account_dirs
+            .iter()
+            .filter(|d| !d.trim().is_empty())
+            .filter_map(|d| crate::agy_usage::resolve_agy_home(Some(d))),
+    );
+    homes
+}
+
 /// The charter, for a Claude chat (`agy == false`) or the shared base of an Antigravity
 /// chat's (`root_chat_agy::charter` adds what differs there): the Claude-only tool policy,
 /// GitHub powers and writable dirs are left out of the latter. `scoped` = the chat has a
@@ -945,6 +1046,8 @@ pub struct TurnFlags<'a> {
     /// User MCP servers written into `mcp_config` beside Conduit's: each must ALSO be on
     /// `--allowedTools`, or `-p` denies its every call (same rule as the root namespace).
     pub user_mcps: &'a [String],
+    /// Single FILES the file tools may not read (`Read(<file>)`; `denied_paths` are trees).
+    pub denied_files: &'a [String],
 }
 
 pub fn build_command_with(
@@ -993,13 +1096,18 @@ pub fn build_command_with(
     // Deny the dangerous gh tail: `gh api` is arbitrary REST (a DELETE smuggles past
     // any prefix matcher), and auth/secrets/repo-deletion have no PM use.
     // A scoped chat is also denied the file tools on every project outside its scope.
-    let out_of_scope: String = denied_paths
+    // Every chat is denied private worktrees and the transcript stores (`private_read_denies`).
+    let mut out_of_scope: String = denied_paths
         .iter()
+        .filter(|p| !p.trim().is_empty())
         .map(|p| {
             let r = permission_path(p);
             format!(",Read({r}/**),Glob({r}/**),Grep({r}/**)")
         })
         .collect();
+    for f in flags.denied_files.iter().filter(|f| !f.trim().is_empty()) {
+        out_of_scope.push_str(&format!(",Read({})", permission_path(f)));
+    }
     let deny = crate::pty::quote_cmdline_arg(&format!(
         "NotebookEdit,Bash(gh repo delete:*),Bash(gh secret:*),Bash(gh auth:*),Bash(gh api:*){out_of_scope}"
     ));
@@ -1074,6 +1182,86 @@ mod tests {
         let d = Dirs::under(std::path::Path::new("/data"), "x");
         let cmd = build_command("x", false, "c", &d, None, &["/other/proj".to_string()]);
         assert!(cmd.contains("Read(//other/proj/**)"));
+    }
+
+    #[test]
+    fn every_chat_is_denied_private_worktrees_and_transcript_stores() {
+        use std::path::Path;
+        let project: crate::store::Project = serde_json::from_value(json!({
+            "id": "p", "name": "p", "path": "/w/p",
+            "sessions": [
+                { "id": "a", "name": "a", "worktreePath": "/w/p/.claude/worktrees/a", "silo": true },
+                { "id": "b", "name": "b", "worktreePath": "/w/p/.claude/worktrees/b", "localOnly": true },
+                { "id": "c", "name": "c", "worktreePath": "/w/p/.claude/worktrees/c" },
+                { "id": "d", "name": "d", "silo": true }
+            ]
+        }))
+        .unwrap();
+        let roots = [
+            Path::new("/h/.claude").to_path_buf(),
+            Path::new("/h/.claude/").to_path_buf(),
+        ];
+        let homes = [Path::new("/h").to_path_buf()];
+        let d = private_read_denies(&[project], &roots, &homes, &["/w/p".to_string()]);
+        let norm: Vec<String> = d.dirs.iter().map(|p| p.replace('\\', "/")).collect();
+        for want in [
+            "/w/p/.claude/worktrees/a",
+            "/w/p/.claude/worktrees/b",
+            "/h/.claude/projects",
+            "/h/.claude/file-history",
+            "/h/.claude/todos",
+            "/h/.gemini/antigravity-cli/conversations",
+        ] {
+            assert!(norm.iter().any(|p| p == want), "{want} in {norm:?}");
+        }
+        assert!(
+            !norm.iter().any(|p| p.ends_with("/worktrees/c")),
+            "a public worktree stays readable"
+        );
+        assert!(
+            !norm.iter().any(|p| p == "/h/.claude"),
+            "skills live in the config root"
+        );
+        assert_eq!(norm.len(), 6, "each path once: {norm:?}");
+        assert_eq!(d.files.len(), 1);
+        assert!(d.files[0]
+            .replace('\\', "/")
+            .ends_with("/h/.claude/history.jsonl"));
+        // A store that CONTAINS an in-scope project is never denied.
+        let held = private_read_denies(&[], &roots, &homes, &["/h/.claude/projects/x".to_string()]);
+        assert!(!held
+            .dirs
+            .iter()
+            .any(|p| p.replace('\\', "/") == "/h/.claude/projects"));
+
+        // Claude: trees as Read/Glob/Grep(<p>/**), the history file as Read(<p>).
+        let dd = Dirs::under(Path::new("/data"), "x");
+        let files = vec!["C:\\Users\\me\\.claude\\history.jsonl".to_string()];
+        let cmd = build_command_with(
+            "x",
+            false,
+            "c",
+            &dd,
+            None,
+            &["C:\\Users\\me\\.claude\\projects".to_string(), " ".into()],
+            &TurnFlags {
+                denied_files: &files,
+                ..Default::default()
+            },
+        );
+        for rule in [
+            "Read(//c/Users/me/.claude/projects/**)",
+            "Glob(//c/Users/me/.claude/projects/**)",
+            "Grep(//c/Users/me/.claude/projects/**)",
+            "Read(//c/Users/me/.claude/history.jsonl)",
+        ] {
+            assert!(cmd.contains(rule), "{rule}: {cmd}");
+        }
+        assert!(
+            !cmd.contains("Read(///**)") && !cmd.contains("Read(/ /**)"),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("history.jsonl/**"));
     }
 
     #[test]
@@ -1368,6 +1556,7 @@ mod tests {
                 model: Some("opus"),
                 effort: Some("max"),
                 user_mcps: &mcps,
+                ..Default::default()
             },
         );
         assert!(cmd.contains(" --model opus"), "{cmd}");
@@ -1391,6 +1580,7 @@ mod tests {
                 model: Some("a\" && calc"),
                 effort: Some("turbo"),
                 user_mcps: &mcps,
+                ..Default::default()
             },
         );
         assert!(

@@ -109,6 +109,9 @@ export function PortMirrorProvider({ children }: { children: React.ReactNode }) 
       plan.kind === "stop"
         ? native.stop().then(() => {
             applied.current = null;
+            // Mirrors the start branch: the service reports `running: false` a moment later;
+            // until then this IS stopped, or the next render would issue the stop again.
+            setStatus((s) => ({ ...s, running: false }));
           })
         : native
             .start({ url: plan.applied.url, token: plan.applied.token, computer, ports: plan.applied.ports })

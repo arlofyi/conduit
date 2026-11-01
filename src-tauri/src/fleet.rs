@@ -378,7 +378,9 @@ const WAKE_DEBOUNCE: Duration = Duration::from_millis(2000);
 /// already woke it.
 pub fn is_wake_event(event: &str, body: &Value) -> bool {
     match event {
-        "stop" => true,
+        // A turn that died on an API error ends as `StopFailure`, not `Stop`; the worker
+        // is just as finished, and a Conductor left unwoken would wait on it forever.
+        "stop" | "stopfailure" => true,
         "notification" => {
             let kind = body.get("notification_type").and_then(|v| v.as_str());
             // "" as the current status: no session is ever at that status, so the
@@ -1047,6 +1049,7 @@ mod tests {
     fn is_wake_event_matches_stop_and_notification_only() {
         let none = serde_json::json!({});
         assert!(is_wake_event("stop", &none));
+        assert!(is_wake_event("stopfailure", &none));
         assert!(is_wake_event("notification", &none));
         assert!(!is_wake_event("prompt", &none));
         assert!(!is_wake_event("pretool", &none));

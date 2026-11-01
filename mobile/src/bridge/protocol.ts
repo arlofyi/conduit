@@ -201,6 +201,9 @@ export type ServerMsg =
   | { type: "pairResult"; ok: false; reason: string }
   | { type: "macs"; macs: WireMac[] }
   | ({ type: "projects" } & WireProjectsView)
+  /** the answer to an explicit `list` when the view has not changed since the last `projects`
+   * this socket got (the computer sends identical views only once) */
+  | { type: "listed"; unchanged?: boolean }
   | { type: "context"; sessionId: string; used: number; window: number; fraction: number; model: string | null }
   | { type: "size"; cols: number; rows: number }
   // `sessionId` names the session the frame is about; absent from desktops before it was added.

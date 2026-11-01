@@ -9,7 +9,7 @@ import { useLive } from "../bridge/LiveProvider";
 import { connStatus } from "../logic/connCopy";
 import { offlineLine } from "../logic/offlineCache";
 import { useTheme } from "../theme/ThemeContext";
-import { TYPE } from "../theme/type";
+import { MIN_TOUCH, TYPE } from "../theme/type";
 import { Icon } from "./Glass";
 
 export interface OfflineLine {
@@ -124,7 +124,9 @@ export function CatchUpLine({ text, onPress, onDismiss, inset = 16 }: { text: st
           {text}
         </Text>
       </Pressable>
-      <Pressable onPress={onDismiss} hitSlop={10} accessibilityRole="button" accessibilityLabel="Dismiss" style={{ padding: 4 }}>
+      <Pressable onPress={onDismiss} hitSlop={10} accessibilityRole="button" accessibilityLabel="Dismiss"
+        style={{ minWidth: MIN_TOUCH, minHeight: MIN_TOUCH, alignItems: "center", justifyContent: "center" }}
+      >
         <Icon name="xmark" size={13} color={p.textMid} />
       </Pressable>
     </View>

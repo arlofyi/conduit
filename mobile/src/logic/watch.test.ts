@@ -21,6 +21,7 @@ import {
   UNREACHABLE_MS,
   watchAddresses,
   watchBaseline,
+  baselineSignals,
   watchItemOf,
   watchSessionsOf,
   watchStep,
@@ -279,6 +280,34 @@ describe("hand-over", () => {
     const b = watchBaseline(view(sess({ id: "a", status: "running" })), pending);
     expect(b.seen).toEqual(["1"]);
     expect(b.signals).toEqual({ a: { needs: null, status: "running", running: true, stopped: false, failed: null, live: true } });
+  });
+
+  it("a_finish_the_app_was_settling_goes_across_with_its_age", () => {
+    // the app saw the turn end 5 s before it handed over (app clock: 1_000_000)
+    const app = { a: { needs: null, status: "done" as const, running: true, stopped: false, failed: null, live: true, finishAt: 995_000 } };
+    const b = watchBaseline(view(sess({ id: "a", status: "done" }), sess({ id: "r", status: "running" })), emptyPending, {
+      ...app,
+      r: { ...RUNNING, finishAt: 990_000 },
+    }, 1_000_000);
+    expect(b.signals.a.finishAgoMs).toBe(5_000);
+    // only a quiet session carries one
+    expect(b.signals.r.finishAgoMs).toBeUndefined();
+    // the watcher's clock starts elsewhere: the age, not the instant, is what lands
+    const signals = baselineSignals(JSON.parse(JSON.stringify(b.signals)), 100_000);
+    expect(signals.a.finishAt).toBe(95_000);
+    expect(signals.r.finishAt).toBeUndefined();
+    let s = run(initialWatch([], signals), projectsAt(100_000, sess({ id: "a", status: "done" })));
+    s = run(s, { t: "tick", now: 95_000 + FINISH_SETTLE_MS - 1 });
+    expect(keys(s)).toEqual([]);
+    expect(nextWakeAt(s)).toBe(95_000 + FINISH_SETTLE_MS);
+    s = run(s, { t: "tick", now: 95_000 + FINISH_SETTLE_MS });
+    expect(keys(s)).toEqual(["done:a"]);
+  });
+
+  it("a_baseline_age_on_a_session_no_longer_quiet_is_dropped", () => {
+    const signals = baselineSignals({ a: { needs: "question", status: "needsInput", finishAgoMs: 3_000 } }, 50_000);
+    expect(signals.a.finishAt).toBeUndefined();
+    expect(watchBaseline(view(sess({ id: "a", status: "done" })), emptyPending).signals.a.finishAgoMs).toBeUndefined();
   });
 
   it("the_app_socket_waits_for_the_watcher_to_connect_or_fail_once", () => {

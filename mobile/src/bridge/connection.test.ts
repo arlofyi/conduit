@@ -363,4 +363,19 @@ describe("intermittent use: kick, stale links, retry", () => {
     expect(isStale("connecting", 1000, 1000 + STALE_MS * 10)).toBe(false);
     expect(isStale("ready", null, 1e12)).toBe(false);
   });
+
+  it("a_listed_answer_keeps_a_quiet_ready_link_alive", () => {
+    // An idle computer answers each 10 s `list` with `listed` instead of an identical view: the
+    // socket stays ready, and the provider's per-frame stamp keeps the watchdog quiet.
+    const listed = { type: "listed", unchanged: true } as ServerMsg;
+    const r = run(ready(), [{ t: "frame", msg: listed }]);
+    expect(r.state.phase).toBe("ready");
+    let alive = 0;
+    for (let now = 10_000; now <= 120_000; now += 10_000) {
+      expect(isStale("ready", alive, now)).toBe(false);
+      alive = now; // the listed reply to that poll
+    }
+    // with no reply at all, the same polling goes stale
+    expect(isStale("ready", 0, 40_000)).toBe(true);
+  });
 });
