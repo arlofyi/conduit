@@ -183,6 +183,11 @@ The `mobile/` app (React Native / Expo) is a full companion for the desktop, not
 mirror. It runs on **Android (phones and tablets) and iOS**; background notifications and port
 mirroring are Android-only for now. Build and pairing steps: [mobile/README.md](./mobile/README.md).
 
+<p align="center">
+  <img src="docs/screenshots/mobile-sessions.jpg" width="300"
+       alt="The phone's Sessions tab: a 'While you were away' summary, project filters, and sessions from several projects with their latest replies">
+</p>
+
 It opens on four tabs — **Sessions**, **Chats**, **Apps** (Android) and **Settings**:
 
 - **Every session as a chat.** Sessions are grouped by project (and filtered by profile) with
