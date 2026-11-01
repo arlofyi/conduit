@@ -9,7 +9,7 @@ import { usePortMirror } from "../data/PortMirrorProvider";
 import { portRows, type PortRow } from "../logic/ports";
 import type { AppsProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
-import { TYPE } from "../theme/type";
+import { TYPE, tabBarClearance } from "../theme/type";
 
 /** How often the list is re-read while this tab is in front. */
 const FOCUS_POLL_MS = 5_000;
@@ -145,7 +145,7 @@ export function AppsScreen(_props: AppsProps) {
       <View style={{ paddingTop: insets.top + 8, paddingHorizontal: 20, paddingBottom: 4 }}>
         <Text style={{ fontSize: TYPE.title, fontWeight: "700", color: p.textBright }}>Apps</Text>
       </View>
-      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 32 }}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: tabBarClearance(32, insets.bottom, Platform.OS) }}>
         {body}
       </ScrollView>
     </View>

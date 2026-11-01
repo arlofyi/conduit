@@ -79,6 +79,9 @@ describe("addressesFor", () => {
   it("skips_empty_hosts", () => {
     expect(addressesFor({ ...mac, dnsName: "" }, { simulator: false })).toEqual(["ws://100.64.0.2:8460"]);
   });
+  it("android_tries_the_ip_before_the_dns_name", () => {
+    expect(addressesFor(mac, { simulator: false, ipFirst: true })).toEqual(["ws://100.64.0.2:8460", "ws://studio.ts.net:8460"]);
+  });
   it("dedupes_a_loopback_mac", () => {
     const loop = { ...mac, token: "", dnsName: "localhost", ip: "127.0.0.1" };
     expect(addressesFor(loop, { simulator: true })).toEqual(["ws://localhost:8460", "ws://127.0.0.1:8460"]);

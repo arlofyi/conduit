@@ -21,6 +21,8 @@ const STATE_TEXT: Record<HeaderState, string> = {
   idle: "idle",
 };
 
+export const COMPACTING_TEXT = "compacting…";
+
 export function stateText(state: HeaderState): string {
   return STATE_TEXT[state];
 }
@@ -120,8 +122,11 @@ export function headerMeta(a: {
   efforts?: readonly string[];
   autoApprove?: boolean;
   context?: ContextRing | null;
+  /** a `/compact` is running (PreCompact seen, no SessionStart yet): it can take a minute or
+   * more, and "idle" over it read as "the computer ignored me" (founder report) */
+  compacting?: boolean;
 }): HeaderMeta {
-  const status = stateText(a.state);
+  const status = a.compacting && a.state !== "needs" ? COMPACTING_TEXT : stateText(a.state);
   const model = compactModel(a.model);
   const effort = effortIndicator(a.effort, a.efforts ?? []);
   const auto = a.autoApprove === true;

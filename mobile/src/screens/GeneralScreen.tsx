@@ -6,7 +6,7 @@
  */
 import { useFocusEffect } from "@react-navigation/native";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
+import { FlatList, Platform, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
 import { GlassCircle, Icon } from "../components/Glass";
@@ -15,7 +15,7 @@ import { ALL_PROFILES, profileName, relativeTime, resolveProfile } from "../logi
 import { agentLabel, chatsForProfile, needsAgentChoice, scopeSummary, startAgents, type RootChat } from "../logic/general";
 import type { GeneralProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
-import { MIN_TOUCH, TYPE } from "../theme/type";
+import { MIN_TOUCH, TYPE, tabBarClearance } from "../theme/type";
 import { useStartChat } from "./GeneralOptions";
 
 const CLOCK_MS = 30_000;
@@ -110,7 +110,7 @@ export function GeneralScreen({ navigation }: GeneralProps) {
           />
         )}
         contentInsetAdjustmentBehavior="automatic"
-        contentContainerStyle={{ paddingBottom: 24, flexGrow: 1 }}
+        contentContainerStyle={{ paddingBottom: tabBarClearance(24, insets.bottom, Platform.OS), flexGrow: 1 }}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}

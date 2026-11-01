@@ -103,4 +103,9 @@ describe("header line 2", () => {
     expect(m.effort.isDefault).toBe(true);
     expect(m.a11y).toBe("s, idle, Effort default. Session details");
   });
+  it("says compacting while a /compact runs, unless the session is waiting on you", () => {
+    const base = { name: "s", projectName: null, model: null, effort: null, compacting: true } as const;
+    expect(headerMeta({ ...base, state: "idle" }).status).toBe("compacting…");
+    expect(headerMeta({ ...base, state: "needs" }).status).toBe("waiting on you");
+  });
 });

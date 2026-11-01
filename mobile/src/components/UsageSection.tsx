@@ -1,6 +1,6 @@
 /**
- * Settings' Usage card: one compact row per agent account (glyph, name, a 5 h and a week
- * gauge); a tap opens the row in place to show its plan, every window with its bar and reset
+ * Settings' Usage card: one compact row per agent account (agent glyph, ACCOUNT name, a 5 h and
+ * a week ring, each captioned "used"); a tap opens the row in place to show its plan, every window with its bar and reset
  * time, credit, models and how fresh the read is. Unknown is said, never drawn as 0 %.
  */
 import React, { useEffect, useState } from "react";
@@ -69,9 +69,12 @@ function UsageRowView({ row, first, open, onToggle, now }: { row: UsageRow; firs
   const info = agentInfo(row.agent);
   const { fiveHour, week } = pickWindows(row);
   const credit = !fiveHour && !week && row.money ? row.money : null;
-  const sub = [row.label !== info.label ? row.label : null, row.plan].filter(Boolean).join(" · ");
+  // The glyph already says which agent; the line names the ACCOUNT (Arlo, Personal), which is
+  // what tells two Claude rows apart. The agent's name is the fallback when no account is named.
+  const title = row.label.trim() || info.label;
+  const sub = [title !== info.label ? info.label : null, row.plan].filter(Boolean).join(" · ");
   const a11y = [
-    info.label,
+    title,
     sub,
     fiveHour ? `5-hour ${usedLabel(fiveHour)}` : null,
     week ? `weekly ${usedLabel(week)}` : null,
@@ -102,7 +105,7 @@ function UsageRowView({ row, first, open, onToggle, now }: { row: UsageRow; firs
         </View>
         <View style={{ flex: 1, minWidth: 0 }}>
           <Text style={{ color: p.textBright, fontSize: TYPE.callout, fontWeight: "600" }} numberOfLines={1}>
-            {info.id ? info.label : row.label}
+            {title}
           </Text>
           {sub ? (
             <Text style={{ color: p.textDim, fontSize: TYPE.caption, marginTop: 1 }} numberOfLines={1}>
@@ -113,7 +116,7 @@ function UsageRowView({ row, first, open, onToggle, now }: { row: UsageRow; firs
         {credit ? (
           <Text style={{ color: p.textMid, fontSize: TYPE.footnote, fontVariant: ["tabular-nums"] }}>{moneyLabel(credit)}</Text>
         ) : (
-          <View style={{ flexDirection: "row", gap: 10 }}>
+          <View style={{ flexDirection: "row", gap: 12 }}>
             <MiniGauge caption="5h" used={fiveHour?.used ?? null} />
             <MiniGauge caption="week" used={week?.used ?? null} />
           </View>

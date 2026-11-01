@@ -127,6 +127,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     efforts,
     autoApprove: session?.session.autoApprove === true,
     context: ctxRing,
+    compacting: sessionLive.compacting === true,
   });
   // An agent with no effort ladder (and none reported) gets no bars: "default" would be a guess.
   const showEffort = header.effort !== null || efforts.length > 0;
@@ -357,7 +358,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
 
   const [headerH, setHeaderH] = useState(insets.top + 56);
   const [composerH, setComposerH] = useState(insets.bottom + 54);
-  const running = header.state === "running";
+  const running = header.state === "running" || (sessionLive.compacting === true && header.state !== "needs");
   // A private chat shows only its notice: no typing bubble and no rows under it. The Mac sends
   // nothing of that session, so the bubble would only be guessing, and any card for it is a
   // private one that repeats the notice -- either would be drawn beneath the centred notice.

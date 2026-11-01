@@ -33,6 +33,7 @@ import { FilesScreen } from "./src/screens/FilesScreen";
 import { FileViewScreen } from "./src/screens/FileViewScreen";
 import { GeneralScreen } from "./src/screens/GeneralScreen";
 import { GeneralChatScreen } from "./src/screens/GeneralChatScreen";
+import { CHAT_TARGET_PREFIX } from "./src/logic/watch";
 import { GeneralNewScreen, GeneralSettingsScreen } from "./src/screens/GeneralOptions";
 import { GeneralScopeScreen } from "./src/screens/GeneralScopeScreen";
 import { ChatsMenuScreen, QuickActionsScreen } from "./src/screens/Sheets";
@@ -160,6 +161,12 @@ function Inner() {
   useEffect(() => {
     if (!openTarget || !currentMac || !navReady) return;
     consumeOpenTarget();
+    // A finished general chat's notification names `chat:<id>`, not a session.
+    if (openTarget.sessionId.startsWith(CHAT_TARGET_PREFIX)) {
+      if (navigationRef.isReady())
+        navigationRef.navigate("GeneralChat", { chatId: openTarget.sessionId.slice(CHAT_TARGET_PREFIX.length), title: openTarget.name });
+      return;
+    }
     openChat(openTarget);
   }, [openTarget, currentMac, navReady, consumeOpenTarget]);
   const navTheme: Theme = {

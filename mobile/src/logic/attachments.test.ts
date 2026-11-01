@@ -75,6 +75,11 @@ describe("submitting a message with files", () => {
   it("holds the Enter only when the message names uploads", () => {
     const { submitDelayMs, promptInput, pasteInput } = require("../bridge/protocol");
     expect(submitDelayMs("plain text")).toBe(0);
+    // a slash command's Enter waits for Claude Code's command menu, or the menu eats it
+    expect(submitDelayMs("/compact")).toBe(600);
+    expect(submitDelayMs("/model opus")).toBe(600);
+    expect(submitDelayMs("a/b path")).toBe(0);
+    expect(submitDelayMs("/compact\nmore")).toBe(0);
     expect(submitDelayMs("@.conduit-uploads/a.jpg @.conduit-uploads/b.jpg Hello?")).toBe(1800);
     expect(promptInput("hi")).toBe(`${pasteInput("hi")}\r`);
   });

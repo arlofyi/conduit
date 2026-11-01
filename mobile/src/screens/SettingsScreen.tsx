@@ -1,5 +1,5 @@
 import React from "react";
-import { Alert, ScrollView, Switch, Text, View } from "react-native";
+import { Alert, Platform, ScrollView, Switch, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useIsFocused } from "@react-navigation/native";
 import { useLive, useUsagePolling } from "../bridge/LiveProvider";
@@ -13,7 +13,7 @@ import { connStatus } from "../logic/connCopy";
 import { isLoopbackMac } from "../logic/macs";
 import type { SettingsProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
-import { TYPE } from "../theme/type";
+import { TYPE, tabBarClearance } from "../theme/type";
 
 /** `ws://host:port` → `host:port` */
 const hostPort = (url: string) => url.replace(/^wss?:\/\//, "");
@@ -74,7 +74,7 @@ export function SettingsScreen({ navigation }: SettingsProps) {
       <View style={{ paddingTop: insets.top + 8, paddingHorizontal: 20, paddingBottom: 4 }}>
         <Text style={{ fontSize: TYPE.title, fontWeight: "700", color: p.textBright }}>Settings</Text>
       </View>
-      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 32 }}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: tabBarClearance(32, insets.bottom, Platform.OS) }}>
         <SectionLabel>Usage</SectionLabel>
         <UsageSection usage={usage} connected={conn.phase === "ready"} />
 

@@ -530,7 +530,19 @@ export function pasteInput(text: string): string {
  */
 export function submitDelayMs(text: string): number {
   const files = text.split("@.conduit-uploads/").length - 1;
-  return files === 0 ? 0 : 1200 + 300 * files;
+  if (files > 0) return 1200 + 300 * files;
+  // A slash command opens Claude Code's command menu as it arrives, and an Enter in the same
+  // burst is taken by the menu: `/compact` sat in the composer until the user pressed Enter.
+  return isSlashCommand(text) ? SLASH_SUBMIT_DELAY_MS : 0;
+}
+
+/** How long a slash command's Enter waits for Claude Code's command menu to draw. */
+export const SLASH_SUBMIT_DELAY_MS = 600;
+
+/** One line starting with `/`, like `/compact` or `/model opus`. */
+export function isSlashCommand(text: string): boolean {
+  const t = text.trim();
+  return /^\/[A-Za-z]/.test(t) && !t.includes("\n");
 }
 
 // ---- session controls + usage (2026-11-01 spec sections 2 and 4) ----

@@ -63,16 +63,22 @@ export interface WatchState {
   alerts: Record<string, "question" | "permission">;
   /** sessions whose turn ended while watching */
   finished: Record<string, true>;
+  /** general chats' titles, from `rootChats` */
+  chatTitles: Record<string, string>;
+  /** general chats whose reply finished while watching: a preview of it ("" = none) */
+  chatsDone: Record<string, string>;
 }
 
 export type WatchEvent =
   | { t: "projects"; sessions: WatchSession[] }
   | { t: "snapshot"; items: WatchItem[] }
   | { t: "added"; item: WatchItem }
-  | { t: "resolved"; id: string };
+  | { t: "resolved"; id: string }
+  | { t: "chats"; chats: { id: string; title: string }[] }
+  | { t: "chatEvent"; event: string; chatId: string; result?: string | null; isError?: boolean };
 
 export function initialWatch(seen: string[], signals: Signals): WatchState {
-  return { sessions: null, signals, items: {}, seen, alerts: {}, finished: {} };
+  return { sessions: null, signals, items: {}, seen, alerts: {}, finished: {}, chatTitles: {}, chatsDone: {} };
 }
 
 const without = <T>(r: Record<string, T>, k: string): Record<string, T> => {
@@ -124,6 +130,16 @@ export function watchStep(s: WatchState, ev: WatchEvent): WatchState {
       return addItem(s, ev.item);
     case "resolved":
       return { ...s, items: without(s.items, ev.id) };
+    case "chats": {
+      const chatTitles: Record<string, string> = {};
+      for (const c of ev.chats) chatTitles[c.id] = c.title;
+      return { ...s, chatTitles };
+    }
+    case "chatEvent":
+      // A reply finished: announce it. A new message from anyone starts a new turn.
+      if (ev.event === "done") return { ...s, chatsDone: { ...s.chatsDone, [ev.chatId]: chatPreview(ev.result, ev.isError) } };
+      if (ev.event === "user") return { ...s, chatsDone: without(s.chatsDone, ev.chatId) };
+      return s;
   }
 }
 
@@ -220,9 +236,35 @@ export function desiredNotifications(s: WatchState, prefs: WatchPrefs): WatchNot
       const session = sessions[sid];
       out.push(made(`done:${sid}`, "finished", session, !!session?.silo, "Finished"));
     }
+    for (const [chatId, body] of Object.entries(s.chatsDone)) {
+      const title = s.chatTitles[chatId]?.trim() || CHAT_DEFAULT_TITLE;
+      out.push({
+        key: `chat:${chatId}`,
+        channel: "finished",
+        title,
+        subtitle: "Chats",
+        body: body || CHAT_REPLIED,
+        target: { sessionId: `${CHAT_TARGET_PREFIX}${chatId}`, projectId: "", name: title, branch: null },
+      });
+    }
   }
   return out;
 }
+
+/** The body of a finished general chat's notification: the reply's start, else a plain line. */
+export function chatPreview(result: string | null | undefined, isError?: boolean): string {
+  if (isError) return CHAT_FAILED;
+  const t = (result ?? "").replace(/\s+/g, " ").trim();
+  if (!t) return CHAT_REPLIED;
+  return t.length > CHAT_PREVIEW_MAX ? `${t.slice(0, CHAT_PREVIEW_MAX - 1).trimEnd()}…` : t;
+}
+
+export const CHAT_REPLIED = "Replied";
+export const CHAT_FAILED = "The reply failed";
+export const CHAT_DEFAULT_TITLE = "Chat";
+export const CHAT_PREVIEW_MAX = 140;
+/** A target naming a general chat rather than a session: `chat:<id>` in `sessionId`. */
+export const CHAT_TARGET_PREFIX = "chat:";
 
 /** A notification's content fingerprint: re-posted only when this changes. */
 export const notificationSignature = (n: WatchNotification): string =>

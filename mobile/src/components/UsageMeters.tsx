@@ -210,18 +210,25 @@ export function UsagePopover({ row, top, onClose, now }: { row: UsageRow | null;
   );
 }
 
-/** A compact labelled gauge for the Settings rows: "5h" over a short bar with its percent. */
+/**
+ * A compact labelled gauge for the Settings rows: a ring with the percent in it, and beside it
+ * what the ring measures ("5h" / "week") over the word "used", so the direction is never a guess
+ * (founder report: a bare bar did not say whether it was usage left or usage spent).
+ */
 export function MiniGauge({ caption, used }: { caption: string; used: number | null }) {
   const { palette: p } = useTheme();
+  const percent = used === null ? null : Math.round(Math.min(1, Math.max(0, used)) * 100);
   return (
-    <View style={{ width: 64, gap: 3 }}>
-      <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
-        <Text style={{ fontSize: TYPE.micro, color: p.textDim }}>{caption}</Text>
-        <Text style={{ fontSize: TYPE.micro, color: used === null ? p.textDim : p.textMid, fontWeight: "600", fontVariant: ["tabular-nums"] }}>
-          {used === null ? "--" : `${Math.round(used * 100)}%`}
-        </Text>
+    <View
+      style={{ flexDirection: "row", alignItems: "center", gap: 6 }}
+      accessible
+      accessibilityLabel={percent === null ? `${caption}: not reported` : `${caption}: ${percent}% used`}
+    >
+      <UsageRing used={used} size={34} stroke={3.5} label={percent === null ? "--" : `${percent}%`} />
+      <View>
+        <Text style={{ fontSize: TYPE.footnote, fontWeight: "600", color: p.textBright }}>{caption}</Text>
+        <Text style={{ fontSize: TYPE.caption, color: p.textDim }}>used</Text>
       </View>
-      <UsageBar fraction={used} height={4} />
     </View>
   );
 }

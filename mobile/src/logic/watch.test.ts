@@ -1,6 +1,7 @@
 import type { WireProjectsView, WireViewSession } from "../bridge/protocol";
 import { emptyPending, pendingReducer } from "./pending";
 import {
+  chatPreview,
   desiredNotifications,
   diffNotifications,
   handoverSettled,
@@ -293,5 +294,36 @@ describe("hand-over", () => {
         createdMs: 0,
       }).question,
     ).toBe("Q?");
+  });
+});
+
+describe("general chats", () => {
+  const run = (...evs: WatchEvent[]): WatchState => evs.reduce(watchStep, initialWatch([], {}));
+
+  it("announces a finished reply with the chat's title and a preview, opening that chat", () => {
+    const s = run(projects(), { t: "chats", chats: [{ id: "c1", title: "Plan the week" }] }, { t: "chatEvent", event: "done", chatId: "c1", result: "Here is   the plan." });
+    expect(desiredNotifications(s, ALL)).toEqual([
+      {
+        key: "chat:c1",
+        channel: "finished",
+        title: "Plan the week",
+        subtitle: "Chats",
+        body: "Here is the plan.",
+        target: { sessionId: "chat:c1", projectId: "", name: "Plan the week", branch: null },
+      },
+    ]);
+  });
+
+  it("clears on the next message, respects the Finished switch, and names an unknown chat", () => {
+    const done = run(projects(), { t: "chatEvent", event: "done", chatId: "c9" });
+    expect(desiredNotifications(done, ALL)[0]).toMatchObject({ title: "Chat", body: "Replied" });
+    expect(desiredNotifications(done, { ...ALL, notifyFinished: false })).toEqual([]);
+    expect(desiredNotifications(watchStep(done, { t: "chatEvent", event: "user", chatId: "c9" }), ALL)).toEqual([]);
+  });
+
+  it("previews: trimmed, capped, and an error says so", () => {
+    expect(chatPreview("x".repeat(200))).toHaveLength(140);
+    expect(chatPreview(null)).toBe("Replied");
+    expect(chatPreview("ok", true)).toBe("The reply failed");
   });
 });

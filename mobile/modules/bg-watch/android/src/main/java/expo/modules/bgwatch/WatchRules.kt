@@ -66,6 +66,22 @@ class WatchRules(private val seen: Set<String>, initialSignals: Map<String, Sign
   private val items = LinkedHashMap<String, WatchItem>()
   private var alerts = LinkedHashMap<String, String>()
   private var finished = LinkedHashSet<String>()
+  /** general chats' titles, from `rootChats` */
+  private var chatTitles: Map<String, String> = emptyMap()
+  /** general chats whose reply finished while watching -> the notification body */
+  private val chatsDone = LinkedHashMap<String, String>()
+
+  fun onChats(list: Map<String, String>) {
+    chatTitles = list
+  }
+
+  /** watch.ts "chatEvent": `done` announces a finished reply, `user` (a new turn) clears it. */
+  fun onChatEvent(event: String, chatId: String, result: String?, isError: Boolean) {
+    when (event) {
+      "done" -> chatsDone[chatId] = chatPreview(result, isError)
+      "user" -> chatsDone.remove(chatId)
+    }
+  }
 
   fun onProjects(list: List<WatchSession>) {
     val nextSessions = LinkedHashMap<String, WatchSession>()
@@ -134,6 +150,19 @@ class WatchRules(private val seen: Set<String>, initialSignals: Map<String, Sign
         val session = sessions[sid]
         out.add(made("done:$sid", "finished", session, session?.silo == true, "Finished"))
       }
+      for ((chatId, body) in chatsDone) {
+        val title = chatTitles[chatId]?.trim()?.ifEmpty { null } ?: CHAT_DEFAULT_TITLE
+        out.add(
+          WatchNotification(
+            "chat:$chatId",
+            "finished",
+            title,
+            "Chats",
+            body.ifEmpty { CHAT_REPLIED },
+            Target("$CHAT_TARGET_PREFIX$chatId", "", title, null),
+          ),
+        )
+      }
     }
     return out
   }
@@ -144,6 +173,31 @@ class WatchRules(private val seen: Set<String>, initialSignals: Map<String, Sign
     const val PRIVATE_FINISHED = "A private session finished"
     const val PUBLIC_NEEDS = "An agent needs you"
     const val PUBLIC_FINISHED = "An agent finished"
+    const val CHAT_REPLIED = "Replied"
+    const val CHAT_FAILED = "The reply failed"
+    const val CHAT_DEFAULT_TITLE = "Chat"
+    const val CHAT_PREVIEW_MAX = 140
+    const val CHAT_TARGET_PREFIX = "chat:"
+
+    /** watch.ts chatPreview: the reply's start (whitespace folded, capped), else a plain line. */
+    fun chatPreview(result: String?, isError: Boolean): String {
+      if (isError) return CHAT_FAILED
+      val t = (result ?: "").replace(Regex("\\s+"), " ").trim()
+      if (t.isEmpty()) return CHAT_REPLIED
+      return if (t.length > CHAT_PREVIEW_MAX) t.take(CHAT_PREVIEW_MAX - 1).trimEnd() + "…" else t
+    }
+
+    /** `rootChats` frame -> id to title. */
+    fun chatTitlesOf(frame: JSONObject): Map<String, String> {
+      val out = HashMap<String, String>()
+      val a = frame.optJSONArray("chats") ?: return out
+      for (i in 0 until a.length()) {
+        val c = a.optJSONObject(i) ?: continue
+        val id = c.str("id") ?: continue
+        out[id] = c.str("title") ?: ""
+      }
+      return out
+    }
 
     private val SHELL_TOOLS = Regex("^(bash|powershell|shell|run_command|run_shell_command|exec|command)$", RegexOption.IGNORE_CASE)
 

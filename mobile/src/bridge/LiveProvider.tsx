@@ -800,7 +800,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     setPending(emptyPending);
     let wasReady = false;
     const client = new BridgeClient(
-      { addresses: addressesFor(mac, { simulator: IS_SIMULATOR_OR_DEV }), mac },
+      { addresses: addressesFor(mac, { simulator: IS_SIMULATOR_OR_DEV, ipFirst: Platform.OS === "android" }), mac },
       {
         onState: (c) => {
           setConn(c);
@@ -1068,7 +1068,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
 
       let sent = false;
       const client: BridgeClient = new BridgeClient(
-        { addresses: addressesFor(stubMac(endpoint), { simulator: IS_SIMULATOR_OR_DEV }), mac: null, pairing: true },
+        { addresses: addressesFor(stubMac(endpoint), { simulator: IS_SIMULATOR_OR_DEV, ipFirst: Platform.OS === "android" }), mac: null, pairing: true },
         {
           onState: (c) => {
             if (!isCurrent()) return;

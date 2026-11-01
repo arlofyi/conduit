@@ -10,7 +10,8 @@ import org.json.JSONObject
 /**
  * The watcher's one socket, as the app's own BridgeClient does it (bridge/connection.ts):
  * `hello` -> `auth` -> `authOk`, then `list` so the computer pushes the projects view on every
- * change, and its `pending` / `pendingAdded` / `resolved` pushes. Every callback is moved onto
+ * change, and its `pending` / `pendingAdded` / `resolved` pushes; and `rootchats`, which makes it
+ * send every general chat's turn events (`rootChatEvent`). Every callback is moved onto
  * [main], so the state below is single-threaded. Reconnects back off 1 s -> 60 s and walk the
  * address list; a network coming back redials at once.
  *
@@ -99,6 +100,8 @@ internal class Link(
         authed = true
         backoffMs = BACKOFF_START_MS
         webSocket.send("""{"type":"list"}""")
+        // general chats: their titles, and every chat's turn events (a finished reply)
+        webSocket.send("""{"type":"rootchats"}""")
         BgWatchState.updatePhase("watching")
       }
       "error" -> when {

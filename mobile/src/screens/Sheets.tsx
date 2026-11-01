@@ -4,7 +4,7 @@
  */
 import { type AppSymbol } from "../components/androidSymbols";
 import React, { useCallback, useEffect, useState } from "react";
-import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
+import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
 import { AgentAvatar } from "../components/AgentAvatar";
@@ -14,7 +14,7 @@ import { agentInfo } from "../logic/agents";
 import { accentFor } from "../logic/accent";
 import { activeModel, contextRing, effortText } from "../logic/sessionHeader";
 import { ALL_PROFILES, profileSheet, profileSummary, resolveProfile, isNeeds } from "../logic/chatList";
-import { QUICK_ACTIONS, quickActionMsgs, quickActionsFor, type QuickAction } from "../logic/quickActions";
+import { QUICK_ACTIONS, quickActionsFor, type QuickAction } from "../logic/quickActions";
 import type { SessionSetPatch } from "../bridge/protocol";
 import {
   canRunNow,
@@ -33,31 +33,35 @@ import { MIN_TOUCH, MONO, TYPE } from "../theme/type";
 export function SheetScaffold({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
+  const { height } = useWindowDimensions();
+  // Capped below the screen with the header pinned and the body scrolling: a fitted Android
+  // sheet otherwise grows past the screen and nothing scrolls (the session sheet's Compact /
+  // Clear / Stop rows were unreachable). The scroll view is vertical for the reason below.
   // The sheet's FIRST scroll view is adopted by the native sheet as its content scroll view and
-  // moved; a horizontal chip row there rendered on top of the title (founder report). So every
-  // sheet's first scroll view is this vertical container, which is also what lets a tall sheet
-  // (keyboard up, many projects) scroll instead of clipping.
+  // moved; a horizontal chip row there rendered on top of the title (founder report).
   return (
-    <ScrollView
-      style={{ flexGrow: 0 }}
-      contentInsetAdjustmentBehavior="never"
-      keyboardShouldPersistTaps="handled"
-      bounces={false}
-      contentContainerStyle={{ paddingTop: 14, paddingBottom: Math.max(insets.bottom, 16) + 4 }}
-    >
-      <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 16, marginBottom: 10 }}>
+    <View style={{ maxHeight: Math.round(height * 0.88) }}>
+      <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingTop: 14, paddingBottom: 10 }}>
         <View style={{ width: 36 }} />
         <Text accessibilityRole="header" style={{ flex: 1, textAlign: "center", fontSize: TYPE.headline, fontWeight: "600", color: p.textBright }}>
           {title}
         </Text>
         <GlassCircle symbol="xmark" label="Close" onPress={onClose} size={36} symbolSize={14} />
       </View>
-      {children}
-    </ScrollView>
+      <ScrollView
+        style={{ flexGrow: 0, flexShrink: 1 }}
+        contentInsetAdjustmentBehavior="never"
+        keyboardShouldPersistTaps="handled"
+        nestedScrollEnabled
+        bounces={false}
+        contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 4 }}
+      >
+        {children}
+      </ScrollView>
+    </View>
   );
 }
 
-/** A grouped-list row in a sheet: symbol, title, optional detail, optional trailing text. */
 export function SheetRow({
   symbol,
   title,
@@ -207,7 +211,7 @@ type Expanded = "model" | "effort" | "rename" | null;
  */
 export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
   const { palette: p } = useTheme();
-  const { sendFrames, interrupt, prompt, view, sessionOptions, sessionSet, sessionAction, context, sessionLive } = useLive();
+  const { interrupt, prompt, view, sessionOptions, sessionSet, sessionAction, context, sessionLive } = useLive();
   const { sessionId, running, agent, projectId, name, branch } = route.params;
   const project = view?.projects.find((x) => x.sessions.some((s) => s.id === sessionId)) ?? view?.projects.find((x) => x.id === projectId) ?? null;
   const session = project?.sessions.find((s) => s.id === sessionId) ?? null;
@@ -309,8 +313,10 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
   const actions = quickActionsFor(running, agent);
   const runAction = (a: QuickAction) => {
     // Interrupt goes through the provider so the open feed marks the interruption.
+    // Compact / Clear go through `prompt`, which holds a slash command's Enter until Claude
+    // Code's command menu has drawn (`submitDelayMs`).
     if (a.id === "stop") interrupt(sessionId);
-    else sendFrames(quickActionMsgs(a.id, sessionId));
+    else prompt(sessionId, `/${a.id}`);
     navigation.goBack();
   };
   const stopSession = () =>

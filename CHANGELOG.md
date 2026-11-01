@@ -40,6 +40,25 @@ All notable changes to Conduit are documented here. This project uses
   every permission request from that session with Allow (commands and file edits
   included). Antigravity's own auto mode still asks for every command, so Conduit answers
   for it.
+- **Added — Notifications on Android with the app closed or the screen off.** While the app
+  is in the background, the phone keeps a light connection to your computer and posts a
+  system notification when a session asks a question, needs a permission or finishes, and
+  when a general chat replies (with the start of the reply). Tapping one opens that chat.
+  Finished alerts pop up like the others rather than filing silently. The "Notify me"
+  switches in Settings choose which ones you get.
+- **Fixed — Compact and Clear from the phone run at once.** They used to land in Claude's
+  input box and wait for you to press Enter (the command menu took the Enter); slash commands
+  typed in the composer get the same fix. While a compact runs, the chat header now says
+  "compacting…" instead of "idle".
+- **Fixed — Long sheets on the phone scroll.** The session sheet's last rows (Compact, Clear,
+  Stop) could not be reached on Android; every sheet now scrolls within the screen.
+- **Fixed — Nothing hides behind the phone's tab bar.** On Android the last rows of Settings,
+  Apps and the session and chat lists sat under the bottom bar.
+- **Changed — Usage in the phone's Settings names the account.** Each row is titled with the
+  account (Arlo, Personal) beside the agent's icon, and the 5-hour and weekly meters are rings
+  captioned "used", so it is clear they show what has been spent.
+- **Changed — Android reaches your computer by its Tailscale address first.** A Tailscale DNS
+  hiccup no longer delays every reconnect; the computer's name is still tried as a fallback.
 - **Added — Project files on the phone.** Browse a session's folder from its info sheet or
   the folder button in the chat, read files (Markdown rendered), view images, edit and save
   text files, and save any file to a folder you choose on the phone (or share it). A file changed

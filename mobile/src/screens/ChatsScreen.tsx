@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, BackHandler, FlatList, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Alert, BackHandler, FlatList, Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
 import { AgentAvatar } from "../components/AgentAvatar";
@@ -21,7 +21,7 @@ import { connStatus } from "../logic/connCopy";
 import { openBySession } from "../logic/pending";
 import type { ChatsProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
-import { TYPE } from "../theme/type";
+import { TYPE, tabBarClearance } from "../theme/type";
 
 /** How long a pull-to-refresh spins without an answer before giving up. */
 const REFRESH_TIMEOUT_MS = 5000;
@@ -222,7 +222,7 @@ export function ChatsScreen({ navigation }: ChatsProps) {
         contentInsetAdjustmentBehavior="automatic"
         onScroll={(e) => setScrolled(e.nativeEvent.contentOffset.y > 2)}
         scrollEventThrottle={64}
-        contentContainerStyle={{ paddingBottom: 24, flexGrow: 1 }}
+        contentContainerStyle={{ paddingBottom: tabBarClearance(24, insets.bottom, Platform.OS), flexGrow: 1 }}
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} enabled={ready} tintColor={p.accent} colors={[p.accent]} />
         }

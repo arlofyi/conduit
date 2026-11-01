@@ -85,6 +85,12 @@ class BgWatchService : Service() {
       "pending" -> r.onSnapshot(WatchRules.itemsOf(o.optJSONArray("asks")) + WatchRules.itemsOf(o.optJSONArray("permissions")))
       "pendingAdded" -> o.optJSONObject("item")?.let { WatchRules.itemOf(it) }?.let { r.onAdded(it) }
       "resolved" -> o.optString("id").takeIf { it.isNotEmpty() }?.let { r.onResolved(it) }
+      "rootChats" -> r.onChats(WatchRules.chatTitlesOf(o))
+      "rootChatEvent" -> {
+        val chatId = o.optString("chatId").takeIf { it.isNotEmpty() } ?: return
+        val result = if (o.isNull("result")) null else o.optString("result")
+        r.onChatEvent(o.optString("event"), chatId, result, o.optBoolean("isError", false))
+      }
       else -> return
     }
     render()
@@ -124,7 +130,7 @@ class BgWatchService : Service() {
       .setContentText(n.body)
       .setStyle(NotificationCompat.BigTextStyle().bigText(n.body))
       .setSubText(n.subtitle)
-      .setPriority(if (needs) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
+      .setPriority(NotificationCompat.PRIORITY_HIGH)
       .setCategory(if (needs) NotificationCompat.CATEGORY_REMINDER else NotificationCompat.CATEGORY_STATUS)
       // a command or question is not for the lock screen unless the reader allows that
       .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
@@ -224,11 +230,13 @@ class BgWatchService : Service() {
     }
     if (nm.getNotificationChannel(CHANNEL_FINISHED) == null) {
       nm.createNotificationChannel(
-        NotificationChannel(CHANNEL_FINISHED, "Agent finished", NotificationManager.IMPORTANCE_DEFAULT).apply {
-          description = "A session finished its turn"
+        NotificationChannel(CHANNEL_FINISHED, "Agent finished", NotificationManager.IMPORTANCE_HIGH).apply {
+          description = "A session or chat finished its turn"
         },
       )
     }
+    // 0.50.0-4 made it at default importance, which OriginOS files silently in the shade.
+    if (nm.getNotificationChannel(OLD_CHANNEL_FINISHED) != null) runCatching { nm.deleteNotificationChannel(OLD_CHANNEL_FINISHED) }
     if (nm.getNotificationChannel(CHANNEL_WATCH) == null) {
       nm.createNotificationChannel(
         NotificationChannel(CHANNEL_WATCH, "Background connection", NotificationManager.IMPORTANCE_MIN).apply {
@@ -245,7 +253,9 @@ class BgWatchService : Service() {
     const val EXTRA_NAME = "expo.modules.bgwatch.NAME"
     const val EXTRA_BRANCH = "expo.modules.bgwatch.BRANCH"
     private const val CHANNEL_NEEDS = "agent_needs_you"
-    private const val CHANNEL_FINISHED = "agent_finished"
+    // A channel's importance is fixed once created, so the heads-up version needs a new id.
+    private const val CHANNEL_FINISHED = "agent_finished_alert"
+    private const val OLD_CHANNEL_FINISHED = "agent_finished"
     private const val CHANNEL_WATCH = "bg_watch"
     private const val TAG_PREFIX = "bgwatch:"
     private const val ITEM_ID = 1
