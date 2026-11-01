@@ -77,7 +77,7 @@ export function spawnErrorText(message: string): string {
     case "unknown project":
       return "That project is no longer on your computer.";
     case "too many new chats — try again later":
-      return "Too many new chats from this phone — try again later.";
+      return "Too many new sessions from this phone — try again later.";
     default:
       return "Your computer couldn't start the chat.";
   }

@@ -163,7 +163,7 @@ pub async fn openrouter_usage(
         .filter(|(_, s)| s.enabled && s.preset == "openrouter")
         .map(|(agent, _)| (agent, store.provider_key(agent)))
         .collect();
-    Ok(tauri::async_runtime::spawn_blocking(move || {
+    let out: Vec<OpenRouterUsage> = tauri::async_runtime::spawn_blocking(move || {
         targets
             .into_iter()
             .map(|(agent, key)| match key {
@@ -175,7 +175,10 @@ pub async fn openrouter_usage(
             .collect()
     })
     .await
-    .unwrap_or_default())
+    .unwrap_or_default();
+    // The phone's `usage` reply serves this read; it never polls the API itself.
+    crate::phone_usage::remember_openrouter(&out);
+    Ok(out)
 }
 
 #[cfg(test)]

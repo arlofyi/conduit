@@ -261,7 +261,9 @@ impl LastMessageCache {
 }
 
 /// The `projects` frame. `last_message` resolves a (non-silo, Claude) session's preview;
-/// it is never called for a silo'd or non-Claude session.
+/// it is never called for a silo'd or non-Claude session. `usage_key` names the session's
+/// `usage` row (`phone_usage::session_usage_key`), or None.
+#[allow(clippy::too_many_arguments)]
 pub fn projects_view(
     projects: &[Project],
     profiles: &[Profile],
@@ -270,6 +272,7 @@ pub fn projects_view(
     running: &HashSet<String>,
     asks: &[AskView],
     last_message: &dyn Fn(&Session) -> Value,
+    usage_key: &dyn Fn(&Project, &Session) -> Option<String>,
 ) -> Value {
     let mut profile_list = vec![json!({ "id": Value::Null, "name": "Default" })];
     profile_list.extend(
@@ -314,7 +317,18 @@ pub fn projects_view(
                         "agent": s.agent,
                         "branch": s.branch,
                         "model": s.model,
+                        "effort": s.effort,
+                        "keepRunning": s.keep_running,
+                        "autoApprove": s.auto_approve,
+                        // Opaque (a hash of agent + account), never the account id.
+                        "usageKey": usage_key(p, s),
                         "stopped": s.stopped,
+                        // The last turn ended on an error (StopFailure): its kind, already a
+                        // short identifier (`fleet::failure_kind`); a silo'd session says
+                        // only that it failed.
+                        "failed": live
+                            .and_then(|f| f.failed.as_deref())
+                            .map(|k| if silo { "error" } else { k }),
                         "running": running.contains(&s.id),
                         "silo": silo,
                         "status": status,
@@ -516,33 +530,126 @@ pub fn diff_pending(prev: &HashSet<String>, now: &[PushItem]) -> (Vec<PushItem>,
     (added, gone)
 }
 
-/// A transcript's non-blank lines.
-pub fn read_lines(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .map(|s| {
-            s.lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+/// Where a transcript tail has read up to. `offset` is the byte just past the last line
+/// consumed; `seen_len` is the file length at the last read, so a pass over an unchanged
+/// file is one `stat` and no read (the tail runs every loop pass, ~20 ms).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TailCursor {
+    offset: u64,
+    seen_len: u64,
+}
+
+/// The non-blank lines appended to `path` since `cursor`, advancing it. Reads only the new
+/// bytes. A trailing line with no newline yet is left for the next pass (Claude may be
+/// mid-write) unless it already parses as a whole JSON value. A file SHORTER than the
+/// cursor was truncated or replaced, so it is read again from the start.
+pub fn read_new_lines(path: &Path, cursor: &mut TailCursor) -> Vec<String> {
+    let Ok(len) = std::fs::metadata(path).map(|m| m.len()) else {
+        return Vec::new();
+    };
+    if len < cursor.offset {
+        *cursor = TailCursor::default();
+    }
+    if len == cursor.seen_len || len == cursor.offset {
+        cursor.seen_len = len;
+        return Vec::new();
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    if f.seek(SeekFrom::Start(cursor.offset)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let complete = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let rest = &buf[complete..];
+    let whole_value =
+        !rest.is_empty() && serde_json::from_slice::<serde::de::IgnoredAny>(rest).is_ok();
+    let consumed = if whole_value { buf.len() } else { complete };
+    cursor.offset += consumed as u64;
+    // A held partial keeps `seen_len` at the stat'd length, so it is re-read only once the
+    // file grows again; otherwise everything read (maybe more than was stat'd) is seen.
+    cursor.seen_len = if consumed < buf.len() {
+        len
+    } else {
+        cursor.offset.max(len)
+    };
+    String::from_utf8_lossy(&buf[..consumed])
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A transcript's lines for a `history` backfill, and the cursor the tail continues from.
+pub fn read_history(path: &Path) -> (Vec<String>, TailCursor) {
+    let mut cursor = TailCursor::default();
+    let lines = read_new_lines(path, &mut cursor);
+    (lines, cursor)
+}
+
+/// Items a `history` frame carries at most: the newest ones. The phone keeps a feed of
+/// `FEED_CAP` = 2000 (`mobile/src/logic/feed.ts`) and drops the rest anyway; twice that
+/// leaves room for tool results, which arrive as their own items and fold into their
+/// calls, so the phone's own cap (and its "earlier messages" divider) stays the one that
+/// decides what is shown. A long conversation no longer ships megabytes it then discards.
+pub const HISTORY_CAP: usize = 4000;
+
+/// The newest [`HISTORY_CAP`] of `items`.
+pub fn cap_history(mut items: Vec<Value>) -> Vec<Value> {
+    if items.len() > HISTORY_CAP {
+        items.drain(..items.len() - HISTORY_CAP);
+    }
+    items
+}
+
+/// A `history` frame: the (capped) backfill of `session_id`'s chat.
+pub fn history_frame(session_id: &str, items: Vec<Value>) -> Value {
+    json!({ "type": "history", "sessionId": session_id, "items": cap_history(items) })
 }
 
 /// `chat` frames for every line appended to `path` since `cursor`, advancing it. Used by
 /// the regular tail AND just before the tail switches transcript after a `/clear`, so
 /// lines the old conversation wrote since the last pass are not lost.
-pub fn tail_frames(path: &Path, cursor: &mut usize, session_id: &str) -> Vec<Value> {
-    let lines = read_lines(path);
-    if lines.len() <= *cursor {
-        return Vec::new();
-    }
-    let frames = lines[*cursor..]
+pub fn tail_frames(path: &Path, cursor: &mut TailCursor, session_id: &str) -> Vec<Value> {
+    read_new_lines(path, cursor)
         .iter()
         .flat_map(|l| crate::transcript::parse_line(l))
         .map(|item| chat_frame(session_id, &item))
-        .collect();
-    *cursor = lines.len();
-    frames
+        .collect()
+}
+
+/// Has a frame changed since this socket last sent it? Remembers `text`'s hash in `last`.
+/// The project list is pushed on every store save and polled by the phone every 10 s,
+/// and most of those ~70 KB frames are byte-identical to the one before.
+pub fn frame_changed(last: &mut Option<u64>, text: &str) -> bool {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    let hash = h.finish();
+    if *last == Some(hash) {
+        return false;
+    }
+    *last = Some(hash);
+    true
+}
+
+/// What to send for a project-list pass. A store-save PUSH whose view is unchanged sends
+/// nothing (the dedupe). A phone's explicit `list` REQUEST always gets a reply: the full
+/// view when it changed, else `{"type":"listed","unchanged":true}` -- silence there let the
+/// phone's 35 s watchdog read an idle computer as dead and redial, and every drop could
+/// hand held questions back to the terminal.
+pub fn projects_reply(last: &mut Option<u64>, text: String, requested: bool) -> Option<String> {
+    if frame_changed(last, &text) {
+        Some(text)
+    } else if requested {
+        Some(json!({ "type": "listed", "unchanged": true }).to_string())
+    } else {
+        None
+    }
 }
 
 /// A `chat` frame: one transcript item of `session_id`. The id lets the phone drop a frame
@@ -619,7 +726,16 @@ mod tests {
     }
 
     fn view(p: &[Project], fleet: &HashMap<String, FleetStatus>, asks: &[AskView]) -> Value {
-        projects_view(p, &[], None, fleet, &HashSet::new(), asks, &|_| Value::Null)
+        projects_view(
+            p,
+            &[],
+            None,
+            fleet,
+            &HashSet::new(),
+            asks,
+            &|_| Value::Null,
+            &|_, _| None,
+        )
     }
 
     #[test]
@@ -638,8 +754,12 @@ mod tests {
             [
                 "activity",
                 "agent",
+                "autoApprove",
                 "branch",
+                "effort",
+                "failed",
                 "id",
+                "keepRunning",
                 "lastMessage",
                 "model",
                 "name",
@@ -648,7 +768,8 @@ mod tests {
                 "silo",
                 "status",
                 "stopped",
-                "updatedAt"
+                "updatedAt",
+                "usageKey"
             ]
         );
         let text = v.to_string();
@@ -797,6 +918,7 @@ mod tests {
             &HashSet::new(),
             &[],
             &|s| panic!("read attempted for {}", s.id),
+            &|_, _| None,
         );
         for i in 0..3 {
             assert!(v["projects"][0]["sessions"][i]["lastMessage"].is_null());
@@ -813,6 +935,7 @@ mod tests {
             &HashSet::new(),
             &[],
             &|s| json!({ "role": "user", "text": s.id, "at": null }),
+            &|_, _| None,
         );
         assert_eq!(
             v["projects"][0]["sessions"][0]["lastMessage"],
@@ -834,6 +957,7 @@ mod tests {
             &HashSet::new(),
             &[],
             &|_| Value::Null,
+            &|_, _| None,
         );
         assert_eq!(v["type"], "projects");
         assert_eq!(v["profiles"][0], json!({ "id": null, "name": "Default" }));
@@ -847,6 +971,7 @@ mod tests {
             &HashSet::new(),
             &[],
             &|_| Value::Null,
+            &|_, _| None,
         );
         assert!(none["activeProfileId"].is_null());
     }
@@ -919,6 +1044,28 @@ mod tests {
         }
         assert!(v["projects"][0]["sessions"][0]["needs"]["text"].is_null());
         assert!(!v.to_string().contains("payroll"));
+    }
+
+    #[test]
+    fn failed_turn_carries_its_kind_and_a_silo_only_that_it_failed() {
+        let mut b = sess("b");
+        b.silo = true;
+        let mut fleet = HashMap::new();
+        for id in ["a", "b"] {
+            fleet.insert(
+                id.to_string(),
+                FleetStatus {
+                    status: "done".into(),
+                    failed: Some("rate_limit".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let v = view(&[project("p", vec![sess("a"), b, sess("c")])], &fleet, &[]);
+        let s = &v["projects"][0]["sessions"];
+        assert_eq!(s[0]["failed"], "rate_limit");
+        assert_eq!(s[1]["failed"], "error");
+        assert!(s[2]["failed"].is_null());
     }
 
     #[test]
@@ -1142,11 +1289,11 @@ mod tests {
             json!({"type":"user","message":{"role":"user","content":t},"uuid":t}).to_string()
         };
         std::fs::write(&path, format!("{}\n", line("one"))).unwrap();
-        let mut cursor = 1;
+        let (lines, mut cursor) = read_history(&path);
+        assert_eq!(lines.len(), 1);
         // Appended after the last tail pass, just before the `/clear` moved the session.
         std::fs::write(&path, format!("{}\n{}\n", line("one"), line("two"))).unwrap();
         let frames = tail_frames(&path, &mut cursor, "s1");
-        assert_eq!(cursor, 2);
         assert!(!frames.is_empty(), "the late line reaches the phone");
         assert!(frames
             .iter()
@@ -1156,6 +1303,98 @@ mod tests {
             "nothing twice"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tail_reads_only_new_bytes_holds_a_partial_line_and_restarts_on_truncation() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("conduit-tail2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let append = |s: &str| {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(s.as_bytes()).unwrap();
+        };
+        append("{\"a\":1}\n\n{\"b\":2}\n");
+        let (lines, mut cursor) = read_history(&path);
+        assert_eq!(lines, ["{\"a\":1}", "{\"b\":2}"], "blank lines skipped");
+        assert!(read_new_lines(&path, &mut cursor).is_empty(), "unchanged");
+
+        // Half a line: held back until its newline arrives, then sent once, whole.
+        append("{\"c\":");
+        assert!(
+            read_new_lines(&path, &mut cursor).is_empty(),
+            "partial held"
+        );
+        assert!(read_new_lines(&path, &mut cursor).is_empty(), "still held");
+        append("3}\n{\"d\":4}\n");
+        assert_eq!(
+            read_new_lines(&path, &mut cursor),
+            ["{\"c\":3}", "{\"d\":4}"]
+        );
+
+        // A whole JSON value with no newline yet is not held forever.
+        append("{\"e\":5}");
+        assert_eq!(read_new_lines(&path, &mut cursor), ["{\"e\":5}"]);
+        assert!(read_new_lines(&path, &mut cursor).is_empty());
+
+        // Replaced by a shorter file: read again from the start.
+        std::fs::write(&path, "{\"z\":0}\n").unwrap();
+        assert_eq!(read_new_lines(&path, &mut cursor), ["{\"z\":0}"]);
+
+        // Missing file: nothing, and no panic.
+        let mut c = TailCursor::default();
+        assert!(read_new_lines(&dir.join("absent.jsonl"), &mut c).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_keeps_only_the_newest_items() {
+        let items: Vec<Value> = (0..HISTORY_CAP + 10).map(|i| json!({ "n": i })).collect();
+        let capped = cap_history(items);
+        assert_eq!(capped.len(), HISTORY_CAP);
+        assert_eq!(capped[0]["n"], 10);
+        assert_eq!(capped[HISTORY_CAP - 1]["n"], HISTORY_CAP + 9);
+        let short = cap_history(vec![json!(1), json!(2)]);
+        assert_eq!(short, vec![json!(1), json!(2)], "under the cap: untouched");
+        let f = history_frame("s1", vec![json!(1)]);
+        assert_eq!(keys(&f), ["items", "sessionId", "type"]);
+        assert_eq!(f["type"], "history");
+    }
+
+    #[test]
+    fn identical_frames_are_sent_once() {
+        let mut last = None;
+        assert!(frame_changed(&mut last, "a"), "a new socket always sends");
+        assert!(!frame_changed(&mut last, "a"));
+        assert!(frame_changed(&mut last, "b"));
+        assert!(frame_changed(&mut last, "a"), "a change back is a change");
+    }
+
+    #[test]
+    fn an_explicit_list_is_always_answered() {
+        let mut last = None;
+        let full = projects_reply(&mut last, "v1".into(), true);
+        assert_eq!(full.as_deref(), Some("v1"), "first view is sent whole");
+        assert_eq!(
+            projects_reply(&mut last, "v1".into(), false),
+            None,
+            "unchanged push is silent"
+        );
+        let ack = projects_reply(&mut last, "v1".into(), true).expect("request answered");
+        assert_eq!(ack, r#"{"type":"listed","unchanged":true}"#);
+        assert_eq!(
+            projects_reply(&mut last, "v2".into(), false).as_deref(),
+            Some("v2")
+        );
+        assert_eq!(
+            projects_reply(&mut last, "v3".into(), true).as_deref(),
+            Some("v3")
+        );
     }
 
     #[test]

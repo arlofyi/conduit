@@ -17,6 +17,13 @@ describe("prefs", () => {
     expect(parsePrefs(JSON.stringify({ theme: "warm-light" })).theme).toBe("warm-light");
     expect(parsePrefs(JSON.stringify({ theme: "toString" })).theme).toBe(DEFAULT_PREFS.theme);
   });
+  it("background_notification_flags_default_off_and_parse", () => {
+    expect(DEFAULT_PREFS.notifyAsked).toBe(false);
+    expect(DEFAULT_PREFS.batteryHintDismissed).toBe(false);
+    const p = parsePrefs(JSON.stringify({ notifyAsked: true, batteryHintDismissed: "yes" }));
+    expect(p.notifyAsked).toBe(true);
+    expect(p.batteryHintDismissed).toBe(false);
+  });
   it("store_round_trips_and_survives_a_read_error", async () => {
     const m = new Map<string, string>();
     const store = createPrefsStore({

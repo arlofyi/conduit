@@ -1,0 +1,26 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'fyi.arlo.conduit'
+version = '1.0.0'
+
+android {
+  namespace "expo.modules.bgwatch"
+  defaultConfig {
+    versionCode 1
+    versionName '1.0.0'
+  }
+}
+
+dependencies {
+  implementation "androidx.core:core-ktx:1.17.0"
+  // React Native's own OkHttp (gradle/libs.versions.toml), as in modules/port-mirror.
+  implementation "com.squareup.okhttp3:okhttp:4.9.2"
+
+  // Plain JVM tests of WatchRules (src/test). android.jar's org.json is a stub that throws in
+  // unit tests, so the real implementation goes on the test classpath.
+  testImplementation "junit:junit:4.13.2"
+  testImplementation "org.json:json:20240303"
+}

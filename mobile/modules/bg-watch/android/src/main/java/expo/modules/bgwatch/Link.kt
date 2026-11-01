@@ -1,0 +1,173 @@
+package expo.modules.bgwatch
+
+import android.os.Handler
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
+
+/**
+ * The watcher's one socket, as the app's own BridgeClient does it (bridge/connection.ts):
+ * `hello` -> `auth` -> `authOk`, then `list` so the computer pushes the projects view on every
+ * change, and its `pending` / `pendingAdded` / `resolved` pushes; and `rootchats`, which makes it
+ * send every general chat's turn events (`rootChatEvent`). Every callback is moved onto
+ * [main], so the state below is single-threaded. Reconnects back off 1 s -> 5 min and walk the
+ * address list; a network coming back redials at once.
+ *
+ * Authenticated as this phone, the socket counts as a phone that can answer: the computer holds
+ * questions and permissions for it (bridge.rs `holder_for`) instead of handing them to the
+ * terminal. The computer's 15 s pings are answered by OkHttp; 35 s of silence drops us there.
+ *
+ * The token is sent in the `auth` frame only; it is never logged.
+ */
+internal class Link(
+  private val main: Handler,
+  private val cfg: WatchConfig,
+  private val onFrame: (JSONObject) -> Unit,
+  /** a terminal refusal: "unauthorized" or "protocol" */
+  private val onFatal: (String) -> Unit,
+) {
+  private var ws: WebSocket? = null
+  private var gen = 0
+  private var index = 0
+  private var backoffMs = BACKOFF_START_MS
+  private var authed = false
+  private var closed = false
+  /** the last failure logged, so a dead route retrying with backoff writes one line, not hundreds */
+  private var lastLogged: String? = null
+  private val redial = Runnable { connect() }
+
+  fun start() = connect()
+
+  fun close() {
+    closed = true
+    main.removeCallbacks(redial)
+    gen += 1
+    runCatching { ws?.close(1000, null) }
+    ws = null
+  }
+
+  /** The network came back (or changed): a link that is not up redials now. */
+  fun networkBack() {
+    if (closed || authed) return
+    main.removeCallbacks(redial)
+    backoffMs = BACKOFF_START_MS
+    connect()
+  }
+
+  /** The backstop alarm fired (BgWatchService ACTION_WAKE): a redial waiting out its backoff may
+   * have been frozen by CPU sleep (Handler delays count uptime), so a link that is down and not
+   * mid-dial dials now. The backoff is kept, so a dead route still backs off. */
+  fun nudge() {
+    if (closed || authed || ws != null) return
+    connect()
+  }
+
+  private fun connect() {
+    if (closed) return
+    main.removeCallbacks(redial)
+    gen += 1
+    val my = gen
+    authed = false
+    runCatching { ws?.cancel() }
+    BgWatchState.updatePhase(if (BgWatchState.phase == "watching" || BgWatchState.phase == "stopped") "connecting" else BgWatchState.phase)
+    val url = cfg.addresses[index % cfg.addresses.size]
+    val listener = object : WebSocketListener() {
+      override fun onMessage(webSocket: WebSocket, text: String) {
+        main.post { if (my == gen) message(webSocket, text) }
+      }
+
+      override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+        main.post { if (my == gen) dropped() }
+      }
+
+      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+        main.post {
+          if (my == gen) {
+            noteFailure("link.failed", NativeLogRules.describe(t))
+            dropped()
+          }
+        }
+      }
+    }
+    ws = try {
+      BgWatchState.http.newWebSocket(Request.Builder().url(url).build(), listener)
+    } catch (e: Exception) {
+      noteFailure("link.dialFailed", NativeLogRules.describe(e))
+      dropped()
+      return
+    }
+    // A host that never answers (a dead tailnet route) must not hold the list.
+    main.postDelayed({ if (my == gen && !authed) dropped() }, HANDSHAKE_MS)
+  }
+
+  private fun message(webSocket: WebSocket, text: String) {
+    val o = runCatching { JSONObject(text) }.getOrNull() ?: return
+    when (o.optString("type")) {
+      "hello" -> {
+        if (o.optInt("protocolVersion", -1) != PROTOCOL_VERSION) {
+          NativeLog.warn("bgwatch", "link.protocol", detail = "computer speaks ${o.optInt("protocolVersion", -1)}")
+          onFatal("protocol")
+          return
+        }
+        webSocket.send(JSONObject().put("type", "auth").put("token", cfg.token).toString())
+      }
+      "authOk" -> {
+        if (lastLogged != null) NativeLog.info("bgwatch", "link.recovered")
+        lastLogged = null
+        authed = true
+        backoffMs = BACKOFF_START_MS
+        webSocket.send("""{"type":"list"}""")
+        // general chats: their titles, and every chat's turn events (a finished reply)
+        webSocket.send("""{"type":"rootchats"}""")
+        BgWatchState.updatePhase("watching")
+      }
+      "error" -> when {
+        authed -> {}
+        o.optString("message") == "unauthorized" -> {
+          NativeLog.warn("bgwatch", "link.unauthorized")
+          onFatal("unauthorized")
+        }
+        // refused before the token was checked (rate limit, access off): retry, same address
+        o.optString("message") == "unavailable" -> {
+          index -= 1
+          dropped()
+        }
+      }
+      else -> if (authed) onFrame(o)
+    }
+  }
+
+  /** Log a link failure once per distinct message (the address host is kept; never the token,
+   * which is only ever in the auth frame). */
+  private fun noteFailure(event: String, detail: String) {
+    val key = "$event|$detail"
+    if (key == lastLogged) return
+    lastLogged = key
+    NativeLog.warn("bgwatch", event, detail = detail)
+  }
+
+  private fun dropped() {
+    if (closed) return
+    gen += 1
+    runCatching { ws?.cancel() }
+    ws = null
+    // Never got in on this address: try the next one. A link that was up retries where it was.
+    if (!authed) index += 1
+    authed = false
+    BgWatchState.updatePhase("retrying")
+    main.removeCallbacks(redial)
+    main.postDelayed(redial, backoffMs)
+    backoffMs = (backoffMs * 2).coerceAtMost(BACKOFF_MAX_MS)
+  }
+
+  private companion object {
+    const val PROTOCOL_VERSION = 1
+    const val BACKOFF_START_MS = 1_000L
+    // Long, because a dead route costs battery; a network coming back does not wait for it
+    // (BgWatchService's default-network callback calls networkBack()).
+    const val BACKOFF_MAX_MS = 300_000L
+    const val HANDSHAKE_MS = 10_000L
+  }
+}

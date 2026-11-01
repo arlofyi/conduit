@@ -57,6 +57,7 @@ import { Settings } from "./components/Settings";
 import { QuickOpen } from "./components/QuickOpen";
 import { SearchPalette } from "./components/SearchPalette";
 import { CommandPalette } from "./components/CommandPalette";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useTelemetry } from "./hooks/useTelemetry";
 import { useUpdater } from "./hooks/useUpdater";
 import { useFileWatch } from "./hooks/useFileWatch";
@@ -345,7 +346,7 @@ export default function App() {
       if (typeof body?.permission_mode === "string") {
         st.setPermissionMode(session, body.permission_mode);
       }
-      if (event === "prompt" || event === "tooluse" || event === "stop" || event === "sessionend") {
+      if (event === "prompt" || event === "tooluse" || event === "stop" || event === "stopfailure" || event === "sessionend") {
         awaiting.delete(session);
       }
       switch (event) {
@@ -389,6 +390,14 @@ export default function App() {
           st.setStatus(session, "idle");
           st.setCompacting(session, false);
           st.setActivity(session, undefined);
+          break;
+        case "stopfailure":
+          // Claude's StopFailure: an API error ended the turn (fires instead of `stop`). Same
+          // end state as fleet.rs `apply_event`, so the sidebar dot and fleet_list agree; no
+          // "finished" alert, since nothing finished.
+          st.setStatus(session, "done");
+          st.setActivity(session, undefined);
+          st.setCompacting(session, false);
           break;
         case "stop":
           st.setStatus(session, "done");
@@ -483,6 +492,10 @@ export default function App() {
   // `app.emit`), so each guards by the CHAT's own profile -- a chat not yet known locally
   // normalizes to Default, same as everywhere else in profiles.ts.
   useEffect(() => {
+    // Phone turns whose done/error has not arrived yet, one token per `root-chat-user`. The
+    // user handler marks the chat running only AFTER `loadRootChats()` resolves, and a fast
+    // turn's done/error can land first -- marking it running then would leave it stuck.
+    const phoneTurns = new Map<string, symbol>();
     const unItem = listen<{ chatId: string; item: ChatItem }>("root-chat-item", ({ payload }) => {
       const st = useStore.getState();
       const chatProfile = () => st.rootChats.find((c) => c.id === payload.chatId)?.profileId;
@@ -490,6 +503,7 @@ export default function App() {
       st.rootChatItemArrived(payload.chatId, payload.item);
     });
     const unDone = listen<{ chatId: string }>("root-chat-done", ({ payload }) => {
+      phoneTurns.delete(payload.chatId);
       const st = useStore.getState();
       const chatProfile = () => st.rootChats.find((c) => c.id === payload.chatId)?.profileId;
       if (!inThisWindow(chatProfile, st.windowProfile.profileId, st.profiles)) return;
@@ -498,16 +512,36 @@ export default function App() {
     const unErr = listen<{ chatId: string; message: string }>(
       "root-chat-error",
       ({ payload }) => {
+        phoneTurns.delete(payload.chatId);
         const st = useStore.getState();
         const chatProfile = () => st.rootChats.find((c) => c.id === payload.chatId)?.profileId;
         if (!inThisWindow(chatProfile, st.windowProfile.profileId, st.profiles)) return;
         st.rootChatFailed(payload.chatId, payload.message);
       },
     );
+    // A turn sent from a PHONE: this window never added the user's bubble (it adds its own
+    // sends locally), and a first phone message may have titled the chat.
+    const unUser = listen<{ chatId: string; item: ChatItem }>("root-chat-user", ({ payload }) => {
+      const turn = Symbol(payload.chatId);
+      phoneTurns.set(payload.chatId, turn);
+      void useStore
+        .getState()
+        .loadRootChats()
+        .then(() => {
+          const st = useStore.getState();
+          const chatProfile = () => st.rootChats.find((c) => c.id === payload.chatId)?.profileId;
+          if (!inThisWindow(chatProfile, st.windowProfile.profileId, st.profiles)) return;
+          st.rootChatItemArrived(payload.chatId, payload.item);
+          // Only if this turn is still in flight: its done/error may already have arrived.
+          if (phoneTurns.get(payload.chatId) !== turn) return;
+          useStore.setState((s2) => ({ rootChatRunning: { ...s2.rootChatRunning, [payload.chatId]: true } }));
+        });
+    });
     return () => {
       void unItem.then((f) => f());
       void unDone.then((f) => f());
       void unErr.then((f) => f());
+      void unUser.then((f) => f());
     };
   }, []);
 
@@ -863,15 +897,29 @@ export default function App() {
   // windows converge through `store-saved`. A phone delete keeps the session's worktree: the
   // desktop asks before removing one (it may hold uncommitted work), a remote tap cannot.
   useEffect(() => {
-    const un = listen<{ action: "stop" | "delete"; projectId: string; sessionId: string }>(
-      "mobile-session-action",
-      ({ payload }) => {
-        const st = useStore.getState();
-        if (!st.windowProfile.isMain) return;
-        if (payload.action === "stop") void st.stopSession(payload.projectId, payload.sessionId);
-        else void st.removeSession(payload.projectId, payload.sessionId);
-      },
-    );
+    // `restart` (a phone changed an idle session's effort or model) is the same stop + start
+    // as the sidebar's (stop_session RETIRES, so the scrollback and conversation survive);
+    // `rename` is the desktop's own rename, so both views agree.
+    const un = listen<{
+      action: "stop" | "delete" | "restart" | "rename";
+      projectId: string;
+      sessionId: string;
+      name?: string;
+    }>("mobile-session-action", ({ payload }) => {
+      const st = useStore.getState();
+      if (!st.windowProfile.isMain) return;
+      const { projectId, sessionId } = payload;
+      if (payload.action === "stop") void st.stopSession(projectId, sessionId);
+      else if (payload.action === "delete") void st.removeSession(projectId, sessionId);
+      else if (payload.action === "restart") {
+        void (async () => {
+          await st.stopSession(projectId, sessionId);
+          await useStore.getState().startSession(projectId, sessionId);
+        })();
+      } else if (payload.action === "rename" && payload.name) {
+        void st.renameSession(projectId, sessionId, payload.name);
+      }
+    });
     return () => {
       void un.then((f) => f());
     };
@@ -1182,7 +1230,11 @@ export default function App() {
             home={home}
           />
         </div>
-        {rootChatActive && <RootChatView />}
+        {rootChatActive && (
+          <ErrorBoundary name="root-chat">
+            <RootChatView />
+          </ErrorBoundary>
+        )}
         {!rightCollapsed && !rootChatActive && (
           <div
             className={`resizer ${dragging ? "dragging" : ""}`}
@@ -1220,18 +1272,28 @@ export default function App() {
       )}
       {/* The command palette is the one palette that works with no project open — half its
           rows (open a project, settings, view toggles) are exactly what you want then. */}
-      {palette === "commands" && <CommandPalette onClose={() => setPalette(null)} />}
+      {palette === "commands" && (
+        <ErrorBoundary name="command-palette" overlay onClose={() => setPalette(null)}>
+          <CommandPalette onClose={() => setPalette(null)} />
+        </ErrorBoundary>
+      )}
       {newProjectDialog && (
-        <NewProjectDialog mode={newProjectDialog} onClose={() => setNewProjectDialog(null)} />
+        <ErrorBoundary name="new-project" overlay onClose={() => setNewProjectDialog(null)}>
+          <NewProjectDialog mode={newProjectDialog} onClose={() => setNewProjectDialog(null)} />
+        </ErrorBoundary>
       )}
       {(() => {
         if (palette !== "quickopen" && palette !== "search") return null;
         const p = projects.find((x) => x.id === selectedProjectId);
         if (!p) return null;
-        return palette === "quickopen" ? (
-          <QuickOpen projectId={p.id} dir={p.path} onClose={() => setPalette(null)} />
-        ) : (
-          <SearchPalette projectId={p.id} dir={p.path} onClose={() => setPalette(null)} />
+        return (
+          <ErrorBoundary name={palette} overlay onClose={() => setPalette(null)}>
+            {palette === "quickopen" ? (
+              <QuickOpen projectId={p.id} dir={p.path} onClose={() => setPalette(null)} />
+            ) : (
+              <SearchPalette projectId={p.id} dir={p.path} onClose={() => setPalette(null)} />
+            )}
+          </ErrorBoundary>
         );
       })()}
     </div>

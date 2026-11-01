@@ -3,7 +3,9 @@ import {
   DEFAULT_LIFECYCLE,
   clampMinutes,
   idleStopTargets,
+  keepRunningIds,
   launchResumeTargets,
+  legacyPinsToMigrate,
   parseLifecycle,
 } from "./sessionLifecycle";
 
@@ -117,5 +119,18 @@ describe("idleStopTargets", () => {
 
   it("does nothing when switched off", () => {
     expect(ids({ ...base, prefs: { ...DEFAULT_LIFECYCLE, autoStopIdle: false } })).toEqual([]);
+  });
+});
+
+describe("keep running", () => {
+  const sessions = [{ id: "a", keepRunning: true }, { id: "b" }, { id: "c", keepRunning: false }];
+
+  it("reads the pin from the store's session field", () => {
+    expect([...keepRunningIds(sessions)]).toEqual(["a"]);
+  });
+
+  it("migrates only legacy pins for live, not-yet-pinned sessions", () => {
+    expect(legacyPinsToMigrate({ a: true, b: true, gone: true }, sessions)).toEqual(["b"]);
+    expect(legacyPinsToMigrate({}, sessions)).toEqual([]);
   });
 });

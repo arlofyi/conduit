@@ -7,16 +7,26 @@
  * dimmed while there is nothing to send. Nothing sits behind it but the conversation, which
  * scrolls under the floating controls.
  */
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Alert, Image, Keyboard, Modal, Pressable, ScrollView, Text, TextInput, View, type LayoutChangeEvent } from "react-native";
 import { canSendWith, type Attachment } from "../logic/attachments";
 import { COMPOSER, composerHeight, composerMetrics } from "../logic/composer";
+import { insertCommand } from "../logic/sessionOptions";
 import { useTheme } from "../theme/ThemeContext";
 import { TYPE } from "../theme/type";
 import { GlassCircle, GlassSurface, Icon } from "./Glass";
 import type { AppSymbol } from "./androidSymbols";
 
 export type AttachSource = "photos" | "camera" | "file";
+
+/** One row of the inline suggestion list above the field (slash commands, skills). Tapping it
+ * replaces the draft with `insert`. */
+export interface ComposerSuggestion {
+  key: string;
+  label: string;
+  detail?: string;
+  insert: string;
+}
 
 /** Pill padding above + below the text (the field's own content height excludes it). */
 const PAD_V = 8;
@@ -29,13 +39,25 @@ export function Composer({
   onRemoveAttachment,
   bottomInset,
   onHeight,
+  suggest,
+  insert,
+  offline,
 }: {
+  /** set while nothing can be sent (offline): the hint replaces the placeholder, Send and "+"
+   * are off, and the draft stays so it can be sent once the link is back */
+  offline?: string;
+  /** optional: put `/command ` into the draft (the session sheet's commands list); a new
+   * `nonce` repeats it */
+  insert?: { command: string; nonce: number };
+  /** optional: the suggestions for the current draft ([] hides the list), e.g. `/` commands */
+  suggest?: (draft: string) => readonly ComposerSuggestion[];
   /** the session's name, for the accessibility label */
   name: string;
   /** the typed text; the screen adds the attachments' references */
   onSend: (text: string) => void;
   attachments: readonly Attachment[];
-  onAttach: (source: AttachSource) => void;
+  /** absent: no "+" (a chat that takes no files) */
+  onAttach?: (source: AttachSource) => void;
   onRemoveAttachment: (id: string) => void;
   bottomInset: number;
   /** the bar's full height, so the list can keep its last message clear of it */
@@ -49,9 +71,23 @@ export function Composer({
   const input = useRef<TextInput>(null);
   const metrics = composerMetrics(oneLine, PAD_V);
   const height = composerHeight(draft, content, metrics);
-  const canSend = canSendWith(draft, attachments);
+  const canSend = !offline && canSendWith(draft, attachments);
   const [menuOpen, setMenuOpen] = useState(false);
   const [barH, setBarH] = useState(0);
+  const suggestions = suggest ? suggest(draft) : [];
+  const pickSuggestion = (s: ComposerSuggestion) => {
+    setDraft(s.insert);
+    input.current?.focus();
+  };
+  const lastInsert = useRef<number | null>(null);
+  useEffect(() => {
+    if (!insert || insert.nonce === lastInsert.current) return;
+    lastInsert.current = insert.nonce;
+    setDraft((d) => insertCommand(d, insert.command));
+    // once the sheet that sent it has gone, so the keyboard opens over the chat
+    const t = setTimeout(() => input.current?.focus(), 350);
+    return () => clearTimeout(t);
+  }, [insert]);
 
   // Measured from an invisible mirror of the text, not from the field's onContentSizeChange:
   // with an explicit height, Fabric does not report a size change for a programmatic value
@@ -74,7 +110,7 @@ export function Composer({
   };
   const choose = (source: AttachSource) => {
     setMenuOpen(false);
-    onAttach(source);
+    onAttach?.(source);
   };
 
   return (
@@ -97,9 +133,12 @@ export function Composer({
           ))}
         </ScrollView>
       ) : null}
-      <AttachMenu open={menuOpen} bottom={barH + 6} onChoose={choose} onClose={() => setMenuOpen(false)} />
+      {suggestions.length > 0 ? <SuggestionList items={suggestions} onPick={pickSuggestion} /> : null}
+      {onAttach ? <AttachMenu open={menuOpen} bottom={barH + 6} onChoose={choose} onClose={() => setMenuOpen(false)} /> : null}
       <View style={{ flexDirection: "row", alignItems: "flex-end", gap: 8, paddingHorizontal: 10 }}>
-      <GlassCircle symbol="plus" label="Attach a photo or file" onPress={openMenu} size={COMPOSER.min} symbolSize={17} />
+      {onAttach ? (
+        <GlassCircle symbol="plus" label="Attach a photo or file" onPress={openMenu} size={COMPOSER.min} symbolSize={17} disabled={!!offline} />
+      ) : null}
       <GlassSurface style={{ flex: 1, borderRadius: COMPOSER.min / 2, minHeight: metrics.min }}>
         <Text
           onLayout={(e) => setOneLine(e.nativeEvent.layout.height)}
@@ -127,7 +166,7 @@ export function Composer({
           onChangeText={setDraft}
           multiline
           scrollEnabled={height >= metrics.max}
-          placeholder="Message"
+          placeholder={offline ?? "Message"}
           placeholderTextColor={p.textMid}
           accessibilityLabel={`Message ${name}`}
           selectionColor={p.accent}
@@ -148,7 +187,7 @@ export function Composer({
         onPress={send}
         disabled={!canSend}
         accessibilityRole="button"
-        accessibilityLabel="Send"
+        accessibilityLabel={offline ? `Send. ${offline}` : "Send"}
         accessibilityState={{ disabled: !canSend }}
         hitSlop={4}
         style={({ pressed }) => ({
@@ -164,6 +203,56 @@ export function Composer({
         <Icon name="paperplane.fill" size={17} color={canSend ? p.meText : p.textDim} weight="semibold" />
       </Pressable>
       </View>
+    </View>
+  );
+}
+
+/** The inline suggestions: a short card above the field, in the order given. */
+function SuggestionList({ items, onPick }: { items: readonly ComposerSuggestion[]; onPick: (s: ComposerSuggestion) => void }) {
+  const { palette: p } = useTheme();
+  return (
+    <View
+      accessibilityRole="menu"
+      style={{
+        marginHorizontal: 10,
+        marginBottom: 8,
+        maxHeight: 240,
+        borderRadius: 14,
+        backgroundColor: p.sidebarBg,
+        borderWidth: 1,
+        borderColor: p.border,
+        overflow: "hidden",
+      }}
+    >
+      <ScrollView keyboardShouldPersistTaps="always">
+        {items.map((s, i) => (
+          <Pressable
+            key={s.key}
+            onPress={() => onPick(s)}
+            accessibilityRole="menuitem"
+            accessibilityLabel={s.detail ? `${s.label}, ${s.detail}` : s.label}
+            android_ripple={{ color: p.selectionBg }}
+            style={({ pressed }) => ({
+              paddingHorizontal: 14,
+              paddingVertical: 9,
+              minHeight: 44,
+              justifyContent: "center",
+              borderTopWidth: i === 0 ? 0 : 1,
+              borderTopColor: p.border,
+              opacity: pressed ? 0.7 : 1,
+            })}
+          >
+            <Text numberOfLines={1} style={{ color: p.textBright, fontSize: TYPE.callout, fontWeight: "600" }}>
+              {s.label}
+            </Text>
+            {s.detail ? (
+              <Text numberOfLines={1} style={{ color: p.textMid, fontSize: TYPE.footnote }}>
+                {s.detail}
+              </Text>
+            ) : null}
+          </Pressable>
+        ))}
+      </ScrollView>
     </View>
   );
 }

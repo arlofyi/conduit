@@ -1,4 +1,4 @@
-//! Read-only filesystem access for the Files tab + file viewer. Never writes.
+//! Filesystem access for the Files tab + file viewer (reads, and the editor's atomic writes).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -105,7 +105,7 @@ pub struct FileContent {
 
 /// Modification time as fractional epoch-ms. Computed identically here, in `write_file`,
 /// and (Phase 2) `stat_file`, so JS `{mtimeMs,size}` baselines compare equal.
-fn mtime_ms_of(meta: &fs::Metadata) -> f64 {
+pub(crate) fn mtime_ms_of(meta: &fs::Metadata) -> f64 {
     match meta
         .modified()
         .ok()
@@ -116,18 +116,18 @@ fn mtime_ms_of(meta: &fs::Metadata) -> f64 {
     }
 }
 
-struct Classified {
-    content: String,
-    truncated: bool,
-    binary: bool,
-    read_only: bool,
+pub(crate) struct Classified {
+    pub(crate) content: String,
+    pub(crate) truncated: bool,
+    pub(crate) binary: bool,
+    pub(crate) read_only: bool,
 }
 
 /// Pure classification of already-read bytes into the editor text payload — split out so
 /// tiering / UTF-8 / binary rules are unit-testable without the filesystem. `size` is the
 /// TRUE on-disk length (drives the 8/24 MB tiers); `data` is what was read (capped at
 /// HARD_CAP by the caller).
-fn classify(data: &[u8], size: u64) -> Classified {
+pub(crate) fn classify(data: &[u8], size: u64) -> Classified {
     // Crude binary sniff: a NUL byte in the first 8 KB.
     let sniff = &data[..data.len().min(8192)];
     if sniff.contains(&0) {
@@ -254,7 +254,7 @@ pub fn read_file_base64(path: &str) -> Result<FileBase64, String> {
 
 /// Size + mtime of a path. Shared by `write_file` (returns it, `exists:true`) and the
 /// Phase 2 `stat_file`. `mtime_ms`/`size` are 0 and `exists:false` when the path is gone.
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FileStat {
     pub mtime_ms: f64,

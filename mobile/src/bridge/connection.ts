@@ -45,7 +45,11 @@ export type ConnEvent =
   /** the app went to the background: close and stay closed */
   | { t: "suspend" }
   /** the app is back in front: redial if suspended */
-  | { t: "resume" };
+  | { t: "resume" }
+  /** something says the link may work again (the app came to the front, the reader tapped
+   * Retry): skip the rest of a backoff wait and dial now. BridgeClient sends it only while it
+   * is WAITING (a timer pending), never mid-handshake. */
+  | { t: "kick" };
 
 export type Effect =
   | { k: "forgetMac"; deviceId: string }
@@ -60,6 +64,27 @@ export interface StepResult {
 
 export const BACKOFF_START_MS = 500;
 export const BACKOFF_MAX_MS = 8000;
+
+/**
+ * A `ready` socket that has heard nothing for this long is dead, not quiet: while the app is in
+ * front the list is asked for every 10 s and always answered -- with the view, or with
+ * `listed` when the view is unchanged (the computer does not resend an identical one). A route that vanished (Tailscale
+ * turned off, the phone changed network) leaves the socket "open" until TCP gives up, which can
+ * take minutes; this is what notices it sooner.
+ */
+export const STALE_MS = 35_000;
+
+/** Whether a Retry button means anything: the client is between attempts or retrying a refusal.
+ * A terminal failure (revoked, update needed, not paired) has nothing to retry. */
+export function canRetry(s: ConnState): boolean {
+  if (s.pairing || s.phase === "ready" || s.phase === "idle") return false;
+  return s.phase !== "failed" || s.error?.kind === "unavailable";
+}
+
+/** True when a ready, foreground link has gone silent past STALE_MS (see there). */
+export function isStale(phase: Phase, lastFrameAt: number | null, now: number): boolean {
+  return phase === "ready" && lastFrameAt !== null && now - lastFrameAt > STALE_MS;
+}
 
 export const initialConn: ConnState = {
   phase: "idle",
@@ -126,6 +151,17 @@ export function step(state: ConnState, ev: ConnEvent): StepResult {
         [],
         [{ k: "reconnect", addressIndex: state.addressIndex, delayMs: 0 }],
       );
+
+    case "kick": {
+      if (state.suspended) return step(state, { t: "resume" });
+      const retrying = state.phase === "failed" && state.error?.kind === "unavailable";
+      if (state.pairing || (state.phase !== "connecting" && !retrying)) return out(state);
+      return out(
+        { ...state, phase: "connecting", backoffMs: BACKOFF_START_MS },
+        [],
+        [{ k: "reconnect", addressIndex: state.addressIndex, delayMs: 0 }],
+      );
+    }
 
     case "start":
       return out({

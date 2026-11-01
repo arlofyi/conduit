@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useStore, WINDOWED } from "../store";
-import { canSend, greeting, isRenderable, relativeTime, type ChatItem } from "../rootChat";
+import { canSend, chatOptionsLabel, greeting, isRenderable, relativeTime, type ChatItem } from "../rootChat";
 import { inProfile } from "../profiles";
 import { renderMarkdown } from "../markdown";
 import { ArrowUpIcon, ChatBubbleIcon } from "./Icons";
@@ -26,7 +26,7 @@ export function RootChatView() {
   return (
     <div className={`root-chat ${home ? "home" : "thread"}`}>
       <div className="hq-grid" aria-hidden />
-      {home ? <HqHome chatId={chatId} /> : <HqThread chatId={chatId} title={chat.title} items={shown} running={running} />}
+      {home ? <HqHome chatId={chatId} /> : <HqThread chatId={chatId} title={chat.title} meta={chatOptionsLabel(chat)} items={shown} running={running} />}
     </div>
   );
 }
@@ -83,11 +83,13 @@ function HqHome({ chatId }: { chatId: string }) {
 function HqThread({
   chatId,
   title,
+  meta,
   items,
   running,
 }: {
   chatId: string;
   title: string;
+  meta: string;
   items: ChatItem[];
   running: boolean;
 }) {
@@ -101,7 +103,10 @@ function HqThread({
 
   return (
     <div className="hq-thread">
-      <div className="hq-thread-title">{title}</div>
+      <div className="hq-thread-title">
+        {title}
+        {meta && <span className="hq-thread-meta"> · {meta}</span>}
+      </div>
       <div className="hq-scroll" ref={scrollRef}>
         <div className="hq-column">
           {items.map((item, i) =>

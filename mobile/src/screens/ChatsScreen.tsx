@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, BackHandler, FlatList, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Alert, BackHandler, FlatList, Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
 import { AgentAvatar } from "../components/AgentAvatar";
@@ -10,7 +10,6 @@ import { mix, readableInk } from "../logic/color";
 import {
   buildRows,
   chipsFor,
-  offlineText,
   resolveFilter,
   resolveProfile,
   sameRow,
@@ -18,10 +17,12 @@ import {
   type Row,
 } from "../logic/chatList";
 import { connStatus } from "../logic/connCopy";
+import { CatchUpLine, OfflineStrip, useOfflineLine } from "../components/OfflineStrip";
+import { awayText } from "../logic/catchUp";
 import { openBySession } from "../logic/pending";
 import type { ChatsProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
-import { TYPE } from "../theme/type";
+import { TYPE, tabBarClearance } from "../theme/type";
 
 /** How long a pull-to-refresh spins without an answer before giving up. */
 const REFRESH_TIMEOUT_MS = 5000;
@@ -38,7 +39,7 @@ const TEXT_INSET = GUTTER + AVATAR_OUTER + 12;
 export function ChatsScreen({ navigation }: ChatsProps) {
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
-  const { view, viewAt, refreshProjects, unread, lastSeen, conn, currentMac, pending, sessionAction } = useLive();
+  const { view, viewAt, viewSavedAt, refreshProjects, unread, conn, currentMac, pending, sessionAction, catchUp, dismissCatchUp } = useLive();
   // Pushed questions/permissions lead their rows at once, ahead of the 10 s poll.
   const openPending = useMemo(() => openBySession(pending), [pending]);
   const { profileSel, filter, setFilter } = useListSelection();
@@ -80,9 +81,9 @@ export function ChatsScreen({ navigation }: ChatsProps) {
 
   const ready = conn.phase === "ready";
   const status = connStatus(conn, macName);
-  // A plain drop reads "<Mac> offline · last seen …"; a reason (refused, update needed) wins.
-  const plainDrop = !conn.error || conn.error.kind === "closed";
-  const offline = ready ? null : lastSeen !== null && plainDrop ? offlineText(macName, lastSeen, now) : status.text;
+  // A plain drop reads "<Mac> offline · last seen …" (or when the saved copy on screen was
+  // saved); a reason (refused, update needed) wins.
+  const offline = useOfflineLine(viewSavedAt);
 
   // Multi-select: a long press starts it (WhatsApp's gesture), taps then add or remove, and
   // the top bar turns into the actions. Private sessions are never selectable: the computer
@@ -169,7 +170,7 @@ export function ChatsScreen({ navigation }: ChatsProps) {
           onDelete={() => run("delete")}
         />
       ) : (
-      /* compact top bar: "…" (profile, Switch computer) · Chats · "+" (new chat) */
+      /* compact top bar: "…" (profile, Switch computer) · Sessions · "+" (new session) */
       <View
         style={{
           paddingTop: insets.top + 4,
@@ -186,12 +187,12 @@ export function ChatsScreen({ navigation }: ChatsProps) {
           accessibilityRole="header"
           style={{ flex: 1, textAlign: "center", fontSize: TYPE.headline, fontWeight: "600", color: p.textBright }}
         >
-          Chats
+          Sessions
         </Text>
         <GlassCircle
           symbol="plus"
           primary
-          label="New chat"
+          label="New session"
           disabled={!ready || !view || view.projects.length === 0}
           onPress={() => navigation.navigate("NewChat")}
         />
@@ -199,17 +200,30 @@ export function ChatsScreen({ navigation }: ChatsProps) {
       )}
 
       {offline && (
-        <Pressable
+        <OfflineStrip
+          text={offline.text}
+          tone={offline.tone}
+          inset={GUTTER + 2}
           onPress={() => navigation.navigate("Settings")}
-          accessibilityRole="button"
-          style={{ flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: GUTTER + 2, paddingVertical: 6 }}
-        >
-          <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: status.tone === "busy" ? p.amber : p.red }} />
-          <Text style={{ flex: 1, fontSize: TYPE.footnote, color: p.textMid }} numberOfLines={1}>
-            {offline}
-          </Text>
-        </Pressable>
+          onRetry={offline.onRetry}
+        />
       )}
+      {catchUp && !selecting ? (
+        <CatchUpLine
+          text={awayText(catchUp, now)}
+          inset={GUTTER + 2}
+          onDismiss={dismissCatchUp}
+          // What needs you leads: show those rows, and the line has done its job.
+          onPress={
+            catchUp.needs > 0
+              ? () => {
+                  setFilter("needs");
+                  dismissCatchUp();
+                }
+              : undefined
+          }
+        />
+      ) : null}
 
       <FlatList
         data={rows}
@@ -222,7 +236,7 @@ export function ChatsScreen({ navigation }: ChatsProps) {
         contentInsetAdjustmentBehavior="automatic"
         onScroll={(e) => setScrolled(e.nativeEvent.contentOffset.y > 2)}
         scrollEventThrottle={64}
-        contentContainerStyle={{ paddingBottom: 24, flexGrow: 1 }}
+        contentContainerStyle={{ paddingBottom: tabBarClearance(24, insets.bottom, Platform.OS), flexGrow: 1 }}
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} enabled={ready} tintColor={p.accent} colors={[p.accent]} />
         }

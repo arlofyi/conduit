@@ -16,6 +16,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { LiveProvider, useLive } from "./src/bridge/LiveProvider";
 import { Banner } from "./src/components/Banner";
+import { ErrorBoundary } from "./src/components/ErrorBoundary";
 import { ReduceMotionProvider } from "./src/components/ReduceMotion";
 import type { Banner as BannerData } from "./src/logic/banner";
 import { PrefsProvider, usePrefs } from "./src/data/PrefsProvider";
@@ -25,8 +26,18 @@ import { ConnectScreen } from "./src/screens/ConnectScreen";
 import { PairScreen } from "./src/screens/PairScreen";
 import { ChatsScreen } from "./src/screens/ChatsScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
+import { AppsScreen } from "./src/screens/AppsScreen";
+import { PortMirrorProvider, usePortMirror } from "./src/data/PortMirrorProvider";
+import { BgWatchProvider, useBgWatch } from "./src/data/BgWatchProvider";
 import { NewChatScreen } from "./src/screens/NewChatScreen";
-import { ChatsMenuScreen, QuickActionsScreen, SessionInfoScreen } from "./src/screens/Sheets";
+import { FilesScreen } from "./src/screens/FilesScreen";
+import { FileViewScreen } from "./src/screens/FileViewScreen";
+import { GeneralScreen } from "./src/screens/GeneralScreen";
+import { GeneralChatScreen } from "./src/screens/GeneralChatScreen";
+import { CHAT_TARGET_PREFIX } from "./src/logic/watch";
+import { GeneralNewScreen, GeneralSettingsScreen } from "./src/screens/GeneralOptions";
+import { GeneralScopeScreen } from "./src/screens/GeneralScopeScreen";
+import { ChatsMenuScreen, QuickActionsScreen } from "./src/screens/Sheets";
 import { ListSelectionProvider, useListSelection } from "./src/data/ListSelection";
 import { needsCount, resolveProfile } from "./src/logic/chatList";
 import { openBySession } from "./src/logic/pending";
@@ -66,8 +77,12 @@ const navigationRef = createNavigationContainerRef<RootStackParamList>();
 /** A banner tap opens its chat. Over another chat it REPLACES it (one chat streams at a time,
  * and a stack of chats would leave the one below detached); elsewhere it pushes as usual. */
 function openFromBanner(b: BannerData) {
+  openChat({ sessionId: b.sessionId, projectId: b.projectId, name: b.name, branch: b.branch });
+}
+
+/** Shared by the in-app banner and a tapped system notification (BgWatchProvider). */
+function openChat(params: RootStackParamList["Chat"]) {
   if (!navigationRef.isReady()) return;
-  const params = { sessionId: b.sessionId, projectId: b.projectId, name: b.name, branch: b.branch };
   if (navigationRef.getCurrentRoute()?.name === "Chat") navigationRef.dispatch(StackActions.replace("Chat", params));
   else navigationRef.navigate("Chat", params);
 }
@@ -86,7 +101,11 @@ function Tabs() {
   const openPending = useMemo(() => openBySession(pending), [pending]);
   const needs = needsCount(view, profile, openPending);
   const chatsIcon = useTabIcon("bubble.left.and.bubble.right");
+  const generalIcon = useTabIcon("sparkles");
+  const appsIcon = useTabIcon("globe");
   const settingsIcon = useTabIcon("gearshape");
+  // iOS has no port mirror yet, and a tab that can only say "not available" is noise.
+  const { available: mirrorAvailable } = usePortMirror();
   return (
     <Tab.Navigator
       screenOptions={{
@@ -101,10 +120,14 @@ function Tabs() {
         name="Chats"
         component={ChatsScreen}
         options={{
+          // route names stay Chats/General; what the reader sees is Sessions/Chats
+          title: "Sessions",
           tabBarIcon: chatsIcon,
           tabBarBadge: needs > 0 ? needs : undefined,
         }}
       />
+      <Tab.Screen name="General" component={GeneralScreen} options={{ title: "Chats", tabBarIcon: generalIcon }} />
+      {mirrorAvailable && <Tab.Screen name="Apps" component={AppsScreen} options={{ tabBarIcon: appsIcon }} />}
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: settingsIcon }} />
     </Tab.Navigator>
   );
@@ -135,23 +158,42 @@ function Inner() {
   const { loaded, currentMac } = useLive();
   const base = palette.appearance === "dark" ? DarkTheme : DefaultTheme;
   const sheet = useMemo(() => sheetOptions(palette.sidebarBg), [palette.sidebarBg]);
-  const navTheme: Theme = {
-    ...base,
-    colors: {
-      ...base.colors,
-      background: palette.panelBg,
-      card: palette.sidebarBg,
-      text: palette.textBright,
-      border: palette.border,
-      primary: palette.accent,
-    },
-  };
+  // A tapped system notification (Android, screen off) opens its chat once navigation is up.
+  const { openTarget, consumeOpenTarget } = useBgWatch();
+  const [navReady, setNavReady] = useState(false);
+  useEffect(() => {
+    if (!openTarget || !currentMac || !navReady) return;
+    consumeOpenTarget();
+    // A finished general chat's notification names `chat:<id>`, not a session.
+    if (openTarget.sessionId.startsWith(CHAT_TARGET_PREFIX)) {
+      if (navigationRef.isReady())
+        navigationRef.navigate("GeneralChat", { chatId: openTarget.sessionId.slice(CHAT_TARGET_PREFIX.length), title: openTarget.name });
+      return;
+    }
+    openChat(openTarget);
+  }, [openTarget, currentMac, navReady, consumeOpenTarget]);
+  // Memoized: Inner re-renders on every LiveProvider frame, and a fresh theme object makes the
+  // whole navigation tree re-render with it.
+  const navTheme: Theme = useMemo(
+    () => ({
+      ...base,
+      colors: {
+        ...base.colors,
+        background: palette.panelBg,
+        card: palette.sidebarBg,
+        text: palette.textBright,
+        border: palette.border,
+        primary: palette.accent,
+      },
+    }),
+    [base, palette.panelBg, palette.sidebarBg, palette.textBright, palette.border, palette.accent],
+  );
 
   // Hold the first frame until we know which Mac (if any) to open on and which theme.
   if (!loaded || !prefsLoaded) return <View style={{ flex: 1, backgroundColor: palette.panelBg }} />;
 
   return (
-    <NavigationContainer ref={navigationRef} theme={navTheme}>
+    <NavigationContainer ref={navigationRef} theme={navTheme} onReady={() => setNavReady(true)}>
       <StatusBar style={palette.appearance === "dark" ? "light" : "dark"} />
       <Stack.Navigator
         screenOptions={{
@@ -169,10 +211,15 @@ function Inner() {
             <Stack.Screen name="Chat" component={ChatScreen} />
             <Stack.Screen name="Connect" component={ConnectScreen} />
             <Stack.Screen name="Pair" component={PairScreen} />
+            <Stack.Screen name="Files" component={FilesScreen} />
+            <Stack.Screen name="FileView" component={FileViewScreen} />
+            <Stack.Screen name="GeneralChat" component={GeneralChatScreen} />
+            <Stack.Screen name="GeneralScope" component={GeneralScopeScreen} options={sheet} />
+            <Stack.Screen name="GeneralNew" component={GeneralNewScreen} options={sheet} />
+            <Stack.Screen name="GeneralSettings" component={GeneralSettingsScreen} options={sheet} />
             <Stack.Screen name="NewChat" component={NewChatScreen} options={sheet} />
             <Stack.Screen name="ChatsMenu" component={ChatsMenuScreen} options={sheet} />
             <Stack.Screen name="QuickActions" component={QuickActionsScreen} options={sheet} />
-            <Stack.Screen name="SessionInfo" component={SessionInfoScreen} options={sheet} />
           </Stack.Group>
         ) : (
           <Stack.Group navigationKey="no-mac">
@@ -188,20 +235,26 @@ function Inner() {
 
 export default function App() {
   return (
-    <GestureHandlerRootView style={{ flex: 1 }}>
-      <SafeAreaProvider>
-        <PrefsProvider>
-          <ThemeProvider>
-            <ReduceMotionProvider>
-              <LiveProvider>
-                <ListSelectionProvider>
-                  <Inner />
-                </ListSelectionProvider>
-              </LiveProvider>
-            </ReduceMotionProvider>
-          </ThemeProvider>
-        </PrefsProvider>
-      </SafeAreaProvider>
-    </GestureHandlerRootView>
+    <ErrorBoundary>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <SafeAreaProvider>
+          <PrefsProvider>
+            <ThemeProvider>
+              <ReduceMotionProvider>
+                <LiveProvider>
+                  <PortMirrorProvider>
+                    <BgWatchProvider>
+                      <ListSelectionProvider>
+                        <Inner />
+                      </ListSelectionProvider>
+                    </BgWatchProvider>
+                  </PortMirrorProvider>
+                </LiveProvider>
+              </ReduceMotionProvider>
+            </ThemeProvider>
+          </PrefsProvider>
+        </SafeAreaProvider>
+      </GestureHandlerRootView>
+    </ErrorBoundary>
   );
 }

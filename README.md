@@ -107,16 +107,55 @@ exactly as they do in a normal terminal.
 - **Private mode trust boundaries** — mark a session sensitive (siloed) and it stays
   visible on your desktop but is withheld from other agents and from remote
   streaming, with read/send policy gates on the fleet tools.
-- **Mobile companion** — a React Native app that shows each agent as a live chat
-  feed (not a terminal mirror), with per-session status and a prompt box to talk to
-  a session from your phone. Loopback-only by default; LAN access is opt-in and
-  token-gated.
+- **A phone app (Android and iOS)** — your sessions, general chat and local web apps in your
+  pocket, connected to your computer over Tailscale. See [Conduit on your phone](#conduit-on-your-phone).
 - **A sidebar that scales** — collapse projects (active work stays in view), drag
   and drop to reorder projects and sessions, and per-session account tags.
 - **Auto-named sessions** (a tiny `claude -p` call titles a session from its first
   prompt), a **shared MCP server matrix** (define a server once, toggle it per
   agent), **Open in VS Code**, a native menu bar, and a warm Tokyo-Night-style
   theme.
+
+## Conduit on your phone
+
+The `mobile/` app (React Native / Expo) is a full companion for the desktop, not a terminal
+mirror. It works on **Android and iOS**; the background notifications and port mirroring
+below are Android-only for now. Build and pairing steps: [mobile/README.md](./mobile/README.md).
+
+- **Every session as a chat.** Sessions are grouped by project with anything waiting on you
+  pinned on top. Open one to read its conversation (Claude and Antigravity), watch new turns
+  stream in, and type into the real terminal. Attach photos, camera shots and files; they land
+  in the session's folder, where the agent can read them.
+- **Answer from anywhere.** Questions (AskUserQuestion) and permission prompts, Claude's and
+  Antigravity's, appear on the phone as cards with the same choices as the terminal. The first
+  answer anywhere wins and every other screen says where it went.
+- **Run sessions.** Start a new Claude or Antigravity session with "+". A session's sheet
+  interrupts it, switches its model live, sets its effort, renames it, pins it "keep
+  running", turns on auto-approve for Antigravity, runs its slash commands and skills,
+  compacts or clears it, and stops it. Long-press to stop or delete several at once.
+- **Project files.** Browse a session's folder, read files (Markdown rendered), view images,
+  edit and save text files (never over a newer copy), and save any file to the phone.
+- **General chat.** Your computer's root chat, on Claude or Antigravity: ask across the
+  projects and profiles you attach, with the chat's model, effort, deep research and MCP
+  servers chosen from its settings.
+- **Your computer's web apps on your phone** (Android). Anything on your computer's
+  `localhost` (a dev server, a container, an agent's preview) opens on the phone at the same
+  `http://localhost:<port>`, so frontends calling their API on another local port keep working.
+- **Notifications** (Android). With the app closed or the screen off, the phone tells you when
+  a session needs you, finishes (once it has really stopped), fails or is stopped, when a general
+  chat replies, and optionally when your computer has been out of reach. Tapping one opens it.
+- **Connect when you want.** Turn Tailscale on, give your agents work, and drop off; when you come
+  back the app reconnects at once and tells you what changed while you were away. Your sessions
+  list and chats are kept on the phone (never private sessions), so you can read them offline.
+- **Plan usage** for every agent account, with the same meters as the desktop.
+
+**How the two work together.** The desktop runs the agents; the phone is a remote control and
+viewer for them. Turn on _Settings → Mobile_ on the computer, pair the phone with a one-time QR
+code and a 4-digit check, and the phone connects to the computer's Tailscale address. Nothing
+listens on your LAN or the internet. Each phone has its own revocable token, and **private
+sessions never reach the phone**: their content, questions and files stay on the computer.
+Whatever you do on the phone (answer a card, stop a session, rename it, change its model) is
+the same action the desktop takes, so both always show the same state.
 
 ## Quick start
 
@@ -233,7 +272,10 @@ Updates are Developer ID–signed, notarized, and minisign-verified before insta
 | Global orchestration board — geometry, sections, undo, attention | `src/canvas.ts`, `src/canvasHistory.ts`, `src/canvasAttention.ts`, `src/terminalZoom.ts` |
 | Orchestration board UI — canvas, sections, rail/edge pips     | `src/components/CanvasView.tsx`, `src/components/CanvasSection.tsx`, `src/components/CanvasRail.tsx` |
 | Local LLM servers — detect / list models / tool-call probe    | `src-tauri/src/local_llm.rs`                       |
-| Mobile companion WebSocket bridge                             | `src-tauri/src/bridge.rs`                           |
+| Mobile bridge (WebSocket over Tailscale), pairing, devices    | `src-tauri/src/bridge.rs`, `pairing.rs`, `mobile_devices.rs`, `tailscale.rs` |
+| Phone views: projects, files, usage, session options, Antigravity chats | `src-tauri/src/bridge_view.rs`, `phone_fs.rs`, `phone_usage.rs`, `session_options.rs`, `agy_transcript.rs` |
+| Port mirroring (local web apps on the phone)                  | `src-tauri/src/local_ports.rs`, `src-tauri/src/port_tunnel.rs` |
+| Phone app (Android + iOS)                                     | `mobile/` (see `mobile/README.md`)                  |
 | Git metadata + branch graph data                              | `src-tauri/src/git.rs`                              |
 | Read/write filesystem (tree, editor, search)                  | `src-tauri/src/fsops.rs`, `src-tauri/src/search.rs` |
 | Notifications                                                 | `src-tauri/src/notify.rs`                           |

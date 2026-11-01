@@ -7,6 +7,8 @@
 mod agent;
 mod agent_activity;
 mod agent_profile;
+mod agy_prompts;
+mod agy_transcript;
 mod agy_usage;
 mod asks;
 mod board;
@@ -32,6 +34,7 @@ mod continuity_read;
 mod continuity_tables;
 mod continuity_watch;
 mod conversation_repair;
+mod diag;
 mod fleet;
 mod fleet_mcp;
 mod format;
@@ -45,17 +48,23 @@ mod hooks;
 mod hotexit;
 pub mod ide_host;
 mod local_llm;
+mod local_ports;
 mod menu;
 mod mobile_devices;
 mod notify;
 mod openrouter_usage;
 mod orchestration_policy;
 mod pairing;
+mod phone_fs;
+mod phone_usage;
 mod plugins;
+mod port_tunnel;
 mod project_new;
 mod proposals;
 mod pty;
 mod root_chat;
+mod root_chat_agy;
+mod root_chat_options;
 mod root_mcp;
 mod routing;
 mod scrollback;
@@ -63,6 +72,7 @@ mod search;
 #[cfg_attr(windows, allow(dead_code))]
 mod session_budget;
 mod session_files;
+mod session_options;
 mod status_rules;
 mod store;
 mod subagents;
@@ -215,7 +225,7 @@ fn pty_spawn(
         if let Some(home) = crate::agy_usage::resolve_agy_home(account_config_dir.as_deref()) {
             let enabled = crate::agy_usage::tracking_enabled(&store);
             if let Err(e) = crate::agy_usage::configure_in_home(&home, enabled) {
-                eprintln!("conduit: agy usage tracking sync failed: {e}");
+                crate::diag::warn("spawn", format!("agy usage tracking sync failed: {e}"));
             }
             // Resume bookkeeping. If our captured conversation id's db is gone (agy rotated /
             // the user deleted it), clear it so we start fresh and re-capture instead of
@@ -325,8 +335,9 @@ fn pty_spawn(
     // Graceful skip: board-enabled Claude session, but no usable Node -- the board still
     // works, just without continuity's MCP tools/presence hooks. Never errors the spawn.
     if continuity_precheck && continuity_node.is_none() {
-        eprintln!(
-            "conduit: continuity coordination needs Node >=22.5; skipping -- the board still works."
+        crate::diag::warn(
+            "continuity",
+            "continuity coordination needs Node >=22.5; skipping -- the board still works.",
         );
     }
 
@@ -383,7 +394,7 @@ fn pty_spawn(
             if let Some(dir) = continuity_plugin_dir.as_deref() {
                 match std::fs::read_to_string(std::path::Path::new(dir).join(".mcp.json")) {
                     Ok(manifest) => chosen.extend(crate::agent::plugin_mcp_servers(dir, &manifest)),
-                    Err(e) => eprintln!("conduit: continuity plugin .mcp.json unreadable ({e}); its tools will be missing under a session MCP allowlist"),
+                    Err(e) => crate::diag::warn("spawn", format!("continuity plugin .mcp.json unreadable ({e}); its tools will be missing under a session MCP allowlist")),
                 }
             }
             chosen
@@ -400,7 +411,10 @@ fn pty_spawn(
                 Ok(()) => (Some(path.to_string_lossy().to_string()), true),
                 Err(e) => {
                     // Never fail a spawn over MCP: fall back to inherit-everything.
-                    eprintln!("conduit: session mcp-config write failed ({e}); inheriting MCP");
+                    crate::diag::warn(
+                        "spawn",
+                        format!("session mcp-config write failed ({e}); inheriting MCP"),
+                    );
                     (fleet_only_config().flatten(), false)
                 }
             }
@@ -428,9 +442,10 @@ fn pty_spawn(
         let must_be_local = store.is_private_mode() && store.is_session_local_only(&session_id);
         let usable = settings.is_ready() && (!must_be_local || settings.is_local());
         if settings.is_ready() && !usable {
-            eprintln!(
-                "conduit: a hermes session is local-only, but its configured \
-                 endpoint is not local -- routing skipped, the session runs on its own config."
+            crate::diag::warn(
+                "spawn",
+                "a hermes session is local-only, but its configured \
+                 endpoint is not local -- routing skipped, the session runs on its own config.",
             );
         }
         // The pool is what `/model --provider` can reach mid-session, so the silo has to
@@ -474,9 +489,10 @@ fn pty_spawn(
         // while defeating the silo. Drop the routing instead of honouring it.
         let must_be_local = store.is_private_mode() && store.is_session_local_only(&session_id);
         if must_be_local && settings.is_ready() && !settings.is_local() {
-            eprintln!(
-                "conduit: an opencode session is local-only, but its configured \
-                 endpoint is not local -- routing skipped, the session runs on its own config."
+            crate::diag::warn(
+                "spawn",
+                "an opencode session is local-only, but its configured \
+                 endpoint is not local -- routing skipped, the session runs on its own config.",
             );
             settings.enabled = false;
         }
@@ -521,7 +537,10 @@ fn pty_spawn(
             let base_ref =
                 crate::git::current_branch(&working_directory).unwrap_or_else(|| "HEAD".into());
             if let Err(e) = worktree::add(&working_directory, &wt_path, &branch, &base_ref) {
-                eprintln!("conduit: git worktree add failed for {slug}: {e}");
+                crate::diag::error(
+                    "worktree",
+                    format!("git worktree add failed for {slug}: {e}"),
+                );
                 // Fail-safe: surface the error rather than silently spawning unisolated in
                 // the shared project root -- an isolation failure must be visible, never
                 // quietly downgraded to "no isolation".
@@ -572,11 +591,11 @@ fn pty_spawn(
         // the same `codex exec` result-reporting behavior for free).
         if agent == crate::agent::AgentId::Codex {
             if let Err(e) = hooks::write_codex_result_schema(&wt_path) {
-                eprintln!("conduit: failed to write codex result schema: {e}");
+                crate::diag::warn("spawn", format!("failed to write codex result schema: {e}"));
             }
             #[cfg(windows)]
             if let Err(e) = hooks::write_codex_result_script(&wt_path, port) {
-                eprintln!("conduit: failed to write codex result script: {e}");
+                crate::diag::warn("spawn", format!("failed to write codex result script: {e}"));
             }
         }
         (wt_path, None, None)
@@ -636,10 +655,11 @@ fn pty_spawn(
         };
     if agent == crate::agent::AgentId::Codex {
         if let Err(e) = hooks::write_codex_hook_relay() {
-            eprintln!("conduit: failed to write codex hook relay: {e}");
+            crate::diag::warn("spawn", format!("failed to write codex hook relay: {e}"));
         }
     }
-    pty.spawn(
+    let sid_for_log = session_id.clone();
+    let res = pty.spawn(
         session_id,
         cwd,
         cols,
@@ -664,7 +684,16 @@ fn pty_spawn(
         strict_mcp,
         ide_port,
         on_event,
-    )
+    );
+    match &res {
+        Ok(()) if !shell_only => diag::bump(diag::Counter::SessionsSpawned),
+        Ok(()) => {}
+        Err(e) => {
+            diag::bump(diag::Counter::SpawnFailures);
+            diag::error("spawn", format!("session {sid_for_log}: {e}"));
+        }
+    }
+    res
 }
 
 /// `IdeEvents` over Tauri's event bus: the connection loop's side effects become
@@ -1114,6 +1143,8 @@ fn remove_root_chat(id: String, store: State<Arc<Store>>) {
         // Claude transcript deliberately stays (palette search still finds it), and
         // the shared memory belongs to every chat, so neither is touched.
         let _ = std::fs::remove_dir_all(root_chat::dirs_for(&id).scratch);
+        // Any per-turn MCP config left behind (a crash mid-turn) carries user tokens.
+        root_chat::remove_mcp_configs(&id);
     }
 }
 
@@ -2172,6 +2203,29 @@ fn switch_session_model(
     store: State<Arc<Store>>,
     pty: State<Arc<PtyManager>>,
 ) -> ModelSwitch {
+    apply_model_switch(
+        &store,
+        &pty,
+        &session_id,
+        &model,
+        provider.as_deref(),
+        effort.as_deref(),
+    )
+}
+
+/// The body of `switch_session_model`, shared with the mobile bridge's `sessionset` so a
+/// phone and the desktop change a model through exactly one path.
+pub(crate) fn apply_model_switch(
+    store: &Store,
+    pty: &PtyManager,
+    session_id: &str,
+    model: &str,
+    provider: Option<&str>,
+    effort: Option<&str>,
+) -> ModelSwitch {
+    let session_id = session_id.to_string();
+    let provider = provider.map(str::to_string);
+    let effort = effort.map(str::to_string);
     let model = model.trim().to_string();
     // Persist first: whatever happens to the live process, the next spawn must agree with
     // what the user just chose.
@@ -2519,6 +2573,27 @@ fn stop_session(
 #[tauri::command]
 fn start_session(session_id: String, store: State<Arc<Store>>) {
     store.set_session_stopped(&session_id, false);
+}
+
+/// Pin or unpin "keep running" (exempt from the idle auto-stop). The store is the truth
+/// so a phone and the desktop agree; see `Session::keep_running`.
+#[tauri::command(async)]
+fn set_session_keep_running(session_id: String, keep: bool, store: State<Arc<Store>>) -> bool {
+    store.set_session_keep_running(&session_id, keep)
+}
+
+/// Flip auto-approve (Conduit answers the session's permission prompts with Allow; agy
+/// only, see `agy_prompts.rs`) and return the NEW value. Flipped in Rust, not from the
+/// window's copy, because a phone may have changed it since the window last loaded.
+#[tauri::command(async)]
+fn toggle_session_auto_approve(session_id: String, store: State<Arc<Store>>) -> Option<bool> {
+    if store.session_agent(&session_id) != agent::AgentId::Antigravity {
+        return None;
+    }
+    let on = !store.session_auto_approve(&session_id);
+    store
+        .set_session_auto_approve(&session_id, on)
+        .then_some(on)
 }
 
 /// Stop every idle session in one project. Returns the ids actually stopped, so the UI can
@@ -2956,6 +3031,8 @@ fn quit_app(app: tauri::AppHandle, pty: State<Arc<PtyManager>>) {
 /// happened, so the sessions that were working come back on the next launch.
 #[tauri::command(async)]
 fn prepare_for_update(app: tauri::AppHandle, pty: State<Arc<PtyManager>>) {
+    // On Windows the installer exits the process without a RunEvent::Exit.
+    diag::log_stats("before update");
     pty.kill_all();
     app.state::<Arc<root_chat::RootChatState>>().kill_all();
 }
@@ -3220,6 +3297,8 @@ fn reveal_path(path: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Local log file + panic hook first, so a failure anywhere below is on disk.
+    diag::init();
     // One Conduit per data dir. A second launch (an installer's "launch now" racing the
     // user's own click) otherwise ran a full, windowless second app -- its own hook
     // server, bridge and MCP ports -- reading and writing the SAME state.json. The
@@ -3400,6 +3479,8 @@ pub fn run() {
                 .clone();
             let asks_state = app.state::<Arc<asks::Asks>>().inner().clone();
             let ask_gate = app.state::<Arc<asks::AskGate>>().inner().clone();
+            // agy prompts as permission cards (agy fires no permission hook).
+            agy_prompts::start(app.handle().clone());
             hooks::start(
                 app.handle().clone(),
                 hook_state,
@@ -3429,6 +3510,9 @@ pub fn run() {
                 bridge.start(app.handle().clone());
             }
             continuity_watch::start(app.handle().clone());
+            // No root-chat turn is running yet: any per-turn MCP config on disk is a
+            // crash leftover holding user MCP tokens.
+            std::thread::spawn(root_chat::remove_all_mcp_configs);
 
             // IDE announce: hand the host to the PTY manager (teardown needs it) and
             // sweep OUR stale lock files — every lock dir Conduit could have written
@@ -3499,10 +3583,13 @@ pub fn run() {
                         // never ran", which is exactly the question a host hoarding agents
                         // raises. One line per reap is not noise at this rate.
                         if !reaped.is_empty() {
-                            eprintln!(
-                                "[reap] retired {} idle tmux session(s): {}",
-                                reaped.len(),
-                                reaped.join(" ")
+                            crate::diag::info(
+                                "reap",
+                                format!(
+                                    "retired {} idle tmux session(s): {}",
+                                    reaped.len(),
+                                    reaped.join(" ")
+                                ),
                             );
                         }
                         std::thread::sleep(std::time::Duration::from_secs(cfg.interval_sec));
@@ -3584,6 +3671,8 @@ pub fn run() {
             pty_kill,
             stop_session,
             start_session,
+            set_session_keep_running,
+            toggle_session_auto_approve,
             stop_idle_sessions,
             ide_diff_verdict,
             ide_editor_context,
@@ -3732,6 +3821,7 @@ pub fn run() {
             tailscale::tailscale_status,
             mobile_devices::mobile_settings,
             mobile_devices::mobile_set_enabled,
+            mobile_devices::mobile_set_mirroring,
             mobile_devices::mobile_revoke_device,
             pairing::pair_start,
             pairing::pair_cancel,
@@ -3760,6 +3850,8 @@ pub fn run() {
             mcp_apply,
             install_agent,
             telemetry::telemetry_ping,
+            diag::diagnostics,
+            diag::log_frontend_error,
             updates::update_should_notify,
             clipboard::clipboard_read_for_paste,
             plugins::list_plugins,
@@ -3771,13 +3863,15 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Conduit")
-        .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { .. } => {
                 app_handle.state::<Arc<PtyManager>>().kill_all();
                 app_handle
                     .state::<Arc<root_chat::RootChatState>>()
                     .kill_all();
             }
+            tauri::RunEvent::Exit => diag::log_stats("shutdown"),
+            _ => {}
         });
 }
 

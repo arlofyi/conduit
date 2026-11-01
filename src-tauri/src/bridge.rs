@@ -39,7 +39,7 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{accept_hdr_with_config, Message, WebSocket};
 
 use crate::asks::{AskGate, AskView, Asks};
-use crate::bridge_view::read_lines;
+use crate::bridge_view::{read_history, TailCursor};
 use crate::broker::{Broker, PermissionView};
 use crate::hookbus::HookBus;
 use crate::mobile_devices::MobileDevices;
@@ -88,11 +88,16 @@ pub enum ClientMsg {
     /// Channel), mirroring the fleet-spawn path.
     Spawn {
         project_id: String,
+        /// The first message. Empty starts the agent idle, waiting for one.
+        #[serde(default)]
         prompt: String,
         #[serde(default)]
         agent: Option<String>,
         #[serde(default)]
         worktree: bool,
+        /// An explicit session title; absent or blank derives one from `prompt`.
+        #[serde(default)]
+        name: Option<String>,
     },
     /// First frame from a paired phone: its device token (verified hash-to-hash).
     Auth {
@@ -151,6 +156,155 @@ pub enum ClientMsg {
         request_id: String,
         action: SessionActionKind,
         session_ids: Vec<String>,
+    },
+    /// What a session can be switched to and steered with (`session_options.rs`): models,
+    /// efforts, commands/skills, MCP servers. Session-scoped. Answered with `sessionOptions`.
+    #[serde(rename_all = "camelCase")]
+    SessionOptions {
+        session_id: String,
+        request_id: String,
+    },
+    /// Change a session's model / effort / name / keep-running; only the fields present.
+    /// Session-scoped. Answered with `sessionSetResult`.
+    #[serde(rename_all = "camelCase")]
+    SessionSet {
+        session_id: String,
+        request_id: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        keep_running: Option<bool>,
+        #[serde(default)]
+        auto_approve: Option<bool>,
+    },
+    /// Every agent account's usage, from cached reads only (`phone_usage.rs`). Answered
+    /// with `usage`.
+    #[serde(rename_all = "camelCase")]
+    Usage {
+        request_id: String,
+    },
+    /// Which local web apps a phone may mirror (`local_ports.rs`). Answered with `ports`.
+    Ports,
+    /// First frame of a TUNNEL socket (port mirroring): its own WebSocket per TCP
+    /// connection, authenticated like `auth`, then raw bytes in binary frames. Answered with
+    /// `tunnelOk` or an `error`. Loopback peers send no token, as they send no `auth`.
+    Tunnel {
+        #[serde(default)]
+        token: Option<String>,
+        port: u16,
+    },
+    /// The phone's file browser (`phone_fs.rs`): one directory of the session's own
+    /// directory. Answered with `fsListResult`.
+    #[serde(rename_all = "camelCase")]
+    FsList {
+        session_id: String,
+        request_id: String,
+        #[serde(default)]
+        path: String,
+    },
+    /// A file as text for viewing/editing. `confirm` opens a secret. `fsReadResult`.
+    #[serde(rename_all = "camelCase")]
+    FsRead {
+        session_id: String,
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Save an edit; `base*` is the stat the phone read, so a file changed on the computer
+    /// since is a `conflict`, never overwritten. `fsWriteResult`.
+    #[serde(rename_all = "camelCase")]
+    FsWrite {
+        session_id: String,
+        request_id: String,
+        path: String,
+        content: String,
+        base_mtime_ms: f64,
+        base_size: u64,
+    },
+    /// Download a file to the phone: `fsChunk` frames, each acked with `fsAck` before the
+    /// next is sent (one download per socket; a new one replaces it).
+    #[serde(rename_all = "camelCase")]
+    FsDownload {
+        session_id: String,
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    FsAck {
+        request_id: String,
+    },
+    /// The general chat (root chat, `root_chat.rs`): list every chat. `rootChats`.
+    RootChats,
+    /// A new general chat in a profile, optionally scoped. `rootChatCreated`.
+    #[serde(rename_all = "camelCase")]
+    RootChatCreate {
+        request_id: String,
+        #[serde(default)]
+        profile_id: Option<String>,
+        #[serde(default)]
+        scope: Option<crate::store::ChatScope>,
+        /// "claude" | "antigravity"; absent (an older phone) = claude. Read strictly.
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        research: bool,
+        #[serde(default)]
+        mcps: Vec<String>,
+    },
+    /// Change a chat's model / effort / deep research / MCP servers. A field not sent is
+    /// unchanged; a `model` or `effort` of "" goes back to the agent's default.
+    /// `rootChatSettings`.
+    #[serde(rename_all = "camelCase")]
+    RootChatSettings {
+        chat_id: String,
+        request_id: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        research: Option<bool>,
+        #[serde(default)]
+        mcps: Option<Vec<String>>,
+    },
+    /// What a new general chat can be set to: agents with their models and efforts, the
+    /// user's skills and MCP server NAMES. `rootChatOptions`.
+    #[serde(rename_all = "camelCase")]
+    RootChatOptions {
+        request_id: String,
+    },
+    /// A chat's history so far. `rootChatHistory`; later turns stream as `rootChatEvent`.
+    #[serde(rename_all = "camelCase")]
+    RootChatHistory {
+        chat_id: String,
+    },
+    /// Send one message (one paid `claude -p` turn, so budgeted per phone).
+    #[serde(rename_all = "camelCase")]
+    RootChatSend {
+        chat_id: String,
+        text: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    RootChatStop {
+        chat_id: String,
+    },
+    /// Change which projects a chat covers (None = every project). `rootChatScoped`.
+    #[serde(rename_all = "camelCase")]
+    RootChatScope {
+        chat_id: String,
+        #[serde(default)]
+        scope: Option<crate::store::ChatScope>,
     },
 }
 
@@ -211,12 +365,14 @@ impl std::fmt::Debug for ClientMsg {
                 prompt,
                 agent,
                 worktree,
+                name,
             } => f
                 .debug_struct("Spawn")
                 .field("project_id", project_id)
                 .field("prompt", prompt)
                 .field("agent", agent)
                 .field("worktree", worktree)
+                .field("name", name)
                 .finish(),
             Self::Auth { .. } => f.debug_struct("Auth").field("token", &R).finish(),
             Self::Pair {
@@ -232,6 +388,112 @@ impl std::fmt::Debug for ClientMsg {
                 .field("nonce", &R)
                 .finish(),
             Self::Discover => f.write_str("Discover"),
+            Self::Ports => f.write_str("Ports"),
+            Self::FsList {
+                session_id,
+                request_id,
+                path,
+            } => f
+                .debug_struct("FsList")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .field("path", path)
+                .finish(),
+            Self::FsRead {
+                session_id,
+                request_id,
+                path,
+                confirm,
+            }
+            | Self::FsDownload {
+                session_id,
+                request_id,
+                path,
+                confirm,
+            } => f
+                .debug_struct("FsRead/FsDownload")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .field("path", path)
+                .field("confirm", confirm)
+                .finish(),
+            Self::FsWrite {
+                session_id,
+                request_id,
+                path,
+                content,
+                ..
+            } => f
+                .debug_struct("FsWrite")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .field("path", path)
+                .field("content", &content.len())
+                .finish(),
+            Self::RootChats => f.write_str("RootChats"),
+            Self::RootChatCreate {
+                request_id,
+                profile_id,
+                scope,
+                agent,
+                model,
+                effort,
+                research,
+                mcps,
+            } => f
+                .debug_struct("RootChatCreate")
+                .field("request_id", request_id)
+                .field("profile_id", profile_id)
+                .field("scope", scope)
+                .field("agent", agent)
+                .field("model", model)
+                .field("effort", effort)
+                .field("research", research)
+                .field("mcps", mcps)
+                .finish(),
+            Self::RootChatSettings {
+                chat_id,
+                request_id,
+                model,
+                effort,
+                research,
+                mcps,
+            } => f
+                .debug_struct("RootChatSettings")
+                .field("chat_id", chat_id)
+                .field("request_id", request_id)
+                .field("model", model)
+                .field("effort", effort)
+                .field("research", research)
+                .field("mcps", mcps)
+                .finish(),
+            Self::RootChatOptions { request_id } => f
+                .debug_struct("RootChatOptions")
+                .field("request_id", request_id)
+                .finish(),
+            Self::RootChatHistory { chat_id } | Self::RootChatStop { chat_id } => f
+                .debug_struct("RootChat")
+                .field("chat_id", chat_id)
+                .finish(),
+            Self::RootChatSend { chat_id, text } => f
+                .debug_struct("RootChatSend")
+                .field("chat_id", chat_id)
+                .field("text", &text.len())
+                .finish(),
+            Self::RootChatScope { chat_id, scope } => f
+                .debug_struct("RootChatScope")
+                .field("chat_id", chat_id)
+                .field("scope", scope)
+                .finish(),
+            Self::FsAck { request_id } => f
+                .debug_struct("FsAck")
+                .field("request_id", request_id)
+                .finish(),
+            Self::Tunnel { token, port } => f
+                .debug_struct("Tunnel")
+                .field("token", &token.as_ref().map(|_| R))
+                .field("port", port)
+                .finish(),
             Self::Interrupt { session_id } => f
                 .debug_struct("Interrupt")
                 .field("session_id", session_id)
@@ -256,6 +518,36 @@ impl std::fmt::Debug for ClientMsg {
                 .field("request_id", request_id)
                 .field("action", action)
                 .field("session_ids", session_ids)
+                .finish(),
+            Self::SessionOptions {
+                session_id,
+                request_id,
+            } => f
+                .debug_struct("SessionOptions")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .finish(),
+            Self::SessionSet {
+                session_id,
+                request_id,
+                model,
+                effort,
+                name,
+                keep_running,
+                auto_approve,
+            } => f
+                .debug_struct("SessionSet")
+                .field("session_id", session_id)
+                .field("request_id", request_id)
+                .field("model", model)
+                .field("effort", effort)
+                .field("name", name)
+                .field("keep_running", keep_running)
+                .field("auto_approve", auto_approve)
+                .finish(),
+            Self::Usage { request_id } => f
+                .debug_struct("Usage")
+                .field("request_id", request_id)
                 .finish(),
             // The body is megabytes of base64; its length is what a log needs.
             Self::Upload {
@@ -322,6 +614,11 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 const CONTEXT_EVERY: Duration = Duration::from_secs(15);
 /// Wire protocol version announced in `hello`.
 const PROTOCOL_VERSION: u32 = 1;
+/// Concurrent tunnels one phone may hold. A browser opens ~6 per origin; a few apps with
+/// hot-reload sockets fit easily, a runaway loop does not.
+const TUNNELS_PER_DEVICE: usize = 64;
+/// How long a tunnel waits for the local app to accept.
+const TUNNEL_CONNECT: Duration = Duration::from_secs(3);
 
 /// How often a connection diffs the pending questions against what it has pushed.
 const PUSH_EVERY: Duration = Duration::from_millis(250);
@@ -335,6 +632,9 @@ const PING_EVERY: Duration = Duration::from_secs(15);
 /// nothing to write, the Mac would otherwise never notice, and the phone would keep holding
 /// every question it was sent (`has_remote_phone`) while the terminal showed nothing.
 const STALE_AFTER: Duration = Duration::from_secs(35);
+/// The shortest gap between two pushed project lists: a burst of store saves (a delete
+/// writes more than once) costs one frame, not one per write.
+const PROJECTS_PUSH_GAP: Duration = Duration::from_millis(700);
 /// A write that has not completed in this long fails, which ends the connection. A frozen
 /// or wedged phone stops reading while its kernel keeps the socket open (zero window), so
 /// an unbounded write blocks the loop forever: it never reaches the [`STALE_AFTER`] check,
@@ -471,7 +771,7 @@ fn attached_now_private(attached: Option<&str>, is_private: impl Fn(&str) -> boo
 /// send. None, with nothing touched, while it is still open.
 fn stop_streaming_if_private<R>(
     attached: &mut Option<(String, u64, R)>,
-    transcript: &mut Option<(PathBuf, usize)>,
+    transcript: &mut Option<(PathBuf, TailCursor)>,
     context_path: &mut Option<PathBuf>,
     tail_conversation: &mut Option<String>,
     attached_claude: &mut bool,
@@ -493,6 +793,9 @@ fn stop_streaming_if_private<R>(
 /// How often the tail re-checks which transcript the attached session is writing (a
 /// `/clear` moves it; a phone-spawned chat has none until its first turn).
 const RESOLVE_EVERY: Duration = Duration::from_secs(1);
+/// How often an attached agy session's conversation database is checked for changes (a
+/// stat of two files; it is only READ when one moved).
+const AGY_POLL: Duration = Duration::from_millis(500);
 /// New sessions a phone may start in [`SPAWN_WINDOW`]. Each one is a real agent process on
 /// the Mac, so a stuck button or a misbehaving client must not be able to start dozens.
 const SPAWNS_MAX: usize = 10;
@@ -515,13 +818,232 @@ fn session_scope(msg: &ClientMsg) -> Option<&str> {
         | ClientMsg::Git { session_id, .. }
         | ClientMsg::Kill { session_id }
         | ClientMsg::Interrupt { session_id }
-        | ClientMsg::Upload { session_id, .. } => Some(session_id),
+        | ClientMsg::Upload { session_id, .. }
+        | ClientMsg::FsList { session_id, .. }
+        | ClientMsg::FsRead { session_id, .. }
+        | ClientMsg::FsWrite { session_id, .. }
+        | ClientMsg::FsDownload { session_id, .. }
+        | ClientMsg::SessionOptions { session_id, .. }
+        | ClientMsg::SessionSet { session_id, .. } => Some(session_id),
         _ => None,
     }
 }
 
 /// Take one spawn slot for this phone (`key` = its device id, or the peer IP on loopback).
 /// `false` = the budget is spent; start nothing.
+/// Saves and downloads a phone may make in [`UPLOAD_WINDOW`] (reads and listings are free).
+const FS_OPS_MAX: usize = 120;
+/// An unacked download is dropped after this long.
+const DOWNLOAD_IDLE: Duration = Duration::from_secs(120);
+
+/// The session directory a phone browses, confirmed on disk (see `phone_fs::root_of`).
+fn fs_root(
+    app: &AppHandle,
+    session_id: &str,
+) -> Result<std::path::PathBuf, crate::phone_fs::FsError> {
+    let dir = app
+        .state::<Arc<Store>>()
+        .session_dir(session_id)
+        .ok_or(crate::phone_fs::FsError::NotFound)?;
+    crate::phone_fs::root_of(&dir)
+}
+
+fn fs_error(kind: &str, request_id: &str, e: &crate::phone_fs::FsError) -> serde_json::Value {
+    json!({ "type": kind, "requestId": request_id, "error": e.message() })
+}
+
+/// The next `fsChunk` of an open download, and whether it was the last.
+fn fs_chunk(
+    request_id: &str,
+    d: &mut crate::phone_fs::Download,
+    sent: &mut u64,
+) -> (serde_json::Value, bool) {
+    use base64::Engine;
+    match d.next_chunk() {
+        Ok(bytes) => {
+            *sent += bytes.len() as u64;
+            let done = bytes.len() < crate::phone_fs::CHUNK_RAW || *sent >= d.size;
+            (
+                json!({
+                    "type": "fsChunk",
+                    "requestId": request_id,
+                    "seq": d.seq,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    "done": done,
+                    "size": d.size,
+                    "name": d.name,
+                }),
+                done,
+            )
+        }
+        Err(e) => (fs_error("fsChunk", request_id, &e), true),
+    }
+}
+
+/// General-chat messages a phone may send per [`ROOT_CHAT_WINDOW`]: each is a paid turn.
+const ROOT_CHAT_SENDS_MAX: usize = 60;
+const ROOT_CHAT_WINDOW: Duration = Duration::from_secs(3600);
+
+/// One general chat as a phone sees it -- field by field, never the stored `RootChat`
+/// (which carries the account it bills to).
+fn root_chat_view(c: &crate::store::RootChat, running: bool) -> serde_json::Value {
+    json!({
+        "id": c.id,
+        "title": c.title,
+        "profileId": c.profile_id,
+        "scope": c.scope,
+        "createdAt": c.created_at,
+        "running": running,
+        "agent": c.agent,
+        "model": c.model,
+        "effort": c.effort,
+        "research": c.research,
+        "mcps": c.mcps,
+    })
+}
+
+/// The user-scope MCP server names in a Claude profile (None = the default profile).
+fn user_mcp_names_for(config_dir: Option<&str>) -> Vec<String> {
+    crate::root_chat_options::claude_profile_paths(config_dir)
+        .and_then(|(json, _)| std::fs::read_to_string(json).ok())
+        .map(|t| crate::root_chat_options::user_mcp_names(&t))
+        .unwrap_or_default()
+}
+
+/// "" (or absent) means "the agent's default".
+fn non_empty(s: &Option<String>) -> Option<String> {
+    s.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// A `rootchatcreate`'s options, validated. `known_mcps` = the user-scope MCP names of the
+/// profile a new Claude chat is pinned to.
+fn root_chat_create_options(
+    agent: Option<&str>,
+    model: &Option<String>,
+    effort: &Option<String>,
+    research: bool,
+    mcps: &[String],
+    known_mcps: &[String],
+) -> Result<crate::store::RootChatOptions, String> {
+    let agent = match agent {
+        None => crate::agent::AgentId::Claude,
+        Some(a) => crate::root_chat_options::chat_agent_from_wire(a)
+            .ok_or_else(|| format!("unknown agent {a}"))?,
+    };
+    let (model, effort) = (non_empty(model), non_empty(effort));
+    crate::root_chat_options::validate_settings(
+        agent,
+        model.as_deref(),
+        effort.as_deref(),
+        Some(mcps),
+        known_mcps,
+    )?;
+    let mut mcps = mcps.to_vec();
+    mcps.dedup();
+    Ok(crate::store::RootChatOptions {
+        agent,
+        model,
+        effort,
+        research,
+        mcps,
+    })
+}
+
+/// Apply a `rootchatsettings` and build its `rootChatSettings` reply.
+#[allow(clippy::too_many_arguments)]
+fn root_chat_settings_reply(
+    store: &Store,
+    chat_id: &str,
+    request_id: &str,
+    model: &Option<String>,
+    effort: &Option<String>,
+    research: Option<bool>,
+    mcps: &Option<Vec<String>>,
+    running: bool,
+) -> serde_json::Value {
+    let refuse = |note: String| {
+        json!({ "type": "rootChatSettings", "requestId": request_id, "ok": false,
+            "note": note, "chat": serde_json::Value::Null })
+    };
+    let Some(chat) = store.root_chat(chat_id) else {
+        return refuse("unknown chat".into());
+    };
+    let known = match mcps {
+        Some(list) if !list.is_empty() => {
+            user_mcp_names_for(store.root_chat_config_dir(chat_id).as_deref())
+        }
+        _ => Vec::new(),
+    };
+    if let Err(e) = crate::root_chat_options::validate_settings(
+        chat.agent,
+        model.as_deref().map(str::trim),
+        effort.as_deref().map(str::trim),
+        mcps.as_deref(),
+        &known,
+    ) {
+        return refuse(e);
+    }
+    let updated = store.set_root_chat_settings(
+        chat_id,
+        model.as_ref().map(|_| non_empty(model)),
+        effort.as_ref().map(|_| non_empty(effort)),
+        research,
+        mcps.clone(),
+    );
+    match updated {
+        Some(c) => json!({ "type": "rootChatSettings", "requestId": request_id, "ok": true,
+            "chat": root_chat_view(&c, running) }),
+        None => refuse("unknown chat".into()),
+    }
+}
+
+/// The chat a root-chat message reads, drives or reconfigures -- the ones a remote phone
+/// is refused for a chat that has read a private session. Stop and scope carry no content
+/// and stay allowed; a list is filtered instead.
+fn root_chat_target(m: &ClientMsg) -> Option<&str> {
+    match m {
+        ClientMsg::RootChatHistory { chat_id }
+        | ClientMsg::RootChatSend { chat_id, .. }
+        | ClientMsg::RootChatSettings { chat_id, .. } => Some(chat_id),
+        _ => None,
+    }
+}
+
+/// Is `chat` off-limits to this peer? Only to a REMOTE phone, and only once the chat has
+/// read a private session. Loopback (the Simulator, the sidecar) and unknown ids pass, so
+/// an unknown chat still gets its usual "unknown chat" answer.
+fn chat_hidden_from(remote: bool, chat: Option<&crate::store::RootChat>) -> bool {
+    remote && chat.is_some_and(|c| c.peeked_private)
+}
+
+/// May a remote phone receive a live event of `chat`? Not one that has read a private
+/// session, and not one whose chat is gone (it can no longer be checked).
+fn remote_may_stream(chat: Option<&crate::store::RootChat>) -> bool {
+    chat.is_some_and(|c| !c.peeked_private)
+}
+
+/// The refusal for a hidden chat, in the shape the phone waits for: `rootChatSettings` for
+/// a settings change (it is matched by request id), otherwise a chat-tagged error event.
+fn hidden_chat_reply(m: &ClientMsg, chat_id: &str) -> serde_json::Value {
+    const NOTE: &str = "This chat read a private session -- open it on your computer";
+    match m {
+        ClientMsg::RootChatSettings { request_id, .. } => json!({
+            "type": "rootChatSettings", "requestId": request_id, "ok": false,
+            "note": NOTE, "chat": serde_json::Value::Null }),
+        _ => json!({ "type": "rootChatEvent", "event": "error", "chatId": chat_id,
+            "message": NOTE }),
+    }
+}
+
+/// A root-chat event (`RootChatState::subscribe`) as the frame a phone receives.
+fn root_chat_event_frame(mut event: serde_json::Value) -> serde_json::Value {
+    event["type"] = json!("rootChatEvent");
+    event
+}
+
 /// Files a phone may send in [`UPLOAD_WINDOW`]. Each one is written into a session's checkout.
 const UPLOADS_MAX: usize = 30;
 const UPLOAD_WINDOW: Duration = Duration::from_secs(600);
@@ -621,12 +1143,33 @@ fn spawn_session_name(prompt: &str) -> String {
     let Some(line) = prompt.lines().map(str::trim).find(|l| !l.is_empty()) else {
         return "Mobile".to_string();
     };
+    cap_session_name(line)
+}
+
+/// One line, whitespace collapsed, at most [`SPAWN_NAME_MAX`] characters.
+fn cap_session_name(line: &str) -> String {
     let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() <= SPAWN_NAME_MAX {
         return line;
     }
     let cut: String = line.chars().take(SPAWN_NAME_MAX - 1).collect();
     format!("{}…", cut.trim_end())
+}
+
+/// The name a phone-started session gets: the title the phone typed, else one derived from
+/// the first message (see [`spawn_session_name`]). A title is one line; control characters
+/// (a pasted newline or tab) become spaces.
+fn spawn_name(name: Option<&str>, prompt: &str) -> String {
+    let title: String = name
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if title.trim().is_empty() {
+        spawn_session_name(prompt)
+    } else {
+        cap_session_name(&title)
+    }
 }
 
 /// The reply when a phone has spent its spawn budget.
@@ -687,6 +1230,7 @@ fn spawn_reply(
     prompt: &str,
     agent: Option<&str>,
     worktree: bool,
+    name: Option<&str>,
 ) -> serde_json::Value {
     use tauri::Emitter;
     let Some(agent_id) = spawn_agent(agent) else {
@@ -702,7 +1246,7 @@ fn spawn_reply(
     }
     let Some(session) = store.add_session(
         project_id,
-        spawn_session_name(prompt),
+        spawn_name(name, prompt),
         worktree,
         agent_id,
         crate::store::SessionRole::Worker,
@@ -730,12 +1274,13 @@ fn wake_session(app: &AppHandle, session_id: &str) {
 }
 
 /// Build the transcript backfill payload for `session_id` from raw jsonl lines.
+/// Capped to the newest `bridge_view::HISTORY_CAP` items: the phone shows no more.
 fn history_payload(session_id: &str, lines: &[String]) -> serde_json::Value {
     let items: Vec<serde_json::Value> = lines
         .iter()
         .flat_map(|l| crate::transcript::parse_line(l))
         .collect();
-    json!({ "type": "history", "sessionId": session_id, "items": items })
+    crate::bridge_view::history_frame(session_id, items)
 }
 
 /// The generic failure reply. Identical for a wrong token, a revoked device, a bad or
@@ -1134,7 +1679,7 @@ fn pair_flow(
                 }
             }
             Err(e) => {
-                eprintln!("conduit: could not save paired phone: {e}");
+                crate::diag::error("bridge", format!("could not save paired phone: {e}"));
                 let _ = ws.send(Message::Text(pair_result_err("error").to_string()));
                 ("failed", None)
             }
@@ -1182,6 +1727,10 @@ pub struct BridgeController {
     spawns: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Files sent per phone (same key as `spawns`).
     uploads: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// General-chat turns sent per phone (same key as `spawns`).
+    root_chat_sends: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// File saves and downloads per phone (same key as `spawns`).
+    fs_ops: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Last-message previews for the `projects` frame, keyed by transcript file state.
     last_messages: crate::bridge_view::LastMessageCache,
     /// The question registry and the desktop gate, so the last phone leaving can hand
@@ -1189,6 +1738,11 @@ pub struct BridgeController {
     asks: OnceLock<(Arc<Asks>, Arc<AskGate>)>,
     /// The permission registry, for the same hand-off (`wire_permissions`).
     permissions: OnceLock<Arc<Broker>>,
+    /// Which local ports serve a web app (port mirroring); the tunnel's allowlist.
+    web_ports: Arc<crate::local_ports::WebPorts>,
+    /// Open tunnels' stop flags, by device id ("" for loopback). NOT `live`: a tunnel is
+    /// not a phone a question can be held for. Revoke, access-off and mirroring-off set them.
+    tunnels: Mutex<HashMap<String, Vec<Arc<AtomicBool>>>>,
 }
 
 impl BridgeController {
@@ -1205,9 +1759,53 @@ impl BridgeController {
             pair_prompts: Mutex::new(HashMap::new()),
             spawns: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
+            root_chat_sends: Mutex::new(HashMap::new()),
+            fs_ops: Mutex::new(HashMap::new()),
             last_messages: Default::default(),
             asks: OnceLock::new(),
             permissions: OnceLock::new(),
+            web_ports: Default::default(),
+            tunnels: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Claim a tunnel slot for `device` ("" = loopback). None when it already has
+    /// [`TUNNELS_PER_DEVICE`] open.
+    fn open_tunnel(&self, device: &str) -> Option<Arc<AtomicBool>> {
+        let mut map = lock(&self.tunnels);
+        let slots = map.entry(device.to_string()).or_default();
+        if slots.len() >= TUNNELS_PER_DEVICE {
+            return None;
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        slots.push(flag.clone());
+        Some(flag)
+    }
+
+    fn close_tunnel(&self, device: &str, flag: &Arc<AtomicBool>) {
+        let mut map = lock(&self.tunnels);
+        if let Some(v) = map.get_mut(device) {
+            v.retain(|f| !Arc::ptr_eq(f, flag));
+            if v.is_empty() {
+                map.remove(device);
+            }
+        }
+    }
+
+    fn stop_tunnels_of(&self, device: &str) {
+        if let Some(flags) = lock(&self.tunnels).remove(device) {
+            for f in flags {
+                f.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// End every open tunnel now (mirroring or mobile access switched off).
+    pub fn close_all_tunnels(&self) {
+        for (_, flags) in lock(&self.tunnels).drain() {
+            for f in flags {
+                f.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -1278,20 +1876,26 @@ impl BridgeController {
                 }
             });
             let (Some(port), Some(listener)) = (port, bound.into_inner()) else {
-                eprintln!(
-                    "conduit: no free bridge port in {}..={}",
-                    BRIDGE_PORTS.start(),
-                    BRIDGE_PORTS.end()
+                crate::diag::error(
+                    "bridge",
+                    format!(
+                        "no free bridge port in {}..={}",
+                        BRIDGE_PORTS.start(),
+                        BRIDGE_PORTS.end()
+                    ),
                 );
                 return;
             };
             if persisted != Some(port) {
                 if let Err(e) = me.devices.set_port(port) {
-                    eprintln!("conduit: could not persist bridge port {port}: {e}");
+                    crate::diag::warn(
+                        "bridge",
+                        format!("could not persist bridge port {port}: {e}"),
+                    );
                 }
             }
             me.port.store(port, Ordering::SeqCst);
-            eprintln!("conduit: mobile bridge on ws://127.0.0.1:{port}");
+            crate::diag::info("bridge", format!("mobile bridge on ws://127.0.0.1:{port}"));
             {
                 let (me, app) = (me.clone(), app.clone());
                 let never = Arc::new(AtomicBool::new(false));
@@ -1353,11 +1957,18 @@ impl BridgeController {
                     let ctrl = app.state::<Arc<BridgeController>>().inner().clone();
                     let (flag, app) = (stop.clone(), app.clone());
                     thread::spawn(move || accept_loop(listener, flag, app, ctrl));
-                    eprintln!("conduit: mobile bridge on ws://{ip}:{port} (Tailscale)");
+                    crate::diag::info(
+                        "bridge",
+                        format!("mobile bridge on ws://{ip}:{port} (Tailscale)"),
+                    );
                     *slot = Some((ip, stop));
                 }
                 // Left unbound; the next tick retries.
-                Err(e) => eprintln!("conduit: could not bind bridge to {ip}:{port}: {e}"),
+                Err(e) => crate::diag::warn_once(
+                    &format!("bridge-bind-{ip}:{port}"),
+                    "bridge",
+                    format!("could not bind bridge to {ip}:{port}: {e}"),
+                ),
             }
         }
     }
@@ -1365,6 +1976,7 @@ impl BridgeController {
     /// Close every open socket of a device (revoke). Immediate: each connection checks
     /// its flag on every 20 ms tick.
     pub fn disconnect_device(&self, device_id: &str) {
+        self.stop_tunnels_of(device_id);
         let (removed, now_empty) = {
             let mut live = lock(&self.live);
             let removed = live.remove(device_id);
@@ -1381,6 +1993,7 @@ impl BridgeController {
     }
 
     pub(crate) fn disconnect_all_devices(&self) {
+        self.close_all_tunnels();
         let drained: Vec<_> = lock(&self.live).drain().collect();
         let any = !drained.is_empty();
         for (_, flags) in drained {
@@ -1475,8 +2088,12 @@ impl BridgeController {
         }
         let id = self.devices.verify(token);
         match (auth_outcome(rate_ok, enabled, id.is_some()), id) {
-            (AuthOutcome::Accepted, Some(id)) => Ok(id),
+            (AuthOutcome::Accepted, Some(id)) => {
+                crate::diag::bump(crate::diag::Counter::PhoneConnections);
+                Ok(id)
+            }
             (outcome, _) => {
+                crate::diag::bump(crate::diag::Counter::PhoneAuthFailures);
                 self.record_auth_failure(peer);
                 Err(outcome)
             }
@@ -1507,7 +2124,7 @@ fn accept_loop(
     ctrl: Arc<BridgeController>,
 ) {
     if listener.set_nonblocking(true).is_err() {
-        eprintln!("conduit: bridge listener could not go nonblocking");
+        crate::diag::error("bridge", "bridge listener could not go nonblocking");
         return;
     }
     while !stop.load(Ordering::SeqCst) {
@@ -1566,8 +2183,12 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut attached: Option<(String, u64, std::sync::mpsc::Receiver<String>)> = None;
     // Half-received phone uploads on this socket (chunked; see uploads.rs).
     let mut uploads = crate::uploads::Assembler::default();
-    // (transcript path, lines already sent) — set on attach, advanced while tailing.
-    let mut transcript: Option<(PathBuf, usize)> = None;
+    // The one open download on this socket: (request id, file, bytes sent, last activity).
+    let mut download: Option<(String, crate::phone_fs::Download, u64, Instant)> = None;
+    // General-chat events, subscribed on this socket's first general-chat message.
+    let mut root_chat_sub: Option<(u64, std::sync::mpsc::Receiver<serde_json::Value>)> = None;
+    // (transcript path, how far it has been sent) — set on attach, advanced while tailing.
+    let mut transcript: Option<(PathBuf, TailCursor)> = None;
     // Transcript of the attached session when it is a Claude one (the only agent with a
     // context meter), and when the next `context` frame is due.
     let mut context_path: Option<PathBuf> = None;
@@ -1577,9 +2198,30 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
     let mut tail_conversation: Option<String> = None;
     let mut attached_claude = false;
     let mut next_resolve = Instant::now();
+    // The attached session's Antigravity conversation, when it is an agy session: its chat
+    // is read from agy's own database (`agy_transcript.rs`), not a Claude transcript.
+    let mut agy_tail: Option<crate::agy_transcript::Tail> = None;
+    let mut next_agy = Instant::now();
     // A `discover` probe's reply, produced on its own thread. One probe at a time.
     let (macs_tx, macs_rx) = std::sync::mpsc::channel::<String>();
     let mut discovering = false;
+    // A `ports` scan's reply, produced on its own thread (it runs the OS's socket listing
+    // and HTTP probes). One scan at a time per socket.
+    let (ports_tx, ports_rx) = std::sync::mpsc::channel::<String>();
+    let mut listing_ports = false;
+    // A `rootchatoptions` reply, built on its own thread (it may wait briefly for
+    // `agy models`). One at a time per socket.
+    let (chat_options_tx, chat_options_rx) = std::sync::mpsc::channel::<String>();
+    let mut listing_chat_options = false;
+    // The project list (2d): `listed` once this socket asked for it, then pushed on change.
+    let mut listed = false;
+    let mut want_projects = false;
+    // The phone asked (`list`) rather than a store save pushing: always answered.
+    let mut list_requested = false;
+    let mut projects_gen = 0u64;
+    let mut last_projects = Instant::now();
+    // Hash of the last `projects` frame this socket sent: an identical one is skipped.
+    let mut last_projects_hash: Option<u64> = None;
     // The phone's Tailscale user id, from one `whois` the first time it is needed.
     let peer_owner: Arc<OnceLock<Option<u64>>> = Arc::new(OnceLock::new());
     // Ids of the pending questions this socket has pushed (None = `pending` not sent yet),
@@ -1666,6 +2308,28 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         let _ = ws.flush();
                         break;
                     }
+                    // A tunnel socket (port mirroring): authenticate, then this thread
+                    // becomes the byte pipe and never returns to the control loop.
+                    Some(ClientMsg::Tunnel {
+                        token: Some(token),
+                        port,
+                    }) => match ctrl.authenticate(peer, &token) {
+                        Ok(id) => {
+                            serve_tunnel(&ctrl, ws, &id, port);
+                            return;
+                        }
+                        Err(outcome) => {
+                            let reply = if outcome == AuthOutcome::Unavailable {
+                                unavailable()
+                            } else {
+                                unauthorized()
+                            };
+                            let _ = ws.send(Message::Text(reply.to_string()));
+                            let _ = ws.close(None);
+                            let _ = ws.flush();
+                            break;
+                        }
+                    },
                     // Anything else before auth ends the connection.
                     _ => break,
                 };
@@ -1727,38 +2391,10 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                 }
                 match msg {
                     Some(ClientMsg::List) => {
-                        // Typed, whitelisted tree (see `bridge_view`); never the raw `Project`s.
-                        let running: HashSet<String> = pty.session_ids().into_iter().collect();
-                        // Store is managed as Arc<Store> (lib.rs .manage(Arc::new(Store::new()))) —
-                        // state::<Store>() panics the connection thread on the first `list`.
-                        let store = app.state::<Arc<Store>>();
-                        let fleet = app.state::<Arc<crate::fleet::FleetState>>().snapshot();
-                        let asks = app.state::<Arc<crate::asks::Asks>>().pending();
-                        let view = crate::bridge_view::projects_view(
-                            &store.list(),
-                            &store.list_profiles(),
-                            store.active_profile().as_deref(),
-                            &fleet,
-                            &running,
-                            &asks,
-                            // Resolved exactly as `attach` resolves a transcript; any miss is null.
-                            &|s| {
-                                let conversation = store.claude_conversation_id(&s.id);
-                                ctrl.last_messages
-                                    .path_for(&s.id, &conversation, || {
-                                        crate::pty::session_projects_dir(&store, &s.id).and_then(
-                                            |dir| crate::pty::transcript_path(&conversation, &dir),
-                                        )
-                                    })
-                                    .map_or(serde_json::Value::Null, |p| {
-                                        ctrl.last_messages.for_path(&p)
-                                    })
-                            },
-                        );
-                        ctrl.last_messages.sweep();
-                        if !send_text(&mut ws, view.to_string()) {
-                            break 'conn;
-                        }
+                        // Sent below (2d), where store changes are pushed too.
+                        listed = true;
+                        want_projects = true;
+                        list_requested = true;
                     }
                     Some(ClientMsg::Attach { session_id }) => {
                         // Auto-wake: an idle session has no live PTY (Conduit spawns it
@@ -1797,18 +2433,23 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             transcript = None;
                             context_path = None;
                             attached_claude = is_claude(&store, &session_id);
+                            agy_tail = (session_agent(&store, &session_id)
+                                == Some(crate::agent::AgentId::Antigravity))
+                            .then(|| crate::agy_transcript::Tail::new(&session_id));
+                            next_agy = Instant::now();
                             let found = crate::pty::session_projects_dir(&store, &session_id)
                                 .and_then(|dir| crate::pty::transcript_path(&conversation, &dir));
                             // No transcript yet (a chat opened the moment it was spawned): the
                             // phone still gets an empty history, and the tail tick picks the
                             // transcript up as soon as it appears.
-                            let lines = found.as_deref().map(read_lines).unwrap_or_default();
+                            let (lines, cursor) =
+                                found.as_deref().map(read_history).unwrap_or_default();
                             let history = history_payload(&session_id, &lines);
                             if !send_text(&mut ws, history.to_string()) {
                                 break 'conn;
                             }
                             if let Some(path) = found {
-                                transcript = Some((path.clone(), lines.len()));
+                                transcript = Some((path.clone(), cursor));
                                 if attached_claude {
                                     context_path = Some(path);
                                 }
@@ -1834,6 +2475,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             }
                             tail_conversation = None;
                             attached_claude = false;
+                            agy_tail = None;
                             if !send_text(
                                 &mut ws,
                                 json!({ "type": "error", "message": "no such session" })
@@ -1877,13 +2519,21 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         prompt,
                         agent,
                         worktree,
+                        name,
                     }) => {
                         // Budgeted per phone: its device id, or the peer IP for loopback.
                         let key = device
                             .as_ref()
                             .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
                         let reply = if take_spawn_slot(&ctrl.spawns, &key) {
-                            spawn_reply(&app, &project_id, &prompt, agent.as_deref(), worktree)
+                            spawn_reply(
+                                &app,
+                                &project_id,
+                                &prompt,
+                                agent.as_deref(),
+                                worktree,
+                                name.as_deref(),
+                            )
                         } else {
                             spawn_budget_error()
                         };
@@ -2038,6 +2688,333 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             break 'conn;
                         }
                     }
+                    Some(ClientMsg::FsList {
+                        session_id,
+                        request_id,
+                        path,
+                    }) => {
+                        let reply = match fs_root(&app, &session_id)
+                            .and_then(|root| crate::phone_fs::list(&root, &path))
+                        {
+                            Ok((entries, truncated)) => json!({
+                                "type": "fsListResult", "requestId": request_id, "path": path,
+                                "entries": entries, "truncated": truncated,
+                            }),
+                            Err(e) => fs_error("fsListResult", &request_id, &e),
+                        };
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::FsRead {
+                        session_id,
+                        request_id,
+                        path,
+                        confirm,
+                    }) => {
+                        let reply = match fs_root(&app, &session_id)
+                            .and_then(|root| crate::phone_fs::read(&root, &path, confirm))
+                        {
+                            Ok(t) => {
+                                let mut v = json!({ "type": "fsReadResult", "requestId": request_id, "path": path });
+                                if let (Some(o), Ok(serde_json::Value::Object(t))) =
+                                    (v.as_object_mut(), serde_json::to_value(&t))
+                                {
+                                    o.extend(t);
+                                }
+                                v
+                            }
+                            Err(e) => fs_error("fsReadResult", &request_id, &e),
+                        };
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::FsWrite {
+                        session_id,
+                        request_id,
+                        path,
+                        content,
+                        base_mtime_ms,
+                        base_size,
+                    }) => {
+                        let key = device
+                            .as_ref()
+                            .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
+                        let reply = if !crate::fleet::rate_limited(
+                            &ctrl.fs_ops,
+                            &key,
+                            FS_OPS_MAX,
+                            UPLOAD_WINDOW,
+                        ) {
+                            json!({ "type": "fsWriteResult", "requestId": request_id, "error": "too many saves -- try again later" })
+                        } else {
+                            match fs_root(&app, &session_id).and_then(|root| {
+                                crate::phone_fs::write(
+                                    &root,
+                                    &path,
+                                    &content,
+                                    base_mtime_ms,
+                                    base_size,
+                                )
+                            }) {
+                                Ok(stat) => json!({
+                                    "type": "fsWriteResult", "requestId": request_id, "path": path,
+                                    "mtimeMs": stat.mtime_ms, "size": stat.size,
+                                }),
+                                Err(e) => fs_error("fsWriteResult", &request_id, &e),
+                            }
+                        };
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::FsDownload {
+                        session_id,
+                        request_id,
+                        path,
+                        confirm,
+                    }) => {
+                        download = None;
+                        let key = device
+                            .as_ref()
+                            .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
+                        let opened = if !crate::fleet::rate_limited(
+                            &ctrl.fs_ops,
+                            &key,
+                            FS_OPS_MAX,
+                            UPLOAD_WINDOW,
+                        ) {
+                            Err(crate::phone_fs::FsError::Io(
+                                "too many downloads -- try again later".into(),
+                            ))
+                        } else {
+                            fs_root(&app, &session_id).and_then(|root| {
+                                crate::phone_fs::open_download(&root, &path, confirm)
+                            })
+                        };
+                        let reply = match opened {
+                            Ok(mut d) => {
+                                let mut sent = 0;
+                                let (frame, done) = fs_chunk(&request_id, &mut d, &mut sent);
+                                if !done {
+                                    download = Some((request_id, d, sent, Instant::now()));
+                                }
+                                frame
+                            }
+                            Err(e) => fs_error("fsChunk", &request_id, &e),
+                        };
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(
+                        ref m @ (ClientMsg::RootChats
+                        | ClientMsg::RootChatCreate { .. }
+                        | ClientMsg::RootChatHistory { .. }
+                        | ClientMsg::RootChatSend { .. }
+                        | ClientMsg::RootChatStop { .. }
+                        | ClientMsg::RootChatScope { .. }
+                        | ClientMsg::RootChatSettings { .. }
+                        | ClientMsg::RootChatOptions { .. }),
+                    ) => {
+                        use tauri::Emitter;
+                        let chats = app.state::<Arc<crate::root_chat::RootChatState>>();
+                        let store = app.state::<Arc<Store>>();
+                        if root_chat_sub.is_none() {
+                            root_chat_sub = Some(chats.subscribe());
+                            // The phone waits only seconds for `rootChatOptions`; start the
+                            // agy model list now so that reply is answered from cache.
+                            crate::root_chat_options::prewarm_agy_models(
+                                store.default_account_config_dir_for(
+                                    crate::agent::AgentId::Antigravity,
+                                ),
+                            );
+                        }
+                        // A chat that has read a private session is not a remote phone's to
+                        // read, drive or reconfigure (see `RootChat::peeked_private`).
+                        let remote = device.is_some();
+                        let hidden = root_chat_target(m)
+                            .filter(|id| chat_hidden_from(remote, store.root_chat(id).as_ref()));
+                        let reply = match m {
+                            _ if hidden.is_some() => {
+                                Some(hidden_chat_reply(m, hidden.unwrap_or_default()))
+                            }
+                            ClientMsg::RootChatOptions { request_id } => {
+                                if !listing_chat_options {
+                                    listing_chat_options = true;
+                                    let tx = chat_options_tx.clone();
+                                    let claude_cfg = store.default_account_config_dir_for(
+                                        crate::agent::AgentId::Claude,
+                                    );
+                                    let agy_cfg = store.default_account_config_dir_for(
+                                        crate::agent::AgentId::Antigravity,
+                                    );
+                                    let rid = request_id.clone();
+                                    std::thread::spawn(move || {
+                                        let frame = crate::root_chat_options::options_frame(
+                                            &rid,
+                                            claude_cfg.as_deref(),
+                                            agy_cfg.as_deref(),
+                                        );
+                                        let _ = tx.send(frame.to_string());
+                                    });
+                                }
+                                None
+                            }
+                            ClientMsg::RootChatSettings {
+                                chat_id,
+                                request_id,
+                                model,
+                                effort,
+                                research,
+                                mcps,
+                            } => Some(root_chat_settings_reply(
+                                &store,
+                                chat_id,
+                                request_id,
+                                model,
+                                effort,
+                                *research,
+                                mcps,
+                                chats.is_running(chat_id),
+                            )),
+                            ClientMsg::RootChats => {
+                                let list: Vec<serde_json::Value> = store
+                                    .list_root_chats()
+                                    .iter()
+                                    .filter(|c| !chat_hidden_from(remote, Some(c)))
+                                    .map(|c| root_chat_view(c, chats.is_running(&c.id)))
+                                    .collect();
+                                Some(json!({ "type": "rootChats", "chats": list }))
+                            }
+                            ClientMsg::RootChatCreate {
+                                request_id,
+                                profile_id,
+                                scope,
+                                agent,
+                                model,
+                                effort,
+                                research,
+                                mcps,
+                            } => {
+                                let known = if mcps.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    user_mcp_names_for(
+                                        store
+                                            .default_account_config_dir_for(
+                                                crate::agent::AgentId::Claude,
+                                            )
+                                            .as_deref(),
+                                    )
+                                };
+                                match root_chat_create_options(
+                                    agent.as_deref(),
+                                    model,
+                                    effort,
+                                    *research,
+                                    mcps,
+                                    &known,
+                                ) {
+                                    Ok(opts) => {
+                                        let c = store.add_root_chat_opts(
+                                            profile_id.clone(),
+                                            scope.clone(),
+                                            true,
+                                            opts,
+                                        );
+                                        let _ = app.emit(
+                                            "root-chat-created",
+                                            json!({ "id": c.id, "title": c.title, "seed": "" }),
+                                        );
+                                        Some(json!({
+                                            "type": "rootChatCreated",
+                                            "requestId": request_id,
+                                            "ok": true,
+                                            "chat": root_chat_view(&c, false),
+                                        }))
+                                    }
+                                    Err(note) => Some(json!({
+                                        "type": "rootChatCreated",
+                                        "requestId": request_id,
+                                        "ok": false,
+                                        "note": note,
+                                        "chat": serde_json::Value::Null,
+                                    })),
+                                }
+                            }
+                            ClientMsg::RootChatHistory { chat_id } => {
+                                Some(match store.root_chat(chat_id) {
+                                    Some(_) => json!({
+                                        "type": "rootChatHistory",
+                                        "chatId": chat_id,
+                                        "items": crate::root_chat::history_items(&store, chat_id),
+                                        "running": chats.is_running(chat_id),
+                                    }),
+                                    None => json!({ "type": "rootChatEvent", "event": "error",
+                                        "chatId": chat_id, "message": "unknown chat" }),
+                                })
+                            }
+                            ClientMsg::RootChatSend { chat_id, text } => {
+                                let key = device
+                                    .as_ref()
+                                    .map_or_else(|| peer.to_string(), |d| d.device_id.clone());
+                                let refused = if text.trim().is_empty() {
+                                    Some("empty message".to_string())
+                                } else if !crate::fleet::rate_limited(
+                                    &ctrl.root_chat_sends,
+                                    &key,
+                                    ROOT_CHAT_SENDS_MAX,
+                                    ROOT_CHAT_WINDOW,
+                                ) {
+                                    Some("too many messages -- try again later".to_string())
+                                } else {
+                                    crate::root_chat::send_turn(&app, chat_id, text, None, true)
+                                        .err()
+                                };
+                                refused.map(|message| {
+                                    json!({ "type": "rootChatEvent", "event": "error",
+                                        "chatId": chat_id, "message": message })
+                                })
+                            }
+                            ClientMsg::RootChatStop { chat_id } => {
+                                chats.stop(chat_id);
+                                None
+                            }
+                            ClientMsg::RootChatScope { chat_id, scope } => {
+                                let ok = store.set_root_chat_scope(chat_id, scope.clone());
+                                Some(json!({ "type": "rootChatScoped", "chatId": chat_id,
+                                    "ok": ok, "scope": scope }))
+                            }
+                            _ => None,
+                        };
+                        if let Some(r) = reply {
+                            if !send_text(&mut ws, r.to_string()) {
+                                break 'conn;
+                            }
+                        }
+                    }
+                    Some(ClientMsg::FsAck { request_id }) => {
+                        let mut finished = false;
+                        let mut frame = None;
+                        if let Some((rid, d, sent, at)) = download.as_mut() {
+                            if *rid == request_id {
+                                let (f, done) = fs_chunk(rid, d, sent);
+                                *at = Instant::now();
+                                finished = done;
+                                frame = Some(f);
+                            }
+                        }
+                        if finished {
+                            download = None;
+                        }
+                        if let Some(f) = frame {
+                            if !send_text(&mut ws, f.to_string()) {
+                                break 'conn;
+                            }
+                        }
+                    }
                     Some(ClientMsg::SessionAction {
                         request_id,
                         action,
@@ -2074,8 +3051,73 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             break 'conn;
                         }
                     }
+                    // Session controls (2026-11-01 spec section 2). Both are behind the
+                    // private gate above (`session_scope`). Discovery reads a few small
+                    // files; `agy models` runs on its own thread, never here.
+                    Some(ClientMsg::SessionOptions {
+                        session_id,
+                        request_id,
+                    }) => {
+                        let reply =
+                            crate::session_options::options_frame(&app, &session_id, &request_id);
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::SessionSet {
+                        session_id,
+                        request_id,
+                        model,
+                        effort,
+                        name,
+                        keep_running,
+                        auto_approve,
+                    }) => {
+                        let reply = crate::session_options::apply_set(
+                            &app,
+                            &session_id,
+                            &request_id,
+                            model,
+                            effort,
+                            name,
+                            keep_running,
+                            auto_approve,
+                        );
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    // Cached reads only, rebuilt at most every 30 s: never a new poll of a
+                    // rate-limited usage endpoint.
+                    Some(ClientMsg::Usage { request_id }) => {
+                        let reply = crate::phone_usage::usage_frame(
+                            &request_id,
+                            crate::phone_usage::rows(&app),
+                        );
+                        if !send_text(&mut ws, reply.to_string()) {
+                            break 'conn;
+                        }
+                    }
+                    Some(ClientMsg::Ports) => {
+                        if !listing_ports {
+                            listing_ports = true;
+                            let (tx, ctrl) = (ports_tx.clone(), ctrl.clone());
+                            let remote = device.is_some();
+                            thread::spawn(move || {
+                                let _ = tx.send(ports_payload(&ctrl, remote).to_string());
+                            });
+                        }
+                    }
+                    // Loopback (trusted, no token) may open a tunnel too. A remote phone's
+                    // CONTROL socket may not turn into one: it is registered in `live`.
+                    Some(ClientMsg::Tunnel { port, .. }) if device.is_none() => {
+                        unsubscribe_bus(&bus, &mut bus_sub);
+                        detach(&pty, &attached);
+                        serve_tunnel(&ctrl, ws, "", port);
+                        return;
+                    }
                     // Already authenticated (or loopback): a repeat `auth` changes nothing.
-                    Some(ClientMsg::Auth { .. }) | None => {}
+                    Some(ClientMsg::Auth { .. } | ClientMsg::Tunnel { .. }) | None => {}
                 }
             }
             Ok(Message::Close(_)) => break,
@@ -2167,6 +3209,126 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                 break;
             }
         }
+        // 2d. The project list: on request, and pushed again whenever the store saves (a
+        // delete from this phone lands after its `sessionActionResult`, and a rename or a
+        // new session on the computer would otherwise wait for the phone's next poll).
+        if listed {
+            let gen = app.state::<Arc<Store>>().save_generation();
+            if gen != projects_gen && last_projects.elapsed() >= PROJECTS_PUSH_GAP {
+                want_projects = true;
+            }
+        }
+        if want_projects {
+            want_projects = false;
+            projects_gen = app.state::<Arc<Store>>().save_generation();
+            last_projects = Instant::now();
+            // Typed, whitelisted tree (see `bridge_view`); never the raw `Project`s.
+            let running: HashSet<String> = pty.session_ids().into_iter().collect();
+            // Store is managed as Arc<Store> (lib.rs .manage(Arc::new(Store::new()))) —
+            // state::<Store>() panics the connection thread on the first `list`.
+            let store = app.state::<Arc<Store>>();
+            let fleet = app.state::<Arc<crate::fleet::FleetState>>().snapshot();
+            let asks = app.state::<Arc<crate::asks::Asks>>().pending();
+            // Which `usage` row each session draws from (opaque keys; see `phone_usage`).
+            let usage_rows = crate::phone_usage::row_keys(&crate::phone_usage::rows(&app));
+            let default_accounts = store.default_accounts();
+            let known_accounts: HashSet<String> =
+                store.list_accounts().into_iter().map(|a| a.id).collect();
+            let view = crate::bridge_view::projects_view(
+                &store.list(),
+                &store.list_profiles(),
+                store.active_profile().as_deref(),
+                &fleet,
+                &running,
+                &asks,
+                // Resolved exactly as `attach` resolves a transcript; any miss is null.
+                &|s| {
+                    let conversation = store.claude_conversation_id(&s.id);
+                    ctrl.last_messages
+                        .path_for(&s.id, &conversation, || {
+                            crate::pty::session_projects_dir(&store, &s.id)
+                                .and_then(|dir| crate::pty::transcript_path(&conversation, &dir))
+                        })
+                        .map_or(serde_json::Value::Null, |p| ctrl.last_messages.for_path(&p))
+                },
+                &|p, s| {
+                    crate::phone_usage::session_usage_key(
+                        s,
+                        p,
+                        &default_accounts,
+                        &known_accounts,
+                        &usage_rows,
+                    )
+                },
+            );
+            ctrl.last_messages.sweep();
+            let text = view.to_string();
+            // A push byte-identical to the last one this socket sent is skipped: most store
+            // saves change nothing in the phone's view. A `list` the phone asked for is
+            // always answered (whole, or as a tiny `listed` ack) so an idle computer never
+            // goes silent long enough for the phone's watchdog to redial.
+            let requested = std::mem::take(&mut list_requested);
+            if let Some(frame) =
+                crate::bridge_view::projects_reply(&mut last_projects_hash, text, requested)
+            {
+                if !send_text(&mut ws, frame) {
+                    break;
+                }
+            }
+        }
+
+        // 2e. General-chat events (a turn streaming, from this phone or the computer).
+        if let Some((_, rx)) = root_chat_sub.as_ref() {
+            let mut gone = false;
+            for _ in 0..DRAIN_PER_TICK {
+                match rx.try_recv() {
+                    Ok(event) => {
+                        // A remote phone never streams a chat that has read a private
+                        // session -- including the very turn that read it (the mark is
+                        // set before the tool's result reaches the model).
+                        if device.is_some() {
+                            let chat = event
+                                .get("chatId")
+                                .and_then(|c| c.as_str())
+                                .and_then(|id| app.state::<Arc<Store>>().root_chat(id));
+                            if !remote_may_stream(chat.as_ref()) {
+                                continue;
+                            }
+                        }
+                        if !send_text(&mut ws, root_chat_event_frame(event).to_string()) {
+                            gone = true;
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if gone {
+                break;
+            }
+        }
+
+        // A download the phone stopped acking (it left the screen, or the link dropped).
+        if download
+            .as_ref()
+            .is_some_and(|(_, _, _, at)| at.elapsed() > DOWNLOAD_IDLE)
+        {
+            download = None;
+        }
+
+        // 2c. A finished `ports` scan.
+        if let Ok(ports) = ports_rx.try_recv() {
+            listing_ports = false;
+            if !send_text(&mut ws, ports) {
+                break;
+            }
+        }
+        if let Ok(options) = chat_options_rx.try_recv() {
+            listing_chat_options = false;
+            if !send_text(&mut ws, options) {
+                break;
+            }
+        }
 
         // 3. Forward hook status events (filtered to the attached session).
         let Some((bus_id, bus_rx)) = bus_sub.as_ref() else {
@@ -2255,12 +3417,12 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                             }
                         }
                         if let Some(path) = resolved.clone() {
-                            let lines = read_lines(&path);
+                            let (lines, cursor) = read_history(&path);
                             let history = history_payload(sid, &lines);
                             if !send_text(&mut ws, history.to_string()) {
                                 break 'conn;
                             }
-                            transcript = Some((path.clone(), lines.len()));
+                            transcript = Some((path.clone(), cursor));
                             context_path = Some(path);
                             next_context = Instant::now();
                         }
@@ -2268,6 +3430,39 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                     // Settled only once found: until then, look again next tick.
                     if resolved.is_some() {
                         tail_conversation = Some(conversation);
+                    }
+                }
+            }
+        }
+
+        // 4c. An attached agy session: re-read its conversation database when it moved.
+        //     The first read after attach REPLACES the (empty) Claude-path history.
+        if let Some(tail) = agy_tail.as_mut() {
+            if Instant::now() >= next_agy {
+                next_agy = Instant::now() + AGY_POLL;
+                let first = tail.version.is_none();
+                let store = app.state::<Arc<Store>>();
+                let sid = tail.session_id.clone();
+                let update = tail.poll(|| {
+                    let cid = store.session_agent_conversation_id(&sid)?;
+                    let cfg = store.session_account_config_dir(&sid);
+                    let home = crate::agy_usage::resolve_agy_home(cfg.as_deref())?;
+                    crate::agy_transcript::conversation_db(&home, &cid)
+                });
+                let frames: Vec<serde_json::Value> = match update {
+                    crate::agy_transcript::Update::Append(items) if !first => items
+                        .iter()
+                        .map(|i| crate::bridge_view::chat_frame(&sid, i))
+                        .collect(),
+                    crate::agy_transcript::Update::Append(items)
+                    | crate::agy_transcript::Update::Replace(items) => {
+                        vec![crate::bridge_view::history_frame(&sid, items)]
+                    }
+                    crate::agy_transcript::Update::Nothing => Vec::new(),
+                };
+                for frame in frames {
+                    if !send_text(&mut ws, frame.to_string()) {
+                        break 'conn;
                     }
                 }
             }
@@ -2286,6 +3481,83 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
 
     unsubscribe_bus(&bus, &mut bus_sub);
     detach(&pty, &attached);
+    if let Some((id, _)) = root_chat_sub {
+        app.state::<Arc<crate::root_chat::RootChatState>>()
+            .unsubscribe(id);
+    }
+}
+
+/// May this peer mirror ports now? A remote phone needs mobile access on as well as the
+/// mirroring switch; loopback (the Simulator, the sidecar) only the switch.
+fn mirroring_allowed(ctrl: &BridgeController, remote: bool) -> bool {
+    if remote {
+        ctrl.devices.mirroring()
+    } else {
+        ctrl.devices.mirroring_switch()
+    }
+}
+
+/// The `ports` reply: the web ports a tunnel may reach, or none while mirroring is off.
+fn ports_payload(ctrl: &BridgeController, remote: bool) -> serde_json::Value {
+    let enabled = mirroring_allowed(ctrl, remote);
+    let ports = if enabled {
+        ctrl.web_ports.list()
+    } else {
+        Vec::new()
+    };
+    json!({ "type": "ports", "enabled": enabled, "ports": ports })
+}
+
+/// Become a tunnel to local `port` for `device` ("" = loopback), or refuse and close. The
+/// port must be one the scan found, dialled on the loopback address it was found on --
+/// never a host, never another address. Blocks this connection's thread until the tunnel
+/// ends. Refusal reasons: `port` (not a web port now, or mirroring off), `busy`,
+/// `unauthorized` (revoked between auth and here).
+fn serve_tunnel(ctrl: &BridgeController, mut ws: WebSocket<TcpStream>, device: &str, port: u16) {
+    let refuse = |ws: &mut WebSocket<TcpStream>, why: &str| {
+        let _ = ws.send(Message::Text(
+            json!({ "type": "error", "message": why }).to_string(),
+        ));
+        let _ = ws.close(None);
+        let _ = ws.flush();
+    };
+    let remote = !device.is_empty();
+    if !mirroring_allowed(ctrl, remote) {
+        return refuse(&mut ws, "port");
+    }
+    let Some(target) = ctrl.web_ports.target_for(port) else {
+        return refuse(&mut ws, "port");
+    };
+    let Some(flag) = ctrl.open_tunnel(device) else {
+        return refuse(&mut ws, "busy");
+    };
+    // Re-check now that the slot is registered: a revoke or a switch going off between
+    // the checks above and here found no flag to set.
+    let still = mirroring_allowed(ctrl, remote) && (!remote || ctrl.still_admitted(device));
+    if !still {
+        ctrl.close_tunnel(device, &flag);
+        return refuse(&mut ws, if remote { "unauthorized" } else { "port" });
+    }
+    let Ok(app) = TcpStream::connect_timeout(&SocketAddr::new(target, port), TUNNEL_CONNECT) else {
+        ctrl.close_tunnel(device, &flag);
+        return refuse(&mut ws, "port");
+    };
+    if !send_text(
+        &mut ws,
+        json!({ "type": "tunnelOk", "port": port }).to_string(),
+    ) {
+        ctrl.close_tunnel(device, &flag);
+        return;
+    }
+    lift_preauth_cap(&mut ws);
+    crate::diag::bump(crate::diag::Counter::TunnelsOpened);
+    let timing = crate::port_tunnel::Timing {
+        write_stall: WRITE_STALL,
+        ping_every: PING_EVERY,
+        stale_after: STALE_AFTER,
+    };
+    crate::port_tunnel::relay(ws, app, &flag, timing);
+    ctrl.close_tunnel(device, &flag);
 }
 
 /// Send `pending` (first call) or the `pendingAdded` / `resolved` frames for what changed
@@ -2420,6 +3692,15 @@ impl Drop for LiveConn {
 }
 
 /// Whether a session runs the Claude adapter (the only one with a transcript context meter).
+fn session_agent(store: &Store, session_id: &str) -> Option<crate::agent::AgentId> {
+    store
+        .list()
+        .iter()
+        .flat_map(|p| p.sessions.iter())
+        .find(|s| s.id == session_id)
+        .map(|s| s.agent)
+}
+
 fn is_claude(store: &Store, session_id: &str) -> bool {
     store
         .list()
@@ -2497,6 +3778,12 @@ mod tests {
             r#"{"type":"git","session_id":"s","action":"changes"}"#,
             r#"{"type":"kill","session_id":"s"}"#,
             r#"{"type":"interrupt","sessionId":"s"}"#,
+            r#"{"type":"fslist","sessionId":"s","requestId":"r","path":""}"#,
+            r#"{"type":"fsread","sessionId":"s","requestId":"r","path":"a"}"#,
+            r#"{"type":"fswrite","sessionId":"s","requestId":"r","path":"a","content":"x","baseMtimeMs":1.5,"baseSize":1}"#,
+            r#"{"type":"fsdownload","sessionId":"s","requestId":"r","path":"a","confirm":true}"#,
+            r#"{"type":"sessionoptions","sessionId":"s","requestId":"r"}"#,
+            r#"{"type":"sessionset","sessionId":"s","requestId":"r","keepRunning":true}"#,
         ];
         let upload =
             r#"{"type":"upload","sessionId":"s","requestId":"r","name":"a.png","data":"aGk="}"#;
@@ -2509,6 +3796,7 @@ mod tests {
             r#"{"type":"list"}"#,
             r#"{"type":"discover"}"#,
             r#"{"type":"spawn","project_id":"p","prompt":"x"}"#,
+            r#"{"type":"usage","requestId":"r"}"#,
         ] {
             assert_eq!(
                 session_scope(&parse_client_msg(raw).unwrap()),
@@ -2516,6 +3804,37 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn session_controls_parse_with_optional_fields() {
+        let m = parse_client_msg(
+            r#"{"type":"sessionset","sessionId":"s","requestId":"r","model":"opus","effort":"high","name":"N","keepRunning":false}"#,
+        );
+        assert!(matches!(
+            m,
+            Some(ClientMsg::SessionSet { ref model, ref effort, ref name, keep_running: Some(false), .. })
+                if model.as_deref() == Some("opus") && effort.as_deref() == Some("high") && name.as_deref() == Some("N")
+        ));
+        let m = parse_client_msg(r#"{"type":"sessionset","sessionId":"s","requestId":"r"}"#);
+        assert!(matches!(
+            m,
+            Some(ClientMsg::SessionSet {
+                model: None,
+                effort: None,
+                name: None,
+                keep_running: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_client_msg(r#"{"type":"usage","requestId":"r"}"#),
+            Some(ClientMsg::Usage { .. })
+        ));
+        assert!(matches!(
+            parse_client_msg(r#"{"type":"sessionoptions","sessionId":"s","requestId":"r"}"#),
+            Some(ClientMsg::SessionOptions { .. })
+        ));
     }
 
     #[test]
@@ -2718,6 +4037,69 @@ mod tests {
     }
 
     #[test]
+    fn history_payload_is_capped_to_the_newest_items() {
+        let line = |i: usize| {
+            serde_json::json!({"type":"user","message":{"role":"user","content":format!("m{i}")}})
+                .to_string()
+        };
+        let n = crate::bridge_view::HISTORY_CAP + 5;
+        let lines: Vec<String> = (0..n).map(line).collect();
+        let msg = history_payload("s1", &lines);
+        let items = msg["items"].as_array().unwrap();
+        assert_eq!(items.len(), crate::bridge_view::HISTORY_CAP);
+        assert_eq!(items[0]["text"], "m5", "the oldest are the ones dropped");
+    }
+
+    #[test]
+    fn a_chat_that_read_a_private_session_is_hidden_from_remote_phones_only() {
+        use crate::store::RootChat;
+        let clean = RootChat {
+            id: "c".into(),
+            ..Default::default()
+        };
+        let tainted = RootChat {
+            id: "t".into(),
+            peeked_private: true,
+            ..Default::default()
+        };
+        // Listing / reading / driving.
+        assert!(chat_hidden_from(true, Some(&tainted)));
+        assert!(
+            !chat_hidden_from(false, Some(&tainted)),
+            "loopback keeps it"
+        );
+        assert!(!chat_hidden_from(true, Some(&clean)));
+        assert!(!chat_hidden_from(true, None), "unknown: the usual answer");
+        // Live events (checked for remote peers only).
+        assert!(remote_may_stream(Some(&clean)));
+        assert!(!remote_may_stream(Some(&tainted)));
+        assert!(
+            !remote_may_stream(None),
+            "a vanished chat cannot be checked"
+        );
+
+        // Which messages are gated, and what the refusal looks like.
+        let msg = |t: &str| parse_client_msg(t).unwrap();
+        let hist = msg(r#"{"type":"rootchathistory","chatId":"t"}"#);
+        let send = msg(r#"{"type":"rootchatsend","chatId":"t","text":"hi"}"#);
+        let settings = msg(r#"{"type":"rootchatsettings","chatId":"t","requestId":"r1"}"#);
+        let stop = msg(r#"{"type":"rootchatstop","chatId":"t"}"#);
+        assert_eq!(root_chat_target(&hist), Some("t"));
+        assert_eq!(root_chat_target(&send), Some("t"));
+        assert_eq!(root_chat_target(&settings), Some("t"));
+        assert_eq!(root_chat_target(&stop), None, "stopping leaks nothing");
+        assert_eq!(root_chat_target(&ClientMsg::RootChats), None);
+        let r = hidden_chat_reply(&settings, "t");
+        assert_eq!(r["type"], "rootChatSettings");
+        assert_eq!(r["requestId"], "r1");
+        assert_eq!(r["ok"], false);
+        let r = hidden_chat_reply(&hist, "t");
+        assert_eq!(r["type"], "rootChatEvent");
+        assert_eq!(r["event"], "error");
+        assert_eq!(r["chatId"], "t");
+    }
+
+    #[test]
     fn parses_list() {
         assert_eq!(
             parse_client_msg(r#"{"type":"list"}"#),
@@ -2781,7 +4163,198 @@ mod tests {
                 prompt: "fix the bug".into(),
                 agent: None,
                 worktree: true,
+                name: None,
             })
+        );
+        // A titled spawn with no first message (the agent starts idle).
+        assert_eq!(
+            parse_client_msg(r#"{"type":"spawn","project_id":"p1","name":"Release notes"}"#),
+            Some(ClientMsg::Spawn {
+                project_id: "p1".into(),
+                prompt: String::new(),
+                agent: None,
+                worktree: false,
+                name: Some("Release notes".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_the_general_chat_messages() {
+        assert_eq!(
+            parse_client_msg(r#"{"type":"rootchats"}"#),
+            Some(ClientMsg::RootChats)
+        );
+        assert_eq!(
+            parse_client_msg(
+                r#"{"type":"rootchatcreate","requestId":"r","profileId":null,"scope":{"profiles":[null,"work"],"projects":["p1"]}}"#
+            ),
+            Some(ClientMsg::RootChatCreate {
+                request_id: "r".into(),
+                profile_id: None,
+                scope: Some(crate::store::ChatScope {
+                    all_profiles: false,
+                    profiles: vec![None, Some("work".into())],
+                    projects: vec!["p1".into()],
+                }),
+                agent: None,
+                model: None,
+                effort: None,
+                research: false,
+                mcps: vec![],
+            })
+        );
+        assert_eq!(
+            parse_client_msg(
+                r#"{"type":"rootchatcreate","requestId":"r","agent":"antigravity","model":"m","effort":"high","research":true,"mcps":["gh"]}"#
+            ),
+            Some(ClientMsg::RootChatCreate {
+                request_id: "r".into(),
+                profile_id: None,
+                scope: None,
+                agent: Some("antigravity".into()),
+                model: Some("m".into()),
+                effort: Some("high".into()),
+                research: true,
+                mcps: vec!["gh".into()],
+            })
+        );
+        assert_eq!(
+            parse_client_msg(
+                r#"{"type":"rootchatsettings","chatId":"c","requestId":"r","model":""}"#
+            ),
+            Some(ClientMsg::RootChatSettings {
+                chat_id: "c".into(),
+                request_id: "r".into(),
+                model: Some(String::new()),
+                effort: None,
+                research: None,
+                mcps: None,
+            })
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"type":"rootchatoptions","requestId":"r"}"#),
+            Some(ClientMsg::RootChatOptions {
+                request_id: "r".into()
+            })
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"type":"rootchatsend","chatId":"c","text":"hi"}"#),
+            Some(ClientMsg::RootChatSend {
+                chat_id: "c".into(),
+                text: "hi".into()
+            })
+        );
+        // Not session-scoped: a chat is not a session, and the private gate is the chat's
+        // own (`root_mcp::chat_may_peek`).
+        assert_eq!(
+            session_scope(&parse_client_msg(r#"{"type":"rootchatstop","chatId":"c"}"#).unwrap()),
+            None
+        );
+        // The phone never sees which account a chat bills to.
+        let c: crate::store::RootChat = serde_json::from_value(
+            json!({"id": "c", "title": "t", "accountId": "acct", "createdAt": 1}),
+        )
+        .unwrap();
+        assert!(root_chat_view(&c, false).get("accountId").is_none());
+    }
+
+    #[test]
+    fn a_general_chat_view_carries_its_options_and_never_the_account() {
+        let c: crate::store::RootChat = serde_json::from_value(json!({
+            "id": "c", "title": "t", "accountId": "acct", "createdAt": 1,
+            "agent": "antigravity", "model": "m", "effort": "max", "research": true,
+            "mcps": ["gh"], "agyConversationId": "u"
+        }))
+        .unwrap();
+        let v = root_chat_view(&c, true);
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "agent",
+                "createdAt",
+                "effort",
+                "id",
+                "mcps",
+                "model",
+                "profileId",
+                "research",
+                "running",
+                "scope",
+                "title"
+            ]
+        );
+        assert_eq!(v["agent"], "antigravity");
+        assert_eq!(v["mcps"], json!(["gh"]));
+        // An old chat reads as a plain Claude chat.
+        let old: crate::store::RootChat =
+            serde_json::from_value(json!({"id": "c", "title": "t"})).unwrap();
+        let v = root_chat_view(&old, false);
+        assert_eq!(v["agent"], "claude");
+        assert_eq!(v["research"], false);
+    }
+
+    #[test]
+    fn general_chat_create_options_are_read_strictly() {
+        let known = vec!["gh".to_string()];
+        let o = root_chat_create_options(None, &None, &None, false, &[], &known).unwrap();
+        assert_eq!(o, crate::store::RootChatOptions::default());
+        let o = root_chat_create_options(
+            Some("antigravity"),
+            &Some("".into()),
+            &Some("high".into()),
+            true,
+            &[],
+            &known,
+        )
+        .unwrap();
+        assert_eq!(o.agent, crate::agent::AgentId::Antigravity);
+        assert!(o.model.is_none(), "an empty model is the default");
+        assert_eq!(o.effort.as_deref(), Some("high"));
+        assert!(root_chat_create_options(Some("codex"), &None, &None, false, &[], &known).is_err());
+        assert!(
+            root_chat_create_options(Some("Claude"), &None, &None, false, &[], &known).is_err()
+        );
+        assert!(
+            root_chat_create_options(None, &Some("a;b".into()), &None, false, &[], &known).is_err()
+        );
+        assert!(
+            root_chat_create_options(None, &None, &None, false, &["nope".into()], &known).is_err()
+        );
+        assert!(root_chat_create_options(
+            Some("antigravity"),
+            &None,
+            &None,
+            false,
+            &["gh".into()],
+            &known
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_typed_title_wins_over_the_first_message() {
+        assert_eq!(
+            spawn_name(Some("  Release	notes "), "fix it"),
+            "Release notes"
+        );
+        assert_eq!(
+            spawn_name(
+                Some(
+                    "a
+b"
+                ),
+                ""
+            ),
+            "a b"
+        );
+        assert_eq!(spawn_name(Some("   "), "fix it"), "fix it");
+        assert_eq!(spawn_name(None, ""), "Mobile");
+        assert_eq!(
+            spawn_name(Some(&"x".repeat(80)), "").chars().count(),
+            SPAWN_NAME_MAX
         );
     }
 
@@ -3086,6 +4659,69 @@ mod tests {
     }
 
     #[test]
+    fn parses_ports_and_tunnel_and_redacts_the_tunnel_token() {
+        assert_eq!(
+            parse_client_msg(r#"{"type":"ports"}"#),
+            Some(ClientMsg::Ports)
+        );
+        let t = parse_client_msg(r#"{"type":"tunnel","token":"tok42","port":5173}"#).unwrap();
+        assert_eq!(
+            t,
+            ClientMsg::Tunnel {
+                token: Some("tok42".into()),
+                port: 5173
+            }
+        );
+        let shown = format!("{t:?}");
+        assert!(
+            !shown.contains("tok42") && shown.contains("5173"),
+            "{shown}"
+        );
+        // Loopback sends no token.
+        assert_eq!(
+            parse_client_msg(r#"{"type":"tunnel","port":80}"#),
+            Some(ClientMsg::Tunnel {
+                token: None,
+                port: 80
+            })
+        );
+        // A port outside u16 is not a tunnel at all.
+        assert_eq!(parse_client_msg(r#"{"type":"tunnel","port":70000}"#), None);
+    }
+
+    #[test]
+    fn a_tunnel_slot_cap_and_a_revoke_stop_open_tunnels() {
+        let ctrl = BridgeController::new(Arc::new(MobileDevices::load(
+            std::env::temp_dir().join(format!("conduit-tun-{}.json", uuid::Uuid::new_v4())),
+        )));
+        let flags: Vec<_> = (0..TUNNELS_PER_DEVICE)
+            .map(|_| ctrl.open_tunnel("phone").unwrap())
+            .collect();
+        assert!(ctrl.open_tunnel("phone").is_none(), "capped per device");
+        assert!(ctrl.open_tunnel("other").is_some(), "the cap is per device");
+        ctrl.close_tunnel("phone", &flags[0]);
+        assert!(
+            ctrl.open_tunnel("phone").is_some(),
+            "a closed slot is reusable"
+        );
+        ctrl.disconnect_device("phone");
+        assert!(
+            flags[1..].iter().all(|f| f.load(Ordering::SeqCst)),
+            "revoke stops them"
+        );
+        ctrl.close_all_tunnels();
+        assert!(lock(&ctrl.tunnels).is_empty());
+    }
+
+    #[test]
+    #[ignore = "scans this machine's real sockets; run by hand"]
+    fn print_this_machines_web_ports() {
+        for p in crate::local_ports::WebPorts::default().list() {
+            eprintln!("{} {:?} via {}", p.port, p.process, p.target);
+        }
+    }
+
+    #[test]
     fn client_msg_debug_redacts_secrets() {
         let a = format!(
             "{:?}",
@@ -3339,7 +4975,7 @@ mod tests {
         // The whole step: unsubscribe the PTY stream, drop the tail, say why (tagged).
         let (_tx, rx) = std::sync::mpsc::channel::<String>();
         let mut attached = Some(("secret".to_string(), 7u64, rx));
-        let mut transcript = Some((PathBuf::from("/t/a.jsonl"), 3usize));
+        let mut transcript = Some((PathBuf::from("/t/a.jsonl"), TailCursor::default()));
         let mut context_path = Some(PathBuf::from("/t/a.jsonl"));
         let mut tail_conversation = Some("conv".to_string());
         let mut attached_claude = true;
@@ -3364,7 +5000,7 @@ mod tests {
         // A session that is still open is left streaming, untouched.
         let (_tx, rx) = std::sync::mpsc::channel::<String>();
         let mut attached = Some(("open".to_string(), 8u64, rx));
-        let mut transcript = Some((PathBuf::from("/t/b.jsonl"), 1usize));
+        let mut transcript = Some((PathBuf::from("/t/b.jsonl"), TailCursor::default()));
         let mut context_path = Some(PathBuf::from("/t/b.jsonl"));
         let mut tail_conversation = Some("conv".to_string());
         let mut attached_claude = true;

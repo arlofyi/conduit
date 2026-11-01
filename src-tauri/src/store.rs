@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -204,6 +205,18 @@ pub struct Session {
     /// and skip_serializing_if keeps older state.json files byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<String>,
+    /// Pinned "keep running": the idle auto-stop (`useAutoStopIdle`) never retires it, for
+    /// work the process tree cannot reveal (an agent waiting on a remote job). Lived in the
+    /// desktop's localStorage until the phone needed to read and set it; the desktop migrates
+    /// its legacy pins here once. Skipped when false so older state.json files stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_running: bool,
+    /// Auto-approve: Conduit answers this session's permission prompts with Allow itself
+    /// (`agy_prompts.rs`; agy only for now -- its own `--mode auto` still prompts, measured).
+    /// Skipped when false so older state.json files stay byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_approve: bool,
 }
 
 /// Directed READ policy: may `caller` read `target`'s output? The single source of truth for
@@ -424,7 +437,7 @@ pub struct Profile {
 /// projects (design doc 2026-08-26). `id` doubles as the pinned Claude session id — the
 /// first send uses `--session-id <id>`, later sends `--resume <id>` — so there is no
 /// separate captured session id.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RootChat {
     pub id: String,
@@ -439,6 +452,92 @@ pub struct RootChat {
     /// Same semantics as `Project::profile_id`: the profile this chat is visible under.
     #[serde(default)]
     pub profile_id: Option<String>,
+    /// Which projects this chat is about (`ChatScope`). None = every project, which is
+    /// what every chat made before scopes existed means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ChatScope>,
+    /// A phone has driven this chat. Sticky: such a chat never reads a private session,
+    /// whatever private mode says, because the phone link refuses private sessions
+    /// everywhere else and a chat must not become the way around that.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub phone: bool,
+    /// Which agent runs the turns: Claude (`claude -p`) or Antigravity (`agy` print mode).
+    /// Fixed at creation -- the two keep their history in different stores, so switching
+    /// would orphan the conversation. Anything but `antigravity` runs as Claude.
+    #[serde(default, skip_serializing_if = "is_claude")]
+    pub agent: AgentId,
+    /// `--model` for every turn (an alias or a full id). None = the agent's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `--effort` for every turn (low|medium|high|xhigh|max). None = the agent's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Deep research: effort raised to at least `high` and a research brief in the charter.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub research: bool,
+    /// User-scope MCP servers (names from the profile's `.claude.json`) this chat loads
+    /// beside Conduit's own. Claude chats only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcps: Vec<String>,
+    /// An Antigravity chat's own conversation id, captured from its first turn's `init`
+    /// event and replayed as `--conversation`. Claude chats resume by `id` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_conversation_id: Option<String>,
+    /// This chat has read a private (silo / local-only) session through root MCP -- or a
+    /// chat that had. Sticky: the content is in its transcript for good, so a REMOTE phone
+    /// never lists, reads, drives or streams it again (the phone link refuses private
+    /// sessions everywhere, and a desktop chat must not be the way around that).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub peeked_private: bool,
+}
+
+fn is_claude(a: &AgentId) -> bool {
+    *a == AgentId::Claude
+}
+
+/// What a new root chat runs with (see the matching `RootChat` fields).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RootChatOptions {
+    pub agent: AgentId,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub research: bool,
+    pub mcps: Vec<String>,
+}
+
+/// The projects a root chat may see and act on: the union of whole profiles and single
+/// projects. `all_profiles` is everything. An empty scope sees nothing.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatScope {
+    #[serde(default)]
+    pub all_profiles: bool,
+    /// Profile ids; `null` is the Default profile.
+    #[serde(default)]
+    pub profiles: Vec<Option<String>>,
+    /// Project ids added one by one.
+    #[serde(default)]
+    pub projects: Vec<String>,
+}
+
+/// Is `project` inside `scope`? `known` = the profile ids that exist: a project pointing at
+/// a deleted profile counts as Default, the same normalization `sessions_for_profile` uses.
+pub fn project_in_scope(
+    scope: Option<&ChatScope>,
+    project: &Project,
+    known: &HashSet<String>,
+) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    if scope.all_profiles || scope.projects.contains(&project.id) {
+        return true;
+    }
+    let profile = project.profile_id.clone().filter(|id| known.contains(id));
+    scope
+        .profiles
+        .iter()
+        .any(|p| p.clone().filter(|id| known.contains(id)) == profile)
 }
 
 /// A registered agent account: a profile dir that holds its own credentials (a `.claude`
@@ -631,6 +730,9 @@ pub struct Store {
     /// Callback fired after every successful persisted store write. Used to emit broadcast
     /// events to all windows (e.g., `store-saved`). Never persisted, only set at startup.
     on_save: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Bumped after every successful persisted write: a cheap "did anything change" the
+    /// mobile bridge polls to push a fresh project list (a phone delete, a desktop rename).
+    saves: AtomicU64,
 }
 
 /// A read-only view of the project that owns a given Conductor, plus its sessions.
@@ -755,9 +857,9 @@ fn load_state(save_path: &std::path::Path) -> PersistState {
             let bak = backup_path(save_path);
             let restored = fs::read(&bak).ok().and_then(|data| parse_state(&data));
             if restored.is_some() {
-                eprintln!(
-                    "conduit: state.json is unreadable; restored from {}",
-                    bak.display()
+                crate::diag::warn(
+                    "store",
+                    format!("state.json is unreadable; restored from {}", bak.display()),
                 );
             }
             restored
@@ -796,7 +898,7 @@ fn rotate_backup(save_path: &std::path::Path) {
         return;
     }
     if let Err(e) = write_synced(&bak, &current) {
-        eprintln!("conduit: failed to refresh state backup: {e}");
+        crate::diag::warn("store", format!("failed to refresh state backup: {e}"));
     }
 }
 
@@ -925,11 +1027,17 @@ impl Store {
             provider_keys: Mutex::new(HashMap::new()),
             save_path,
             on_save: OnceLock::new(),
+            saves: AtomicU64::new(0),
         }
     }
 
     pub fn set_on_save(&self, f: Box<dyn Fn() + Send + Sync>) {
         let _ = self.on_save.set(f);
+    }
+
+    /// How many successful persisted writes this run has made (see `saves`).
+    pub fn save_generation(&self) -> u64 {
+        self.saves.load(Ordering::SeqCst)
     }
 
     fn save(&self, projects: &[Project]) -> bool {
@@ -1013,7 +1121,7 @@ impl Store {
         let data = match serde_json::to_vec_pretty(&state) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("conduit: failed to serialize state: {e}");
+                crate::diag::error("store", format!("failed to serialize state: {e}"));
                 return false;
             }
         };
@@ -1021,7 +1129,7 @@ impl Store {
         // Flushed to disk BEFORE the rename: without the fsync a kernel panic or power loss
         // can land the rename ahead of the data and leave a zero-length state.json.
         if let Err(e) = write_synced(&tmp, &data) {
-            eprintln!("conduit: failed to write state: {e}");
+            crate::diag::error("store", format!("failed to write state: {e}"));
             return false;
         }
         rotate_backup(&self.save_path);
@@ -1041,7 +1149,10 @@ impl Store {
                     Err(e) => {
                         if attempt == 9 {
                             let _ = fs::remove_file(&tmp);
-                            eprintln!("conduit: failed to persist state after retries: {e}");
+                            crate::diag::error(
+                                "store",
+                                format!("failed to persist state after retries: {e}"),
+                            );
                         } else {
                             std::thread::sleep(std::time::Duration::from_millis(20));
                         }
@@ -1052,12 +1163,13 @@ impl Store {
         #[cfg(not(windows))]
         {
             if let Err(e) = fs::rename(&tmp, &self.save_path) {
-                eprintln!("conduit: failed to persist state: {e}");
+                crate::diag::error("store", format!("failed to persist state: {e}"));
             } else {
                 success = true;
             }
         }
         if success {
+            self.saves.fetch_add(1, Ordering::SeqCst);
             if let Some(f) = self.on_save.get() {
                 f();
             }
@@ -1161,11 +1273,39 @@ impl Store {
     }
 
     pub fn add_root_chat(&self, profile_id: Option<String>) -> RootChat {
+        self.add_root_chat_with(profile_id, None, false)
+    }
+
+    /// A new chat with a scope, and whether a phone created it (see `RootChat::phone`).
+    pub fn add_root_chat_with(
+        &self,
+        profile_id: Option<String>,
+        scope: Option<ChatScope>,
+        phone: bool,
+    ) -> RootChat {
+        self.add_root_chat_opts(profile_id, scope, phone, RootChatOptions::default())
+    }
+
+    /// A new chat with its agent, model, effort, research and MCP choices. The account is
+    /// the CHAT'S AGENT's global default at this moment (an Antigravity chat's history lives
+    /// under the agy login's home, not Claude's).
+    pub fn add_root_chat_opts(
+        &self,
+        profile_id: Option<String>,
+        scope: Option<ChatScope>,
+        phone: bool,
+        opts: RootChatOptions,
+    ) -> RootChat {
+        let agent = if opts.agent == AgentId::Antigravity {
+            AgentId::Antigravity
+        } else {
+            AgentId::Claude
+        };
         let account_id = self
             .default_accounts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&AgentId::Claude)
+            .get(&agent)
             .cloned();
         let chat = RootChat {
             id: Uuid::new_v4().to_string(),
@@ -1177,6 +1317,15 @@ impl Store {
                 .unwrap_or(0),
             // Stamped from the caller's argument, not the global -- see `add_project`.
             profile_id,
+            scope,
+            phone,
+            agent,
+            model: opts.model,
+            effort: opts.effort,
+            research: opts.research,
+            mcps: opts.mcps,
+            agy_conversation_id: None,
+            peeked_private: false,
         };
         self.root_chats
             .lock()
@@ -1219,6 +1368,84 @@ impl Store {
             self.save(&projects);
         }
         removed
+    }
+
+    /// Change a chat's scope (None = every project). False if there is no such chat.
+    pub fn set_root_chat_scope(&self, id: &str, scope: Option<ChatScope>) -> bool {
+        self.update_root_chat(id, |c| c.scope = scope)
+    }
+
+    /// Mark a chat as driven from a phone (sticky; see `RootChat::phone`).
+    pub fn mark_root_chat_phone(&self, id: &str) {
+        self.update_root_chat(id, |c| c.phone = true);
+    }
+
+    /// Record that a chat has read private-session content (see `RootChat::peeked_private`).
+    /// Saves only on the first mark: `update_root_chat` skips an unchanged chat.
+    pub fn mark_root_chat_peeked_private(&self, id: &str) {
+        self.update_root_chat(id, |c| c.peeked_private = true);
+    }
+
+    /// Change a chat's model / effort / research / MCP choices (each `None` = unchanged;
+    /// an empty model or effort clears it). The agent is fixed. Returns the updated chat.
+    pub fn set_root_chat_settings(
+        &self,
+        id: &str,
+        model: Option<Option<String>>,
+        effort: Option<Option<String>>,
+        research: Option<bool>,
+        mcps: Option<Vec<String>>,
+    ) -> Option<RootChat> {
+        let found = self.update_root_chat(id, |c| {
+            if let Some(m) = model {
+                c.model = m;
+            }
+            if let Some(e) = effort {
+                c.effort = e;
+            }
+            if let Some(r) = research {
+                c.research = r;
+            }
+            if let Some(m) = mcps {
+                c.mcps = m;
+            }
+        });
+        found.then(|| self.root_chat(id)).flatten()
+    }
+
+    /// Record an Antigravity chat's conversation id (captured from its first turn).
+    pub fn set_root_chat_agy_conversation(&self, id: &str, conversation_id: &str) {
+        let cid = conversation_id.to_string();
+        self.update_root_chat(id, |c| c.agy_conversation_id = Some(cid));
+    }
+
+    fn update_root_chat(&self, id: &str, f: impl FnOnce(&mut RootChat)) -> bool {
+        let changed = {
+            let mut chats = self.root_chats.lock().unwrap_or_else(|e| e.into_inner());
+            match chats.iter_mut().find(|c| c.id == id) {
+                Some(c) => {
+                    let before = format!("{c:?}");
+                    f(c);
+                    Some(before != format!("{c:?}"))
+                }
+                None => None,
+            }
+        };
+        if changed == Some(true) {
+            let projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+            self.save(&projects);
+        }
+        changed.is_some()
+    }
+
+    /// The projects a chat may see: everything for an unscoped (or unknown) chat.
+    pub fn projects_for_chat(&self, chat_id: &str) -> Vec<Project> {
+        let scope = self.root_chat(chat_id).and_then(|c| c.scope);
+        let known: HashSet<String> = self.list_profiles().into_iter().map(|p| p.id).collect();
+        self.list()
+            .into_iter()
+            .filter(|p| project_in_scope(scope.as_ref(), p, &known))
+            .collect()
     }
 
     pub fn root_chat(&self, id: &str) -> Option<RootChat> {
@@ -1539,8 +1766,9 @@ impl Store {
             let s = project.sessions.iter_mut().find(|s| s.id == session_id)?;
             if s.worktree_path.is_some() {
                 if taken {
-                    eprintln!(
-                        "conduit: worktree slug {slug} is already used by another session; keeping the derived one"
+                    crate::diag::warn(
+                        "store",
+                        format!("worktree slug {slug} is already used by another session; keeping the derived one"),
                     );
                 } else {
                     s.worktree_path = Some(path);
@@ -2020,6 +2248,52 @@ impl Store {
         if changed {
             self.save(&projects);
         }
+    }
+
+    /// Pin or unpin "keep running" (see `Session::keep_running`). Saves only on a change.
+    /// False when the session is unknown.
+    pub fn set_session_keep_running(&self, session_id: &str, keep: bool) -> bool {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = projects
+            .iter_mut()
+            .flat_map(|p| &mut p.sessions)
+            .find(|s| s.id == session_id)
+        else {
+            return false;
+        };
+        if s.keep_running != keep {
+            s.keep_running = keep;
+            self.save(&projects);
+        }
+        true
+    }
+
+    /// Turn auto-approve on or off (see `Session::auto_approve`). Saves only on a change.
+    /// False when the session is unknown.
+    pub fn set_session_auto_approve(&self, session_id: &str, on: bool) -> bool {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = projects
+            .iter_mut()
+            .flat_map(|p| &mut p.sessions)
+            .find(|s| s.id == session_id)
+        else {
+            return false;
+        };
+        if s.auto_approve != on {
+            s.auto_approve = on;
+            self.save(&projects);
+        }
+        true
+    }
+
+    /// Whether the session auto-approves its permission prompts.
+    pub fn session_auto_approve(&self, session_id: &str) -> bool {
+        self.projects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|p| &p.sessions)
+            .any(|s| s.id == session_id && s.auto_approve)
     }
 
     /// Record the agent's latest activity (see `Session::agent_state`). Saves only on an
@@ -2702,6 +2976,7 @@ mod tests {
                 provider_keys: Mutex::new(HashMap::new()),
                 save_path: dir.join("state.json"),
                 on_save: OnceLock::new(),
+                saves: AtomicU64::new(0),
             }
         }
     }
@@ -3646,6 +3921,35 @@ mod tests {
     }
 
     #[test]
+    fn auto_approve_is_absent_when_false_and_round_trips() {
+        let mut s: Session = serde_json::from_value(serde_json::json!({
+            "id": "s", "name": "n", "createdAt": 1
+        }))
+        .unwrap();
+        assert!(!s.auto_approve);
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("autoApprove").is_none(), "{v}");
+        s.auto_approve = true;
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["autoApprove"], true);
+    }
+
+    #[test]
+    fn keep_running_is_absent_when_false_and_round_trips() {
+        let v = serde_json::to_value(mk("plain")).unwrap();
+        assert!(v.get("keepRunning").is_none(), "{v}");
+        let mut s = mk("pinned");
+        s.keep_running = true;
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["keepRunning"], true);
+        let back: Session = serde_json::from_value(v).unwrap();
+        assert!(back.keep_running);
+        let old: Session =
+            serde_json::from_value(serde_json::json!({"id": "x", "name": "x"})).unwrap();
+        assert!(!old.keep_running);
+    }
+
+    #[test]
     fn can_read_allows_self_and_equal_public_clearance() {
         let a = mk("a");
         let b = mk("b");
@@ -4470,6 +4774,167 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_scope_selects_profiles_and_single_projects() {
+        let known: HashSet<String> = ["work".to_string()].into_iter().collect();
+        let mk = |id: &str, profile: Option<&str>| Project {
+            id: id.into(),
+            profile_id: profile.map(String::from),
+            ..serde_json::from_value(serde_json::json!({"id": id, "name": id, "path": "/x"}))
+                .unwrap()
+        };
+        let work = mk("w", Some("work"));
+        let home = mk("h", None);
+        let stranded = mk("s", Some("deleted-profile"));
+        assert!(project_in_scope(None, &home, &known));
+        let only_work = ChatScope {
+            profiles: vec![Some("work".into())],
+            ..Default::default()
+        };
+        assert!(project_in_scope(Some(&only_work), &work, &known));
+        assert!(!project_in_scope(Some(&only_work), &home, &known));
+        let default_plus_one = ChatScope {
+            profiles: vec![None],
+            projects: vec!["w".into()],
+            ..Default::default()
+        };
+        assert!(project_in_scope(Some(&default_plus_one), &home, &known));
+        assert!(project_in_scope(Some(&default_plus_one), &stranded, &known));
+        assert!(project_in_scope(Some(&default_plus_one), &work, &known));
+        assert!(!project_in_scope(
+            Some(&ChatScope::default()),
+            &home,
+            &known
+        ));
+        let all = ChatScope {
+            all_profiles: true,
+            ..Default::default()
+        };
+        assert!(project_in_scope(Some(&all), &work, &known));
+    }
+
+    #[test]
+    fn an_empty_scope_means_nothing_attached_and_none_means_everything() {
+        let dir = temp_dir("empty-scope");
+        let store = Store::for_test(&dir);
+        let a = store.add_project("/a".into(), store.active_profile());
+        store.add_project("/b".into(), store.active_profile());
+        // What the phone sends for a new chat: nothing attached, so nothing visible.
+        let empty = store.add_root_chat_with(None, Some(ChatScope::default()), true);
+        assert!(store.projects_for_chat(&empty.id).is_empty());
+        // The chat's own profile is NOT implied by an empty scope.
+        let listed =
+            store.add_root_chat_with(store.active_profile(), Some(ChatScope::default()), true);
+        assert!(store.projects_for_chat(&listed.id).is_empty());
+        // A chat from before scopes (None) still sees every project.
+        let legacy = store.add_root_chat_with(None, None, false);
+        assert_eq!(store.projects_for_chat(&legacy.id).len(), 2);
+        // Attaching one project later (`rootchatscope`) makes exactly that one visible.
+        assert!(store.set_root_chat_scope(
+            &empty.id,
+            Some(ChatScope {
+                projects: vec![a.id.clone()],
+                ..Default::default()
+            })
+        ));
+        let seen: Vec<String> = store
+            .projects_for_chat(&empty.id)
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(seen, vec![a.id]);
+        // ...and detaching everything goes back to nothing.
+        assert!(store.set_root_chat_scope(&empty.id, Some(ChatScope::default())));
+        assert!(store.projects_for_chat(&empty.id).is_empty());
+        // The wire form of an empty scope parses as Some(empty), never as None.
+        let wire: Option<ChatScope> = serde_json::from_value(
+            serde_json::json!({"allProfiles": false, "profiles": [], "projects": []}),
+        )
+        .unwrap();
+        assert_eq!(wire, Some(ChatScope::default()));
+    }
+
+    #[test]
+    fn an_old_root_chat_has_no_scope_and_was_never_on_a_phone() {
+        let c: RootChat =
+            serde_json::from_value(serde_json::json!({"id": "c", "title": "t"})).unwrap();
+        assert!(c.scope.is_none() && !c.phone);
+        let v = serde_json::to_value(&c).unwrap();
+        assert!(v.get("scope").is_none() && v.get("phone").is_none());
+    }
+
+    #[test]
+    fn an_old_root_chat_runs_claude_with_no_options_and_writes_none_back() {
+        let c: RootChat =
+            serde_json::from_value(serde_json::json!({"id": "c", "title": "t"})).unwrap();
+        assert_eq!(c.agent, AgentId::Claude);
+        assert!(c.model.is_none() && c.effort.is_none() && !c.research && c.mcps.is_empty());
+        let v = serde_json::to_value(&c).unwrap();
+        for k in [
+            "agent",
+            "model",
+            "effort",
+            "research",
+            "mcps",
+            "agyConversationId",
+        ] {
+            assert!(
+                v.get(k).is_none(),
+                "{k} must be skipped at its default: {v}"
+            );
+        }
+        // An agent id this build does not know degrades to Claude instead of failing the load.
+        let odd: RootChat =
+            serde_json::from_value(serde_json::json!({"id": "c", "title": "t", "agent": "gpt-9"}))
+                .unwrap();
+        assert_eq!(odd.agent, AgentId::Claude);
+        let agy: RootChat = serde_json::from_value(serde_json::json!({
+            "id": "c", "title": "t", "agent": "antigravity", "model": "m", "effort": "high",
+            "research": true, "mcps": ["x"], "agyConversationId": "u"
+        }))
+        .unwrap();
+        let back = serde_json::to_value(&agy).unwrap();
+        assert_eq!(back["agent"], "antigravity");
+        assert_eq!(back["mcps"], serde_json::json!(["x"]));
+        assert_eq!(back["agyConversationId"], "u");
+    }
+
+    #[test]
+    fn root_chat_settings_change_only_what_was_sent() {
+        let dir = temp_dir("root_chat_settings");
+        let store = Store::for_test(&dir);
+        let chat = store.add_root_chat_opts(
+            None,
+            None,
+            true,
+            RootChatOptions {
+                agent: AgentId::Antigravity,
+                model: Some("m1".into()),
+                effort: Some("low".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(chat.agent, AgentId::Antigravity);
+        let c = store
+            .set_root_chat_settings(&chat.id, None, Some(None), Some(true), None)
+            .unwrap();
+        assert_eq!(c.model.as_deref(), Some("m1"));
+        assert!(c.effort.is_none());
+        assert!(c.research);
+        assert!(store
+            .set_root_chat_settings("nope", None, None, None, None)
+            .is_none());
+        store.set_root_chat_agy_conversation(&chat.id, "conv");
+        assert_eq!(
+            store
+                .root_chat(&chat.id)
+                .unwrap()
+                .agy_conversation_id
+                .as_deref(),
+            Some("conv")
+        );
+    }
+
+    #[test]
     fn root_chat_config_dir_resolves_pinned_account() {
         let dir = temp_dir("root_chat_cfg");
         let store = Store::for_test(&dir);
@@ -4506,6 +4971,9 @@ mod tests {
                 account_id: Some("a1".into()),
                 created_at: 1_724_000_000,
                 profile_id: None,
+                scope: None,
+                phone: false,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -4517,6 +4985,29 @@ mod tests {
         let back: PersistState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.root_chats.len(), 1);
         assert_eq!(back.root_chats[0].title, "Roadmap");
+    }
+
+    #[test]
+    fn peeked_private_is_sticky_and_absent_until_set() {
+        let chat = RootChat {
+            id: "c1".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&chat).unwrap();
+        assert!(
+            !json.contains("peekedPrivate"),
+            "omitted while false: {json}"
+        );
+        let back: RootChat = serde_json::from_str(r#"{"id":"c1","title":"t"}"#).unwrap();
+        assert!(!back.peeked_private, "an old chat has not peeked");
+        let marked = RootChat {
+            peeked_private: true,
+            ..chat
+        };
+        let json = serde_json::to_string(&marked).unwrap();
+        assert!(json.contains("\"peekedPrivate\":true"), "{json}");
+        let back: RootChat = serde_json::from_str(&json).unwrap();
+        assert!(back.peeked_private, "survives a round trip");
     }
 
     #[test]

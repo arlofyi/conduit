@@ -1,15 +1,21 @@
 import React from "react";
-import { Alert, ScrollView, Switch, Text, View } from "react-native";
+import { Alert, Platform, ScrollView, Switch, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useLive } from "../bridge/LiveProvider";
+import { useIsFocused } from "@react-navigation/native";
+import { useLive, useUsagePolling } from "../bridge/LiveProvider";
 import { Card, Row, SectionLabel } from "../components/form";
+import { UsageSection } from "../components/UsageSection";
+import { StorageCard } from "../components/StorageCard";
+import { DiagnosticsCard } from "../components/DiagnosticsCard";
 import { usePrefs } from "../data/PrefsProvider";
+import { useBgWatch } from "../data/BgWatchProvider";
+import { anyNotify } from "../logic/watch";
 import type { Prefs } from "../data/prefs";
 import { connStatus } from "../logic/connCopy";
 import { isLoopbackMac } from "../logic/macs";
 import type { SettingsProps } from "../navigation";
 import { useTheme } from "../theme/ThemeContext";
-import { TYPE } from "../theme/type";
+import { TYPE, tabBarClearance } from "../theme/type";
 
 /** `ws://host:port` → `host:port` */
 const hostPort = (url: string) => url.replace(/^wss?:\/\//, "");
@@ -17,8 +23,20 @@ const hostPort = (url: string) => url.replace(/^wss?:\/\//, "");
 export function SettingsScreen({ navigation }: SettingsProps) {
   const { palette: p, cycle } = useTheme();
   const insets = useSafeAreaInsets();
-  const { currentMac, conn, address, hello, forget } = useLive();
+  const { currentMac, conn, address, hello, forget, usage } = useLive();
+  // Usage first: polled while this tab is showing (at most once a minute).
+  useUsagePolling(useIsFocused());
   const { prefs, setPrefs } = usePrefs();
+  // Android: these switches also reach the lock screen (modules/bg-watch).
+  const bg = useBgWatch();
+  const notifyKeys: (keyof Prefs)[] = [
+    "notifyQuestion",
+    "notifyPermission",
+    "notifyFinished",
+    "notifyFailed",
+    "notifyStopped",
+    "notifyUnreachable",
+  ];
 
   const macName = hello?.macName ?? currentMac?.macName ?? "—";
   const status = connStatus(conn, macName);
@@ -40,15 +58,20 @@ export function SettingsScreen({ navigation }: SettingsProps) {
     );
   };
 
-  const toggle = (key: keyof Omit<Prefs, "theme">, title: string, first?: boolean) => (
+  const toggle = (key: keyof Omit<Prefs, "theme">, title: string, first?: boolean, subtitle?: string) => (
     <Row
       first={first}
       title={title}
+      subtitle={subtitle}
       accessibilityLabel={title}
       right={
         <Switch
           value={prefs[key]}
-          onValueChange={(v) => setPrefs({ [key]: v })}
+          onValueChange={(v) => {
+            setPrefs({ [key]: v });
+            // turning one on is when notifications are worth asking for
+            if (v && bg.available && notifyKeys.includes(key) && !bg.notificationsAllowed) bg.requestNotifications().catch(() => {});
+          }}
           trackColor={{ true: p.accent, false: p.selectionBg }}
           accessibilityLabel={title}
         />
@@ -61,7 +84,65 @@ export function SettingsScreen({ navigation }: SettingsProps) {
       <View style={{ paddingTop: insets.top + 8, paddingHorizontal: 20, paddingBottom: 4 }}>
         <Text style={{ fontSize: TYPE.title, fontWeight: "700", color: p.textBright }}>Settings</Text>
       </View>
-      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 32 }}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: tabBarClearance(32, insets.bottom, Platform.OS) }}>
+        <SectionLabel>Usage</SectionLabel>
+        <UsageSection usage={usage} connected={conn.phase === "ready"} />
+
+        <SectionLabel>Notify me when</SectionLabel>
+        <Card>
+          {toggle("notifyQuestion", "A session asks a question", true)}
+          {toggle("notifyPermission", "A permission is needed")}
+          {toggle("notifyFinished", "A session finishes")}
+          {toggle("notifyFailed", "A turn fails", false, "It ended on an error: a rate limit, sign-in or API problem")}
+          {toggle("notifyStopped", "A running session is stopped", false, "From your computer, this phone, or the idle auto-stop")}
+          {bg.available &&
+            toggle(
+              "notifyUnreachable",
+              "Your computer is out of reach",
+              false,
+              "With the screen off, for 10 minutes, while Tailscale is on. Never when you turn Tailscale off.",
+            )}
+          {bg.available && anyNotify(prefs) && !bg.notificationsAllowed && (
+            <Row
+              title="Notifications are off for Conduit"
+              subtitle="You'll only see these while the app is open. Turn them on to get them on your lock screen."
+              value="Turn on"
+              tone="accent"
+              onPress={() => {
+                bg.requestNotifications().catch(() => {});
+              }}
+            />
+          )}
+          {bg.available && anyNotify(prefs) && bg.stoppedByUser && (
+            <Row
+              title="Stopped from the notification"
+              subtitle="Nothing reaches you while the screen is off until you turn this back on (or change a switch above)."
+              value="Turn on"
+              tone="accent"
+              onPress={bg.resumeWatching}
+            />
+          )}
+          {bg.available && anyNotify(prefs) && bg.notificationsAllowed && bg.batteryRestricted && !prefs.batteryHintDismissed && (
+            <>
+              <Row
+                title="Let Conduit run in the background"
+                subtitle="Your phone may stop Conduit while the screen is off, and then nothing reaches you. Allow background activity under Battery."
+                value="Open"
+                tone="accent"
+                onPress={bg.openBatterySettings}
+              />
+              <Row title="Not now" tone="dim" onPress={() => setPrefs({ batteryHintDismissed: true })} />
+            </>
+          )}
+        </Card>
+
+        <SectionLabel>Appearance</SectionLabel>
+        <Card>
+          <Row first title="Theme" value={p.label} onPress={cycle} accessibilityLabel={`Theme, ${p.label}. Tap to change.`} />
+        </Card>
+
+        <StorageCard />
+
         <SectionLabel>Connection</SectionLabel>
         <Card>
           <Row first title="Computer" value={macName} />
@@ -89,17 +170,7 @@ export function SettingsScreen({ navigation }: SettingsProps) {
           <Row title="Forget this computer" tone="danger" onPress={confirmForget} disabled={!currentMac} />
         </Card>
 
-        <SectionLabel>Notify me when</SectionLabel>
-        <Card>
-          {toggle("notifyQuestion", "A session asks a question", true)}
-          {toggle("notifyPermission", "A permission is needed")}
-          {toggle("notifyFinished", "A session finishes")}
-        </Card>
-
-        <SectionLabel>Appearance</SectionLabel>
-        <Card>
-          <Row first title="Theme" value={p.label} onPress={cycle} accessibilityLabel={`Theme, ${p.label}. Tap to change.`} />
-        </Card>
+        <DiagnosticsCard />
       </ScrollView>
     </View>
   );

@@ -44,6 +44,9 @@ struct FileV1 {
     enabled: bool,
     port: Option<u16>,
     devices: Vec<Device>,
+    /// Port mirroring is ON unless this is set: stored inverted so every file written
+    /// before the feature reads as "on" through `#[serde(default)]`.
+    mirror_off: bool,
 }
 
 pub struct MobileDevices {
@@ -59,6 +62,8 @@ pub struct MobileDevices {
 pub struct MobileSettings {
     pub enabled: bool,
     pub port: Option<u16>,
+    /// paired phones may open this computer's local web apps (port mirroring)
+    pub mirroring: bool,
     pub devices: Vec<DeviceView>,
 }
 
@@ -176,6 +181,21 @@ impl MobileDevices {
         self.lock().port
     }
 
+    /// May paired phones mirror local web ports? Off whenever mobile access is.
+    pub fn mirroring(&self) -> bool {
+        let f = self.lock();
+        f.enabled && !f.mirror_off
+    }
+
+    /// The mirroring switch itself, independent of mobile access.
+    pub fn mirroring_switch(&self) -> bool {
+        !self.lock().mirror_off
+    }
+
+    pub fn set_mirroring(&self, on: bool) -> io::Result<()> {
+        self.update(|f| f.mirror_off = !on)
+    }
+
     pub fn set_port(&self, p: u16) -> io::Result<()> {
         self.update(|f| f.port = Some(p))
     }
@@ -256,6 +276,7 @@ pub fn mobile_settings(state: tauri::State<'_, Arc<MobileDevices>>) -> MobileSet
     MobileSettings {
         enabled: state.enabled(),
         port: state.port(),
+        mirroring: state.mirroring_switch(),
         devices: state.list(),
     }
 }
@@ -279,6 +300,21 @@ pub fn mobile_set_enabled(
         bridge.disconnect_all_devices();
     }
     bridge.reconcile();
+    Ok(())
+}
+
+/// Port mirroring on/off. Off closes every open tunnel at once (a phone's browser loses
+/// the page); the phones' own switches are left alone and simply find no ports.
+#[tauri::command(async)]
+pub fn mobile_set_mirroring(
+    state: tauri::State<'_, Arc<MobileDevices>>,
+    bridge: tauri::State<'_, Arc<crate::bridge::BridgeController>>,
+    on: bool,
+) -> Result<(), String> {
+    state.set_mirroring(on).map_err(|e| e.to_string())?;
+    if !on {
+        bridge.close_all_tunnels();
+    }
     Ok(())
 }
 
@@ -368,6 +404,29 @@ mod tests {
         m.verify(&token).unwrap();
         assert_eq!(m.list()[0].last_seen, Some(recent));
         let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn mirroring_defaults_on_for_old_files_and_follows_the_access_switch() {
+        let path = tmp();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"enabled":true,"port":8456,"devices":[]}"#,
+        )
+        .unwrap();
+        let m = MobileDevices::load(path.clone());
+        assert!(m.mirroring(), "a file from before the feature reads as on");
+        m.set_mirroring(false).unwrap();
+        assert!(!m.mirroring());
+        assert!(
+            !MobileDevices::load(path.clone()).mirroring_switch(),
+            "persisted"
+        );
+        m.set_mirroring(true).unwrap();
+        m.set_enabled(false).unwrap();
+        assert!(!m.mirroring(), "never on while mobile access is off");
+        assert!(m.mirroring_switch());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

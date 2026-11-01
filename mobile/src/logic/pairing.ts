@@ -87,9 +87,14 @@ export async function confirmCode(
   return String(parseInt(digest.slice(0, 4), 16) % 10000).padStart(4, "0");
 }
 
-/** Hosts to try in order: dnsName, ip, then (Simulator/dev only) loopback. */
-export function addressesFor(mac: SavedMac, opts: { simulator: boolean }): string[] {
-  const hosts = [mac.dnsName, mac.ip];
+/**
+ * Hosts to try in order: dnsName, ip, then (Simulator/dev only) loopback. `ipFirst` (Android)
+ * tries the tailnet IP before the MagicDNS name: Tailscale's DNS on Android can fail on its own
+ * ("DNS unavailable" until the VPN is toggled), and every reconnect then waited on a failing name
+ * lookup before reaching the IP. A device's tailnet IP is stable, so the name stays a fallback.
+ */
+export function addressesFor(mac: SavedMac, opts: { simulator: boolean; ipFirst?: boolean }): string[] {
+  const hosts = opts.ipFirst ? [mac.ip, mac.dnsName] : [mac.dnsName, mac.ip];
   // Loopback is only for a token-less (loopback / pairing) Mac: a paired Mac's token is
   // never offered to whatever happens to listen on this machine's loopback.
   if (opts.simulator && !mac.token) hosts.push("127.0.0.1");

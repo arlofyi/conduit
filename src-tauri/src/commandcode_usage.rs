@@ -221,7 +221,7 @@ pub async fn fetch_command_code_usage(
     store: tauri::State<'_, std::sync::Arc<crate::store::Store>>,
 ) -> Result<Vec<CommandCodeAccountUsage>, String> {
     let targets = store.usage_targets(crate::agent::AgentId::CommandCode);
-    tauri::async_runtime::spawn_blocking(move || {
+    let out = tauri::async_runtime::spawn_blocking(move || {
         targets
             .into_iter()
             .map(|(account_id, label, config_dir)| CommandCodeAccountUsage {
@@ -232,7 +232,10 @@ pub async fn fetch_command_code_usage(
             .collect::<Vec<_>>()
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    // The phone's `usage` reply serves this read; it never polls the API itself.
+    crate::phone_usage::remember_command_code(&out);
+    Ok(out)
 }
 
 #[cfg(test)]

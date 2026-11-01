@@ -182,6 +182,12 @@ function sessionOf(v: unknown): WireViewSession | null {
     needs: silo && needs ? { kind: "input", text: null } : needs,
     // The Mac sends null for a silo session; never show one regardless.
     lastMessage: silo ? null : lastMessageOf(s.lastMessage),
+    // session controls (2026-11-01); an older desktop omits them
+    effort: str(s.effort),
+    keepRunning: s.keepRunning === true,
+    usageKey: str(s.usageKey),
+    // the last turn ended on an error (Claude's StopFailure); only present when it did
+    ...(str(s.failed) ? { failed: str(s.failed) } : {}),
   };
 }
 
@@ -282,6 +288,8 @@ export function statusPatch(event: string, body: HookBody | null | undefined): L
     case "sessionend":
       return { status: "idle", compacting: false, clearActivity: true };
     case "stop":
+    // Claude's StopFailure: the turn ended on an API error, instead of `stop`
+    case "stopfailure":
       return { status: "done", compacting: false, clearActivity: true };
     case "notification":
       return { status: "needsInput" };

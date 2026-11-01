@@ -6,7 +6,6 @@ import {
   Easing,
   FlatList,
   Image,
-  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -17,7 +16,8 @@ import {
   type NativeSyntheticEvent,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useLive } from "../bridge/LiveProvider";
+import { useIsFocused } from "@react-navigation/native";
+import { useLive, useUsagePolling } from "../bridge/LiveProvider";
 import type { WireDiff } from "../bridge/protocol";
 import { AgentAvatar, useReduceMotion } from "../components/AgentAvatar";
 import { AssistantMarkdown } from "../components/AssistantMarkdown";
@@ -39,6 +39,10 @@ import type {
 import { chatOnPhone, glyphStateFor, NO_PHONE_CHAT_TEXT } from "../logic/agents";
 import { PRIVATE_SESSION_TEXT } from "../logic/frames";
 import { chatHeader } from "../logic/chatHeader";
+import { composerSuggestions, type CommandOption } from "../logic/sessionOptions";
+import { rowForSession } from "../logic/usage";
+import { contextRing, headerMeta, usageBadge } from "../logic/sessionHeader";
+import { EffortBars, HeaderUsageGauge, UsagePopover } from "../components/UsageMeters";
 import { outputPreview } from "../logic/chatView";
 import { mix, readableInk } from "../logic/color";
 import { callVerb, groupFeed, groupLabel, type Call, type FeedRow } from "../logic/feed";
@@ -50,6 +54,10 @@ import type { ChatProps } from "../navigation";
 import { hq } from "../theme/hq";
 import { useTheme } from "../theme/ThemeContext";
 import { MIN_TOUCH, MONO, TYPE } from "../theme/type";
+import { useKeyboardInset } from "../hooks/useKeyboardInset";
+import { diag } from "../data/diagnostics";
+import { OfflineStrip, useOfflineLine } from "../components/OfflineStrip";
+import { OFFLINE_COMPOSER_HINT, OFFLINE_NOT_SAVED } from "../logic/offlineCache";
 
 const DIFF_CAP = 16;
 /** Only the newest few rows animate in: a re-attach re-maps the whole history, and a wall of
@@ -61,7 +69,9 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   const { palette: p } = useTheme();
   const h = hq(p);
   const insets = useSafeAreaInsets();
-  const { sessionLive, context, view, attach, detach, prompt, pending, answer, approve, upload } = useLive();
+  const { sessionLive, context, view, attach, detach, prompt, interrupt, pending, answer, approve, upload, usage, sessionOptions, conn } = useLive();
+  // The header's mini gauge draws this session's agent account (polled while the chat is showing).
+  useUsagePolling(useIsFocused());
   const list = useRef<FlatList<DisplayRow>>(null);
 
   // Attach to this session's live stream (transcript history + tail + status) while the screen
@@ -89,6 +99,44 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   }, [view, sessionId]);
   const projectName = session?.project.name ?? null;
   const agent = session?.session.agent ?? "";
+  // The session's commands/skills (composer `/` suggestions) and its effort ladder (header bars).
+  // An older computer never answers: no suggestions, and the bars use the common ladder.
+  const [commands, setCommands] = useState<readonly CommandOption[]>(NO_COMMANDS);
+  const [efforts, setEfforts] = useState<readonly string[]>([]);
+  const ready = conn.phase === "ready";
+  const silo = session?.session.silo === true;
+  useEffect(() => {
+    if (!ready || silo) return;
+    let live = true;
+    sessionOptions(sessionId).then((r) => {
+      if (!live || !r.ok) return;
+      setCommands(r.options.commands);
+      setEfforts(r.options.efforts);
+    });
+    return () => {
+      live = false;
+    };
+  }, [sessionId, ready, silo, sessionOptions]);
+  const suggest = useCallback((d: string) => composerSuggestions(d, commands), [commands]);
+  // Header: line 1 the name; line 2 project · status · model · effort bars [· auto-approve].
+  // The context window is the ring around the avatar; usage is the gauge left of preferences.
+  const ctxRing = contextRing(context ? context.fraction : null);
+  const meta = headerMeta({
+    name: header.name,
+    projectName: projectName,
+    state: header.state,
+    model: header.model,
+    effort: header.effort,
+    efforts,
+    autoApprove: session?.session.autoApprove === true,
+    context: ctxRing,
+    compacting: sessionLive.compacting === true,
+  });
+  // An agent with no effort ladder (and none reported) gets no bars: "default" would be a guess.
+  const showEffort = header.effort !== null || efforts.length > 0;
+  const usageRow = rowForSession(usage?.rows ?? null, header.usageKey, header.agent);
+  const badge = usageBadge(usageRow);
+  const [usageOpen, setUsageOpen] = useState(false);
   // The Mac follows the session onto a new transcript itself (/clear, a just-spawned chat) and
   // re-sends `history`, so the chat never has to re-attach to catch up.
 
@@ -233,6 +281,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
           source === "photos" ? await pickPhotos(room) : source === "camera" ? [await takePhoto()].filter((x): x is Picked => !!x) : await pickFiles(room);
         picked.forEach(startUpload);
       } catch (e) {
+        diag.error("attach", "pick.failed", e);
         Alert.alert("Couldn't attach that", e instanceof Error ? e.message : String(e));
       }
     },
@@ -278,46 +327,29 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     [decide, onCopied, answer, approve],
   );
   const refused = sessionLive.refused === "private";
+  // Offline, the chat reads from this phone's saved copy (read-only); the line says when it was saved.
+  const offline = useOfflineLine(sessionLive.cachedAt ?? null);
   // Only Claude's conversation reaches the phone (its transcript); say so rather than show nothing.
-  const notice = refused ? PRIVATE_SESSION_TEXT : session && !chatOnPhone(agent) && feed.length === 0 ? NO_PHONE_CHAT_TEXT : null;
+  const notice = refused
+    ? PRIVATE_SESSION_TEXT
+    : session && !chatOnPhone(agent) && feed.length === 0
+      ? NO_PHONE_CHAT_TEXT
+      : !ready && offline?.tone === "bad" && feed.length === 0
+        ? OFFLINE_NOT_SAVED
+        : null;
 
   // With the keyboard up there is no home indicator to clear, so the composer sits on the keys.
-  // Android fires no keyboardWill* events, only keyboardDid*. It also gets the keyboard's
-  // height applied by hand (`androidKeyboard`), not by KeyboardAvoidingView: the app is
-  // edge-to-edge (forced from Android 15), the window no longer resizes for the keyboard, and
-  // KAV's Android arm left its padding behind after the keyboard closed (measured on a vivo
-  // X200 Pro, Android 16), floating the composer over an empty band.
-  const [keyboardUp, setKeyboardUp] = useState(false);
-  const [androidKeyboard, setAndroidKeyboard] = useState(0);
-  const insetsRef = useRef(insets);
-  insetsRef.current = insets;
-  useEffect(() => {
-    const ios = Platform.OS === "ios";
-    const show = Keyboard.addListener(ios ? "keyboardWillShow" : "keyboardDidShow", (e) => {
-      setKeyboardUp(true);
-      // React Native reports the IME inset MINUS the navigation bar (ReactRootView:
-      // ime.bottom - systemBars.bottom), but this screen runs under the nav bar
-      // (edge-to-edge), so the composer must clear both. Without the nav bar's share it sat
-      // one nav-bar height too low, behind the keys (measured on the vivo, 3-button nav).
-      if (!ios) setAndroidKeyboard(e.endCoordinates.height + insetsRef.current.bottom);
-    });
-    const hide = Keyboard.addListener(ios ? "keyboardWillHide" : "keyboardDidHide", () => {
-      setKeyboardUp(false);
-      if (!ios) setAndroidKeyboard(0);
-    });
-    return () => {
-      show.remove();
-      hide.remove();
-    };
-  }, []);
+  // Android applies the keyboard's height by hand (see useKeyboardInset on edge-to-edge).
+  const { keyboardUp, androidKeyboard } = useKeyboardInset();
 
   const [headerH, setHeaderH] = useState(insets.top + 56);
   const [composerH, setComposerH] = useState(insets.bottom + 54);
-  const running = header.state === "running";
+  const running = header.state === "running" || (sessionLive.compacting === true && header.state !== "needs");
   // A private chat shows only its notice: no typing bubble and no rows under it. The Mac sends
   // nothing of that session, so the bubble would only be guessing, and any card for it is a
   // private one that repeats the notice -- either would be drawn beneath the centred notice.
-  const typing = running && !refused;
+  // Offline the "working" state is a guess from the saved list: no typing bubble on a guess.
+  const typing = running && !refused && ready;
   const rowsShown = refused ? NO_ROWS : data;
   const stateColor = header.state === "needs" ? p.amber : running ? p.green : p.textMid;
   const ringState = glyphStateFor(
@@ -325,6 +357,11 @@ export function ChatScreen({ route, navigation }: ChatProps) {
     session?.session.running ?? false,
   );
   const accent = readableInk(session ? (header.color ?? p.accent) : p.accent, p.textBright, p.panelBg);
+  // ONE session sheet: the title tap and the preferences button both open it.
+  const openSheet = () => {
+    setUsageOpen(false);
+    navigation.navigate("QuickActions", { sessionId, running, agent, projectId, name: route.params.name, branch: route.params.branch });
+  };
 
   return (
     <View style={{ flex: 1, backgroundColor: p.panelBg }}>
@@ -363,7 +400,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
               accessibilityRole="text"
               style={{ maxWidth: 320, flexDirection: "row", alignItems: "flex-start", gap: 10, paddingHorizontal: 16, paddingVertical: 14, borderRadius: 14, backgroundColor: p.sidebarBg, borderWidth: StyleSheet.hairlineWidth, borderColor: p.border }}
             >
-              <Icon name={refused ? "lock.fill" : "laptopcomputer"} size={16} color={p.textMid} />
+              <Icon name={refused ? "lock.fill" : notice === OFFLINE_NOT_SAVED ? "wifi.slash" : "laptopcomputer"} size={16} color={p.textMid} />
               <Text style={{ flex: 1, color: p.textMid, fontSize: TYPE.subhead, lineHeight: 20 }}>{notice}</Text>
             </View>
           </View>
@@ -412,6 +449,9 @@ export function ChatScreen({ route, navigation }: ChatProps) {
               onAttach={onAttach}
               onRemoveAttachment={removeAttachment}
               onHeight={setComposerH}
+              suggest={commands.length > 0 ? suggest : undefined}
+              insert={route.params.insert}
+              offline={ready ? undefined : OFFLINE_COMPOSER_HINT}
             />
           )}
         </View>
@@ -420,54 +460,87 @@ export function ChatScreen({ route, navigation }: ChatProps) {
 
       {/* header: system material, the project's colour as a thin rule under it */}
       <MaterialBar style={{ position: "absolute", top: 0, left: 0, right: 0 }}>
+        <View onLayout={(e) => setHeaderH(e.nativeEvent.layout.height)}>
         <View
-          onLayout={(e) => setHeaderH(e.nativeEvent.layout.height)}
-          style={{ paddingTop: insets.top + 4, paddingBottom: 8, paddingHorizontal: 10, flexDirection: "row", alignItems: "center", gap: 10 }}
+          style={{ paddingTop: insets.top + 4, paddingBottom: 8, paddingHorizontal: 10, flexDirection: "row", alignItems: "center", gap: 8 }}
         >
-          <GlassCircle symbol="chevron.left" label="Back to chats" onPress={() => navigation.goBack()} size={38} symbolSize={16} />
+          <GlassCircle symbol="chevron.left" label="Back to sessions" onPress={() => navigation.goBack()} size={38} symbolSize={16} />
           <Pressable
-            onPress={() => navigation.navigate("SessionInfo", { sessionId, projectId })}
+            onPress={openSheet}
             accessibilityRole="button"
-            accessibilityLabel={`${header.name}, ${projectName ?? ""} ${header.subline}. Session details`}
-            style={({ pressed }) => ({ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 9, opacity: pressed ? 0.7 : 1 })}
+            accessibilityLabel={meta.a11y}
+            style={({ pressed }) => ({ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 8, opacity: pressed ? 0.7 : 1 })}
           >
-            <AgentAvatar agent={session?.session.agent ?? ""} projectColor={header.color} state={ringState} size={34} />
+            <AgentAvatar
+              agent={session?.session.agent ?? ""}
+              projectColor={header.color}
+              state={ringState}
+              size={34}
+              context={ctxRing ? ctxRing.fraction : null}
+            />
             <View style={{ flex: 1, minWidth: 0 }}>
               <Text style={{ fontWeight: "600", fontSize: TYPE.callout, color: p.textBright }} numberOfLines={1}>
                 {header.name}
               </Text>
-              <Text style={{ fontSize: TYPE.caption, marginTop: 1 }} numberOfLines={1}>
-                {projectName ? <Text style={{ color: accent, fontWeight: "600" }}>{projectName}</Text> : null}
-                {projectName ? <Text style={{ color: p.textDim }}>{"  ·  "}</Text> : null}
-                <Text style={{ color: stateColor }}>{header.subline}</Text>
-              </Text>
+              {/* line 2: project · status · model · effort bars [· auto-approve]; the project and
+                  model give way first, the status never does */}
+              <View style={{ flexDirection: "row", alignItems: "center", marginTop: 2, minWidth: 0 }}>
+                {meta.project ? (
+                  <>
+                    <Text maxFontSizeMultiplier={1.3} style={{ flexShrink: 1, color: accent, fontWeight: "600", fontSize: TYPE.caption }} numberOfLines={1}>
+                      {meta.project}
+                    </Text>
+                    <MetaDot />
+                  </>
+                ) : null}
+                <Text maxFontSizeMultiplier={1.3} style={{ flexShrink: 0, color: stateColor, fontSize: TYPE.caption }} numberOfLines={1}>
+                  {meta.status}
+                </Text>
+                {meta.model ? (
+                  <>
+                    <MetaDot />
+                    <Text
+                      maxFontSizeMultiplier={1.3}
+                      style={{ flexShrink: 1, maxWidth: 104, color: p.textMid, fontWeight: "600", fontSize: TYPE.caption }}
+                      numberOfLines={1}
+                    >
+                      {meta.model}
+                    </Text>
+                  </>
+                ) : null}
+                {showEffort ? (
+                  <View style={{ flexShrink: 0, marginLeft: 6 }}>
+                    <EffortBars filled={meta.effort.filled} steps={meta.effort.steps} height={10} color={p.textMid} outlined={meta.effort.isDefault} />
+                  </View>
+                ) : null}
+                {meta.autoApprove ? (
+                  <View style={{ flexShrink: 0, marginLeft: 5 }}>
+                    <Icon name="bolt" size={12} color={p.amber} />
+                  </View>
+                ) : null}
+              </View>
             </View>
           </Pressable>
-          {!header.canStop && (
-            <GlassCircle
-              symbol="slider.horizontal.3"
-              label="Steer: compact or clear the conversation"
-              onPress={() => navigation.navigate("QuickActions", { sessionId, running, agent })}
-              size={38}
-              symbolSize={17}
-            />
-          )}
-          {header.canStop && (
-            <Pressable
-              onPress={() => navigation.navigate("QuickActions", { sessionId, running: true, agent })}
-              hitSlop={8}
-              accessibilityRole="button"
-              accessibilityLabel="Stop or steer the current turn"
-            >
-              <GlassSurface interactive style={{ height: 34, borderRadius: 17, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", gap: 5 }}>
-                <Icon name="stop.fill" size={11} color={p.red} />
-                <Text maxFontSizeMultiplier={1.6} style={{ color: p.red, fontSize: TYPE.footnote, fontWeight: "600" }}>Stop</Text>
-              </GlassSurface>
-            </Pressable>
-          )}
+          <HeaderUsageGauge badge={badge} size={38} onPress={() => setUsageOpen((o) => !o)} />
+          {/* one tap to stop a running turn, as the general chat has; idle shows nothing extra.
+              Not for a private session: the computer refuses its controls. */}
+          {running && !refused && ready ? (
+            <GlassCircle symbol="stop.fill" label="Interrupt this turn" onPress={() => interrupt(sessionId)} size={38} symbolSize={15} tint={p.red} />
+          ) : null}
+          <GlassCircle
+            symbol="slider.horizontal.3"
+            label={running ? "Session details and options: interrupt, files, model, commands" : "Session details and options: files, model, commands, compact or stop"}
+            onPress={openSheet}
+            size={38}
+            symbolSize={17}
+          />
         </View>
         <View style={{ height: 1, backgroundColor: header.color ? mix(header.color, p.panelBg, 0.55) : h.hairline }} />
+        {offline && !refused ? <OfflineStrip text={offline.text} tone={offline.tone} onRetry={offline.onRetry} inset={14} /> : null}
+        </View>
       </MaterialBar>
+
+      {usageOpen ? <UsagePopover row={usageRow} top={headerH + 6} now={Date.now()} onClose={() => setUsageOpen(false)} /> : null}
 
       <CopiedToast at={copiedAt} top={headerH + 10} />
     </View>
@@ -480,6 +553,17 @@ type DisplayRow =
   | { type: "pending"; key: string; card: CardView };
 
 const NO_ROWS: DisplayRow[] = [];
+const NO_COMMANDS: readonly CommandOption[] = [];
+
+/** The separator between the header's line-2 parts. */
+function MetaDot() {
+  const { palette: p } = useTheme();
+  return (
+    <Text maxFontSizeMultiplier={1.3} style={{ flexShrink: 0, color: p.textDim, fontSize: TYPE.caption }}>
+      {" · "}
+    </Text>
+  );
+}
 
 function threadKey(t: DisplayRow): string {
   return t.key;
@@ -510,7 +594,7 @@ const PendingRowView = React.memo(
 );
 
 /** A row re-renders only when what it draws changed (see `sameFeedRow`), not on every new message. */
-const ThreadRowView = React.memo(
+export const ThreadRowView = React.memo(
   ThreadRowBody,
   (a: RowProps, b: RowProps) =>
     sameFeedRow(a.t.row, b.t.row) &&
@@ -559,7 +643,7 @@ function ThreadRowBody({
 }
 
 /** "Today" / "Yesterday" / date, centred between days. */
-function DatePill({ label }: { label: string }) {
+export function DatePill({ label }: { label: string }) {
   const { palette: p } = useTheme();
   return (
     <View style={{ alignItems: "center", marginTop: 14, marginBottom: 4 }}>
@@ -580,7 +664,7 @@ function DatePill({ label }: { label: string }) {
 }
 
 /** The agent at work: WhatsApp's typing bubble, carrying what it is doing right now (hook `activity`). */
-function WorkingBubble({ activity }: { activity?: string }) {
+export function WorkingBubble({ activity }: { activity?: string }) {
   const { palette: p } = useTheme();
   const reduce = useReduceMotion();
   const t = useRef(new Animated.Value(0)).current;
@@ -625,7 +709,7 @@ function WorkingBubble({ activity }: { activity?: string }) {
   );
 }
 
-function CopiedToast({ at, top }: { at: number; top: number }) {
+export function CopiedToast({ at, top }: { at: number; top: number }) {
   const { palette: p } = useTheme();
   const o = useRef(new Animated.Value(0)).current;
   useEffect(() => {

@@ -5,12 +5,17 @@
  * exactly as the desktop's `glyph-pulse` does (2.4 s / 1.6 s, opacity + scale only, so it
  * stays on the native driver) and hold still under Reduce Motion — the ring alone still tells
  * the states apart.
+ *
+ * With `context` (0..1) the static ring becomes a context gauge: an arc from 12 o'clock
+ * filled to the fraction of the context window used, green -> amber (70 %) -> red (90 %),
+ * over a faint track. The pulse still carries the running / needs-you state.
  */
 import React, { useEffect, useRef } from "react";
 import { Animated, Easing, Text, View } from "react-native";
-import Svg, { Path } from "react-native-svg";
+import Svg, { Circle, Path } from "react-native-svg";
 import { AGENT_MARKS, agentInfo, GLYPH_STATE_TITLE, pulsePeriod, type GlyphState } from "../logic/agents";
 import { glyphInk, mix } from "../logic/color";
+import { contextRing } from "../logic/sessionHeader";
 import { useTheme } from "../theme/ThemeContext";
 import { useReduceMotion } from "./ReduceMotion";
 
@@ -38,6 +43,7 @@ export function AgentAvatar({
   state,
   size = 52,
   ground,
+  context,
 }: {
   agent: string;
   /** the project's accent: the plate's wash */
@@ -46,6 +52,8 @@ export function AgentAvatar({
   size?: number;
   /** the surface the avatar sits on (the ring's gap) */
   ground?: string;
+  /** 0..1 of the context window used: draws the ring as a context gauge; null/absent = state ring */
+  context?: number | null;
 }) {
   const { palette: p } = useTheme();
   const reduce = useReduceMotion();
@@ -86,7 +94,13 @@ export function AgentAvatar({
   const ringW = state === "running" || state === "needsInput" ? 2 : 1.5;
   // Fixed footprint whatever the state, so a list's text column never shifts when a ring appears.
   const outer = size + (ringGap + 2) * 2;
-  const label = state ? `${info.label}, ${GLYPH_STATE_TITLE[state]}` : info.label;
+  const gauge = contextRing(context);
+  const stateLabel = state ? `${info.label}, ${GLYPH_STATE_TITLE[state]}` : info.label;
+  const label = gauge ? `${stateLabel}, ${gauge.a11y}` : stateLabel;
+  const gaugeW = Math.max(2.5, Math.round(size * 0.075 * 2) / 2);
+  const gaugeR = (outer - gaugeW) / 2;
+  const gaugeC = 2 * Math.PI * gaugeR;
+  const gaugeColor = gauge ? (gauge.tone === "bad" ? p.red : gauge.tone === "warn" ? p.amber : p.green) : null;
 
   return (
     <View
@@ -109,7 +123,24 @@ export function AgentAvatar({
           }}
         />
       ) : null}
-      {ring ? (
+      {gauge && gaugeColor ? (
+        <Svg pointerEvents="none" width={outer} height={outer} style={{ position: "absolute", transform: [{ rotate: "-90deg" }] }}>
+          <Circle cx={outer / 2} cy={outer / 2} r={gaugeR} stroke={mix(p.textMid, base, 0.28)} strokeWidth={gaugeW} fill="none" />
+          {gauge.fraction > 0 ? (
+            <Circle
+              cx={outer / 2}
+              cy={outer / 2}
+              r={gaugeR}
+              stroke={gaugeColor}
+              strokeWidth={gaugeW}
+              fill="none"
+              strokeDasharray={`${gaugeC} ${gaugeC}`}
+              strokeDashoffset={gaugeC * (1 - gauge.fraction)}
+              strokeLinecap={gauge.fraction >= 1 ? "butt" : "round"}
+            />
+          ) : null}
+        </Svg>
+      ) : ring ? (
         <View
           pointerEvents="none"
           style={{ position: "absolute", width: outer, height: outer, borderRadius: outer / 2, borderWidth: ringW, borderColor: ring }}

@@ -90,7 +90,8 @@ describe("colour mixing", () => {
 describe("chatOnPhone", () => {
   it("is Claude only: its transcript is the chat, and its slash commands are the quick actions", () => {
     expect(chatOnPhone("claude")).toBe(true);
-    for (const a of AGENTS.filter((x) => x.id !== "claude")) expect(chatOnPhone(a.id)).toBe(false);
+    expect(chatOnPhone("antigravity")).toBe(true);
+    for (const a of AGENTS.filter((x) => x.id !== "claude" && x.id !== "antigravity")) expect(chatOnPhone(a.id)).toBe(false);
     expect(chatOnPhone("")).toBe(false);
   });
 });

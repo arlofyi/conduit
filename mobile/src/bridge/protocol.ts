@@ -104,6 +104,20 @@ export interface WireViewSession {
   updatedAt: number | null;
   needs: WireNeeds;
   lastMessage: WireLastMessage | null;
+  // ---- session controls (2026-11-01 spec section 2); absent from older desktops ----
+  /** the effort level the session runs at (applies at its next start) */
+  effort?: string | null;
+  /** pinned "keep running": idle auto-stop skips it */
+  keepRunning?: boolean;
+  /** the `usage` row (`key`) this session's agent account draws from */
+  usageKey?: string | null;
+  // ---- auto-approve (2026-11-01 spec section 5, Round 4); absent from older desktops ----
+  /** Conduit answers this session's permission prompts itself */
+  autoApprove?: boolean;
+  // ---- failure (StopFailure); absent from older desktops ----
+  /** the last turn ended on an error: its kind ("rate_limit", ...; "error" for a private
+   * session); null when the last turn did not fail */
+  failed?: string | null;
 }
 
 export interface WireViewProject {
@@ -187,6 +201,9 @@ export type ServerMsg =
   | { type: "pairResult"; ok: false; reason: string }
   | { type: "macs"; macs: WireMac[] }
   | ({ type: "projects" } & WireProjectsView)
+  /** the answer to an explicit `list` when the view has not changed since the last `projects`
+   * this socket got (the computer sends identical views only once) */
+  | { type: "listed"; unchanged?: boolean }
   | { type: "context"; sessionId: string; used: number; window: number; fraction: number; model: string | null }
   | { type: "size"; cols: number; rows: number }
   // `sessionId` names the session the frame is about; absent from desktops before it was added.
@@ -210,7 +227,132 @@ export type ServerMsg =
   | { type: "uploadResult"; requestId: string; ok: true; path: string }
   | { type: "uploadResult"; requestId: string; ok: false; error: string }
   /** the answer to one `sessionaction`: what was done, and what was refused and why */
-  | { type: "sessionActionResult"; requestId: string; action: "stop" | "delete"; done: string[]; skipped: { id: string; reason: string }[] };
+  | { type: "sessionActionResult"; requestId: string; action: "stop" | "delete"; done: string[]; skipped: { id: string; reason: string }[] }
+  /** answer to `ports`: the computer's local web apps a phone may mirror (empty when off) */
+  | { type: "ports"; enabled: boolean; ports: { port: number; process: string | null }[] }
+  /** tunnel sockets only: the computer accepted a `tunnel` frame; raw TCP bytes follow */
+  | { type: "tunnelOk"; port: number }
+  // ---- session controls + usage (2026-11-01 spec section 2) ----
+  | WireSessionOptionsMsg
+  | WireSessionSetResult
+  | WireUsageMsg
+  // ---- the file browser (desktop phone_fs.rs); every answer echoes its requestId ----
+  | WireFsListResult
+  | WireFsReadResult
+  | WireFsWriteResult
+  | WireFsChunk
+  // ---- the general chat (desktop root_chat.rs via bridge.rs) ----
+  | { type: "rootChats"; chats: WireRootChat[] }
+  | { type: "rootChatCreated"; requestId: string; chat: WireRootChat }
+  | { type: "rootChatHistory"; chatId: string; items: WireChatItem[]; running: boolean }
+  | { type: "rootChatScoped"; chatId: string; ok: boolean; scope: WireScope | null }
+  | { type: "rootChatSettings"; requestId: string; ok: boolean; chat?: WireRootChat | null; note?: string | null }
+  | WireRootChatOptions
+  | WireRootChatEvent;
+
+// ---- general chat (root chat, HQ): a non-coding chat across projects ----
+
+/** Which projects a general chat may see: whole profiles (`null` = Default) plus single
+ * projects; `allProfiles` is everything. A chat's `scope: null` also means every project. */
+export interface WireScope {
+  allProfiles: boolean;
+  profiles: (string | null)[];
+  projects: string[];
+}
+
+export interface WireRootChat {
+  id: string;
+  title: string;
+  /** the profile the chat is listed under (`null` = Default) */
+  profileId: string | null;
+  scope: WireScope | null;
+  /** unix SECONDS */
+  createdAt: number;
+  running: boolean;
+  // ---- chat options (2026-11-01 contract §3); older desktops omit them all ----
+  /** "claude" | "antigravity", fixed for the chat's life */
+  agent?: string;
+  /** null = the agent's default */
+  model?: string | null;
+  effort?: string | null;
+  /** deep research: more effort plus a research brief */
+  research?: boolean;
+  /** user MCP server names opted in */
+  mcps?: string[];
+}
+
+/** Answer to `rootchatoptions`: what a general chat can be set to on this computer. */
+export interface WireRootChatOptions {
+  type: "rootChatOptions";
+  requestId: string;
+  agents: { id: string; label: string; models: { id: string; label: string }[]; efforts: string[] }[];
+  skills: { name: string; description?: string | null }[];
+  mcps: { name: string }[];
+}
+
+/** A chat's options as `rootchatcreate` / `rootchatsettings` carry them (absent = unchanged
+ * or the computer's default). */
+export interface WireRootChatSettings {
+  agent?: string;
+  model?: string;
+  effort?: string;
+  research?: boolean;
+  mcps?: string[];
+}
+
+/** Pushed to every socket that has sent any rootchat* frame. `user` = a turn started (from
+ * this phone or the computer); `item` = a chat item in the session-chat shapes. */
+export type WireRootChatEvent =
+  | { type: "rootChatEvent"; event: "user"; chatId: string; text: string }
+  | { type: "rootChatEvent"; event: "item"; chatId: string; item: WireChatItem }
+  | { type: "rootChatEvent"; event: "done"; chatId: string; isError: boolean; result?: string | null; costUsd?: number | null; numTurns?: number | null }
+  | { type: "rootChatEvent"; event: "error"; chatId: string; message: string };
+
+// ---- file browser (phone_fs.rs) ----
+
+/** One entry of a session directory. A `link` is shown but can never be opened; a `sensitive`
+ * name (.env, a key) asks before it is read and is never writable. */
+export interface WireFsEntry {
+  name: string;
+  dir: boolean;
+  size: number;
+  mtimeMs: number;
+  link?: true;
+  sensitive?: true;
+}
+
+/** `error` is one of "not available" | "not found" | "confirm" | "read-only" | "conflict" |
+ * "too large" or free text; a frame carrying it has none of the success fields. */
+export type WireFsListResult =
+  | { type: "fsListResult"; requestId: string; path: string; entries: WireFsEntry[]; truncated: number; error?: undefined }
+  | { type: "fsListResult"; requestId: string; error: string };
+
+export interface WireFsText {
+  path: string;
+  /** "" when `binary` */
+  content: string;
+  binary: boolean;
+  /** over the 1 MB text cap: a read-only preview of the start */
+  truncated: boolean;
+  readOnly: boolean;
+  size: number;
+  mtimeMs: number;
+  sensitive?: boolean;
+}
+export type WireFsReadResult =
+  | ({ type: "fsReadResult"; requestId: string; error?: undefined } & WireFsText)
+  | { type: "fsReadResult"; requestId: string; error: string };
+
+export type WireFsWriteResult =
+  | { type: "fsWriteResult"; requestId: string; path: string; mtimeMs: number; size: number; error?: undefined }
+  | { type: "fsWriteResult"; requestId: string; error: string };
+
+/** One piece of a download (base64, 1-based `seq`); each one not `done` is acked with `fsack`. */
+export type WireFsChunk =
+  | { type: "fsChunk"; requestId: string; seq: number; data: string; done: boolean; size: number; name: string; error?: undefined }
+  | { type: "fsChunk"; requestId: string; error: string };
+
+export type WireFsReply = WireFsListResult | WireFsReadResult | WireFsWriteResult | WireFsChunk;
 
 // ---- client → server ----
 // Spellings are mixed ON PURPOSE (pinned by Rust tests): attach/input/resize/git/kill/spawn use
@@ -226,12 +368,30 @@ export type ClientMsg =
   | { type: "resize"; session_id: string; cols: number; rows: number }
   | { type: "git"; session_id: string; action: "changes" | "diff"; path?: string }
   | { type: "kill"; session_id: string }
-  | { type: "spawn"; project_id: string; prompt: string; agent?: string; worktree?: boolean }
+  | { type: "spawn"; project_id: string; prompt: string; agent?: string; worktree?: boolean; name?: string }
   | { type: "interrupt"; sessionId: string }
   | { type: "answer"; askId: string; answers: Record<string, string> }
   | { type: "approve"; id: string; allow: boolean }
   | { type: "upload"; sessionId: string; requestId: string; name: string; data: string; seq: number; done: boolean }
-  | { type: "sessionaction"; requestId: string; action: "stop" | "delete"; sessionIds: string[] };
+  | { type: "sessionaction"; requestId: string; action: "stop" | "delete"; sessionIds: string[] }
+  | { type: "ports" }
+  // ---- session controls + usage (2026-11-01 spec section 2) ----
+  | { type: "sessionoptions"; sessionId: string; requestId: string }
+  | ({ type: "sessionset"; sessionId: string; requestId: string } & SessionSetPatch)
+  | { type: "usage"; requestId: string }
+  | { type: "fslist"; sessionId: string; requestId: string; path: string }
+  | { type: "fsread"; sessionId: string; requestId: string; path: string; confirm?: boolean }
+  | { type: "fswrite"; sessionId: string; requestId: string; path: string; content: string; baseMtimeMs: number; baseSize: number }
+  | { type: "fsdownload"; sessionId: string; requestId: string; path: string; confirm?: boolean }
+  | { type: "fsack"; requestId: string }
+  | { type: "rootchats" }
+  | ({ type: "rootchatcreate"; requestId: string; profileId: string | null; scope: WireScope | null } & WireRootChatSettings)
+  | ({ type: "rootchatsettings"; chatId: string; requestId: string } & Omit<WireRootChatSettings, "agent">)
+  | { type: "rootchatoptions"; requestId: string }
+  | { type: "rootchathistory"; chatId: string }
+  | { type: "rootchatsend"; chatId: string; text: string }
+  | { type: "rootchatstop"; chatId: string }
+  | { type: "rootchatscope"; chatId: string; scope: WireScope | null };
 
 export const authMsg = (token: string): ClientMsg => ({ type: "auth", token });
 
@@ -244,6 +404,9 @@ export function pairMsg(
 }
 
 export const discoverMsg = (): ClientMsg => ({ type: "discover" });
+/** Ask for the computer's local web apps; answered by `ports`. (The `tunnel` frame that opens
+ * one is sent by the native mirror on its own socket, never on this one.) */
+export const portsMsg = (): ClientMsg => ({ type: "ports" });
 export const listMsg = (): ClientMsg => ({ type: "list" });
 export const attachMsg = (id: string): ClientMsg => ({ type: "attach", session_id: id });
 export const inputMsg = (id: string, data: string): ClientMsg => ({ type: "input", session_id: id, data });
@@ -270,12 +433,82 @@ export const sessionActionMsg = (requestId: string, action: "stop" | "delete", s
   action,
   sessionIds,
 });
-/** Start a new session in a project with its first message; the Mac answers `spawned` or `error`. */
-export const spawnMsg = (projectId: string, prompt: string, agent: string): ClientMsg => ({
+/** List one folder of a session's directory ("" = its root); answered by `fsListResult`. */
+export const fsListMsg = (sessionId: string, requestId: string, path: string): ClientMsg => ({ type: "fslist", sessionId, requestId, path });
+/** Read a file as text; `confirm` opens a secret the computer flagged. Answered by `fsReadResult`. */
+export const fsReadMsg = (sessionId: string, requestId: string, path: string, confirm = false): ClientMsg => ({
+  type: "fsread",
+  sessionId,
+  requestId,
+  path,
+  ...(confirm ? { confirm: true } : {}),
+});
+/** Save an edit. `base` is the stat of the read the edit started from: a file changed on the
+ * computer since is refused as "conflict", never overwritten. Answered by `fsWriteResult`. */
+export const fsWriteMsg = (
+  sessionId: string,
+  requestId: string,
+  path: string,
+  content: string,
+  base: { mtimeMs: number; size: number },
+): ClientMsg => ({ type: "fswrite", sessionId, requestId, path, content, baseMtimeMs: base.mtimeMs, baseSize: base.size });
+/** Download a file as `fsChunk` frames (the computer sends the next only after an `fsack`). */
+export const fsDownloadMsg = (sessionId: string, requestId: string, path: string, confirm = false): ClientMsg => ({
+  type: "fsdownload",
+  sessionId,
+  requestId,
+  path,
+  ...(confirm ? { confirm: true } : {}),
+});
+export const fsAckMsg = (requestId: string): ClientMsg => ({ type: "fsack", requestId });
+
+// General chat. The first rootchat* frame on a socket subscribes it to `rootChatEvent`.
+/** List every general chat; answered by `rootChats`. */
+export const rootChatsMsg = (): ClientMsg => ({ type: "rootchats" });
+/** Start a general chat listed under `profileId`; answered by `rootChatCreated`. The options
+ * ride along only when set, so an older desktop sees the frame it always did. */
+export const rootChatCreateMsg = (
+  requestId: string,
+  profileId: string | null,
+  scope: WireScope | null,
+  settings: WireRootChatSettings = {},
+): ClientMsg => ({
+  type: "rootchatcreate",
+  requestId,
+  profileId,
+  scope,
+  ...definedOnly(settings),
+});
+/** Change a chat's options (only the fields named); answered by `rootChatSettings`. A model or
+ * effort of "" means the agent's default. */
+export const rootChatSettingsMsg = (chatId: string, requestId: string, patch: Omit<WireRootChatSettings, "agent">): ClientMsg => ({
+  type: "rootchatsettings",
+  chatId,
+  requestId,
+  ...definedOnly(patch),
+});
+/** What a chat can be set to (agents, models, efforts, skills, MCP servers); answered by
+ * `rootChatOptions`. An older desktop never answers. */
+export const rootChatOptionsMsg = (requestId: string): ClientMsg => ({ type: "rootchatoptions", requestId });
+
+function definedOnly<T extends object>(o: T): T {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T;
+}
+/** A chat's history so far; answered by `rootChatHistory`. */
+export const rootChatHistoryMsg = (chatId: string): ClientMsg => ({ type: "rootchathistory", chatId });
+/** One message: the turn streams back as `rootChatEvent`s (a refusal as an `error` event). */
+export const rootChatSendMsg = (chatId: string, text: string): ClientMsg => ({ type: "rootchatsend", chatId, text });
+export const rootChatStopMsg = (chatId: string): ClientMsg => ({ type: "rootchatstop", chatId });
+/** Change which projects a chat covers (`null` = every project); answered by `rootChatScoped`. */
+export const rootChatScopeMsg = (chatId: string, scope: WireScope | null): ClientMsg => ({ type: "rootchatscope", chatId, scope });
+/** Start a new session in a project; the Mac answers `spawned` or `error`. An empty `prompt`
+ * starts the agent idle; a blank `name` lets the Mac derive one from the prompt. */
+export const spawnMsg = (projectId: string, prompt: string, agent: string, name = ""): ClientMsg => ({
   type: "spawn",
   project_id: projectId,
   prompt,
   agent,
+  ...(name.trim() ? { name: name.trim() } : {}),
 });
 
 /** A chat message as PTY input: bracketed paste around the text, then a bare `\r`.
@@ -304,5 +537,120 @@ export function pasteInput(text: string): string {
  */
 export function submitDelayMs(text: string): number {
   const files = text.split("@.conduit-uploads/").length - 1;
-  return files === 0 ? 0 : 1200 + 300 * files;
+  if (files > 0) return 1200 + 300 * files;
+  // A slash command opens Claude Code's command menu as it arrives, and an Enter in the same
+  // burst is taken by the menu: `/compact` sat in the composer until the user pressed Enter.
+  return isSlashCommand(text) ? SLASH_SUBMIT_DELAY_MS : 0;
 }
+
+/** How long a slash command's Enter waits for Claude Code's command menu to draw. */
+export const SLASH_SUBMIT_DELAY_MS = 600;
+
+/** One line starting with `/`, like `/compact` or `/model opus`. */
+export function isSlashCommand(text: string): boolean {
+  const t = text.trim();
+  return /^\/[A-Za-z]/.test(t) && !t.includes("\n");
+}
+
+// ---- session controls + usage (2026-11-01 spec sections 2 and 4) ----
+// Every field is read defensively by logic/sessionOptions.ts and logic/usage.ts: an older
+// desktop omits them, and the Rust side was written in parallel against these names.
+
+export interface WireModelOption {
+  id: string;
+  label: string;
+}
+export interface WireCommandOption {
+  name: string;
+  description: string;
+  kind: "builtin" | "command" | "skill";
+}
+export interface WireMcpOption {
+  name: string;
+  source: string;
+  enabled: boolean;
+}
+
+/** The answer to `sessionoptions`: what this session can be switched to and steered with. */
+export interface WireSessionOptionsMsg {
+  type: "sessionOptions";
+  requestId: string;
+  sessionId: string;
+  agent: string;
+  model: string | null;
+  effort: string | null;
+  keepRunning: boolean;
+  /** true: a model change applies now (the agent's own /model); false: at the next start */
+  modelLive: boolean;
+  models: WireModelOption[];
+  efforts: string[];
+  commands: WireCommandOption[];
+  mcps: WireMcpOption[];
+  // ---- auto-approve (Round 4); absent from older desktops ----
+  autoApprove?: boolean;
+  /** the agent has an auto-approve switch (Antigravity for now) */
+  autoApproveSupported?: boolean;
+}
+
+/** Only the keys present are changed. */
+export interface SessionSetPatch {
+  model?: string;
+  effort?: string;
+  name?: string;
+  keepRunning?: boolean;
+  /** Round 4: Conduit allows every request of this session itself */
+  autoApprove?: boolean;
+}
+
+export interface WireSessionSetResult {
+  type: "sessionSetResult";
+  requestId: string;
+  ok: boolean;
+  /** what happened ("Switched to Sonnet", "Applies at the next start", why it was refused) */
+  note: string | null;
+}
+
+export interface WireUsageWindow {
+  /** desktop WinKind: "fiveHour" | "weekly" | "weeklyOpus" | "context" | "credit" */
+  kind: string;
+  label: string;
+  /** fraction CONSUMED, 0..1 */
+  used: number;
+  resetsAt: string | number | null;
+}
+
+/** One usage row: one agent account (`key` matches a session's `usageKey`). */
+export interface WireUsageRow {
+  key: string;
+  agent: string;
+  label: string;
+  plan: string | null;
+  windows: WireUsageWindow[];
+  /** prepaid credit (OpenRouter): `limit` null = uncapped, so no bar */
+  money?: { spent: number; limit: number | null; remaining: number | null } | null;
+  models?: (string | WireModelOption)[] | null;
+  updatedAt: number | string | null;
+  source: string | null;
+}
+
+export interface WireUsageMsg {
+  type: "usage";
+  requestId: string;
+  agents: WireUsageRow[];
+}
+
+/** Ask for a session's models, efforts, commands/skills and MCP servers; answered by `sessionOptions`. */
+export const sessionOptionsMsg = (sessionId: string, requestId: string): ClientMsg => ({ type: "sessionoptions", sessionId, requestId });
+/** Change a session's model / effort / name / keep-running; answered by `sessionSetResult`. */
+export const sessionSetMsg = (sessionId: string, requestId: string, patch: SessionSetPatch): ClientMsg => ({
+  type: "sessionset",
+  sessionId,
+  requestId,
+  ...(patch.model !== undefined ? { model: patch.model } : {}),
+  ...(patch.effort !== undefined ? { effort: patch.effort } : {}),
+  ...(patch.name !== undefined ? { name: patch.name } : {}),
+  ...(patch.keepRunning !== undefined ? { keepRunning: patch.keepRunning } : {}),
+  ...(patch.autoApprove !== undefined ? { autoApprove: patch.autoApprove } : {}),
+});
+/** Ask for every agent account's cached usage; answered by `usage`. */
+export const usageMsg = (requestId: string): ClientMsg => ({ type: "usage", requestId });

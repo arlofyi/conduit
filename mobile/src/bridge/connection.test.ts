@@ -1,7 +1,11 @@
 import type { SavedMac } from "../data/types";
 import {
+  BACKOFF_MAX_MS,
   BACKOFF_START_MS,
+  canRetry,
   handshaking,
+  isStale,
+  STALE_MS,
   initialConn,
   isLoopbackAddress,
   lifecycleAction,
@@ -312,5 +316,66 @@ describe("backgrounding", () => {
     const sus = run(unavailable, [{ t: "suspend" }]);
     expect(sus.state.suspended).toBe(true);
     expect(run(sus.state, [{ t: "resume" }]).effects).toHaveLength(1);
+  });
+});
+
+describe("intermittent use: kick, stale links, retry", () => {
+  const ready = () => run(initialConn, [start(), { t: "open" }, { t: "frame", msg: hello() }, { t: "frame", msg: { type: "authOk" } as ServerMsg }]).state;
+
+  it("kick_skips_a_long_backoff_and_dials_now_with_the_backoff_reset", () => {
+    // An hour of Tailscale off: the backoff has climbed to its cap.
+    let s = ready();
+    for (let i = 0; i < 8; i++) s = run(s, [{ t: "close" }]).state;
+    expect(s.backoffMs).toBe(BACKOFF_MAX_MS);
+    const r = run(s, [{ t: "kick" }]);
+    expect(r.state.phase).toBe("connecting");
+    expect(r.state.backoffMs).toBe(BACKOFF_START_MS);
+    expect(r.effects).toEqual([{ k: "reconnect", addressIndex: s.addressIndex, delayMs: 0 }]);
+  });
+
+  it("kick_on_a_suspended_client_resumes_it", () => {
+    const sus = run(ready(), [{ t: "suspend" }]).state;
+    const r = run(sus, [{ t: "kick" }]);
+    expect(r.state.suspended).toBe(false);
+    expect(r.effects).toEqual([{ k: "reconnect", addressIndex: sus.addressIndex, delayMs: 0 }]);
+  });
+
+  it("kick_does_nothing_while_connected_or_after_a_terminal_failure", () => {
+    const s = ready();
+    expect(run(s, [{ t: "kick" }]).state).toBe(s);
+    const revoked = run(s, [{ t: "close" }, { t: "open" }, { t: "frame", msg: hello() }, { t: "frame", msg: { type: "error", message: "unauthorized" } as ServerMsg }]).state;
+    expect(revoked.phase).toBe("failed");
+    expect(run(revoked, [{ t: "kick" }]).effects).toEqual([]);
+  });
+
+  it("canRetry_only_between_attempts_or_while_refused_for_now", () => {
+    expect(canRetry(ready())).toBe(false);
+    expect(canRetry(initialConn)).toBe(false);
+    expect(canRetry(run(ready(), [{ t: "close" }]).state)).toBe(true);
+    const unavailable = run(ready(), [{ t: "close" }, { t: "open" }, { t: "frame", msg: hello() }, { t: "frame", msg: { type: "error", message: "unavailable" } as ServerMsg }]).state;
+    expect(unavailable.phase).toBe("failed");
+    expect(canRetry(unavailable)).toBe(true);
+  });
+
+  it("isStale_only_for_a_ready_link_silent_past_the_limit", () => {
+    expect(isStale("ready", 1000, 1000 + STALE_MS + 1)).toBe(true);
+    expect(isStale("ready", 1000, 1000 + STALE_MS)).toBe(false);
+    expect(isStale("connecting", 1000, 1000 + STALE_MS * 10)).toBe(false);
+    expect(isStale("ready", null, 1e12)).toBe(false);
+  });
+
+  it("a_listed_answer_keeps_a_quiet_ready_link_alive", () => {
+    // An idle computer answers each 10 s `list` with `listed` instead of an identical view: the
+    // socket stays ready, and the provider's per-frame stamp keeps the watchdog quiet.
+    const listed = { type: "listed", unchanged: true } as ServerMsg;
+    const r = run(ready(), [{ t: "frame", msg: listed }]);
+    expect(r.state.phase).toBe("ready");
+    let alive = 0;
+    for (let now = 10_000; now <= 120_000; now += 10_000) {
+      expect(isStale("ready", alive, now)).toBe(false);
+      alive = now; // the listed reply to that poll
+    }
+    // with no reply at all, the same polling goes stale
+    expect(isStale("ready", 0, 40_000)).toBe(true);
   });
 });

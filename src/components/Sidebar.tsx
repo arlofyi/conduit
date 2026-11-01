@@ -586,6 +586,19 @@ function SessionRow({
         </span>
       )}
       {!editing && <TrustChip session={session} />}
+      {!editing && session.agent === "antigravity" && session.autoApprove && (
+        // The phone shows the same amber bolt. U+FE0E keeps it a text glyph so it takes the
+        // colour instead of rendering as a fixed-colour emoji.
+        <span
+          className="trust-chip"
+          style={{ color: "var(--amber)" }}
+          role="img"
+          aria-label="Auto-approve is on"
+          title="Auto-approve is on: Conduit answers Allow to every request from this session"
+        >
+          {"⚡︎"}
+        </span>
+      )}
       {!editing && session.stopped ? (
         // A stopped session has no agent, so there is no live status to show — the chip
         // replaces the accessory rather than sitting next to a misleading idle dot.
@@ -843,8 +856,8 @@ function SessionContextMenu() {
   const accounts = useStore((s) => s.accounts);
   const setSessionAccount = useStore((s) => s.setSessionAccount);
   const stopSession = useStore((s) => s.stopSession);
-  const keepRunning = useStore((s) => s.keepRunning);
   const toggleKeepRunning = useStore((s) => s.toggleKeepRunning);
+  const toggleAutoApprove = useStore((s) => s.toggleAutoApprove);
   const startSession = useStore((s) => s.startSession);
   const stopIdleSessions = useStore((s) => s.stopIdleSessions);
   const pushToast = useStore((s) => s.pushToast);
@@ -1136,7 +1149,29 @@ function SessionContextMenu() {
           }}
           title="Never stop this session automatically after its agent finishes. Use it for an agent waiting on something Conduit cannot see, like a remote job."
         >
-          {keepRunning[menuSession.id] ? "✓ Keep running (no auto-stop)" : "Keep running (no auto-stop)"}
+          {menuSession.keepRunning ? "✓ Keep running (no auto-stop)" : "Keep running (no auto-stop)"}
+        </button>
+      )}
+      {menuSession?.agent === "antigravity" && (
+        <button
+          onClick={() => {
+            // Turning it ON hands every command and file edit a blanket yes, so it asks first;
+            // turning it off only restores the prompts and needs no confirmation.
+            if (
+              !menuSession.autoApprove &&
+              !confirm(
+                `Auto-approve every request from "${menuSession.name}"?\n\nConduit will answer Allow to each command and file edit this Antigravity session asks for, without showing you the request.`,
+              )
+            ) {
+              closeMenu();
+              return;
+            }
+            toggleAutoApprove(menuSession.id);
+            closeMenu();
+          }}
+          title="Conduit answers every permission request from this Antigravity session with Allow, commands and file edits included. Antigravity's own auto mode still asks, so Conduit answers for it."
+        >
+          {menuSession.autoApprove ? "✓ Auto-approve requests" : "Auto-approve requests"}
         </button>
       )}
       <button onClick={toggleSensitive} title="Silo this session: no other agent can read it">

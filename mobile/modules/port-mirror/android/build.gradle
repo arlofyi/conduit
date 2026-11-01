@@ -1,0 +1,25 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'fyi.arlo.conduit'
+version = '1.0.0'
+
+android {
+  namespace "expo.modules.portmirror"
+  defaultConfig {
+    versionCode 1
+    versionName '1.0.0'
+  }
+}
+
+dependencies {
+  implementation "androidx.core:core-ktx:1.17.0"
+  // React Native's own OkHttp (gradle/libs.versions.toml); declared so this module compiles
+  // against it, and resolved to the same artifact the app already ships.
+  implementation "com.squareup.okhttp3:okhttp:4.9.2"
+  // NativeLog (the shared, redacting diagnostics log). Both modules are always autolinked
+  // together on Android, so this adds no artifact the app does not already ship.
+  implementation project(":bg-watch")
+}

@@ -130,6 +130,7 @@ export function GlassCircle({
   primary = false,
   disabled = false,
   symbolSize = 18,
+  tint,
 }: {
   symbol: AppSymbol;
   onPress: () => void;
@@ -139,10 +140,12 @@ export function GlassCircle({
   primary?: boolean;
   disabled?: boolean;
   symbolSize?: number;
+  /** the symbol's colour on a glass (non-primary) circle, e.g. red for a stop */
+  tint?: string;
 }) {
   const { palette: p } = useTheme();
   const slop = Math.max(0, (MIN_TOUCH - size) / 2);
-  const inner = <Icon name={symbol} size={symbolSize} color={primary ? p.meText : p.textBright} weight="semibold" />;
+  const inner = <Icon name={symbol} size={symbolSize} color={primary ? p.meText : (tint ?? p.textBright)} weight="semibold" />;
   return (
     <Pressable
       onPress={onPress}

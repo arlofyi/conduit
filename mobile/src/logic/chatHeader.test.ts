@@ -79,7 +79,24 @@ describe("chatHeader", () => {
     expect(h.color).toBe("#123456");
     expect(h.state).toBe("running");
     expect(h.canStop).toBe(true);
-    expect(h.subline).toBe("working… · Opus");
+    // the model has its own chip now, so the sub-line carries only state and context
+    expect(h.subline).toBe("working…");
+    expect(h.model).toBe("Opus");
+    expect(h.projectName).toBe("conduit");
+    expect(h.effort).toBeNull();
+    expect(h.keepRunning).toBe(false);
+  });
+
+  it("carries the session-control fields from the view", () => {
+    const v: WireProjectsView = {
+      ...VIEW,
+      projects: [{ ...VIEW.projects[0], sessions: [sess({ id: "s1", effort: "high", keepRunning: true, usageKey: "claude:a" })] }],
+    };
+    const h = chatHeader({ ...base, view: v, live: NO_LIVE });
+    expect(h.effort).toBe("high");
+    expect(h.keepRunning).toBe(true);
+    expect(h.usageKey).toBe("claude:a");
+    expect(h.agent).toBe("claude");
   });
 
   it("a newer live status wins over the polled view, an older one does not", () => {
@@ -98,7 +115,8 @@ describe("chatHeader", () => {
 
   it("prefers the context frame's model and shows its fraction", () => {
     const h = chatHeader({ ...base, live: NO_LIVE, context: { fraction: 0.415, model: "claude-sonnet-4-5" } });
-    expect(h.subline).toBe("working… · Sonnet · 42% context");
+    expect(h.subline).toBe("working… · 42% context");
+    expect(h.model).toBe("Sonnet");
   });
 
   it("falls back to the route params when the view does not have the session yet", () => {

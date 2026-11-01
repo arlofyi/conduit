@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { invoke } from "@tauri-apps/api/core";
 import {
   useStore,
@@ -644,7 +645,9 @@ export function WorkspaceCenter({
             the attention rail/edge pips floating over a plane the user cannot see. */}
         {projectId && centerMode === "board" && !canvasMode && (
           <div className="board-overlay">
-            <BoardView projectId={projectId} />
+            <ErrorBoundary name="board">
+              <BoardView projectId={projectId} />
+            </ErrorBoundary>
           </div>
         )}
 
@@ -652,7 +655,9 @@ export function WorkspaceCenter({
             stack and never unmounts or reparents one. */}
         {projectId && centerMode === "continuity" && !canvasMode && (
           <div className="board-overlay continuity-overlay">
-            <ContinuityView projectId={projectId} />
+            <ErrorBoundary name="continuity">
+              <ContinuityView projectId={projectId} />
+            </ErrorBoundary>
           </div>
         )}
 

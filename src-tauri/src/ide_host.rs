@@ -404,7 +404,10 @@ impl IdeHost {
             return None;
         }
         if std::fs::create_dir_all(lock_dir).is_err() {
-            eprintln!("conduit: ide lock dir {lock_dir:?} not writable; session runs without IDE");
+            crate::diag::warn(
+                "ide",
+                format!("ide lock dir {lock_dir:?} not writable; session runs without IDE"),
+            );
             return None;
         }
         let token = mint_token();
@@ -557,7 +560,7 @@ fn write_lock_file(path: &Path, _port: u16, workspace_dir: &str, token: &str) {
     // compiles away, which leaves the return as the function's last statement and fails
     // clippy's `needless_return` on the Windows leg only.
     if std::fs::write(path, body).is_err() {
-        eprintln!("conduit: could not write ide lock file {path:?}");
+        crate::diag::warn("ide", format!("could not write ide lock file {path:?}"));
     } else {
         #[cfg(unix)]
         {

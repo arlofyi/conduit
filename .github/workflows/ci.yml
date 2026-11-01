@@ -48,6 +48,80 @@ jobs:
       - name: Build
         run: pnpm build
 
+  # The phone app (mobile/) is its own npm project with its own lockfile, typecheck and
+  # jest suite; nothing above touches it. No Android build here: it costs a full Gradle
+  # + NDK run per push, and the pure logic it would exercise is what jest covers.
+  mobile:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Tests
+        run: npx jest
+
+  # The background watcher's rules ship as Kotlin (WatchRules.kt is a port of
+  # mobile/src/logic/watch.ts, NativeLogRules.kt of diagLog.ts), and their JUnit suites are
+  # what keeps the two sides in step. Those four files touch nothing Android -- only
+  # org.json, java.* and JUnit -- so they compile with plain kotlinc on a JVM: no Android
+  # SDK, no expo prebuild, no Gradle. Versions are pinned; the jars come from Maven Central.
+  kotlin-rules:
+    runs-on: ubuntu-latest
+    env:
+      KOTLIN_VERSION: 2.1.20
+      SRC: mobile/modules/bg-watch/android/src
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Download kotlinc and test jars
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kt"
+          cd "$RUNNER_TEMP/kt"
+          curl -fsSL -o kotlin.zip "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip"
+          unzip -q kotlin.zip
+          chmod +x kotlinc/bin/*
+          M=https://repo1.maven.org/maven2
+          curl -fsSLO "$M/junit/junit/4.13.2/junit-4.13.2.jar"
+          curl -fsSLO "$M/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar"
+          curl -fsSLO "$M/org/json/json/20240303/json-20240303.jar"
+
+      - name: Compile rules and tests
+        run: |
+          set -euo pipefail
+          K="$RUNNER_TEMP/kt"
+          P=expo/modules/bgwatch
+          "$K/kotlinc/bin/kotlinc" -include-runtime \
+            -cp "$K/junit-4.13.2.jar:$K/hamcrest-core-1.3.jar:$K/json-20240303.jar" \
+            -d "$K/rules.jar" \
+            "$SRC/main/java/$P/WatchRules.kt" "$SRC/main/java/$P/NativeLogRules.kt" \
+            "$SRC/test/java/$P/WatchRulesTest.kt" "$SRC/test/java/$P/NativeLogRulesTest.kt"
+
+      - name: Tests
+        run: |
+          K="$RUNNER_TEMP/kt"
+          java -cp "$K/rules.jar:$K/junit-4.13.2.jar:$K/hamcrest-core-1.3.jar:$K/json-20240303.jar" \
+            org.junit.runner.JUnitCore expo.modules.bgwatch.WatchRulesTest expo.modules.bgwatch.NativeLogRulesTest
+
   rust:
     # Both shipping platforms, because they compile DIFFERENT programs. Whole modules
     # are cfg-gated (`tmux`, `session_budget`) and the spawn, PTY, path, and

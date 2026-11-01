@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   appendItem,
   canSend,
+  chatOptionsLabel,
   greeting,
   isRenderable,
   relativeTime,
@@ -62,5 +63,16 @@ describe("relativeTime", () => {
     expect(relativeTime(at(120), now)).toBe("2m ago");
     expect(relativeTime(at(7200), now)).toBe("2h ago");
     expect(relativeTime(at(172800), now)).toBe("2d ago");
+  });
+});
+
+describe("chatOptionsLabel", () => {
+  it("is empty for a plain Claude chat and names only what differs", () => {
+    expect(chatOptionsLabel({})).toBe("");
+    expect(chatOptionsLabel({ agent: "claude" })).toBe("");
+    expect(chatOptionsLabel({ agent: "antigravity", model: "gemini-3.8-flash-low", research: true })).toBe(
+      "Antigravity · gemini-3.8-flash-low · deep research",
+    );
+    expect(chatOptionsLabel({ effort: "high" })).toBe("high effort");
   });
 });

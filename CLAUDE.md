@@ -467,8 +467,9 @@ themselves; prefs are Settings → Sessions (`SessionSettings.tsx`, stored as
   install runs no cleanup, so the last write must already be right. Stop paths and the
   stale sweep write `idle`.
 - **Idle auto-stop** (`useAutoStopIdle`) calls the normal `stopSession` (RETIRE). Never a
-  `running` agent, a Conductor, or a session pinned "keep running" (`keepRunning`,
-  localStorage). **A hook `done` means the TURN ended, not the agent**: one that started a
+  `running` agent, a Conductor, or a session pinned "keep running" (`Session.keep_running`
+  in the Rust store, so the phone and the sidebar agree; `store.ts` migrates the old
+  `keepRunning` localStorage pins once). **A hook `done` means the TURN ended, not the agent**: one that started a
   background command waits after `Stop`, and stopping it killed that work (it killed the
   agent that wrote this feature, mid CI-watch). So every candidate is checked first with
   `busy_sessions` (`agent_activity.rs`): a shell at depth >= 2 under the session root is a
@@ -635,11 +636,17 @@ plus install/remove/status), and one listener in `App.tsx`.
   most once a second, scanning only when the conversation id moved or none was found
   (`needs_resolve`/`should_switch_tail`), and re-sends `history` on a switch -- that is how a
   `/clear` and a just-spawned chat are followed. Don't move that back to the phone.
+  **The tail is a BYTE cursor** (`TailCursor`, `read_new_lines`): one stat per loop pass and
+  a read of only the appended bytes, holding a partial last line; a shorter file resets it.
+  It used to re-read the whole JSONL every 20 ms pass (54 MB transcripts exist), pinning a
+  core per attached phone. `history` frames keep the newest `HISTORY_CAP` (4000 = 2x the
+  phone's `FEED_CAP`, so the phone's "earlier messages" divider still appears), and a socket
+  skips a `projects` frame identical to the last one it sent (`frame_changed`).
 - **Phones can start sessions** (`spawn`, the "+" new chat). The agent is read STRICTLY
   (`AgentId::from_wire`; the lenient deserialize would start Claude under an invented id),
   the name comes from the first message's first line (<= 40 chars, else "Mobile"), and each
   phone gets 10 per hour (`take_spawn_slot`, keyed by device id, or peer IP on loopback).
-  The phone offers only Claude, the one agent whose chat it can show.
+  The phone offers Claude and Antigravity, the agents whose chat it can show.
 - **Questions and permissions are held for whoever can see a card** (`hooks::holder_for`,
   shared by `/ask` and `/permission`): the desktop gate, OR a connected REMOTE phone when
   the session is not private. Loopback (the Simulator) never counts as a phone -- only an
@@ -649,7 +656,9 @@ plus install/remove/status), and one listener in `App.tsx`.
   silence (`has_remote_phone` stops counting it at once). **Every bridge write is bounded
   (`WRITE_STALL`, 10 s)**: a frozen phone keeps its socket open at zero window, and an
   unbounded write blocked the loop before the staleness check -- measured, 70 s frozen and
-  the question still held. The phone also closes its socket itself when backgrounded.
+  the question still held. The app's own socket closes when it is backgrounded; on Android
+  the bg-watch service's socket (see "Where the phone's background notifications live")
+  then takes over and counts as a phone, so questions keep waiting for the phone.
   **Any send that fails with an I/O error ends the connection** (`send_text` /
   `send_failure_is_fatal`): never `let _ = ws.send(..)` and carry on -- on Windows a
   timed-out send leaves the socket indeterminate, and tungstenite would retry the
@@ -733,6 +742,176 @@ plus install/remove/status), and one listener in `App.tsx`.
   desktop's MAIN window runs its own `stopSession`/`removeSession`, so a phone action and a
   sidebar click end in the same state, and a broadcast never runs a delete twice. A phone
   delete keeps the worktree -- the desktop asks before removing one; a remote tap cannot.
+
+## Where the phone's files, Antigravity chats and general chat live
+
+Design: `docs/superpowers/specs/2026-10-31-phone-sessions-files-general-chat-design.md`.
+
+- **Files** (`phone_fs.rs`, `fs*` messages): session-scoped, so `session_scope` is the
+  privacy gate -- a new fs message must be added there (a test pins it). A phone path is
+  validated per segment and WALKED with `symlink_metadata`; never join it onto the root as a
+  string, and never follow a link. Secrets read only with `confirm` and are never written.
+  A save carries the stat the phone read; a mismatch is `conflict`, never an overwrite.
+  Hidden names (`.git`, `.conduit-uploads`, `.claude/worktrees` at any depth) are compared
+  case-INSENSITIVELY -- NTFS and APFS resolve `.GIT` to `.git` -- and on Windows a segment
+  with `~<digit>` (an 8.3 short name) is refused. `.claude/worktrees` is hidden because a
+  session with no worktree is rooted at the project root, which CONTAINS every other
+  session's worktree, private ones included; a worktree session's own root is its worktree.
+- **Antigravity chat** (`agy_transcript.rs`): each step is rewritten as a Claude JSONL line
+  and parsed by `transcript::parse_line`, so phone and desktop renderers need no agy case.
+  Never open agy's db plainly read-only when there is no `-wal`: that CREATES sidecar files
+  next to agy's (`immutable=1` then). The protobuf field numbers are internal to agy and
+  pinned in the findings doc; an agy update can move them.
+- **agy permission prompts** (`agy_prompts.rs`): agy fires no permission hook, but holds a
+  tool step at `steps.status = 9` while its menu is up. A watcher registers those in the SAME
+  `Broker` as Claude's `/permission` (gated by `hooks::card_holder`), so no surface needs an
+  agy case. Answers are KEYSTROKES, measured: Allow = `1`, Deny = Esc. Never send a digit for
+  "No" -- option counts differ per tool and a digit can land on "Yes, always". The step is
+  re-read before sending; a step that leaves 9 by itself was answered in the TUI (`by:
+  terminal`). **Only the OLDEST waiting step gets a card, and a waiter presses only while its
+  step is still the oldest** (`is_oldest_waiting`): the keys go to whichever menu is on
+  screen, so a card for a later step would answer an earlier command. A step is settled only
+  when a key was sent (or it timed out / was cancelled); a hand-back to the terminal with no
+  key leaves it eligible to be raised again (`outcome_for`). **Auto-approve** (`Session.auto_approve`, agy only) presses Allow itself, ONE
+  step per tick: parallel calls show their menus one after another, and a key sent before the
+  next menu draws lands in agy's input box as text. agy's own `--mode auto` still prompts
+  for every command (measured), which is why Conduit answers instead. Measuring agy from a Claude session needs the REAL `HOME`/`USERPROFILE`: a
+  redirected home shows agy's first-run onboarding (ToS with data sharing pre-ticked).
+- **The project list is pushed**: `Store::save_generation` moves on every persisted write
+  and the bridge re-sends `projects` (step 2d). Don't add a second builder for that frame.
+- **General chat = root chat.** `root_chat::send_turn` runs a turn for the desktop command
+  and the bridge alike; `RootChatState::subscribe` is how a socket follows turns.
+  `RootChat.scope` filters the charter roster and every root-MCP tool through
+  `store.projects_for_chat`. File reads are narrowed by DENY rules on out-of-scope project
+  paths -- an allow list cannot narrow Read/Glob/Grep (measured). `RootChat.phone` is sticky
+  and makes `chat_may_peek` refuse private sessions regardless of private mode.
+  **`RootChat.peeked_private` is the other half**: a desktop chat MAY peek a private session,
+  and once it has (`session_peek` on a silo/local-only session, reading a marked chat, or a
+  fork seeded from one) it is marked for good and a REMOTE peer never sees it -- not listed
+  in `rootchats`, refused for history/send/settings, its live events dropped. Loopback is
+  unchanged. Without it every desktop chat's transcript was a way round `session_is_private`.
+- **Every root chat, scoped or not, also carries `root_chat::private_read_denies`**:
+  private (`silo || local_only`) session worktrees, `<cfg>/{projects,file-history,todos}/**`
+  and `Read(<cfg>/history.jsonl)` for every Claude config root (ambient, `~/.claude`, each
+  account), and each agy home's `.gemini/antigravity-cli/conversations`. Without them Read/
+  Glob/Grep (allowed with no path limit) read private work straight from disk, bypassing both
+  `chat_may_peek` and `peeked_private`. It never denies a config root itself (skills live
+  there) or a path that contains an in-scope project. A private session with NO worktree runs
+  in the shared project root and cannot be denied without breaking the project.
+- **A chat's `--mcp-config` file is per TURN** (`rootchat-mcp-<chat>-<uuid>.json`) and is
+  deleted when the child exits, with the chat, and at startup: it carries the user's MCP
+  env/headers. stderr is drained on its own thread from spawn -- read after stdout's EOF, a
+  chatty child filled the pipe and the turn hung.
+- **The charter's `TOOL_POLICY` must match `build_command`'s allow list** (a test pins both).
+  `-p` refuses an unallowed call before it runs, and a model never told it had no shell kept
+  trying `Bash` with `$var`, PowerShell and `pwsh -File` (measured: every one a refusal). Do
+  not "fix" that by widening the allow list -- `fd -x`, `rg --pre`, `git -c` are exec vectors.
+- **Chat options** (`root_chat_options.rs`): `RootChat.agent/model/effort/research/mcps`.
+  User MCP servers are read from the chat profile's `.claude.json` (`claude_profile_paths`
+  mirrors the spawn redirect), merged into the ONE `--mcp-config` file (written 0600 where the
+  OS allows; Conduit's `conduit-root` entry always wins its name) and each added to
+  `--allowedTools` as `mcp__<name>` -- under `-p` an unallowed MCP tool is denied. The phone
+  only ever gets server NAMES, never definitions (env/headers carry secrets).
+- **Antigravity chats** (`root_chat_agy.rs`; findings in
+  `docs/superpowers/specs/2026-11-01-agy-print-mode-findings.md`). The prompt goes on STDIN as
+  one `--input-format stream-json` line, never the command line (`-p` takes the prompt as its
+  own value). The conversation id comes from the stream's `init` line. The charter is an
+  `AGENTS.md` in the chat's scratch dir (its cwd) -- agy has no system-prompt flag. Print mode
+  auto-denies unallowed tools without hanging, BUT the user's own `permissions.allow` still
+  applies, so `--settings` DENIES `command(*)`, `write_file(*)`, `execute_url(*)`, `mcp(*)` and
+  `read_file(<out-of-scope project>)`; `--add-dir` does not scope reads. Never emit an empty
+  `read_file()` rule: it denies the cwd.
+
+## Where the phone's background notifications live
+
+Android only: `mobile/modules/bg-watch` is a foreground service that keeps ONE authenticated
+socket (`Link.kt`, `auth` + `list` + `rootchats`) while the app is in the background, and posts
+system notifications. iOS has in-app banners only.
+
+- **`WatchRules.kt` is a line-for-line port of `mobile/src/logic/watch.ts`** (and the bits of
+  `banner.ts` it uses). jest (`watch.test.ts`) and JUnit (`WatchRulesTest.kt`) mirror each other
+  case for case; change one side, change both tests. The TS state machine runs only in tests --
+  the Kotlin is what ships -- which is why the JUnit suite exists.
+- **"Finished" settles.** A running -> done/idle flip only starts `FINISH_SETTLE_MS` (20 s); it
+  becomes a notification if the session stays quiet, and running/needs/failed/stopped or a held
+  item cancels it. A turn flips many times: the 3 s done-holdoff, an agy permission menu (agy's
+  `agent_state` reads as `idle`, not `needsInput`), a compaction, a background-task wake. Posting
+  on the first flip notified once per tool step. In-app banners use the same rule.
+- **Failed** comes from Claude's `StopFailure` hook (verb `stopfailure`): `fleet.rs` sets `done`
+  plus `failed` (a short sanitized kind, `rate_limit` etc.; a private session gets just "error")
+  and the next turn clears it. agy has no failure signal and a crashed agent process has none
+  either -- don't invent one.
+- **Stopped** and **computer unreachable** (10 min, shown only while a VPN is up, so turning
+  Tailscale off on purpose never triggers it) are off by default and post on `agent_status`.
+- **Channel importance is fixed at creation**, so changing it needs a NEW channel id (that is
+  why finished alerts are `agent_finished_alert`). Notifications group per computer with a
+  silent summary; lock-screen versions are content-free; private sessions use fixed wording.
+- **The watcher counts as a phone** (it is in `live`), so questions keep waiting for the phone
+  while it runs. Its ongoing notification's Stop pauses it (in memory) until a Notify switch changes, the user resumes it in Settings, or the app restarts.
+- **Opening a chat from a notification carries a per-process nonce** (`EXTRA_NONCE`): the
+  launcher activity is exported, and without it any app could open Conduit on a session of its
+  choosing with a spoofed header.
+
+## Where the phone's offline copy lives
+
+`mobile/src/logic/offlineCache.ts` (pure rules), `offlineStore.ts` (debounced writer, takes the
+file system as a parameter so jest runs it), `data/offlineFs.ts` (expo-file-system backend):
+`conduit-offline/<computer>/` (Android: the document dir, kept out of Google backup only because expo-secure-store's backup rules include just sharedprefs; iOS: the CACHE dir, because Documents goes to iCloud and expo-file-system cannot exclude it) holds the projects list, root chats and per-chat feeds as versioned
+JSON. Bounded (500 items and 1 MB per chat, 50 chats, 12 MB per computer, LRU), written at most
+every 2.5-15 s and on background/disconnect, never per frame. **The computer's `history` always
+replaces the saved copy**; saved data is shown only until live data arrives. Private sessions are
+never written (and are deleted when a session turns private or a refusal names it); forgetting or
+being revoked by a computer deletes its folder. Large inline images are stored as placeholders.
+`logic/catchUp.ts` diffs the saved list against the first fresh one after a gap of 3+ minutes for
+the "Since 2:05 PM: ..." line.
+
+## Where port mirroring lives
+
+A paired phone opens this computer's local web apps at the SAME `http://localhost:<port>`
+(`local_ports.rs` finds them, `port_tunnel.rs` moves the bytes, `bridge.rs` `tunnel`/`ports`;
+phone: `mobile/modules/port-mirror`, an Android foreground service). Same host and port is
+the point -- a frontend calling `localhost:8000`, Vite's host check and the secure-context
+rule all keep working, which browsing to the computer's tailnet name breaks.
+
+- **The scan IS the tunnel's allowlist.** A tunnel reaches only a port the scan found, on the
+  loopback address it was found on -- never a host or another address. Excluded: Conduit's
+  own pid and `CONDUIT_RESERVED`, Windows pid 0/4, the OS's ephemeral range (IPC servers
+  with their own tokens), `DEBUGGER_PORTS` and `CONTROL_PORTS` (Docker 2375/2376, Ollama
+  11434): while mirroring, ANY app or web page on the phone can reach a mirrored port, with
+  no token, and it arrives on this computer from loopback. Kept only if it answers a
+  `HEAD /` with an `HTTP/` status line, AND `classify()` passes: a `GET /json/version` reply
+  with `webSocketDebuggerUrl`/`Protocol-Version` (a debugger on any port) or Docker headers
+  on either reply drops it. A web port is cached per (port, pid) for the process's life;
+  "not a web port" is re-probed after 30 s (a dev server compiling its first page misses the
+  400 ms probe). Scans are single-flight, and `target_for` never trusts a scan older than
+  `SCAN_EVERY`. On Windows `tasklist` (~0.7 s) runs only for pids not seen before.
+- netstat rows are matched by foreign port `:0`, never by `LISTENING` (Windows localizes it).
+- **A tunnel is not a phone.** It never registers in `live` (it would hold questions for a
+  phone nobody is looking at); it registers in `tunnels`, which revoke, access-off and
+  mirroring-off stop. A remote CONTROL socket may not become a tunnel.
+- `mirrorOff` in `mobile-devices.json` is inverted on purpose: absent reads as "on".
+- The tunnel's read wait adapts (10 ms for 1 s after traffic, then 50, then 200 ms): a fixed
+  10 ms poll woke every idle browser keep-alive tunnel 100 times a second.
+- Design: `docs/superpowers/specs/2026-10-31-port-mirroring-design.md`.
+
+## Where diagnostics live
+
+Local only -- `diag.rs` shares nothing with the opt-out PostHog ping in `telemetry.rs`, and
+nothing it records leaves the machine. Rust logs through `diag::error/warn/info(source, msg)`
+(`warn_once(key, ..)` inside poll loops), never a bare `eprintln!` on an error path: lines go
+to `data_dir()/logs/conduit.log` (2 MB x 3 files, UTC timestamps) and to stderr. The file is
+opened only by `diag::init()`, which only `run()` calls, so tests never write the real data
+dir. `init` also chains a panic hook (thread, location, backtrace; `try_lock` so a panic under
+the log lock cannot deadlock) and an hourly stats line; the same line is written at
+`RunEvent::Exit` and in `prepare_for_update`, because the Windows updater exits with no Exit
+event. Counters (`diag::bump(Counter::..)`) are per-run, in memory. `redact` is a SECOND line
+of defence, not a licence: never pass a token, QR secret, nonce, prompt/chat text, MCP env or
+file contents (root chat logs the exit status, never the stderr tail). The frontend forwards
+through `src/reportError.ts` -> `log_frontend_error` (capped, 20/min, deduped for 5 s in TS).
+`ErrorBoundary` panels remount their children on "Reload panel", so a boundary must NEVER wrap
+`.term-stack` or `RightColumn` (keep-alive rule): only overlays and conditionally mounted views.
+UI: Settings -> About -> Diagnostics (`diagnostics` command; its `report` is pre-redacted).
+The phone keeps its own local log (see `mobile/README.md`); the two never exchange logs.
 
 ## Where the IDE integration lives
 

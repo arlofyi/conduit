@@ -114,6 +114,9 @@ describe("mapProjectsView", () => {
     updatedAt: 1700000000000,
     needs: { kind: "ask", text: "Ship it?" },
     lastMessage: { role: "assistant", text: "Done: tests pass.", at: "2026-10-29T20:11:42.123Z" },
+    effort: "high",
+    keepRunning: true,
+    usageKey: "claude:default",
   };
   const frame = {
     type: "projects",
@@ -128,6 +131,13 @@ describe("mapProjectsView", () => {
     expect(v.activeProfileId).toBe("w");
     expect(v.profiles).toEqual(frame.profiles);
     expect(v.projects[0]).toEqual({ ...frame.projects[0], sessions: [session] });
+  });
+
+  it("carries a failed turn's kind only when there is one", () => {
+    const failed = mapProjectsView({ ...frame, projects: [{ ...frame.projects[0], sessions: [{ ...session, failed: "rate_limit" }] }] });
+    expect(failed.projects[0].sessions[0].failed).toBe("rate_limit");
+    const fine = mapProjectsView({ ...frame, projects: [{ ...frame.projects[0], sessions: [{ ...session, failed: null }] }] });
+    expect(fine.projects[0].sessions[0]).not.toHaveProperty("failed");
   });
 
   it("never lets a silo session carry activity or question text", () => {
@@ -174,6 +184,10 @@ describe("mapProjectsView", () => {
         updatedAt: null,
         needs: null,
         lastMessage: null,
+        // an older desktop sends no session-control fields
+        effort: null,
+        keepRunning: false,
+        usageKey: null,
       },
     ]);
   });
@@ -195,6 +209,8 @@ describe("statusPatch", () => {
   });
   it("stop → done, notification → needsInput, sessionend → idle", () => {
     expect(statusPatch("stop", {})).toMatchObject({ status: "done" });
+    // StopFailure (an API error ended the turn) fires instead of Stop
+    expect(statusPatch("stopfailure", {})).toMatchObject({ status: "done", clearActivity: true });
     expect(statusPatch("notification", { message: "needs you" })).toMatchObject({ status: "needsInput" });
     expect(statusPatch("sessionend", {})).toMatchObject({ status: "idle" });
   });
