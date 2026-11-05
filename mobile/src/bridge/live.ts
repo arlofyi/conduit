@@ -9,6 +9,8 @@ import type {
   WireChatItem,
   WireLastMessage,
   WireNeeds,
+  WireAccount,
+  WireAccounts,
   WireProjectsView,
   WireStatus,
   WireViewSession,
@@ -188,7 +190,34 @@ function sessionOf(v: unknown): WireViewSession | null {
     usageKey: str(s.usageKey),
     // the last turn ended on an error (Claude's StopFailure); only present when it did
     ...(str(s.failed) ? { failed: str(s.failed) } : {}),
+    // accounts (2026-11-05); an older desktop omits them
+    ...(str(s.accountRef) ? { accountRef: str(s.accountRef) } : {}),
+    ...(str(s.accountLabel) ? { accountLabel: str(s.accountLabel) } : {}),
   };
+}
+
+function strMap(v: unknown): Record<string, string> {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, x] of Object.entries(v as Record<string, unknown>)) if (typeof x === "string") out[k] = x;
+  return out;
+}
+
+function defaultsOf(v: unknown): { defaultAccounts?: Record<string, string> } {
+  const m = strMap(v);
+  return Object.keys(m).length > 0 ? { defaultAccounts: m } : {};
+}
+
+function accountsOf(v: unknown): WireAccounts | undefined {
+  const a = v as { list?: unknown; defaultUsage?: unknown } | null;
+  if (!a || typeof a !== "object" || !Array.isArray(a.list)) return undefined;
+  const list = a.list.flatMap((x): WireAccount[] => {
+    const r = x as Record<string, unknown> | null;
+    if (!r || typeof r.ref !== "string" || typeof r.label !== "string") return [];
+    const agents = Array.isArray(r.agents) ? r.agents.filter((g): g is string => typeof g === "string") : [];
+    return [{ ref: r.ref, label: r.label, agents, usage: strMap(r.usage) }];
+  });
+  return { list, defaultUsage: strMap(a.defaultUsage) };
 }
 
 function lastMessageOf(v: unknown): WireLastMessage | null {
@@ -218,13 +247,14 @@ export function mapProjectsView(m: unknown): WireProjectsView {
         const sessions = Array.isArray(pr.sessions)
           ? pr.sessions.map(sessionOf).filter((s): s is WireViewSession => s !== null)
           : [];
-        return [{ id: pr.id, name: str(pr.name) ?? pr.id, profileId: str(pr.profileId), color: str(pr.color), sessions }];
+        return [{ id: pr.id, name: str(pr.name) ?? pr.id, profileId: str(pr.profileId), color: str(pr.color), sessions, ...defaultsOf(pr.defaultAccounts) }];
       })
     : [];
   return {
     profiles: profiles.length > 0 ? profiles : [{ id: null, name: "Default" }],
     activeProfileId: str(v.activeProfileId),
     projects,
+    ...(accountsOf(v.accounts) ? { accounts: accountsOf(v.accounts) } : {}),
   };
 }
 

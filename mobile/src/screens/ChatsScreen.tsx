@@ -1,7 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, BackHandler, FlatList, Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useLive } from "../bridge/LiveProvider";
+import { useIsFocused } from "@react-navigation/native";
+import { useLive, useUsagePolling } from "../bridge/LiveProvider";
+import { useIsSplit, useSplitCurrent } from "../components/SplitFrame";
+import { openChatPane } from "../navRef";
+import { availability } from "../logic/usage";
 import { AgentAvatar } from "../components/AgentAvatar";
 import { GlassCircle, Icon } from "../components/Glass";
 import { confirmText, prune, resultText, toggle, type SessionAction } from "../logic/selection";
@@ -39,7 +43,18 @@ const TEXT_INSET = GUTTER + AVATAR_OUTER + 12;
 export function ChatsScreen({ navigation }: ChatsProps) {
   const { palette: p } = useTheme();
   const insets = useSafeAreaInsets();
-  const { view, viewAt, viewSavedAt, refreshProjects, unread, conn, currentMac, pending, sessionAction, catchUp, dismissCatchUp } = useLive();
+  const { view, viewAt, viewSavedAt, refreshProjects, unread, conn, currentMac, pending, sessionAction, catchUp, dismissCatchUp, usage } = useLive();
+  const split = useIsSplit();
+  const current = useSplitCurrent();
+  // Rows whose account is out of usage say so: the meter at the top of a chat is too late.
+  useUsagePolling(useIsFocused());
+  const spentSessions = useMemo(() => {
+    const out = new Set<string>();
+    if (!view || !usage) return out;
+    const spentKeys = new Set(usage.rows.filter((r) => availability(r).state === "blocked").map((r) => r.key));
+    for (const pr of view.projects) for (const s of pr.sessions) if (s.usageKey && spentKeys.has(s.usageKey)) out.add(s.id);
+    return out;
+  }, [view, usage]);
   // Pushed questions/permissions lead their rows at once, ahead of the 10 s poll.
   const openPending = useMemo(() => openBySession(pending), [pending]);
   const { profileSel, filter, setFilter } = useListSelection();
@@ -113,9 +128,9 @@ export function ChatsScreen({ navigation }: ChatsProps) {
         select(row);
         return;
       }
-      navigation.navigate("Chat", { sessionId: row.id, projectId: row.projectId, name: row.title, branch: row.branch });
+      openChatPane({ sessionId: row.id, projectId: row.projectId, name: row.title, branch: row.branch }, split);
     },
-    [navigation, selecting, select],
+    [split, selecting, select],
   );
 
   const [acting, setActing] = useState(false);
@@ -204,7 +219,7 @@ export function ChatsScreen({ navigation }: ChatsProps) {
           text={offline.text}
           tone={offline.tone}
           inset={GUTTER + 2}
-          onPress={() => navigation.navigate("Settings")}
+          onPress={() => navigation.navigate("Tabs", { screen: "Settings" })}
           onRetry={offline.onRetry}
         />
       )}
@@ -229,9 +244,17 @@ export function ChatsScreen({ navigation }: ChatsProps) {
         data={rows}
         keyExtractor={(r) => r.id}
         renderItem={({ item }) => (
-          <ChatRow row={item} onOpen={open} onLongPress={select} selecting={selecting} selected={selected.has(item.id)} />
+          <ChatRow
+            row={item}
+            onOpen={open}
+            onLongPress={select}
+            selecting={selecting}
+            selected={selected.has(item.id)}
+            current={current?.sessionId === item.id}
+            spent={spentSessions.has(item.id)}
+          />
         )}
-        extraData={selected}
+        extraData={[selected, current, spentSessions]}
         ItemSeparatorComponent={Separator}
         contentInsetAdjustmentBehavior="automatic"
         onScroll={(e) => setScrolled(e.nativeEvent.contentOffset.y > 2)}
@@ -353,6 +376,8 @@ const ChatRow = React.memo(
     a.onLongPress === b.onLongPress &&
     a.selecting === b.selecting &&
     a.selected === b.selected &&
+    a.current === b.current &&
+    a.spent === b.spent &&
     sameRow(a.row, b.row),
 );
 
@@ -362,12 +387,18 @@ function ChatRowView({
   onLongPress,
   selecting,
   selected,
+  current = false,
+  spent = false,
 }: {
   row: Row;
   onOpen: (row: Row) => void;
   onLongPress: (row: Row) => void;
   selecting: boolean;
   selected: boolean;
+  /** the split view's detail pane shows this session */
+  current?: boolean;
+  /** its account is out of usage: messages won't run */
+  spent?: boolean;
 }) {
   const { palette: p } = useTheme();
   const pv = row.preview;
@@ -381,9 +412,9 @@ function ChatRowView({
       delayLongPress={350}
       disabled={!row.openable}
       accessibilityRole={selecting ? "checkbox" : "button"}
-      accessibilityState={{ disabled: !row.openable, ...(selecting ? { checked: selected } : {}) }}
+      accessibilityState={{ disabled: !row.openable, selected: current, ...(selecting ? { checked: selected } : {}) }}
       accessibilityHint={selecting ? undefined : "Long press to select"}
-      accessibilityLabel={`${row.title}, ${row.projectName}, ${state}${row.time ? `, ${row.time}` : ""}${unread ? `, ${row.unread} unread` : ""}. ${pv.prefix ?? ""} ${pv.text}${row.openable ? "" : ". Private session, open it on your computer"}`}
+      accessibilityLabel={`${row.title}, ${row.projectName}, ${state}${row.time ? `, ${row.time}` : ""}${unread ? `, ${row.unread} unread` : ""}. ${pv.prefix ?? ""} ${pv.text}${row.openable ? "" : ". Private session, open it on your computer"}${spent ? ". Its account is out of usage" : ""}`}
       style={({ pressed }) => ({
         flexDirection: "row",
         alignItems: "center",
@@ -391,7 +422,10 @@ function ChatRowView({
         paddingLeft: GUTTER,
         paddingRight: GUTTER + 2,
         paddingVertical: 9,
-        backgroundColor: selected || pressed ? p.selectionBg : "transparent",
+        backgroundColor: selected || pressed || current ? p.selectionBg : "transparent",
+        // The split view marks the open session with an accent edge, like a sidebar.
+        borderLeftWidth: current ? 3 : 0,
+        borderLeftColor: p.accent,
         opacity: row.openable ? 1 : 0.55,
       })}
     >
@@ -423,6 +457,13 @@ function ChatRowView({
           <Text style={{ flex: 1, fontSize: TYPE.body, fontWeight: "600", color: p.textBright }} numberOfLines={1}>
             {row.title}
           </Text>
+          {spent ? (
+            <View style={{ paddingHorizontal: 6, paddingVertical: 1, borderRadius: 6, backgroundColor: mix(p.red, p.panelBg, 0.18) }}>
+              <Text maxFontSizeMultiplier={1.3} style={{ fontSize: TYPE.caption, fontWeight: "600", color: p.red }}>
+                Out of usage
+              </Text>
+            </View>
+          ) : null}
           {row.time !== "" && (
             <Text
               style={{

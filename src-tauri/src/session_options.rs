@@ -622,16 +622,27 @@ pub fn set_result(request_id: &str, ok: bool, note: &str) -> Value {
 /// Apply a `sessionset`. Each named field is applied in turn; `ok` is false if any was
 /// refused, and `note` says what happened in short user-facing copy.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_set(
-    app: &AppHandle,
-    session_id: &str,
-    request_id: &str,
-    model: Option<String>,
-    effort: Option<String>,
-    name: Option<String>,
-    keep_running: Option<bool>,
-    auto_approve: Option<bool>,
-) -> Value {
+/// What a `sessionSet` asks to change; every field is optional.
+#[derive(Default)]
+pub struct SetFields {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub name: Option<String>,
+    pub keep_running: Option<bool>,
+    pub auto_approve: Option<bool>,
+    /// `phone_accounts::account_ref`, or `""` for the default chain.
+    pub account: Option<String>,
+}
+
+pub fn apply_set(app: &AppHandle, session_id: &str, request_id: &str, fields: SetFields) -> Value {
+    let SetFields {
+        model,
+        effort,
+        name,
+        keep_running,
+        auto_approve,
+        account,
+    } = fields;
     let store = app.state::<Arc<Store>>();
     let pty = app.state::<Arc<crate::pty::PtyManager>>();
     let Some((project_id, s)) = find_session(&store, session_id) else {
@@ -735,6 +746,46 @@ pub fn apply_set(
         } else {
             ok = false;
             notes.push("Auto-approve isn't available for this agent yet.".into());
+        }
+    }
+
+    if let Some(r) = account {
+        let accounts = store.list_accounts();
+        match crate::phone_accounts::choose(&accounts, s.agent, &r) {
+            Err(why) => {
+                ok = false;
+                notes.push(why.into());
+            }
+            Ok(choice) => {
+                let (id, label) = match choice {
+                    crate::phone_accounts::AccountChoice::Default => {
+                        (None, "the default account".to_string())
+                    }
+                    crate::phone_accounts::AccountChoice::Account(a) => {
+                        (Some(a.id.clone()), a.label.clone())
+                    }
+                };
+                if id == s.account_id {
+                    notes.push(format!("Already on {label}."));
+                } else {
+                    let carried =
+                        crate::phone_accounts::move_session_account(&store, session_id, id);
+                    notes.push(format!("Moved to {label}."));
+                    if carried {
+                        notes.push("The conversation comes with it.".into());
+                    }
+                    if live && idle() {
+                        want_restart = true;
+                    } else if live {
+                        notes.push(
+                            "It is mid-turn, so the switch applies when the session next starts."
+                                .into(),
+                        );
+                    } else {
+                        notes.push("It starts on that account next time.".into());
+                    }
+                }
+            }
         }
     }
 

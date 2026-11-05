@@ -5,6 +5,8 @@
  * when the computer offers one. Everything else is set from inside the chat.
  */
 import { useFocusEffect } from "@react-navigation/native";
+import { useIsSplit, useSplitCurrent } from "../components/SplitFrame";
+import { openGeneralPane } from "../navRef";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { FlatList, Platform, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -47,7 +49,9 @@ export function GeneralScreen({ navigation }: GeneralProps) {
   }, [ready, optionsLive, loadRootChatOptions]);
 
   // "+": one agent (or an older desktop) starts the chat right here; a choice opens the chooser.
-  const onStarted = useCallback((chat: RootChat) => navigation.navigate("GeneralChat", { chatId: chat.id, title: chat.title }), [navigation]);
+  const split = useIsSplit();
+  const current = useSplitCurrent();
+  const onStarted = useCallback((chat: RootChat) => openGeneralPane({ chatId: chat.id, title: chat.title }, split), [split]);
   const { start, starting, error: startError } = useStartChat(onStarted);
   const newChat = () => {
     if (rootChatOptions && !needsAgentChoice(rootChatOptions)) void start(startAgents(rootChatOptions)[0].id);
@@ -96,7 +100,7 @@ export function GeneralScreen({ navigation }: GeneralProps) {
         </View>
         <GlassCircle symbol="plus" primary label={starting ? "Starting a chat" : "New chat"} disabled={!ready || starting} onPress={newChat} />
       </View>
-      {offline ? <OfflineStrip text={offline.text} tone={offline.tone} onRetry={offline.onRetry} onPress={() => navigation.navigate("Settings")} /> : null}
+      {offline ? <OfflineStrip text={offline.text} tone={offline.tone} onRetry={offline.onRetry} onPress={() => navigation.navigate("Tabs", { screen: "Settings" })} /> : null}
       {startError ? (
         <Text accessibilityLiveRegion="polite" style={{ marginHorizontal: 16, marginBottom: 8, fontSize: TYPE.footnote, color: p.red }}>
           {startError}
@@ -112,7 +116,8 @@ export function GeneralScreen({ navigation }: GeneralProps) {
             // a non-Claude chat says which agent answers it
             scope={item.agent && item.agent !== "claude" ? `${scopeSummary(item.scope, view)} · ${agentLabel(rootChatOptions, item.agent)}` : scopeSummary(item.scope, view)}
             time={relativeTime(item.createdAt * 1000, now)}
-            onOpen={() => navigation.navigate("GeneralChat", { chatId: item.id, title: item.title })}
+            current={current?.chatId === item.id}
+            onOpen={() => openGeneralPane({ chatId: item.id, title: item.title }, split)}
           />
         )}
         contentInsetAdjustmentBehavior="automatic"
@@ -139,13 +144,14 @@ export function GeneralScreen({ navigation }: GeneralProps) {
   );
 }
 
-function ChatRow({ chat, first, scope, time, onOpen }: { chat: RootChat; first: boolean; scope: string; time: string; onOpen: () => void }) {
+function ChatRow({ chat, first, scope, time, onOpen, current = false }: { chat: RootChat; first: boolean; scope: string; time: string; onOpen: () => void; current?: boolean }) {
   const { palette: p } = useTheme();
   return (
     <Pressable
       onPress={onOpen}
       accessibilityRole="button"
       accessibilityLabel={`${chat.title}, ${scope}${chat.running ? ", working" : ""}`}
+      accessibilityState={{ selected: current }}
       style={({ pressed }) => ({
         flexDirection: "row",
         alignItems: "center",
@@ -153,7 +159,9 @@ function ChatRow({ chat, first, scope, time, onOpen }: { chat: RootChat; first: 
         minHeight: MIN_TOUCH + 20,
         paddingHorizontal: 16,
         paddingVertical: 10,
-        backgroundColor: pressed ? p.selectionBg : "transparent",
+        backgroundColor: pressed || current ? p.selectionBg : "transparent",
+        borderLeftWidth: current ? 3 : 0,
+        borderLeftColor: p.accent,
         borderTopWidth: first ? 0 : StyleSheet.hairlineWidth,
         borderTopColor: p.border,
       })}

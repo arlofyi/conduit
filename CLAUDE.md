@@ -624,6 +624,19 @@ plus install/remove/status), and one listener in `App.tsx`.
 - **What leaves the Mac is a whitelist.** The `projects` frame is built by `bridge_view.rs`
   (`projects_view`) field by field, never by serializing `Project`/`Session` (those carry
   `seedMemory`, account ids, paths). Add a field there deliberately, and to the key-list test.
+- **Accounts reach the phone as opaque refs, never ids** (`phone_accounts.rs`). The `projects`
+  frame carries `accounts` (ref = one-way hash, label, agents, per-agent usage key), each
+  session's `accountRef` (its own pin) + `accountLabel` (what it runs on), and each project's
+  `defaultAccounts`; `spawn` and `sessionset` take `account` (a ref, `""` = default) and an
+  unknown ref is refused, never guessed. **Moving a Claude session between accounts copies its
+  conversation's transcript** into the new account's `projects` dir first
+  (`move_session_account`, also behind the desktop's `set_session_account`, hence `async`):
+  without it the restart finds nothing to `--resume` and starts over. It never overwrites.
+- **Phone releases are `mobile-b<build>` tags, never `v*`, and never `--latest`**
+  (`.github/workflows/mobile-release.yml`): `v*` drives the desktop release, and the desktop
+  updater reads `releases/latest`. They are signed with the private key from the `MOBILE_*`
+  secrets (`mobile/plugins/withReleaseSigning.js`); the template's debug key is public, and
+  in-app updates install whatever APK the release carries, so a debug-signed release is refused.
 - **Private sessions are refused, not just hidden.** `bridge_view::session_is_private`
   (`silo || local_only`) gates every session-scoped message (`session_scope`: attach, input,
   resize, git, kill, interrupt) from ANY peer, loopback included, with `{error: "private

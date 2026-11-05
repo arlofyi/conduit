@@ -118,6 +118,11 @@ export interface WireViewSession {
   /** the last turn ended on an error: its kind ("rate_limit", ...; "error" for a private
    * session); null when the last turn did not fail */
   failed?: string | null;
+  // ---- accounts (2026-11-05); absent from older desktops ----
+  /** the session's own account pin (an opaque ref); null = following the default */
+  accountRef?: string | null;
+  /** the label of the account it runs on; null = the computer's own login */
+  accountLabel?: string | null;
 }
 
 export interface WireViewProject {
@@ -127,6 +132,24 @@ export interface WireViewProject {
   /** user-chosen colour only; the phone derives the accent otherwise */
   color: string | null;
   sessions: WireViewSession[];
+  /** agent -> ref of the account a new session starts on by default (absent: none set) */
+  defaultAccounts?: Record<string, string>;
+}
+
+/** One agent account (never its id or config path: `ref` is an opaque handle). */
+export interface WireAccount {
+  ref: string;
+  label: string;
+  /** the agents it is signed in for */
+  agents: string[];
+  /** agent -> the `usage` row key a session of that agent on this account draws from */
+  usage: Record<string, string>;
+}
+
+export interface WireAccounts {
+  list: WireAccount[];
+  /** agent -> usage row key of the computer's own login ("Default" with no account set) */
+  defaultUsage: Record<string, string>;
 }
 
 export interface WireProfile {
@@ -138,6 +161,8 @@ export interface WireProjectsView {
   profiles: WireProfile[];
   activeProfileId: string | null;
   projects: WireViewProject[];
+  /** absent from older desktops (no account picking there) */
+  accounts?: WireAccounts;
 }
 
 export interface WireMac {
@@ -368,7 +393,7 @@ export type ClientMsg =
   | { type: "resize"; session_id: string; cols: number; rows: number }
   | { type: "git"; session_id: string; action: "changes" | "diff"; path?: string }
   | { type: "kill"; session_id: string }
-  | { type: "spawn"; project_id: string; prompt: string; agent?: string; worktree?: boolean; name?: string }
+  | { type: "spawn"; project_id: string; prompt: string; agent?: string; worktree?: boolean; name?: string; account?: string }
   | { type: "interrupt"; sessionId: string }
   | { type: "answer"; askId: string; answers: Record<string, string> }
   | { type: "approve"; id: string; allow: boolean }
@@ -503,12 +528,14 @@ export const rootChatStopMsg = (chatId: string): ClientMsg => ({ type: "rootchat
 export const rootChatScopeMsg = (chatId: string, scope: WireScope | null): ClientMsg => ({ type: "rootchatscope", chatId, scope });
 /** Start a new session in a project; the Mac answers `spawned` or `error`. An empty `prompt`
  * starts the agent idle; a blank `name` lets the Mac derive one from the prompt. */
-export const spawnMsg = (projectId: string, prompt: string, agent: string, name = ""): ClientMsg => ({
+export const spawnMsg = (projectId: string, prompt: string, agent: string, name = "", account = ""): ClientMsg => ({
   type: "spawn",
   project_id: projectId,
   prompt,
   agent,
   ...(name.trim() ? { name: name.trim() } : {}),
+  // blank = the project/global default, which an older desktop also does without the key
+  ...(account ? { account } : {}),
 });
 
 /** A chat message as PTY input: bracketed paste around the text, then a bare `\r`.
@@ -600,6 +627,8 @@ export interface SessionSetPatch {
   keepRunning?: boolean;
   /** Round 4: Conduit allows every request of this session itself */
   autoApprove?: boolean;
+  /** move the session to an account (`WireAccount.ref`; "" = back to the default) */
+  account?: string;
 }
 
 export interface WireSessionSetResult {
@@ -651,6 +680,7 @@ export const sessionSetMsg = (sessionId: string, requestId: string, patch: Sessi
   ...(patch.name !== undefined ? { name: patch.name } : {}),
   ...(patch.keepRunning !== undefined ? { keepRunning: patch.keepRunning } : {}),
   ...(patch.autoApprove !== undefined ? { autoApprove: patch.autoApprove } : {}),
+  ...(patch.account !== undefined ? { account: patch.account } : {}),
 });
 /** Ask for every agent account's cached usage; answered by `usage`. */
 export const usageMsg = (requestId: string): ClientMsg => ({ type: "usage", requestId });

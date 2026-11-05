@@ -24,7 +24,9 @@ The app is the phone half of Conduit's mobile bridge (`src-tauri/src/bridge.rs`)
 
 - **Sessions**: every session, grouped by project and filtered by profile, with anything
   waiting on you pinned on top. Long-press to select several, then Stop or Delete. "+"
-  starts a new Claude or Antigravity session. Opening one attaches to it: the transcript
+  starts a new Claude or Antigravity session, on the agent account you pick (an account whose
+  usage is spent is marked, and a spent default is passed over for one that can work). A
+  session's sheet moves it to another account; a Claude conversation comes with it. Opening one attaches to it: the transcript
   renders as a chat, new turns stream in, the composer types into the real terminal, and
   attachments (photos, camera, files) upload into the session's folder.
 - **Chats**: the computer's general (root) chat. Ask across your projects without a coding
@@ -153,6 +155,50 @@ The bridge is plain `ws://` inside the Tailscale tunnel, so release builds set
 On Windows, the computer's firewall must let the phone in: allow Conduit inbound on TCP
 8455-8474 from `100.64.0.0/10` on the Private profile (Tailscale's network is Private).
 
+## Releases and in-app updates (Android)
+
+Every change under `mobile/` that lands on `main` is built by
+`.github/workflows/mobile-release.yml` into a signed APK and published as a GitHub release
+tagged `mobile-b<build>` (also runnable by hand: Actions -> Mobile release -> Run workflow).
+The phone checks for one when it opens (at most every 6 hours; Settings -> App -> "Check
+automatically") and shows a badge on Settings. **Update** downloads the APK and opens Android's
+installer: no USB debugging, no adb. The first time, Android asks you to allow installs from
+Conduit.
+
+- `<build>` is the APK's versionCode (the last phone tag + 1, starting at 100) and is what the
+  app compares. The version name is `app.json`'s `version` plus the build (`1.1.0.104`); bump
+  `version` for a release with new features. Local builds keep versionCode 1, so any published
+  build counts as newer.
+- Phone tags never start with `v` (those are the desktop's) and are published with
+  `--latest=false`, because the desktop updater reads `releases/latest`.
+- **Signing.** Android installs an update only over an app signed with the same key. Release
+  builds are signed with Conduit's own key (`plugins/withReleaseSigning.js` reads
+  `CONDUIT_KEYSTORE`, `CONDUIT_KEYSTORE_PASSWORD`, `CONDUIT_KEY_ALIAS` and
+  `CONDUIT_KEY_PASSWORD` at build time), never the template's public debug key. The workflow
+  refuses to publish without the four repository secrets `MOBILE_KEYSTORE_BASE64`,
+  `MOBILE_KEYSTORE_PASSWORD`, `MOBILE_KEY_ALIAS` and `MOBILE_KEY_PASSWORD`, and fails if the APK
+  turns out debug-signed. Create the key once, outside the repository:
+  ```powershell
+  & ./mobile/scripts/New-ReleaseKey.ps1 -OutFile "$HOME/conduit-keys/conduit-release.jks" -SetSecrets
+  ```
+  Keep the `.jks` and its password (left on your clipboard, never printed) in a password manager.
+  Losing the key means every phone must uninstall Conduit once (and pair again) to take builds
+  signed with a new one. The same applies once, when moving from a hand-installed debug-signed
+  build to the first released one.
+- A local build signed with the release key installs over a released one:
+  `CONDUIT_KEYSTORE=... CONDUIT_KEYSTORE_PASSWORD=... CONDUIT_KEY_ALIAS=... CONDUIT_KEY_PASSWORD=...
+  ./gradlew assembleRelease`.
+
+## Tablets, landscape and split screen
+
+The app rotates and follows the WINDOW, not the device: a tablet, a phone in landscape and an
+Android split-screen or freeform window all resize it live. From 720 dp wide (`logic/split.ts`)
+the session list (or the general chats list) stays beside whatever is open (a chat, a general
+chat, a session's files) and the open row is marked. Drag the divider to resize the list, or tap
+it to reset. Settings -> Appearance -> "Side-by-side on wide screens" turns it off. A wide chat
+pane keeps a readable centred column. One chat is attached at a time, so the right pane shows one
+conversation; picking another row swaps it (`navRef.ts openPane`).
+
 ## First-time pairing (a real phone)
 
 1. Install Tailscale on the phone and sign in to the same tailnet as the computer.
@@ -206,9 +252,12 @@ src/screens/                 Connect, Pair, Chats (sessions), Chat, Sheets, File
 src/theme/                   Warm palettes, type scale, tab-bar clearance
 modules/bg-watch/            Android foreground service: background notifications (Kotlin)
 modules/port-mirror/         Android foreground service: localhost port mirroring (Kotlin)
+modules/app-update/          Android: installed version + hand-off to the system installer (Kotlin)
+plugins/withReleaseSigning.js  config plugin: release builds signed with Conduit's own key
+app.config.js                app.json + the release build number (CONDUIT_MOBILE_BUILD)
 ```
 
-The two `modules/` are local Expo native modules, linked by `expo prebuild`. They are
+The three `modules/` are local Expo native modules, linked by `expo prebuild`. They are
 Android-only; on iOS `requireOptionalNativeModule` returns null and the app hides or explains
 the feature.
 

@@ -5,6 +5,30 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Pick the agent account from the phone.** Starting a session on the phone now has an
+  Account choice (shown when the agent has accounts registered on the computer), each marked
+  with whether it can work right now. When the default account is out of usage, a usable one is
+  picked instead and the sheet says why.
+- **Added — Move a session to another account, from the phone or the computer.** The session
+  sheet's Account row moves it; an idle session restarts on the new account at once, a busy one
+  at its next start. A Claude conversation comes with it: its transcript is copied to the new
+  account, so the session resumes where it was instead of starting over.
+- **Added — Tablets, landscape and split screen on the phone app.** The app rotates and follows
+  its window (tablet, landscape, Android split-screen). On a wide window the session list stays
+  beside the open chat, files or general chat, with the open row marked; drag the divider to
+  resize it. Long chats keep a readable column on wide screens. Settings -> Appearance turns the
+  side-by-side view off.
+- **Added — Phone app updates without USB.** Every phone app change merged to main is built into
+  a signed APK on a GitHub release (`mobile-b<build>`, never marked latest, so the desktop
+  updater is unaffected). The app checks for a newer build when it opens and offers Update in
+  Settings -> App, which downloads it and opens Android's installer.
+- **Fixed — The phone's usage meter could read "0%" on an account that could not work.** The
+  chat header now shows whichever window is most spent, not always the 5-hour one, so an account
+  at 0% of its 5 hours and 100% of its week reads 100%. Settings names the state in words
+  ("Weekly limit reached · back Fri 3 PM"), the session list marks sessions whose account is out
+  of usage, and a chat on a spent account says so above the composer with a Switch account
+  button.
+
 ## 0.50.0 — 2026-11-01
 
 - **Added — Session controls on the phone.** One sheet (the tune button in a chat's header)

@@ -21,6 +21,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Switch, Text, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLive } from "../bridge/LiveProvider";
+import { useIsSplit } from "../components/SplitFrame";
+import { openGeneralPane } from "../navRef";
 import { AgentMarkGlyph } from "../components/AgentAvatar";
 import { GlassCircle, Icon } from "../components/Glass";
 import { useListSelection } from "../data/ListSelection";
@@ -128,9 +130,13 @@ export function GeneralNewScreen({ navigation }: GeneralNewProps) {
   const { palette: p } = useTheme();
   const { rootChatOptions, loadRootChatOptions } = useLive();
   const lastAgent = useLastAgent();
+  const split = useIsSplit();
   const onStarted = useCallback(
-    (chat: RootChat) => navigation.dispatch(StackActions.replace("GeneralChat", { chatId: chat.id, title: chat.title })),
-    [navigation],
+    (chat: RootChat) =>
+      split
+        ? openGeneralPane({ chatId: chat.id, title: chat.title }, true)
+        : navigation.dispatch(StackActions.replace("GeneralChat", { chatId: chat.id, title: chat.title })),
+    [navigation, split],
   );
   const { start, starting, error, ready } = useStartChat(onStarted);
 

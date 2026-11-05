@@ -3,8 +3,6 @@ import {
   DarkTheme,
   DefaultTheme,
   NavigationContainer,
-  StackActions,
-  createNavigationContainerRef,
   type Theme,
 } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
@@ -21,19 +19,17 @@ import { ReduceMotionProvider } from "./src/components/ReduceMotion";
 import type { Banner as BannerData } from "./src/logic/banner";
 import { PrefsProvider, usePrefs } from "./src/data/PrefsProvider";
 import type { RootStackParamList, TabParamList } from "./src/navigation";
-import { ChatScreen } from "./src/screens/ChatScreen";
 import { ConnectScreen } from "./src/screens/ConnectScreen";
+import { AppUpdateProvider, useAppUpdate } from "./src/data/AppUpdateProvider";
+import { ChatPane, FilesPane, FileViewPane, GeneralChatPane, GeneralTab, SessionsTab } from "./src/screens/Panes";
+import { useIsSplit } from "./src/components/SplitFrame";
+import { navigationRef, openChatPane, openGeneralPane } from "./src/navRef";
 import { PairScreen } from "./src/screens/PairScreen";
-import { ChatsScreen } from "./src/screens/ChatsScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
 import { AppsScreen } from "./src/screens/AppsScreen";
 import { PortMirrorProvider, usePortMirror } from "./src/data/PortMirrorProvider";
 import { BgWatchProvider, useBgWatch } from "./src/data/BgWatchProvider";
 import { NewChatScreen } from "./src/screens/NewChatScreen";
-import { FilesScreen } from "./src/screens/FilesScreen";
-import { FileViewScreen } from "./src/screens/FileViewScreen";
-import { GeneralScreen } from "./src/screens/GeneralScreen";
-import { GeneralChatScreen } from "./src/screens/GeneralChatScreen";
 import { CHAT_TARGET_PREFIX } from "./src/logic/watch";
 import { GeneralNewScreen, GeneralSettingsScreen } from "./src/screens/GeneralOptions";
 import { GeneralScopeScreen } from "./src/screens/GeneralScopeScreen";
@@ -72,19 +68,10 @@ LogBox.ignoreLogs(["Sending `onAnimatedValueUpdate` with no listeners registered
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 const Tab = createNativeBottomTabNavigator<TabParamList>();
-const navigationRef = createNavigationContainerRef<RootStackParamList>();
-
-/** A banner tap opens its chat. Over another chat it REPLACES it (one chat streams at a time,
- * and a stack of chats would leave the one below detached); elsewhere it pushes as usual. */
-function openFromBanner(b: BannerData) {
-  openChat({ sessionId: b.sessionId, projectId: b.projectId, name: b.name, branch: b.branch });
-}
-
-/** Shared by the in-app banner and a tapped system notification (BgWatchProvider). */
-function openChat(params: RootStackParamList["Chat"]) {
-  if (!navigationRef.isReady()) return;
-  if (navigationRef.getCurrentRoute()?.name === "Chat") navigationRef.dispatch(StackActions.replace("Chat", params));
-  else navigationRef.navigate("Chat", params);
+/** A banner tap opens its chat (`openChatPane`: over another chat it REPLACES it, since one chat
+ * streams at a time; in the split view it swaps the right pane). */
+function openFromBanner(b: BannerData, split: boolean) {
+  openChatPane({ sessionId: b.sessionId, projectId: b.projectId, name: b.name, branch: b.branch }, split);
 }
 
 /**
@@ -106,6 +93,8 @@ function Tabs() {
   const settingsIcon = useTabIcon("gearshape");
   // iOS has no port mirror yet, and a tab that can only say "not available" is noise.
   const { available: mirrorAvailable } = usePortMirror();
+  // A newer phone app on GitHub: a dot on Settings, where the Update button is.
+  const { release } = useAppUpdate();
   return (
     <Tab.Navigator
       screenOptions={{
@@ -118,7 +107,7 @@ function Tabs() {
     >
       <Tab.Screen
         name="Chats"
-        component={ChatsScreen}
+        component={SessionsTab}
         options={{
           // route names stay Chats/General; what the reader sees is Sessions/Chats
           title: "Sessions",
@@ -126,9 +115,9 @@ function Tabs() {
           tabBarBadge: needs > 0 ? needs : undefined,
         }}
       />
-      <Tab.Screen name="General" component={GeneralScreen} options={{ title: "Chats", tabBarIcon: generalIcon }} />
+      <Tab.Screen name="General" component={GeneralTab} options={{ title: "Chats", tabBarIcon: generalIcon }} />
       {mirrorAvailable && <Tab.Screen name="Apps" component={AppsScreen} options={{ tabBarIcon: appsIcon }} />}
-      <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: settingsIcon }} />
+      <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: settingsIcon, tabBarBadge: release ? "1" : undefined }} />
     </Tab.Navigator>
   );
 }
@@ -158,6 +147,10 @@ function Inner() {
   const { loaded, currentMac } = useLive();
   const base = palette.appearance === "dark" ? DarkTheme : DefaultTheme;
   const sheet = useMemo(() => sheetOptions(palette.sidebarBg), [palette.sidebarBg]);
+  // Split view (tablet / wide window): the list stays put beside the detail pane, so a detail
+  // screen fades in rather than sliding the whole window -- including the list -- over.
+  const split = useIsSplit();
+  const pane = useMemo(() => (split ? { animation: "fade" as const } : {}), [split]);
   // A tapped system notification (Android, screen off) opens its chat once navigation is up.
   const { openTarget, consumeOpenTarget } = useBgWatch();
   const [navReady, setNavReady] = useState(false);
@@ -166,12 +159,11 @@ function Inner() {
     consumeOpenTarget();
     // A finished general chat's notification names `chat:<id>`, not a session.
     if (openTarget.sessionId.startsWith(CHAT_TARGET_PREFIX)) {
-      if (navigationRef.isReady())
-        navigationRef.navigate("GeneralChat", { chatId: openTarget.sessionId.slice(CHAT_TARGET_PREFIX.length), title: openTarget.name });
+      openGeneralPane({ chatId: openTarget.sessionId.slice(CHAT_TARGET_PREFIX.length), title: openTarget.name }, split);
       return;
     }
-    openChat(openTarget);
-  }, [openTarget, currentMac, navReady, consumeOpenTarget]);
+    openChatPane(openTarget, split);
+  }, [openTarget, currentMac, navReady, consumeOpenTarget, split]);
   // Memoized: Inner re-renders on every LiveProvider frame, and a fresh theme object makes the
   // whole navigation tree re-render with it.
   const navTheme: Theme = useMemo(
@@ -208,12 +200,12 @@ function Inner() {
           // Keyed by Mac: switching, pairing or forgetting resets the stack to the new Mac's tabs.
           <Stack.Group navigationKey={currentMac.deviceId}>
             <Stack.Screen name="Tabs" component={Tabs} />
-            <Stack.Screen name="Chat" component={ChatScreen} />
+            <Stack.Screen name="Chat" component={ChatPane} options={pane} />
             <Stack.Screen name="Connect" component={ConnectScreen} />
             <Stack.Screen name="Pair" component={PairScreen} />
-            <Stack.Screen name="Files" component={FilesScreen} />
-            <Stack.Screen name="FileView" component={FileViewScreen} />
-            <Stack.Screen name="GeneralChat" component={GeneralChatScreen} />
+            <Stack.Screen name="Files" component={FilesPane} options={pane} />
+            <Stack.Screen name="FileView" component={FileViewPane} options={pane} />
+            <Stack.Screen name="GeneralChat" component={GeneralChatPane} options={pane} />
             <Stack.Screen name="GeneralScope" component={GeneralScopeScreen} options={sheet} />
             <Stack.Screen name="GeneralNew" component={GeneralNewScreen} options={sheet} />
             <Stack.Screen name="GeneralSettings" component={GeneralSettingsScreen} options={sheet} />
@@ -228,7 +220,7 @@ function Inner() {
           </Stack.Group>
         )}
       </Stack.Navigator>
-      {currentMac && <Banner onOpen={openFromBanner} />}
+      {currentMac && <Banner onOpen={(b) => openFromBanner(b, split)} />}
     </NavigationContainer>
   );
 }
@@ -244,9 +236,11 @@ export default function App() {
                 <LiveProvider>
                   <PortMirrorProvider>
                     <BgWatchProvider>
-                      <ListSelectionProvider>
-                        <Inner />
-                      </ListSelectionProvider>
+                      <AppUpdateProvider>
+                        <ListSelectionProvider>
+                          <Inner />
+                        </ListSelectionProvider>
+                      </AppUpdateProvider>
                     </BgWatchProvider>
                   </PortMirrorProvider>
                 </LiveProvider>

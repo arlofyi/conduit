@@ -6,6 +6,7 @@ import { useLive, useUsagePolling } from "../bridge/LiveProvider";
 import { Card, Row, SectionLabel } from "../components/form";
 import { UsageSection } from "../components/UsageSection";
 import { StorageCard } from "../components/StorageCard";
+import { UpdateCard } from "../components/UpdateCard";
 import { DiagnosticsCard } from "../components/DiagnosticsCard";
 import { usePrefs } from "../data/PrefsProvider";
 import { useBgWatch } from "../data/BgWatchProvider";
@@ -58,7 +59,7 @@ export function SettingsScreen({ navigation }: SettingsProps) {
     );
   };
 
-  const toggle = (key: keyof Omit<Prefs, "theme">, title: string, first?: boolean, subtitle?: string) => (
+  const toggle = (key: keyof Omit<Prefs, "theme" | "splitListWidth">, title: string, first?: boolean, subtitle?: string) => (
     <Row
       first={first}
       title={title}
@@ -139,7 +140,15 @@ export function SettingsScreen({ navigation }: SettingsProps) {
         <SectionLabel>Appearance</SectionLabel>
         <Card>
           <Row first title="Theme" value={p.label} onPress={cycle} accessibilityLabel={`Theme, ${p.label}. Tap to change.`} />
+          {toggle(
+            "splitView",
+            "Side-by-side on wide screens",
+            false,
+            "On a tablet, in landscape or in a wide split-screen window, the list stays beside the open chat. Drag the divider to resize it.",
+          )}
         </Card>
+
+        <UpdateCard />
 
         <StorageCard />
 

@@ -33,7 +33,16 @@ export type RootStackParamList = {
   /** the ONE session sheet (the chat header's title tap and its preferences button): details,
    * files, session options, commands, MCP servers, compact / clear / stop.
    * `projectId`/`name`/`branch` let it hand a command back to the chat. */
-  QuickActions: { sessionId: string; running: boolean; agent: string; projectId?: string; name?: string; branch?: string | null };
+  QuickActions: {
+    sessionId: string;
+    running: boolean;
+    agent: string;
+    projectId?: string;
+    name?: string;
+    branch?: string | null;
+    /** open with a section expanded ("account": the chat's "this account is spent" banner) */
+    focus?: "account";
+  };
   /** one folder of a session's directory ("" = its root), pushed per folder; `title` names the root */
   Files: { sessionId: string; path: string; title?: string };
   /** one file of a session's directory */

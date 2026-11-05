@@ -1,4 +1,8 @@
 import {
+  availability,
+  availabilityHeadline,
+  availabilityLine,
+  backCopy,
   headerGauge,
   moneyFraction,
   moneyLabel,
@@ -142,16 +146,75 @@ describe("rowForSession", () => {
 });
 
 describe("headerGauge", () => {
-  it("draws the 5 h window and names both in its label", () => {
+  it("draws the more spent window and names both in its label", () => {
     const rows = parseUsageFrame(frame)!;
     const g = headerGauge(rows[0])!;
-    expect(g.window.kind).toBe("fiveHour");
-    expect(g.a11y).toBe("Usage: 5-hour 18% used, Weekly 42% used");
+    expect(g.window.kind).toBe("weekly");
+    expect(g.a11y).toBe("Usage: Weekly 42% used, 5-hour 18% used");
+  });
+  it("never reads as healthy when the week is spent (founder report: 0 % 5 h, 100 % week)", () => {
+    const row: UsageRow = {
+      key: "k", agent: "claude", label: "Arlo", plan: null, money: null, models: [], updatedAt: null, source: null,
+      windows: [
+        { kind: "fiveHour", label: "5-hour", used: 0, resetsAt: null },
+        { kind: "weekly", label: "Weekly", used: 1, resetsAt: NOW + 3 * 3_600_000 },
+      ],
+    };
+    const g = headerGauge(row)!;
+    expect(g.window.kind).toBe("weekly");
+    expect(g.window.used).toBe(1);
+    expect(g.a11y).toBe("Usage: Weekly limit reached, Weekly 100% used, 5-hour 0% used");
   });
   it("falls back to the week; nothing with neither", () => {
     const row: UsageRow = { key: "k", agent: "a", label: "a", plan: null, windows: [{ kind: "weekly", label: "Weekly", used: 0.5, resetsAt: null }], money: null, models: [], updatedAt: null, source: null };
     expect(headerGauge(row)?.window.kind).toBe("weekly");
     expect(headerGauge({ ...row, windows: [] })).toBeNull();
     expect(headerGauge(null)).toBeNull();
+  });
+});
+
+describe("availability", () => {
+  const base: UsageRow = { key: "k", agent: "claude", label: "Arlo", plan: null, windows: [], money: null, models: [], updatedAt: null, source: null };
+  const w = (kind: string, used: number, resetsAt: number | null = null) => ({ kind, label: kind === "fiveHour" ? "5-hour" : kind === "weekly" ? "Weekly" : kind, used, resetsAt });
+
+  it("is blocked by a spent week however empty the 5 hours are", () => {
+    const a = availability({ ...base, windows: [w("fiveHour", 0, NOW + 3_600_000), w("weekly", 1, NOW + 2 * 3_600_000)] });
+    expect(a.state).toBe("blocked");
+    if (a.state !== "blocked") throw new Error("not blocked");
+    expect(a.binding?.kind).toBe("weekly");
+    expect(a.until).toBe(NOW + 2 * 3_600_000);
+    expect(availabilityHeadline(a)).toBe("Weekly limit reached");
+    expect(availabilityLine(a, NOW)).toBe("Weekly limit reached · back in 2h");
+  });
+  it("comes back only when the LAST spent window resets", () => {
+    const a = availability({ ...base, windows: [w("fiveHour", 1, NOW + 3_600_000), w("weekly", 1, NOW + 5 * 3_600_000)] });
+    expect(a.state === "blocked" && a.until).toBe(NOW + 5 * 3_600_000);
+    const unknown = availability({ ...base, windows: [w("fiveHour", 1, NOW + 3_600_000), w("weekly", 1, null)] });
+    expect(unknown.state === "blocked" && unknown.until).toBeNull();
+    expect(availabilityLine(unknown, NOW)).toBe("Weekly limit reached · reset time not reported");
+  });
+  it("is low near a limit and ok otherwise, naming what runs out first", () => {
+    const low = availability({ ...base, windows: [w("fiveHour", 0.2), w("weekly", 0.93)] });
+    expect(low.state).toBe("low");
+    expect(availabilityHeadline(low)).toBe("93% of the weekly limit used");
+    const ok = availability({ ...base, windows: [w("fiveHour", 0.5), w("weekly", 0.5)] });
+    expect(ok.state === "ok" && ok.binding?.kind).toBe("weekly");
+    expect(availabilityHeadline(ok)).toBe("Available");
+  });
+  it("ignores the context window, and is unknown with nothing readable", () => {
+    expect(availability({ ...base, windows: [w("context", 1)] }).state).toBe("unknown");
+    expect(availability(null).state).toBe("unknown");
+    expect(availabilityHeadline(availability(null))).toBe("Usage not reported");
+  });
+  it("treats capped credit that is spent as blocked, uncapped credit as usable", () => {
+    expect(availability({ ...base, money: { spent: 50, limit: 50, remaining: 0 } }).state).toBe("blocked");
+    expect(availability({ ...base, money: { spent: 12, limit: null, remaining: null } }).state).toBe("ok");
+  });
+  it("says a far reset as a weekday and time", () => {
+    const until = NOW + 3 * 86_400_000 + 3_600_000;
+    const d = new Date(until);
+    const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    expect(backCopy(until, NOW)).toMatch(new RegExp(`^back ${days[d.getDay()]} \\d{1,2}(:\\d{2})? (AM|PM)$`));
+    expect(backCopy(NOW + 10_000, NOW)).toBe("back any moment");
   });
 });

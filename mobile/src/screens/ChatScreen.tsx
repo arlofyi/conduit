@@ -40,7 +40,9 @@ import { chatOnPhone, glyphStateFor, NO_PHONE_CHAT_TEXT } from "../logic/agents"
 import { PRIVATE_SESSION_TEXT } from "../logic/frames";
 import { chatHeader } from "../logic/chatHeader";
 import { composerSuggestions, type CommandOption } from "../logic/sessionOptions";
-import { rowForSession } from "../logic/usage";
+import { availability, availabilityLine, rowForSession } from "../logic/usage";
+import { accountOptions } from "../logic/accounts";
+import { readingInset } from "../logic/split";
 import { contextRing, headerMeta, usageBadge } from "../logic/sessionHeader";
 import { EffortBars, HeaderUsageGauge, UsagePopover } from "../components/UsageMeters";
 import { outputPreview } from "../logic/chatView";
@@ -137,6 +139,17 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   const usageRow = rowForSession(usage?.rows ?? null, header.usageKey, header.agent);
   const badge = usageBadge(usageRow);
   const [usageOpen, setUsageOpen] = useState(false);
+  // A spent account refuses every message: say so ABOVE the composer, with the way out, rather
+  // than letting a send fail into the transcript (founder report: 0 % 5 h read as usable while
+  // the week was spent).
+  const avail = availability(usageRow);
+  const spent = avail.state === "blocked" && !session?.session.silo;
+  const canSwitch = spent && accountOptions(view, projectId, header.agent, usage?.rows ?? null).length > 1;
+  const [spentH, setSpentH] = useState(0);
+  // A tablet's pane can be far wider than a readable line: the conversation and the composer
+  // keep a centred column (READING_MAX) and the rest becomes margin.
+  const [paneW, setPaneW] = useState(0);
+  const gutter = readingInset(paneW);
   // The Mac follows the session onto a new transcript itself (/clear, a just-spawned chat) and
   // re-sends `history`, so the chat never has to re-attach to catch up.
 
@@ -358,13 +371,13 @@ export function ChatScreen({ route, navigation }: ChatProps) {
   );
   const accent = readableInk(session ? (header.color ?? p.accent) : p.accent, p.textBright, p.panelBg);
   // ONE session sheet: the title tap and the preferences button both open it.
-  const openSheet = () => {
+  const openSheet = (focus?: "account") => {
     setUsageOpen(false);
-    navigation.navigate("QuickActions", { sessionId, running, agent, projectId, name: route.params.name, branch: route.params.branch });
+    navigation.navigate("QuickActions", { sessionId, running, agent, projectId, name: route.params.name, branch: route.params.branch, focus });
   };
 
   return (
-    <View style={{ flex: 1, backgroundColor: p.panelBg }}>
+    <View style={{ flex: 1, backgroundColor: p.panelBg }} onLayout={(e) => setPaneW(e.nativeEvent.layout.width)}>
       <KeyboardAvoidingView
         style={{ flex: 1, paddingBottom: androidKeyboard }}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -381,8 +394,8 @@ export function ChatScreen({ route, navigation }: ChatProps) {
           renderItem={renderItem}
           style={{ flex: 1 }}
           // inverted: paddingTop is the visual BOTTOM (above the composer), paddingBottom the top
-          contentContainerStyle={{ paddingHorizontal: 10, paddingTop: composerH + 6, paddingBottom: headerH + 10 }}
-          scrollIndicatorInsets={{ top: composerH, bottom: headerH }}
+          contentContainerStyle={{ paddingHorizontal: 10 + gutter, paddingTop: composerH + (spent ? spentH : 0) + 6, paddingBottom: headerH + 10 }}
+          scrollIndicatorInsets={{ top: composerH + (spent ? spentH : 0), bottom: headerH }}
           ListHeaderComponent={typing ? <WorkingBubble activity={sessionLive.activity} /> : null}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="interactive"
@@ -410,7 +423,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
             the bar is solid: otherwise text shows through beside and below the controls. */}
         <View
           style={[
-            { position: "absolute", left: 0, right: 0, bottom: 0 },
+            { position: "absolute", left: 0, right: 0, bottom: 0, paddingHorizontal: gutter },
             Platform.OS === "android" && { backgroundColor: p.panelBg, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: p.border },
           ]}
         >
@@ -438,6 +451,29 @@ export function ChatScreen({ route, navigation }: ChatProps) {
               )}
             </View>
           )}
+          {spent && !refused ? (
+            <View
+              onLayout={(e) => setSpentH(e.nativeEvent.layout.height)}
+              accessibilityLiveRegion="polite"
+              style={{ flexDirection: "row", alignItems: "center", gap: 10, marginHorizontal: 10, marginTop: 8, paddingHorizontal: 12, paddingVertical: 9, borderRadius: 12, backgroundColor: mix(p.red, p.panelBg, 0.14), borderWidth: StyleSheet.hairlineWidth, borderColor: mix(p.red, p.panelBg, 0.5) }}
+            >
+              <Icon name="exclamationmark.triangle.fill" size={16} color={p.red} />
+              <Text style={{ flex: 1, color: p.textBright, fontSize: TYPE.footnote, lineHeight: 18 }}>
+                {`${session?.session.accountLabel ?? "This account"}: ${availabilityLine(avail, Date.now())}. Messages won't run until then.`}
+              </Text>
+              {canSwitch ? (
+                <Pressable
+                  onPress={() => openSheet("account")}
+                  accessibilityRole="button"
+                  accessibilityLabel="Switch account"
+                  hitSlop={8}
+                  style={({ pressed }) => ({ paddingHorizontal: 10, minHeight: 32, justifyContent: "center", borderRadius: 16, backgroundColor: pressed ? mix(p.accent, p.panelBg, 0.7) : p.accent })}
+                >
+                  <Text style={{ color: p.meText, fontWeight: "600", fontSize: TYPE.footnote }}>Switch account</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          ) : null}
           {refused ? null : (
             <Composer
               name={header.name}
@@ -466,7 +502,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
         >
           <GlassCircle symbol="chevron.left" label="Back to sessions" onPress={() => navigation.goBack()} size={38} symbolSize={16} />
           <Pressable
-            onPress={openSheet}
+            onPress={() => openSheet()}
             accessibilityRole="button"
             accessibilityLabel={meta.a11y}
             style={({ pressed }) => ({ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 8, opacity: pressed ? 0.7 : 1 })}
@@ -530,7 +566,7 @@ export function ChatScreen({ route, navigation }: ChatProps) {
           <GlassCircle
             symbol="slider.horizontal.3"
             label={running ? "Session details and options: interrupt, files, model, commands" : "Session details and options: files, model, commands, compact or stop"}
-            onPress={openSheet}
+            onPress={() => openSheet()}
             size={38}
             symbolSize={17}
           />

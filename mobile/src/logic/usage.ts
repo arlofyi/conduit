@@ -213,12 +213,110 @@ export function rowForSession(rows: readonly UsageRow[] | null, usageKey: string
   return rows.find((r) => r.agent === agent) ?? null;
 }
 
-/** The header's mini gauge: the 5-hour window, else the week, else nothing. */
+/**
+ * The header's mini gauge: the BINDING window -- whichever of the 5-hour and the week is more
+ * spent -- else nothing. It used to draw the 5-hour window whenever there was one, so an
+ * account with 0 % of its 5 hours used and 100 % of its week read as a healthy 0 % while every
+ * message was refused (founder report). The spoken label names the binding window first.
+ */
 export function headerGauge(row: UsageRow | null): { window: UsageWindow; a11y: string } | null {
   const { fiveHour, week } = pickWindows(row);
-  const w = fiveHour ?? week;
+  const w = binding(fiveHour, week);
   if (!w) return null;
+  const other = w === fiveHour ? week : fiveHour;
   const parts = [`${w.label} ${usedLabel(w)}`];
-  if (fiveHour && week) parts.push(`${week.label} ${usedLabel(week)}`);
-  return { window: w, a11y: `Usage: ${parts.join(", ")}` };
+  if (other) parts.push(`${other.label} ${usedLabel(other)}`);
+  const a = availability(row);
+  const lead = a.state === "blocked" ? `${availabilityHeadline(a)}, ` : "";
+  return { window: w, a11y: `Usage: ${lead}${parts.join(", ")}` };
+}
+
+/** The more spent of the two; a tie goes to the week, the one that takes longer to come back. */
+function binding(fiveHour: UsageWindow | null, week: UsageWindow | null): UsageWindow | null {
+  if (!fiveHour) return week;
+  if (!week) return fiveHour;
+  return fiveHour.used > week.used ? fiveHour : week;
+}
+
+// ---- availability: "can I use this account right now?" ----------------------------------
+
+/** A window at or past this is spent: the agent refuses work until it resets. */
+export const SPENT_AT = 0.995;
+/** At or past this an account is about to run out. */
+export const LOW_AT = 0.9;
+
+export type Availability =
+  /** nothing readable: never shown as available or as spent */
+  | { state: "unknown" }
+  /** usable; `binding` is the most spent window (what runs out first) */
+  | { state: "ok" | "low"; binding: UsageWindow | null }
+  /** a window is spent: `binding` is the spent window that comes back LAST, `until` when the
+   * account is usable again (null when the agent gave no reset time) */
+  | { state: "blocked"; binding: UsageWindow | null; until: number | null };
+
+/** Windows that gate work (a context window measures a conversation, not the account). */
+const quota = (w: UsageWindow) => w.kind !== "context";
+
+/**
+ * Whether an account can take work NOW. The answer is the most restrictive window, never the
+ * shortest one: 0 % of the 5 hours used means nothing while the week is spent.
+ */
+export function availability(row: UsageRow | null): Availability {
+  if (!row) return { state: "unknown" };
+  const ws = row.windows.filter(quota);
+  const spent = ws.filter((w) => w.used >= SPENT_AT);
+  if (spent.length > 0) {
+    // Usable again only when EVERY spent window has reset: the latest reset wins, and one
+    // spent window with no reset time makes the whole answer "unknown when".
+    // A spent window with no reset time is the one that cannot be dated, so it is named.
+    const undated = spent.find((w) => w.resetsAt === null);
+    if (undated) return { state: "blocked", binding: undated, until: null };
+    const last = spent.reduce((a, w) => ((w.resetsAt ?? 0) > (a.resetsAt ?? 0) ? w : a));
+    return { state: "blocked", binding: last, until: last.resetsAt };
+  }
+  if (row.money && row.money.limit !== null && row.money.spent >= row.money.limit) {
+    return { state: "blocked", binding: null, until: null };
+  }
+  if (ws.length === 0) return row.money ? { state: "ok", binding: null } : { state: "unknown" };
+  const top = ws.reduce((a, w) => (w.used > a.used || (w.used === a.used && isWeek(w)) ? w : a));
+  return { state: top.used >= LOW_AT ? "low" : "ok", binding: top };
+}
+
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** "3 PM" / "3:30 PM", local time. */
+function clock(d: Date): string {
+  const h = d.getHours();
+  const m = d.getMinutes();
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}${m ? `:${String(m).padStart(2, "0")}` : ""} ${h < 12 ? "AM" : "PM"}`;
+}
+
+/** When a spent account comes back: "back in 2h 10m" within a day, else "back Fri 3 PM". */
+export function backCopy(until: number | null, now: number): string {
+  if (until === null) return "reset time not reported";
+  const ms = until - now;
+  if (ms <= 30_000) return "back any moment";
+  if (ms < 86_400_000) return `back in ${span(ms)}`;
+  const d = new Date(until);
+  return `back ${DAYS[d.getDay()]} ${clock(d)}`;
+}
+
+/** The short name of a window for a headline: "Weekly", "5-hour", "Weekly · Opus". */
+function windowName(w: UsageWindow | null): string {
+  return w ? w.label : "Credit";
+}
+
+/** "Weekly limit reached" / "92% of the weekly limit used" / "Available". */
+export function availabilityHeadline(a: Availability): string {
+  if (a.state === "unknown") return "Usage not reported";
+  if (a.state === "blocked") return `${windowName(a.binding)} limit reached`;
+  if (a.state === "low" && a.binding) return `${pct(a.binding.used)}% of the ${a.binding.label.toLowerCase()} limit used`;
+  return "Available";
+}
+
+/** One line for a list or a picker: headline plus when it comes back, if spent. */
+export function availabilityLine(a: Availability, now: number): string {
+  const head = availabilityHeadline(a);
+  return a.state === "blocked" ? `${head} · ${backCopy(a.until, now)}` : head;
 }

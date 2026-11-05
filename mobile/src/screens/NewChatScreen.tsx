@@ -13,7 +13,12 @@
 import { StackActions } from "@react-navigation/native";
 import React, { useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
-import { useLive } from "../bridge/LiveProvider";
+import { useLive, useUsagePolling } from "../bridge/LiveProvider";
+import { severityColor } from "../components/UsageMeters";
+import { useIsSplit } from "../components/SplitFrame";
+import { openChatPane } from "../navRef";
+import { accountOptions, suggestedAccount } from "../logic/accounts";
+import { availabilityLine } from "../logic/usage";
 import { AgentMarkGlyph } from "../components/AgentAvatar";
 import { useListSelection } from "../data/ListSelection";
 import { accentFor } from "../logic/accent";
@@ -26,7 +31,9 @@ import { SheetScaffold } from "./Sheets";
 
 export function NewChatScreen({ navigation }: NewChatProps) {
   const { palette: p } = useTheme();
-  const { view, spawn, spawnState, resetSpawn, conn } = useLive();
+  const { view, spawn, spawnState, resetSpawn, conn, usage } = useLive();
+  useUsagePolling(true);
+  const split = useIsSplit();
   const { filter } = useListSelection();
   const projects = useMemo(() => view?.projects ?? [], [view]);
 
@@ -43,6 +50,15 @@ export function NewChatScreen({ navigation }: NewChatProps) {
   const [agent, setAgent] = useState("claude");
   const [text, setText] = useState("");
   const [title, setTitle] = useState("");
+  // The account: "" follows the project's default. Until the reader picks one, it follows the
+  // suggestion, which moves off a SPENT default onto an account that can work now.
+  const accountOpts = useMemo(() => accountOptions(view, projectId, agent, usage?.rows ?? null), [view, projectId, agent, usage]);
+  const suggested = suggestedAccount(accountOpts);
+  const [picked, setPicked] = useState<{ key: string; ref: string } | null>(null);
+  const pickKey = `${projectId}|${agent}`;
+  const account = picked && picked.key === pickKey && accountOpts.some((o) => o.ref === picked.ref) ? picked.ref : suggested;
+  const accountOpt = accountOpts.find((o) => o.ref === account) ?? null;
+  const defaultOpt = accountOpts.find((o) => o.ref === "") ?? null;
 
   // A previous attempt's answer must not open a chat now.
   useEffect(() => {
@@ -53,10 +69,12 @@ export function NewChatScreen({ navigation }: NewChatProps) {
     if (spawnState.phase !== "spawned") return;
     const s = spawnState;
     resetSpawn();
-    navigation.dispatch(
-      StackActions.replace("Chat", { sessionId: s.sessionId, projectId: s.projectId, name: s.name, branch: null }),
-    );
-  }, [spawnState, resetSpawn, navigation]);
+    const params = { sessionId: s.sessionId, projectId: s.projectId, name: s.name, branch: null };
+    // Split view: the new chat takes the right pane (a second chat stacked on the open one
+    // would keep both attached).
+    if (split) openChatPane(params, true);
+    else navigation.dispatch(StackActions.replace("Chat", params));
+  }, [spawnState, resetSpawn, navigation, split]);
 
   const pending = spawnState.phase === "pending";
   const ready = conn.phase === "ready";
@@ -146,6 +164,59 @@ export function NewChatScreen({ navigation }: NewChatProps) {
         })}
       </ScrollView>
 
+      {accountOpts.length > 0 ? (
+        <>
+          <Label>Account</Label>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentInsetAdjustmentBehavior="never" style={{ flexGrow: 0 }} contentContainerStyle={{ gap: 8, paddingHorizontal: 16, paddingBottom: 4 }}>
+            {accountOpts.map((o) => {
+              const on = o.ref === account;
+              const st = o.availability.state;
+              const dot = st === "blocked" ? p.red : st === "low" ? p.amber : st === "ok" ? p.green : p.textDim;
+              return (
+                <Pressable
+                  key={o.ref || "default"}
+                  onPress={() => setPicked({ key: pickKey, ref: o.ref })}
+                  accessibilityRole="button"
+                  accessibilityLabel={`${o.label}, ${availabilityLine(o.availability, Date.now())}`}
+                  accessibilityState={{ selected: on }}
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 7,
+                    height: 34,
+                    paddingHorizontal: 13,
+                    borderRadius: 17,
+                    borderWidth: 1,
+                    borderColor: on ? mix(p.accent, p.panelBg, 0.6) : p.border,
+                    backgroundColor: on ? mix(p.accent, p.panelBg, 0.16) : "transparent",
+                    opacity: st === "blocked" && !on ? 0.6 : 1,
+                  }}
+                >
+                  <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: dot }} />
+                  <Text maxFontSizeMultiplier={1.6} style={{ fontSize: TYPE.subhead, color: on ? p.textBright : p.textMid, fontWeight: on ? "600" : "400" }}>
+                    {o.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+          {accountOpt ? (
+            <Text
+              style={{
+                marginHorizontal: 20,
+                marginBottom: 6,
+                fontSize: TYPE.footnote,
+                color: accountOpt.availability.state === "blocked" ? p.red : accountOpt.availability.state === "low" ? severityColor(p, "warn") : p.textMid,
+              }}
+            >
+              {account !== "" && account === suggested && defaultOpt?.availability.state === "blocked"
+                ? `The default account is out of usage (${availabilityLine(defaultOpt.availability, Date.now())}), so this starts on ${accountOpt.label}.`
+                : availabilityLine(accountOpt.availability, Date.now())}
+            </Text>
+          ) : null}
+        </>
+      ) : null}
+
       <Label>Title (optional)</Label>
       <View style={{ marginHorizontal: 16, marginBottom: 6 }}>
         <TextInput
@@ -202,7 +273,7 @@ export function NewChatScreen({ navigation }: NewChatProps) {
           <Text style={{ marginTop: 8, fontSize: TYPE.footnote, color: p.red }}>{spawnState.message}</Text>
         ) : null}
         <Pressable
-          onPress={() => projectId && spawn(projectId, text, agent, title)}
+          onPress={() => projectId && spawn(projectId, text, agent, title, account)}
           disabled={!canStart}
           accessibilityRole="button"
           accessibilityLabel="Start session"

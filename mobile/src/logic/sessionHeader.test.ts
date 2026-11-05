@@ -56,14 +56,32 @@ describe("contextRing", () => {
 });
 
 describe("usageBadge", () => {
-  it("draws the 5-hour window with a caption and both windows spoken", () => {
+  it("draws the more spent window with a caption and both windows spoken", () => {
     const b = usageBadge(
       row([
         { kind: "fiveHour", label: "5-hour", used: 0.19, resetsAt: null },
         { kind: "weekly", label: "Weekly", used: 0.42, resetsAt: null },
       ]),
     )!;
-    expect(b).toEqual({ used: 0.19, percent: 19, caption: "5h", tone: "ok", a11y: "Usage: 5-hour 19% used, Weekly 42% used" });
+    expect(b).toEqual({ used: 0.42, percent: 42, caption: "wk", tone: "ok", a11y: "Usage: Weekly 42% used, 5-hour 19% used", blocked: false });
+    const five = usageBadge(
+      row([
+        { kind: "fiveHour", label: "5-hour", used: 0.6, resetsAt: null },
+        { kind: "weekly", label: "Weekly", used: 0.42, resetsAt: null },
+      ]),
+    )!;
+    expect(five.caption).toBe("5h");
+  });
+  it("is blocked and red when the week is spent, whatever the 5 hours say", () => {
+    const b = usageBadge(
+      row([
+        { kind: "fiveHour", label: "5-hour", used: 0, resetsAt: null },
+        { kind: "weekly", label: "Weekly", used: 1, resetsAt: null },
+      ]),
+    )!;
+    expect(b.blocked).toBe(true);
+    expect(b.percent).toBe(100);
+    expect(b.tone).toBe("bad");
   });
   it("falls back to the week, and to nothing", () => {
     const b = usageBadge(row([{ kind: "weekly", label: "Weekly", used: 0.93, resetsAt: null }]))!;

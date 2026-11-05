@@ -9,6 +9,8 @@ import type { UsageState } from "../bridge/LiveProvider";
 import { agentInfo } from "../logic/agents";
 import { glyphInk } from "../logic/color";
 import {
+  availability,
+  availabilityLine,
   moneyFraction,
   moneyLabel,
   pickWindows,
@@ -73,8 +75,13 @@ function UsageRowView({ row, first, open, onToggle, now }: { row: UsageRow; firs
   // what tells two Claude rows apart. The agent's name is the fallback when no account is named.
   const title = row.label.trim() || info.label;
   const sub = [title !== info.label ? info.label : null, row.plan].filter(Boolean).join(" · ");
+  // The answer to "can I use it now?" in words: the binding window, never the shortest one.
+  const avail = availability(row);
+  const state = avail.state === "unknown" ? null : availabilityLine(avail, now);
+  const stateColor = avail.state === "blocked" ? p.red : avail.state === "low" ? p.amber : p.green;
   const a11y = [
     title,
+    state,
     sub,
     fiveHour ? `5-hour ${usedLabel(fiveHour)}` : null,
     week ? `weekly ${usedLabel(week)}` : null,
@@ -110,6 +117,11 @@ function UsageRowView({ row, first, open, onToggle, now }: { row: UsageRow; firs
           {sub ? (
             <Text style={{ color: p.textDim, fontSize: TYPE.caption, marginTop: 1 }} numberOfLines={1}>
               {sub}
+            </Text>
+          ) : null}
+          {state ? (
+            <Text style={{ color: stateColor, fontSize: TYPE.caption, fontWeight: "600", marginTop: 2 }} numberOfLines={2}>
+              {state}
             </Text>
           ) : null}
         </View>
