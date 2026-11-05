@@ -293,7 +293,7 @@ export interface LiveValue {
   /** send prepared frames (quick actions) */
   sendFrames: (frames: ClientMsg[]) => void;
   /** start a new session with its first message; the answer lands in `spawnState` */
-  spawn: (projectId: string, text: string, agent: string, name?: string) => void;
+  spawn: (projectId: string, text: string, agent: string, name?: string, account?: string) => void;
   spawnState: SpawnState;
   resetSpawn: () => void;
   /** questions/permissions the current Mac holds for a human, and how each one ended */
@@ -1660,7 +1660,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     for (const f of frames) clientRef.current?.send(f);
   }, []);
 
-  const spawn = useCallback((projectId: string, text: string, agent: string, name = "") => {
+  const spawn = useCallback((projectId: string, text: string, agent: string, name = "", account = "") => {
     const trimmed = text.trim();
     if (spawnPending.current) return;
     const client = clientRef.current;
@@ -1671,7 +1671,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     spawnPending.current = true;
     spawnLate.current = false;
     setSpawnState({ phase: "pending" });
-    client.send(spawnMsg(projectId, trimmed, agent, name));
+    client.send(spawnMsg(projectId, trimmed, agent, name, account));
   }, []);
 
   // A spawn the Mac never answers (link dropped mid-request) must not spin forever. It is NOT

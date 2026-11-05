@@ -55,6 +55,7 @@ mod notify;
 mod openrouter_usage;
 mod orchestration_policy;
 mod pairing;
+mod phone_accounts;
 mod phone_fs;
 mod phone_usage;
 mod plugins;
@@ -2147,9 +2148,12 @@ fn set_account_agents(
     store.set_account_agents(&account_id, agents);
 }
 
-#[tauri::command]
+/// Async: moving a Claude session to another account copies its conversation's transcript
+/// into the new account's config dir (`phone_accounts::move_session_account`), and a
+/// transcript can be tens of MB -- never on the UI thread.
+#[tauri::command(async)]
 fn set_session_account(session_id: String, account_id: Option<String>, store: State<Arc<Store>>) {
-    store.set_session_account(&session_id, account_id);
+    crate::phone_accounts::move_session_account(&store, &session_id, account_id);
 }
 
 /// Pin or clear one session's model. `None` clears it, which is how a session goes back to

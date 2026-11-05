@@ -25,6 +25,13 @@ export interface Prefs {
   batteryHintDismissed: boolean;
   /** keep the last sessions list and opened chats on this phone, to read offline */
   keepChats: boolean;
+  /** wide screens (tablets, landscape, a wide split-screen window): the session list stays
+   * beside the open chat */
+  splitView: boolean;
+  /** the list pane's width in the split view, dp (dragged by its divider) */
+  splitListWidth: number;
+  /** Android: look for a newer phone app on GitHub Releases when the app starts */
+  updateCheck: boolean;
   theme: ThemeId;
 }
 
@@ -43,6 +50,9 @@ export const DEFAULT_PREFS: Prefs = {
   notifyAsked: false,
   batteryHintDismissed: false,
   keepChats: true,
+  splitView: true,
+  splitListWidth: 360,
+  updateCheck: true,
   theme: DEFAULT_THEME,
 };
 
@@ -56,7 +66,9 @@ type BoolKey =
   | "mirrorPorts"
   | "notifyAsked"
   | "batteryHintDismissed"
-  | "keepChats";
+  | "keepChats"
+  | "splitView"
+  | "updateCheck";
 
 /** Unknown or wrong-typed fields fall back to their defaults one at a time; a corrupt blob
  * is the defaults. */
@@ -86,6 +98,12 @@ export function parsePrefs(raw: string | null): Prefs {
     notifyAsked: bool("notifyAsked"),
     batteryHintDismissed: bool("batteryHintDismissed"),
     keepChats: bool("keepChats"),
+    splitView: bool("splitView"),
+    splitListWidth:
+      typeof r.splitListWidth === "number" && Number.isFinite(r.splitListWidth) && r.splitListWidth > 0
+        ? Math.round(r.splitListWidth)
+        : DEFAULT_PREFS.splitListWidth,
+    updateCheck: bool("updateCheck"),
     theme,
   };
 }

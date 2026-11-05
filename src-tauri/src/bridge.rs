@@ -98,6 +98,10 @@ pub enum ClientMsg {
         /// An explicit session title; absent or blank derives one from `prompt`.
         #[serde(default)]
         name: Option<String>,
+        /// Which account to start on (`phone_accounts::account_ref`); absent or blank
+        /// follows the project/global default.
+        #[serde(default)]
+        account: Option<String>,
     },
     /// First frame from a paired phone: its device token (verified hash-to-hash).
     Auth {
@@ -180,6 +184,10 @@ pub enum ClientMsg {
         keep_running: Option<bool>,
         #[serde(default)]
         auto_approve: Option<bool>,
+        /// Move the session to another account (`phone_accounts::account_ref`, `""` = the
+        /// default chain). A Claude conversation is carried across.
+        #[serde(default)]
+        account: Option<String>,
     },
     /// Every agent account's usage, from cached reads only (`phone_usage.rs`). Answered
     /// with `usage`.
@@ -366,6 +374,7 @@ impl std::fmt::Debug for ClientMsg {
                 agent,
                 worktree,
                 name,
+                account,
             } => f
                 .debug_struct("Spawn")
                 .field("project_id", project_id)
@@ -373,6 +382,7 @@ impl std::fmt::Debug for ClientMsg {
                 .field("agent", agent)
                 .field("worktree", worktree)
                 .field("name", name)
+                .field("account", account)
                 .finish(),
             Self::Auth { .. } => f.debug_struct("Auth").field("token", &R).finish(),
             Self::Pair {
@@ -535,6 +545,7 @@ impl std::fmt::Debug for ClientMsg {
                 name,
                 keep_running,
                 auto_approve,
+                account,
             } => f
                 .debug_struct("SessionSet")
                 .field("session_id", session_id)
@@ -544,6 +555,7 @@ impl std::fmt::Debug for ClientMsg {
                 .field("name", name)
                 .field("keep_running", keep_running)
                 .field("auto_approve", auto_approve)
+                .field("account", account)
                 .finish(),
             Self::Usage { request_id } => f
                 .debug_struct("Usage")
@@ -1231,6 +1243,7 @@ fn spawn_reply(
     agent: Option<&str>,
     worktree: bool,
     name: Option<&str>,
+    account: Option<&str>,
 ) -> serde_json::Value {
     use tauri::Emitter;
     let Some(agent_id) = spawn_agent(agent) else {
@@ -1239,6 +1252,14 @@ fn spawn_reply(
     let store = app.state::<Arc<Store>>();
     let Some(project) = store.list().into_iter().find(|p| p.id == project_id) else {
         return json!({ "type": "error", "message": "unknown project" });
+    };
+    // Resolved BEFORE the session exists: a refused account must not leave a session behind.
+    let accounts = store.list_accounts();
+    let account_id = match crate::phone_accounts::choose(&accounts, agent_id, account.unwrap_or(""))
+    {
+        Ok(crate::phone_accounts::AccountChoice::Default) => None,
+        Ok(crate::phone_accounts::AccountChoice::Account(a)) => Some(a.id.clone()),
+        Err(why) => return json!({ "type": "error", "message": why }),
     };
     // A worktree needs a git repo; refuse rather than spawn a broken session.
     if worktree && crate::git::current_branch(&project.path).is_none() {
@@ -1253,6 +1274,13 @@ fn spawn_reply(
     ) else {
         return json!({ "type": "error", "message": "could not create session" });
     };
+    // Pinned before `fleet-spawn`: the frontend spawns the PTY on that event, and the
+    // spawn reads the account from the store.
+    let mut session = session;
+    if account_id.is_some() {
+        store.set_session_account(&session.id, account_id.clone());
+        session.account_id = account_id;
+    }
     let _ = app.emit(
         "fleet-spawn",
         json!({ "projectId": project_id, "session": session, "task": prompt }),
@@ -2520,6 +2548,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         agent,
                         worktree,
                         name,
+                        account,
                     }) => {
                         // Budgeted per phone: its device id, or the peer IP for loopback.
                         let key = device
@@ -2533,6 +2562,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                                 agent.as_deref(),
                                 worktree,
                                 name.as_deref(),
+                                account.as_deref(),
                             )
                         } else {
                             spawn_budget_error()
@@ -3072,16 +3102,20 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         name,
                         keep_running,
                         auto_approve,
+                        account,
                     }) => {
                         let reply = crate::session_options::apply_set(
                             &app,
                             &session_id,
                             &request_id,
-                            model,
-                            effort,
-                            name,
-                            keep_running,
-                            auto_approve,
+                            crate::session_options::SetFields {
+                                model,
+                                effort,
+                                name,
+                                keep_running,
+                                auto_approve,
+                                account,
+                            },
                         );
                         if !send_text(&mut ws, reply.to_string()) {
                             break 'conn;
@@ -3232,8 +3266,13 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
             // Which `usage` row each session draws from (opaque keys; see `phone_usage`).
             let usage_rows = crate::phone_usage::row_keys(&crate::phone_usage::rows(&app));
             let default_accounts = store.default_accounts();
+            let account_list = store.list_accounts();
             let known_accounts: HashSet<String> =
-                store.list_accounts().into_iter().map(|a| a.id).collect();
+                account_list.iter().map(|a| a.id.clone()).collect();
+            let accounts_ctx = crate::bridge_view::AccountsCtx {
+                list: account_list,
+                globals: default_accounts.clone(),
+            };
             let view = crate::bridge_view::projects_view(
                 &store.list(),
                 &store.list_profiles(),
@@ -3260,6 +3299,7 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         &usage_rows,
                     )
                 },
+                &accounts_ctx,
             );
             ctrl.last_messages.sweep();
             let text = view.to_string();
@@ -3824,8 +3864,16 @@ mod tests {
                 effort: None,
                 name: None,
                 keep_running: None,
+                account: None,
                 ..
             })
+        ));
+        let m = parse_client_msg(
+            r#"{"type":"sessionset","sessionId":"s","requestId":"r","account":""}"#,
+        );
+        assert!(matches!(
+            m,
+            Some(ClientMsg::SessionSet { ref account, .. }) if account.as_deref() == Some("")
         ));
         assert!(matches!(
             parse_client_msg(r#"{"type":"usage","requestId":"r"}"#),
@@ -4164,6 +4212,7 @@ mod tests {
                 agent: None,
                 worktree: true,
                 name: None,
+                account: None,
             })
         );
         // A titled spawn with no first message (the agent starts idle).
@@ -4175,8 +4224,14 @@ mod tests {
                 agent: None,
                 worktree: false,
                 name: Some("Release notes".into()),
+                account: None,
             })
         );
+        // An account pick rides the spawn as an opaque ref.
+        assert!(matches!(
+            parse_client_msg(r#"{"type":"spawn","project_id":"p1","account":"uabc"}"#),
+            Some(ClientMsg::Spawn { ref account, .. }) if account.as_deref() == Some("uabc")
+        ));
     }
 
     #[test]

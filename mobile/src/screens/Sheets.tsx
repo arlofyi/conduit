@@ -6,7 +6,9 @@ import { type AppSymbol } from "../components/androidSymbols";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useLive } from "../bridge/LiveProvider";
+import { useLive, useUsagePolling } from "../bridge/LiveProvider";
+import { accountOptions, currentAccountRef } from "../logic/accounts";
+import { availabilityLine } from "../logic/usage";
 import { AgentAvatar } from "../components/AgentAvatar";
 import { GlassCircle, Icon } from "../components/Glass";
 import { useListSelection } from "../data/ListSelection";
@@ -215,7 +217,7 @@ export function ChatsMenuScreen({ navigation }: ChatsMenuProps) {
 
 // ---- the session sheet: the chat header's title tap AND its preferences button ----
 
-type Expanded = "model" | "effort" | "rename" | null;
+type Expanded = "model" | "effort" | "rename" | "account" | null;
 
 /**
  * ONE sheet for a session (Round 4: the title tap and the preferences button used to open two
@@ -228,15 +230,16 @@ type Expanded = "model" | "effort" | "rename" | null;
  */
 export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
   const { palette: p } = useTheme();
-  const { interrupt, prompt, view, sessionOptions, sessionSet, sessionAction, context, sessionLive } = useLive();
-  const { sessionId, running, agent, projectId, name, branch } = route.params;
+  const { interrupt, prompt, view, sessionOptions, sessionSet, sessionAction, context, sessionLive, usage } = useLive();
+  const { sessionId, running, agent, projectId, name, branch, focus } = route.params;
+  useUsagePolling(true);
   const project = view?.projects.find((x) => x.sessions.some((s) => s.id === sessionId)) ?? view?.projects.find((x) => x.id === projectId) ?? null;
   const session = project?.sessions.find((s) => s.id === sessionId) ?? null;
   const silo = !!session?.silo;
   const [autoApprove, setAutoApprove] = useState<boolean>(session?.autoApprove === true);
   const [opts, setOpts] = useState<SessionOptions | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<Expanded>(null);
+  const [expanded, setExpanded] = useState<Expanded>(focus === "account" ? "account" : null);
   const [note, setNote] = useState<{ text: string; ok: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
   const [rename, setRename] = useState("");
@@ -286,6 +289,12 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
   };
 
   const sessionName = session?.name ?? name ?? "Session";
+  // Accounts: what this session runs on, and what it could be moved to (with each account's
+  // usage, so a spent one is visible before it is picked).
+  const accountOpts = accountOptions(view, project?.id ?? projectId ?? null, session?.agent ?? agent, usage?.rows ?? null);
+  const accountRef = currentAccountRef(session);
+  const accountNow = accountOpts.find((o) => o.ref === accountRef) ?? accountOpts[0] ?? null;
+  const nowMs = Date.now();
   // `opts.model`/`effort` are PINS (null when unpinned): the sheet shows what is ACTIVE -- the
   // pin, else the model the session reports (transcript, then view); an unpinned effort is
   // "Default". Never a dash.
@@ -502,6 +511,28 @@ export function QuickActionsScreen({ navigation, route }: QuickActionsProps) {
                   selected={e === effort}
                   disabled={busy}
                   onPress={() => (e === effort ? setExpanded(null) : set({ effort: e }, `Effort ${effortName(e)} applies at the next start`))}
+                />
+              ))
+            : null}
+          {accountOpts.length > 0 ? (
+            <SheetRow
+              symbol="person.crop.circle"
+              title="Account"
+              trailing={session?.accountLabel ?? accountNow?.label ?? "Default"}
+              detail={accountNow ? availabilityLine(accountNow.availability, nowMs) : undefined}
+              disabled={busy}
+              onPress={() => setExpanded((e) => (e === "account" ? null : "account"))}
+            />
+          ) : null}
+          {expanded === "account"
+            ? accountOpts.map((o) => (
+                <SheetRow
+                  key={o.ref || "default"}
+                  title={o.label}
+                  detail={availabilityLine(o.availability, nowMs)}
+                  selected={o.ref === accountRef}
+                  disabled={busy}
+                  onPress={() => (o.ref === accountRef ? setExpanded(null) : set({ account: o.ref }, `Moved to ${o.label}`))}
                 />
               ))
             : null}

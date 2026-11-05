@@ -273,6 +273,7 @@ pub fn projects_view(
     asks: &[AskView],
     last_message: &dyn Fn(&Session) -> Value,
     usage_key: &dyn Fn(&Project, &Session) -> Option<String>,
+    accounts: &AccountsCtx,
 ) -> Value {
     let mut profile_list = vec![json!({ "id": Value::Null, "name": "Default" })];
     profile_list.extend(
@@ -311,6 +312,12 @@ pub fn projects_view(
                         last_message(s)
                     };
                     let updated_at = live.map(|f| f.updated_at).filter(|t| *t > 0);
+                    let (account_ref, account_label) = crate::phone_accounts::session_fields(
+                        s,
+                        p,
+                        &accounts.globals,
+                        &accounts.list,
+                    );
                     json!({
                         "id": s.id,
                         "name": s.name,
@@ -322,6 +329,10 @@ pub fn projects_view(
                         "autoApprove": s.auto_approve,
                         // Opaque (a hash of agent + account), never the account id.
                         "usageKey": usage_key(p, s),
+                        // The account's pin (opaque ref; null = following the default) and
+                        // the LABEL of the account it runs on (null = the computer's own login).
+                        "accountRef": account_ref,
+                        "accountLabel": account_label,
                         "stopped": s.stopped,
                         // The last turn ended on an error (StopFailure): its kind, already a
                         // short identifier (`fleet::failure_kind`); a silo'd session says
@@ -344,6 +355,11 @@ pub fn projects_view(
                 "name": p.name,
                 "profileId": p.profile_id,
                 "color": p.color,
+                "defaultAccounts": crate::phone_accounts::project_defaults(
+                    p,
+                    &accounts.globals,
+                    &accounts.list,
+                ),
                 "sessions": sessions,
             })
         })
@@ -353,7 +369,16 @@ pub fn projects_view(
         "profiles": profile_list,
         "activeProfileId": active_profile,
         "projects": projects,
+        "accounts": crate::phone_accounts::accounts_view(&accounts.list),
     })
+}
+
+/// The agent accounts the `projects` frame describes (as opaque refs + labels; see
+/// `phone_accounts`).
+#[derive(Default)]
+pub struct AccountsCtx {
+    pub list: Vec<crate::store::Account>,
+    pub globals: HashMap<crate::agent::AgentId, String>,
 }
 
 /// The `context` frame for the attached session.
@@ -735,6 +760,7 @@ mod tests {
             asks,
             &|_| Value::Null,
             &|_, _| None,
+            &AccountsCtx::default(),
         )
     }
 
@@ -747,11 +773,20 @@ mod tests {
         let v = view(&[project("p1", vec![s])], &HashMap::new(), &[]);
         assert_eq!(
             keys(&v["projects"][0]),
-            ["color", "id", "name", "profileId", "sessions"]
+            [
+                "color",
+                "defaultAccounts",
+                "id",
+                "name",
+                "profileId",
+                "sessions"
+            ]
         );
         assert_eq!(
             keys(&v["projects"][0]["sessions"][0]),
             [
+                "accountLabel",
+                "accountRef",
                 "activity",
                 "agent",
                 "autoApprove",
@@ -774,6 +809,42 @@ mod tests {
         );
         let text = v.to_string();
         for leak in ["TOP SECRET", "acct", "/secret"] {
+            assert!(!text.contains(leak), "{leak} leaked");
+        }
+
+        // With the account registered, the phone gets its label and an opaque ref -- still
+        // never the id or its config dir.
+        let mut s = sess("s1");
+        s.account_id = Some("acct-id-1".into());
+        let ctx = AccountsCtx {
+            list: vec![crate::store::Account {
+                id: "acct-id-1".into(),
+                label: "Arlo".into(),
+                config_dir: "/secret/cfg".into(),
+                agents: vec![crate::agent::AgentId::Claude],
+            }],
+            globals: HashMap::new(),
+        };
+        let v = projects_view(
+            &[project("p1", vec![s])],
+            &[],
+            None,
+            &HashMap::new(),
+            &HashSet::new(),
+            &[],
+            &|_| Value::Null,
+            &|_, _| None,
+            &ctx,
+        );
+        let row = &v["projects"][0]["sessions"][0];
+        assert_eq!(row["accountLabel"], "Arlo");
+        assert_eq!(
+            row["accountRef"],
+            json!(crate::phone_accounts::account_ref("acct-id-1"))
+        );
+        assert_eq!(v["accounts"]["list"][0]["label"], "Arlo");
+        let text = v.to_string();
+        for leak in ["acct-id-1", "/secret"] {
             assert!(!text.contains(leak), "{leak} leaked");
         }
     }
@@ -919,6 +990,7 @@ mod tests {
             &[],
             &|s| panic!("read attempted for {}", s.id),
             &|_, _| None,
+            &AccountsCtx::default(),
         );
         for i in 0..3 {
             assert!(v["projects"][0]["sessions"][i]["lastMessage"].is_null());
@@ -936,6 +1008,7 @@ mod tests {
             &[],
             &|s| json!({ "role": "user", "text": s.id, "at": null }),
             &|_, _| None,
+            &AccountsCtx::default(),
         );
         assert_eq!(
             v["projects"][0]["sessions"][0]["lastMessage"],
@@ -958,6 +1031,7 @@ mod tests {
             &[],
             &|_| Value::Null,
             &|_, _| None,
+            &AccountsCtx::default(),
         );
         assert_eq!(v["type"], "projects");
         assert_eq!(v["profiles"][0], json!({ "id": null, "name": "Default" }));
@@ -972,6 +1046,7 @@ mod tests {
             &[],
             &|_| Value::Null,
             &|_, _| None,
+            &AccountsCtx::default(),
         );
         assert!(none["activeProfileId"].is_null());
     }

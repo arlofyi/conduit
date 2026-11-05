@@ -2,8 +2,8 @@
   "expo": {
     "name": "Conduit",
     "slug": "conduit",
-    "version": "1.0.0",
-    "orientation": "portrait",
+    "version": "1.1.0",
+    "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
     "ios": {

@@ -9,7 +9,7 @@
  * - The context ring around the avatar and the usage gauge both colour by CONSUMPTION
  *   (green, amber from 70 %, red from 90 %), the same ramp as every other meter.
  */
-import { headerGauge, pct, severity, type Severity, type UsageRow } from "./usage";
+import { availability, headerGauge, pct, severity, type Severity, type UsageRow } from "./usage";
 import { modelLabel, type HeaderState } from "./chatHeader";
 import { effortLevel, effortName, type ModelOption } from "./sessionOptions";
 
@@ -93,6 +93,8 @@ export interface UsageBadge {
   caption: string;
   tone: Severity;
   a11y: string;
+  /** a window is spent: the agent refuses work until it resets */
+  blocked: boolean;
 }
 
 export function usageBadge(row: UsageRow | null): UsageBadge | null {
@@ -100,7 +102,8 @@ export function usageBadge(row: UsageRow | null): UsageBadge | null {
   if (!g) return null;
   const w = g.window;
   const five = w.kind === "fiveHour" || /5[\s-]?h/i.test(w.label);
-  return { used: w.used, percent: pct(w.used), caption: five ? "5h" : "wk", tone: severity(w.used), a11y: g.a11y };
+  const blocked = availability(row).state === "blocked";
+  return { used: w.used, percent: pct(w.used), caption: five ? "5h" : "wk", tone: blocked ? "bad" : severity(w.used), a11y: g.a11y, blocked };
 }
 
 /** Line 2 of the header, and the whole header's spoken label. */

@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- Hands a downloaded update to the system installer. Android still asks the user, once,
+       to allow installs from Conduit, and refuses any APK not signed with the same key. -->
+  <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+</manifest>
