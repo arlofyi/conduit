@@ -137,8 +137,9 @@ jobs:
             exit 1
           fi
           echo "$certs"
-          # The certificate's SHA-256 (apksigner names the signer "#1" or by SDK range).
-          digest=$(echo "$certs" | sed -n 's/^Signer.*certificate SHA-256 digest: *//p' | head -n 1)
+          # The certificate's SHA-256. apksigner's wording moves between build-tools: "Signer #1 certificate",
+          # "Signer (minSdkVersion=..) certificate", "V2 Signer: certificate" (37.0.0).
+          digest=$(echo "$certs" | sed -n 's/^.*[Ss]igner.*certificate SHA-256 digest: *//p' | head -n 1)
           if [ -z "$digest" ]; then
             echo "::error::No signing certificate found in apksigner's output."
             exit 1
