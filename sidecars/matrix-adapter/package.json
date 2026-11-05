@@ -23,11 +23,8 @@
     "@types/ws": "^8.5.13",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.11"
+    "vite": "^7.3.7",
+    "vitest": "^4.1.12"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "@matrix-org/matrix-sdk-crypto-nodejs"
-    ]
-  }
+  "packageManager": "pnpm@10.33.0"
 }
