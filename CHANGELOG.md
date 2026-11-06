@@ -5,6 +5,10 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — Security updates across the app's dependencies.** The desktop moves to Tauri 2.12 and
+  its updater plugin 2.14 (which replaces a vulnerable zip reader), with patched TLS, and the
+  build and test tooling, the phone app's toolchain and the Matrix sidecar pick up patched
+  versions of their libraries. A debug log line no longer prints an Antigravity account id.
 - **Added — Pick the agent account from the phone.** Starting a session on the phone now has an
   Account choice (shown when the agent has accounts registered on the computer), each marked
   with whether it can work right now. When the default account is out of usage, a usable one is

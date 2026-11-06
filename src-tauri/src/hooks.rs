@@ -278,10 +278,15 @@ pub fn start(
                 // quota-less tick would otherwise clobber a good snapshot (see has_data).
                 if usage.has_data() {
                     if std::env::var("CONDUIT_HOOK_LOG").as_deref() == Ok("1") {
-                        // Summary only -- never log the raw body (it carries the account email).
+                        // Summary only -- never log the raw body or the account id (it can be
+                        // the account email); say only whether one was reported.
                         eprintln!(
-                            "[hook] agyusage account={:?} groups={} tier={:?}",
-                            usage.account_id,
+                            "[hook] agyusage account={} groups={} tier={:?}",
+                            if usage.account_id.is_some() {
+                                "set"
+                            } else {
+                                "none"
+                            },
                             usage.groups.len(),
                             usage.plan_tier
                         );
