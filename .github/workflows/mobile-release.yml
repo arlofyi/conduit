@@ -22,6 +22,11 @@ on:
       - "mobile/**"
       - ".github/workflows/mobile-release.yml"
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a release (off = build and check only, e.g. from a branch)"
+        type: boolean
+        default: true
 
 # One phone release at a time: two runs would compute the same build number.
 concurrency:
@@ -121,17 +126,34 @@ jobs:
       - name: Check the signature
         working-directory: mobile/android
         run: |
+          set -o pipefail
           apk=app/build/outputs/apk/release/app-release.apk
-          signer=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n 1)apksigner
-          certs=$("$signer" verify --print-certs "$apk")
-          echo "$certs" | grep -E "Signer #1 certificate (DN|SHA-256)"
-          # Never publish a build signed with the public debug key.
-          if echo "$certs" | grep -q "CN=Android Debug"; then
+          ls -l "$apk"
+          tools=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n 1)
+          echo "apksigner from $tools"
+          if ! certs=$("${tools}apksigner" verify --print-certs "$apk" 2>&1); then
+            echo "$certs"
+            echo "::error::apksigner could not verify the APK."
+            exit 1
+          fi
+          echo "$certs"
+          # The certificate's SHA-256. apksigner's wording moves between build-tools: "Signer #1 certificate",
+          # "Signer (minSdkVersion=..) certificate", "V2 Signer: certificate" (37.0.0).
+          digest=$(echo "$certs" | sed -n 's/^.*[Ss]igner.*certificate SHA-256 digest: *//p' | head -n 1)
+          if [ -z "$digest" ]; then
+            echo "::error::No signing certificate found in apksigner's output."
+            exit 1
+          fi
+          # Never publish a build signed with the public debug key (by name or by its digest).
+          debug=fac61745dc0903786fb9ede62a962b399f7348f0bb6f899b8332667591033b9c
+          if [ "$digest" = "$debug" ] || echo "$certs" | grep -q "CN=Android Debug"; then
             echo "::error::The APK is signed with the debug key."
             exit 1
           fi
+          echo "Signed with $digest"
 
       - name: Publish the release
+        if: github.event_name == 'push' || inputs.publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BASE: ${{ steps.meta.outputs.base }}
