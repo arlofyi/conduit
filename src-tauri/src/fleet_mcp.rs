@@ -377,6 +377,9 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
                 .unwrap_or("claude");
             let agent: crate::agent::AgentId = serde_json::from_value(json!(agent_str))
                 .map_err(|_| format!("unknown agent: {agent_str}"))?;
+            // model and effort reach the agent's command line, so they are checked BEFORE a
+            // session exists: the schema's `enum` is advisory and a model may send anything.
+            check_spawn_flags(args)?;
             let snap = ctx
                 .store
                 .fleet_snapshot(&ctx.conductor_id)
@@ -873,6 +876,25 @@ pub fn start(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `fleet_spawn`'s `model` must look like a model id and its `effort` must be one Conduit
+/// knows: both are written onto the agent's command line at spawn.
+fn check_spawn_flags(args: &Value) -> Result<(), String> {
+    if let Some(m) = args.get("model").and_then(|v| v.as_str()) {
+        if !crate::session_options::valid_model(m) {
+            return Err(format!("invalid model id {m:?}"));
+        }
+    }
+    if let Some(e) = args.get("effort").and_then(|v| v.as_str()) {
+        if !crate::root_chat_options::valid_effort(e) {
+            return Err(format!(
+                "unknown effort {e:?}; expected one of {}",
+                crate::root_chat_options::EFFORTS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn handle_request(
     mut request: Request,
     app: AppHandle,
@@ -964,6 +986,19 @@ fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_spawn_refuses_a_model_or_effort_that_is_not_a_flag_value() {
+        assert!(check_spawn_flags(&json!({ "task": "t" })).is_ok());
+        assert!(
+            check_spawn_flags(&json!({ "model": "claude-opus-4-8[1m]", "effort": "high" })).is_ok()
+        );
+        assert!(check_spawn_flags(&json!({ "model": "deepseek/deepseek-v4-flash" })).is_ok());
+        assert!(check_spawn_flags(&json!({ "model": "opus\r\ncalc.exe" })).is_err());
+        assert!(check_spawn_flags(&json!({ "model": "opus & calc" })).is_err());
+        assert!(check_spawn_flags(&json!({ "effort": "high\ncalc.exe" })).is_err());
+        assert!(check_spawn_flags(&json!({ "effort": "turbo" })).is_err());
+    }
 
     #[test]
     fn jsonrpc_result_envelope_shape() {

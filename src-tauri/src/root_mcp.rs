@@ -372,6 +372,12 @@ fn dispatch_work_inner(
             ));
         }
     }
+    // The model rides the approved session's command line, so it must look like a model id.
+    if let Some(m) = str_arg("model") {
+        if !crate::session_options::valid_model(&m) {
+            return Err(format!("invalid model id {m:?}"));
+        }
+    }
     let p = proposals.register(
         chat_id,
         project_id,
@@ -1113,6 +1119,19 @@ mod tests {
         assert!(known_chat(&store, "nope").is_err());
         let chat = store.add_root_chat(store.active_profile());
         assert!(known_chat(&store, &chat.id).is_ok());
+    }
+
+    #[test]
+    fn dispatch_work_refuses_a_model_id_that_is_not_one() {
+        let dir = temp_dir("dispatch-model");
+        let store = Arc::new(Store::for_test(&dir));
+        let project = store.add_project("/repo".into(), store.active_profile());
+        let chat = store.add_root_chat(store.active_profile());
+        let proposals = Proposals::default();
+        let args = |m: &str| json!({ "projectId": project.id, "task": "t", "model": m });
+        let bad = args("opus\r\ncalc.exe");
+        assert!(dispatch_work_inner(&store, &proposals, &chat.id, &bad, 1).is_err());
+        assert!(dispatch_work_inner(&store, &proposals, &chat.id, &args("opus"), 1).is_ok());
     }
 
     #[test]
