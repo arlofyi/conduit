@@ -5,6 +5,10 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — A model name could carry a command on Windows.** A model or effort with a line break
+  in it, sent by an orchestrating chat or a Conductor when it starts a worker, could end the
+  Windows launch line and run what followed as a separate command. Those values are now checked
+  before a session is created, and line breaks never reach the launch line.
 - **Fixed — Security updates across the app's dependencies.** The desktop moves to Tauri 2.12 and
   its updater plugin 2.14 (which replaces a vulnerable zip reader), with patched TLS, and the
   build and test tooling, the phone app's toolchain and the Matrix sidecar pick up patched

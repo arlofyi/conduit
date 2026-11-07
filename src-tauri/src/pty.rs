@@ -1254,8 +1254,19 @@ pub(crate) fn win_quote_cmdline(s: &str) -> String {
     win_quote_with(s, |q| q.replace('^', "^^").replace('%', "^%"))
 }
 
+///
+/// A control character never survives: a CR or LF ends the batch (or `cmd /C`) line and runs
+/// whatever follows as a NEW command, so a model id arriving from an MCP tool call as
+/// `opus<CR><LF>calc.exe` would have executed `calc.exe`. They become spaces -- no argument
+/// quoted here has a legitimate line break (a prompt with one is rerouted to a file first,
+/// see `windows_prompt_arg`).
 #[cfg(windows)]
 fn win_quote_with(s: &str, escape_percent: impl Fn(&str) -> String) -> String {
+    let flat: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let s = flat.as_str();
     let simple = !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_./:@=\\".contains(c));
@@ -2533,6 +2544,20 @@ mod tests {
         broadcast(&mut subs, "next");
         assert_eq!(rx_fast.recv().unwrap(), "next");
         assert_eq!(subs.len(), 2);
+    }
+
+    /// A line break would end the batch line and run the rest as a new command.
+    #[cfg(windows)]
+    #[test]
+    fn win_quote_never_lets_a_line_break_through() {
+        for q in [
+            win_quote("opus\r\ncalc.exe"),
+            win_quote_cmdline("opus\ncalc.exe"),
+        ] {
+            assert!(!q.contains(['\r', '\n']), "{q:?}");
+            assert!(q.starts_with('"'), "a flattened value is quoted: {q:?}");
+        }
+        assert_eq!(win_quote("a\tb"), "\"a b\"");
     }
 
     #[cfg(windows)]
