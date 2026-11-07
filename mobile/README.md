@@ -155,22 +155,32 @@ The bridge is plain `ws://` inside the Tailscale tunnel, so release builds set
 On Windows, the computer's firewall must let the phone in: allow Conduit inbound on TCP
 8455-8474 from `100.64.0.0/10` on the Private profile (Tailscale's network is Private).
 
-## Releases and in-app updates (Android)
+## Releases and in-app updates
 
-Every change under `mobile/` that lands on `main` is built by
-`.github/workflows/mobile-release.yml` into a signed APK and published as a GitHub release
-tagged `mobile-b<build>` (also runnable by hand: Actions -> Mobile release -> Run workflow).
-The phone checks for one when it opens (at most every 6 hours; Settings -> App -> "Check
-automatically") and shows a badge on Settings. **Update** downloads the APK and opens Android's
-installer: no USB debugging, no adb. The first time, Android asks you to allow installs from
-Conduit.
+The phone app ships inside every Conduit release. `.github/workflows/release.yml` builds, from
+the same `vX.Y.Z` tag as the desktop's `.dmg` and `.msi`:
 
-- `<build>` is the APK's versionCode (the last phone tag + 1, starting at 100) and is what the
-  app compares. The version name is `app.json`'s `version` plus the build (`1.1.0.104`); bump
-  `version` for a release with new features. Local builds keep versionCode 1, so any published
-  build counts as newer.
-- Phone tags never start with `v` (those are the desktop's) and are published with
-  `--latest=false`, because the desktop updater reads `releases/latest`.
+- **Android:** `conduit-mobile-X.Y.Z-b<build>.apk`, signed with Conduit's release key. The phone
+  checks the releases when it opens (at most every 6 hours; Settings -> App -> "Check
+  automatically") and shows a badge on Settings. **Update** downloads the APK and opens Android's
+  installer: no USB debugging, no adb. The first time, Android asks you to allow installs from
+  Conduit.
+- **iOS:** `conduit-mobile-X.Y.Z-unsigned.ipa`, an unsigned Release build. Install it with a
+  sideloading tool (AltStore, Sideloadly), which signs it with your own Apple ID. App Store /
+  TestFlight distribution needs an iOS distribution certificate and profile in the repository
+  secrets; until then there are no in-app updates on iOS.
+
+To check a phone change before a release, run the workflow by hand (Actions -> Release -> Run
+workflow, on your branch): it builds both apps as artifacts and publishes nothing.
+
+- `<build>` is the Android versionCode and the iOS build number, derived from the version so it
+  only ever goes up: `((major*1000 + minor)*1000 + patch)*10 + 9` (0.51.0 -> 510009); a
+  prerelease `-rcN` ends in N instead of 9. The app's version name is the Conduit version.
+  Prereleases are never offered as an update. Local builds keep `app.json`'s version and
+  versionCode 1, so any published build counts as newer.
+- Builds 100 and 101 were published on their own as `mobile-b<build>` releases. The app still
+  reads those, but they cannot see the new releases: install the first Conduit release's APK
+  over them once by hand (same key, so no uninstall and no re-pairing).
 - **Signing.** Android installs an update only over an app signed with the same key. Release
   builds are signed with Conduit's own key (`plugins/withReleaseSigning.js` reads
   `CONDUIT_KEYSTORE`, `CONDUIT_KEYSTORE_PASSWORD`, `CONDUIT_KEY_ALIAS` and
