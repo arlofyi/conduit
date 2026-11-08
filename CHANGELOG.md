@@ -26,10 +26,12 @@ All notable changes to Conduit are documented here. This project uses
   beside the open chat, files or general chat, with the open row marked; drag the divider to
   resize it. Long chats keep a readable column on wide screens. Settings -> Appearance turns the
   side-by-side view off.
-- **Added — Phone app updates without USB.** Every phone app change merged to main is built into
-  a signed APK on a GitHub release (`mobile-b<build>`, never marked latest, so the desktop
-  updater is unaffected). The app checks for a newer build when it opens and offers Update in
-  Settings -> App, which downloads it and opens Android's installer.
+- **Added — Phone app updates without USB.** The app checks for a newer build when it opens and
+  offers Update in Settings -> App, which downloads the APK and opens Android's installer.
+- **Changed — One release for everything.** Each Conduit release now carries the macOS `.dmg`,
+  the Windows `.msi`, the Android `.apk` and an unsigned iOS `.ipa` (install it with AltStore or
+  Sideloadly), all built from the same version. The phone app takes its updates from these
+  releases; a phone on build 100 or 101 needs this release's APK installed by hand once.
 - **Fixed — The phone's usage meter could read "0%" on an account that could not work.** The
   chat header now shows whichever window is most spent, not always the 5-hour one, so an account
   at 0% of its 5 hours and 100% of its week reads 100%. Settings names the state in words

@@ -632,11 +632,14 @@ plus install/remove/status), and one listener in `App.tsx`.
   conversation's transcript** into the new account's `projects` dir first
   (`move_session_account`, also behind the desktop's `set_session_account`, hence `async`):
   without it the restart finds nothing to `--resume` and starts over. It never overwrites.
-- **Phone releases are `mobile-b<build>` tags, never `v*`, and never `--latest`**
-  (`.github/workflows/mobile-release.yml`): `v*` drives the desktop release, and the desktop
-  updater reads `releases/latest`. They are signed with the private key from the `MOBILE_*`
-  secrets (`mobile/plugins/withReleaseSigning.js`); the template's debug key is public, and
-  in-app updates install whatever APK the release carries, so a debug-signed release is refused.
+- **The phone ships inside the Conduit release** (`.github/workflows/release.yml`): one `v*` tag
+  carries the `.dmg`, the `.msi`, `conduit-mobile-<v>-b<build>.apk` and an unsigned
+  `conduit-mobile-<v>-unsigned.ipa`. `<build>` is derived from the version (0.51.0 -> 510009),
+  so it only goes up; `mobile/src/logic/update.ts` reads it from the APK's name and never offers
+  a prerelease. There are no phone-only releases any more (`mobile-b100`/`b101` predate this and
+  are still parsed). The APK is signed with the private key from the `MOBILE_*` secrets
+  (`mobile/plugins/withReleaseSigning.js`); the template's debug key is public, and in-app
+  updates install whatever APK the release carries, so a debug-signed APK fails the job.
 - **Private sessions are refused, not just hidden.** `bridge_view::session_is_private`
   (`silo || local_only`) gates every session-scoped message (`session_scope`: attach, input,
   resize, git, kill, interrupt) from ANY peer, loopback included, with `{error: "private
