@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.51.1 — 2026-11-08
+
 - **Fixed — The tab bar disappeared in the tablet's side-by-side view.** Opening a session, a
   general chat or a session's files beside the list hid Sessions, Chats and Settings at the
   bottom. The bar now stays under the open pane, with the same badges, and the chat's composer
