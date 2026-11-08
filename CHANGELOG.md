@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.51.0 — 2026-11-08
+
 - **Fixed — A model name could carry a command on Windows.** A model or effort with a line break
   in it, sent by an orchestrating chat or a Conductor when it starts a worker, could end the
   Windows launch line and run what followed as a separate command. Those values are now checked
