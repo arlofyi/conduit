@@ -5,6 +5,14 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — The tab bar disappeared in the tablet's side-by-side view.** Opening a session, a
+  general chat or a session's files beside the list hid Sessions, Chats and Settings at the
+  bottom. The bar now stays under the open pane, with the same badges, and the chat's composer
+  still sits right above the keyboard.
+- **Fixed — The phone's Update gave no sign of progress.** Downloading an update now shows a
+  percentage, says when Android's installer has opened, and offers "Open the installer again"
+  (no second download) if it was closed or hidden. Release notes show as plain text.
+
 ## 0.51.0 — 2026-11-08
 
 - **Fixed — A model name could carry a command on Windows.** A model or effort with a line break

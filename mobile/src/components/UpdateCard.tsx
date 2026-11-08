@@ -15,7 +15,14 @@ import { Card, Row, SectionLabel } from "./form";
 function notesPreview(notes: string): string {
   return notes
     .split("\n")
-    .map((l) => l.replace(/^[-*#>\s]+/, "").trim())
+    // Plain text: list/heading markers, emphasis, code ticks, and links shown as their label.
+    .map((l) =>
+      l
+        .replace(/^[-*#>\s]+/, "")
+        .replace(/\*\*|__|`/g, "")
+        .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+        .trim(),
+    )
     .filter(Boolean)
     .slice(0, 6)
     .join("\n");
@@ -32,7 +39,11 @@ export function UpdateCard() {
     u.phase === "checking"
       ? "Checking…"
       : u.phase === "downloading"
-        ? "Downloading…"
+        ? u.progress !== null
+          ? `Downloading… ${Math.round(u.progress * 100)}%`
+          : "Downloading…"
+        : u.phase === "handedOff"
+          ? "Android's installer is open"
         : u.phase === "current"
           ? "Up to date"
           : r
@@ -67,6 +78,14 @@ export function UpdateCard() {
               disabled={busy}
               onPress={() => void u.install()}
             />
+            {u.phase === "handedOff" ? (
+              <Row
+                title="Open the installer again"
+                subtitle="If you closed it or it didn't appear. Uses the APK already downloaded."
+                tone="accent"
+                onPress={u.reopenInstaller}
+              />
+            ) : null}
             <Row title="See the release on GitHub" tone="dim" onPress={() => void Linking.openURL(r.pageUrl)} />
           </>
         ) : null}

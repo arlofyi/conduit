@@ -14,7 +14,8 @@ import { AppUpdate } from "../../modules/app-update";
 import { AUTO_CHECK_EVERY_MS, RELEASES_URL, newerRelease, parseReleases, type MobileRelease } from "../logic/update";
 import { usePrefs } from "./PrefsProvider";
 
-export type UpdatePhase = "idle" | "checking" | "current" | "available" | "downloading" | "error";
+/** `handedOff`: the download finished and Android's installer was opened on it. */
+export type UpdatePhase = "idle" | "checking" | "current" | "available" | "downloading" | "handedOff" | "error";
 
 export interface AppUpdateValue {
   /** false on iOS / web / a build without the native module: nothing here applies */
@@ -24,9 +25,13 @@ export interface AppUpdateValue {
   release: MobileRelease | null;
   error: string | null;
   checkedAt: number | null;
+  /** 0..1 while downloading, when the size is known */
+  progress: number | null;
   check: () => Promise<void>;
   /** download the release and open the system installer */
   install: () => Promise<void>;
+  /** open the installer again on the APK already downloaded (it was dismissed or hidden) */
+  reopenInstaller: () => void;
 }
 
 const Ctx = createContext<AppUpdateValue | null>(null);
@@ -47,6 +52,10 @@ export function AppUpdateProvider({ children }: { children: React.ReactNode }) {
   const [release, setRelease] = useState<MobileRelease | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [checkedAt, setCheckedAt] = useState<number | null>(null);
+  const [progress, setProgress] = useState<number | null>(null);
+  // The APK handed to the installer, so a dismissed installer can be reopened without a
+  // second download (a 50 MB APK took over 4 minutes on a tablet's Wi-Fi).
+  const downloaded = useRef<string | null>(null);
   const busy = useRef(false);
   const lastAuto = useRef(0);
 
@@ -94,27 +103,45 @@ export function AppUpdateProvider({ children }: { children: React.ReactNode }) {
     }
     busy.current = true;
     setPhase("downloading");
+    setProgress(null);
     setError(null);
     try {
       const dir = new Directory(Paths.cache, "updates");
       // Only ever the one APK being installed: an old download is just space.
       if (dir.exists) dir.delete();
       dir.create({ intermediates: true });
-      const file = await File.downloadFileAsync(release.apkUrl, new File(dir, release.apkName));
+      const file = await File.downloadFileAsync(release.apkUrl, new File(dir, release.apkName), {
+        onProgress: ({ bytesWritten, totalBytes }) => {
+          const total = totalBytes > 0 ? totalBytes : (release.apkSize ?? 0);
+          if (total > 0) setProgress(Math.min(1, bytesWritten / total));
+        },
+      });
       if (release.apkSize !== null && file.size !== release.apkSize) throw new Error("The download was incomplete. Try again.");
+      downloaded.current = file.contentUri;
       native.install(file.contentUri);
-      setPhase("available");
+      setPhase("handedOff");
     } catch (e) {
       setError(e instanceof Error ? e.message : "The download failed.");
       setPhase("error");
     } finally {
       busy.current = false;
+      setProgress(null);
     }
   }, [release]);
 
+  const reopenInstaller = useCallback(() => {
+    if (!AppUpdate || !downloaded.current) return;
+    try {
+      AppUpdate.install(downloaded.current);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't open the installer.");
+      setPhase("error");
+    }
+  }, []);
+
   const value = useMemo<AppUpdateValue>(
-    () => ({ available: installed !== null, installed, phase, release, error, checkedAt, check, install }),
-    [installed, phase, release, error, checkedAt, check, install],
+    () => ({ available: installed !== null, installed, phase, release, error, checkedAt, progress, check, install, reopenInstaller }),
+    [installed, phase, release, error, checkedAt, progress, check, install, reopenInstaller],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

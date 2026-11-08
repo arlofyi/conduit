@@ -8,10 +8,12 @@
  */
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { PanResponder, StyleSheet, View, useWindowDimensions } from "react-native";
+import { SafeAreaInsetsContext, useSafeAreaInsets } from "react-native-safe-area-context";
 import { usePrefs } from "../data/PrefsProvider";
 import { DEFAULT_PREFS } from "../data/prefs";
 import { isSplit, listWidth } from "../logic/split";
 import { useTheme } from "../theme/ThemeContext";
+import { SPLIT_TAB_BAR_HEIGHT, SplitTabBar, type SplitTab } from "./SplitTabBar";
 
 /** What the detail pane is showing, so the list beside it can mark that row. */
 export interface SplitCurrent {
@@ -26,6 +28,18 @@ export function useSplitCurrent(): SplitCurrent | null {
   return useContext(CurrentCtx);
 }
 
+/**
+ * How much of the screen's bottom edge the split view's tab bar takes from the detail pane: its
+ * own height plus the real bottom inset it pads. 0 everywhere else. Inside the frame the bottom
+ * safe-area inset reads 0 (the bar already clears the home indicator / nav bar), so a screen
+ * that lifts its content above the keyboard by hand subtracts this (`useKeyboardInset`).
+ */
+const BarSpaceCtx = createContext(0);
+
+export function useSplitBarSpace(): number {
+  return useContext(BarSpaceCtx);
+}
+
 /** Is the window wide enough for the split view (and is it switched on)? */
 export function useIsSplit(): boolean {
   const { width } = useWindowDimensions();
@@ -38,17 +52,23 @@ export function SplitFrame({
   children,
   primary,
   current = null,
+  tab,
 }: {
   list: React.ReactNode;
   children: React.ReactNode;
   /** what a phone-width window shows */
   primary: "list" | "detail";
   current?: SplitCurrent | null;
+  /** the tab a detail screen belongs to: in the split view it gets a tab bar under it */
+  tab?: SplitTab;
 }) {
   const { palette: p } = useTheme();
   const { width } = useWindowDimensions();
   const { prefs, setPrefs } = usePrefs();
   const split = isSplit(width, prefs.splitView);
+  const insets = useSafeAreaInsets();
+  const bar = split && primary === "detail" && tab !== undefined;
+  const innerInsets = useMemo(() => (bar ? { ...insets, bottom: 0 } : insets), [bar, insets]);
   // Dragged live; stored once, on release.
   const [drag, setDrag] = useState<number | null>(null);
   const w = listWidth(drag ?? prefs.splitListWidth, width);
@@ -86,6 +106,11 @@ export function SplitFrame({
   const showDetail = split || primary === "detail";
   return (
     <CurrentCtx.Provider value={split ? current : null}>
+      {/* The column, the insets provider and the row are always rendered, so the slots never
+          change position in the tree when the bar comes and goes (see the file comment). */}
+      <View style={{ flex: 1, backgroundColor: p.panelBg }}>
+      <BarSpaceCtx.Provider value={bar ? SPLIT_TAB_BAR_HEIGHT + insets.bottom : 0}>
+      <SafeAreaInsetsContext.Provider value={innerInsets}>
       <View style={{ flex: 1, flexDirection: "row", backgroundColor: p.panelBg }}>
         <View style={split ? { width: w } : showList ? { flex: 1 } : { width: 0 }}>{showList ? list : null}</View>
         {split ? (
@@ -108,6 +133,10 @@ export function SplitFrame({
           </View>
         ) : null}
         <View style={showDetail ? { flex: 1 } : { width: 0 }}>{showDetail ? children : null}</View>
+      </View>
+      </SafeAreaInsetsContext.Provider>
+      </BarSpaceCtx.Provider>
+      {bar && tab ? <SplitTabBar active={tab} bottomInset={insets.bottom} /> : null}
       </View>
     </CurrentCtx.Provider>
   );
