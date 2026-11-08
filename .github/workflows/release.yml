@@ -212,6 +212,33 @@ jobs:
           CONDUIT_RELEASE_VERSION: ${{ needs.meta.outputs.base }}
         run: npx expo prebuild --platform android --clean --no-install
 
+      # The Gradle wrapper downloads Gradle itself from services.gradle.org, and an outage there
+      # (504s on 2026-11-08, mirrors included) failed the whole release. Cache it, pin the
+      # official checksum so the wrapper verifies whatever it downloads, and fall back to a
+      # mirror only when Gradle's own server does not answer -- the checksum keeps a mirror
+      # from serving anything but the exact official file.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: gradle-wrapper-${{ hashFiles('mobile/android/gradle/wrapper/gradle-wrapper.properties') }}
+
+      - name: Pin the Gradle download
+        working-directory: mobile/android
+        run: |
+          props=gradle/wrapper/gradle-wrapper.properties
+          url=$(sed -n 's/^distributionUrl=//p' "$props" | sed 's/\\:/:/g')
+          file=${url##*/}
+          sum=$(curl -fsSL --retry 3 "$url.sha256") || { echo "::error::Gradle's checksum for $file is unavailable."; exit 1; }
+          echo "$sum" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::Unexpected checksum: $sum"; exit 1; }
+          echo "distributionSha256Sum=$sum" >> "$props"
+          if ! curl -fsIL --retry 2 --max-time 30 "$url" > /dev/null; then
+            mirror="https://mirrors.cloud.tencent.com/gradle/$file"
+            echo "::warning::services.gradle.org is not serving $file; using $mirror (checked against Gradle's checksum)."
+            # An unescaped ':' is valid in a .properties VALUE.
+            sed -i "s|^distributionUrl=.*|distributionUrl=$mirror|" "$props"
+          fi
+          cat "$props"
+
       - name: Write the keystore
         env:
           KS: ${{ secrets.MOBILE_KEYSTORE_BASE64 }}
