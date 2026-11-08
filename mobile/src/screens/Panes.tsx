@@ -53,7 +53,7 @@ export function GeneralTab(props: GeneralProps) {
 
 export function ChatPane(props: ChatProps) {
   return (
-    <SplitFrame primary="detail" current={{ sessionId: props.route.params.sessionId }} list={<ChatsScreen {...asList<ChatsProps>(props)} />}>
+    <SplitFrame primary="detail" tab="Chats" current={{ sessionId: props.route.params.sessionId }} list={<ChatsScreen {...asList<ChatsProps>(props)} />}>
       <ChatScreen {...props} />
     </SplitFrame>
   );
@@ -61,7 +61,7 @@ export function ChatPane(props: ChatProps) {
 
 export function GeneralChatPane(props: GeneralChatProps) {
   return (
-    <SplitFrame primary="detail" current={{ chatId: props.route.params.chatId }} list={<GeneralScreen {...asList<GeneralProps>(props)} />}>
+    <SplitFrame primary="detail" tab="General" current={{ chatId: props.route.params.chatId }} list={<GeneralScreen {...asList<GeneralProps>(props)} />}>
       <GeneralChatScreen {...props} />
     </SplitFrame>
   );
@@ -69,7 +69,7 @@ export function GeneralChatPane(props: GeneralChatProps) {
 
 export function FilesPane(props: FilesProps) {
   return (
-    <SplitFrame primary="detail" current={{ sessionId: props.route.params.sessionId }} list={<ChatsScreen {...asList<ChatsProps>(props)} />}>
+    <SplitFrame primary="detail" tab="Chats" current={{ sessionId: props.route.params.sessionId }} list={<ChatsScreen {...asList<ChatsProps>(props)} />}>
       <FilesScreen {...props} />
     </SplitFrame>
   );
@@ -77,7 +77,7 @@ export function FilesPane(props: FilesProps) {
 
 export function FileViewPane(props: FileViewProps) {
   return (
-    <SplitFrame primary="detail" current={{ sessionId: props.route.params.sessionId }} list={<ChatsScreen {...asList<ChatsProps>(props)} />}>
+    <SplitFrame primary="detail" tab="Chats" current={{ sessionId: props.route.params.sessionId }} list={<ChatsScreen {...asList<ChatsProps>(props)} />}>
       <FileViewScreen {...props} />
     </SplitFrame>
   );
