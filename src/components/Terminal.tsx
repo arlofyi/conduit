@@ -4,6 +4,7 @@ import {
   cellFromPoint,
   decPrivateSeq,
   partitionMouseModes,
+  parseOsc52,
   sgrWheelReport,
   wheelLines,
 } from "../terminalMouse";
@@ -391,11 +392,28 @@ export function TerminalView({
     // macOS uses Cmd+C / Cmd+V; Windows & Linux use Ctrl+Shift+C / Ctrl+Shift+V, plus the
     // "smart" Ctrl+C that copies the current selection (then releases it so a second
     // Ctrl+C still sends SIGINT) and Ctrl+V to paste — matching Windows Terminal.
+    // Written on the Rust side for the same reason paste reads there: WebKit only allows a
+    // browser clipboard write inside a user gesture, and an OSC 52 copy arrives from the
+    // PTY some milliseconds after the mouse-up that caused it.
+    const writeClipboard = (text: string) => {
+      void invoke("clipboard_write_text", { text }).catch(() =>
+        navigator.clipboard.writeText(text).catch(() => {}),
+      );
+    };
     const copySelection = () => {
       const sel = term.getSelection();
-      if (sel) void navigator.clipboard.writeText(sel).catch(() => {});
+      if (sel) writeClipboard(sel);
       term.clearSelection();
     };
+    // OSC 52: how a copy made INSIDE the pane gets out. tmux sends one when a copy-mode
+    // selection is copied (`set-clipboard on`) -- which is what a drag is in an agent pane
+    // whose agent has exited -- and agents with their own selection send one too. xterm has
+    // no built-in handler, so without this every such copy was silently dropped.
+    const osc52 = term.parser.registerOscHandler(52, (data) => {
+      const text = parseOsc52(data);
+      if (text !== null) writeClipboard(text);
+      return true;
+    });
     // Read the clipboard on the Rust side, not via `navigator.clipboard.readText()`:
     // WKWebView gates browser clipboard reads behind a native "Paste" consent popup
     // (macOS 26+) and the canvas terminal has no editable target for it, so the browser
@@ -521,9 +539,11 @@ export function TerminalView({
         // Defensive: if the swallow above ever stops taking (an xterm upgrade moving the
         // parser registry), hand the wheel back instead of leaving the pane unscrollable.
         if (term.modes.mouseTrackingMode !== "none") return true;
-        // Alternate screen has no history behind it, and xterm's arrow-key fallback is
-        // what a native terminal does there.
-        if (term.buffer.active.type === "alternate") return true;
+        // Do NOT bail out on `term.buffer.active.type === "alternate"`. tmux is itself a
+        // full-screen program to this xterm, so the buffer is ALWAYS alternate under it and
+        // the check sent every wheel to xterm's arrow-key fallback -- the wheel walked the
+        // shell's history instead of scrolling. Whether the INNER program is full-screen is
+        // tmux's knowledge (`#{alternate_on}`), and its WheelUpPane binding decides there.
         const host = innerRef.current;
         if (!host) return true;
         const rect = host.getBoundingClientRect();
@@ -613,6 +633,7 @@ export function TerminalView({
       innerRef.current?.removeEventListener("contextmenu", onContextMenu);
       innerRef.current?.removeEventListener("mousedown", onWakeClick);
       mouseDisposables.forEach((d) => d.dispose());
+      osc52.dispose();
       // Renderer addon first, xterm second — see disposePane. React runs this cleanup
       // before the renderer effect's own, so a bare term.dispose() here would be the one
       // that disposes the addon, and its throw would take the whole UI down with it.

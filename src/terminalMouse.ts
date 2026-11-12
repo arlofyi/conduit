@@ -109,3 +109,38 @@ export function cellFromPoint(
   const row = height > 0 ? Math.floor(y / (height / rows)) + 1 : 1;
   return { col: clamp(col, cols), row: clamp(row, rows) };
 }
+
+/** Largest clipboard write a terminal program may make through OSC 52, in decoded bytes. */
+export const OSC52_MAX_BYTES = 1024 * 1024;
+
+/**
+ * The text an OSC 52 clipboard WRITE carries, or null when there is nothing to write.
+ *
+ * The payload is `<targets>;<base64>`. tmux (`set-clipboard on`) sends one when a copy-mode
+ * selection is copied, and agents with their own selection send one too; without a handler
+ * xterm drops it and the copy goes nowhere.
+ *
+ * A `?` payload is a READ request and always answers null: replying would hand the
+ * clipboard to whatever happens to be printing into the pane. Oversized or undecodable
+ * payloads are dropped rather than written in part.
+ */
+export function parseOsc52(data: string): string | null {
+  const sep = data.indexOf(";");
+  if (sep < 0) return null;
+  const payload = data.slice(sep + 1).trim();
+  if (payload === "" || payload === "?") return null;
+  if (payload.length > Math.ceil(OSC52_MAX_BYTES / 3) * 4) return null;
+  let binary: string;
+  try {
+    binary = atob(payload);
+  } catch {
+    return null;
+  }
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return text === "" ? null : text;
+  } catch {
+    return null;
+  }
+}

@@ -6,6 +6,8 @@ import {
   sgrWheelReport,
   wheelLines,
   cellFromPoint,
+  parseOsc52,
+  OSC52_MAX_BYTES,
 } from "./terminalMouse";
 
 describe("partitionMouseModes", () => {
@@ -88,5 +90,32 @@ describe("cellFromPoint", () => {
   it("clamps a point outside the grid instead of emitting an invalid cell", () => {
     expect(cellFromPoint(-40, -40, 800, 480, 80, 24)).toEqual({ col: 1, row: 1 });
     expect(cellFromPoint(9999, 9999, 800, 480, 80, 24)).toEqual({ col: 80, row: 24 });
+  });
+});
+
+describe("parseOsc52", () => {
+  const b64 = (t: string) => btoa(String.fromCharCode(...new TextEncoder().encode(t)));
+
+  it("decodes a clipboard write, whatever targets it names", () => {
+    expect(parseOsc52(`c;${b64("hello")}`)).toBe("hello");
+    expect(parseOsc52(`;${b64("hello")}`)).toBe("hello");
+    expect(parseOsc52(`pc;${b64("hello")}`)).toBe("hello");
+  });
+
+  it("decodes UTF-8, not Latin-1", () => {
+    expect(parseOsc52(`c;${b64("naïve → 日本")}`)).toBe("naïve → 日本");
+  });
+
+  it("never answers a read request", () => {
+    expect(parseOsc52("c;?")).toBeNull();
+  });
+
+  it("drops empty, malformed and oversized payloads", () => {
+    expect(parseOsc52("c;")).toBeNull();
+    expect(parseOsc52("c")).toBeNull();
+    expect(parseOsc52("c;!!!not-base64!!!")).toBeNull();
+    // A lone continuation byte is not valid UTF-8.
+    expect(parseOsc52(`c;${btoa("\x80")}`)).toBeNull();
+    expect(parseOsc52(`c;${"A".repeat(Math.ceil(OSC52_MAX_BYTES / 3) * 4 + 4)}`)).toBeNull();
   });
 });

@@ -3858,6 +3858,7 @@ pub fn run() {
             diag::log_frontend_error,
             updates::update_should_notify,
             clipboard::clipboard_read_for_paste,
+            clipboard::clipboard_write_text,
             plugins::list_plugins,
             plugins::read_plugin_source,
             plugins::set_plugin_enabled,
