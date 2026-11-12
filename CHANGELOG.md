@@ -5,6 +5,14 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — The wheel walked your command history in the side terminal.** Scrolling there now
+  scrolls the terminal's history, and scrolls `less`, `man` and other full-screen programs.
+- **Fixed — Copying from a terminal after its agent exited did nothing.** Dragging to select
+  in that shell now puts the selection on the clipboard when you let go. Copies made by an
+  agent's own selection reach the clipboard too.
+- **Fixed — Right-click in a plain shell opened a Split / Kill menu.** It now only does what
+  right-click does everywhere else in Conduit: copy the selection, or paste.
+
 ## 0.51.1 — 2026-11-08
 
 - **Fixed — The tab bar disappeared in the tablet's side-by-side view.** Opening a session, a

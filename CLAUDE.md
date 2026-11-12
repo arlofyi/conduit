@@ -531,6 +531,20 @@ with `set -g mouse on`, which the WHEEL needs and the BUTTONS must not have.
   stalls nor bolts. It never scrolls xterm's own buffer. If the swallow ever stops taking
   (an xterm upgrade moving the parser registry) the handler checks `term.modes.mouseTrackingMode`
   and hands the wheel back rather than leaving the pane unscrollable.
+- **Never test `term.buffer.active.type === "alternate"` to learn what the inner program is
+  doing.** tmux is itself a full-screen program to xterm, so the buffer is ALWAYS alternate
+  under it. The wheel handler once bailed out on that check, so every wheel fell to xterm's
+  arrow-key fallback and walked the shell's history. Only tmux knows (`#{alternate_on}`).
+- **An agent pane whose agent exited is a bare shell too, and is not `shellOnly`.** tmux
+  answers its buttons, so `tmux::MOUSE_BINDINGS` makes those answers sane: right-click does
+  nothing unless the program asked for the mouse (no Split/Kill menu), and the wheel sends
+  arrows to a full-screen program that did not. The drag stays tmux's copy-mode; releasing
+  copies through OSC 52.
+- **OSC 52 is handled by hand** (`parseOsc52` + `registerOscHandler(52)`), for every pane.
+  xterm has no built-in handler, so `set-clipboard on` was copying into nothing. Writes only:
+  a `?` read request is never answered. The write goes through Rust (`clipboard_write_text`)
+  because WebKit refuses a clipboard write outside a user gesture and the sequence arrives
+  after the mouse-up.
 - Trade, accepted deliberately: a mouse-aware TUI run INSIDE the companion shell (vim
   `set mouse=a`) does not get the mouse there. Selection is the commoner need in a scratch
   shell; agent panes are untouched.

@@ -73,6 +73,22 @@ pub fn clipboard_read_for_paste(app: tauri::AppHandle) -> Result<ClipboardPaste,
     Ok(ClipboardPaste::Empty)
 }
 
+/// Largest text a terminal copy may put on the clipboard. Matches `OSC52_MAX_BYTES`.
+const MAX_WRITE_BYTES: usize = 1024 * 1024;
+
+/// Put terminal-copied text on the OS clipboard.
+///
+/// WebKit allows `navigator.clipboard.writeText` only inside a user gesture, and a copy
+/// that arrives as OSC 52 (tmux copy-mode, an agent's own selection) reaches the frontend
+/// from the PTY after the gesture has ended, so the write happens here instead.
+#[tauri::command]
+pub fn clipboard_write_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
+    if text.len() > MAX_WRITE_BYTES {
+        return Err("clipboard text too large".into());
+    }
+    app.clipboard().write_text(text).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
