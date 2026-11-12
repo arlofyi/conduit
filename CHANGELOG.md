@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.51.2 — 2026-11-12
+
 - **Fixed — The wheel walked your command history in the side terminal.** Scrolling there now
   scrolls the terminal's history, and scrolls `less`, `man` and other full-screen programs.
 - **Fixed — Copying from a terminal after its agent exited did nothing.** Dragging to select
