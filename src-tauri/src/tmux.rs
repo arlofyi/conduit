@@ -232,11 +232,27 @@ pub fn conf_body(scrollback: u32) -> String {
 ///   a program that is not listening, so the wheel did nothing there. Everything else is
 ///   the default: forward to a mouse-aware program, else scroll tmux's history.
 ///
-/// The drag binding is deliberately left alone: in a bare shell it enters copy-mode, and
+/// Scrolling back IS tmux's copy-mode, and by default that is a modal editor: a yellow
+/// `[14/24]` position badge, and every key is a copy-mode command or is swallowed, so
+/// typing, pasting and right-click all appear dead until `q`. A terminal's scrollback is
+/// not a mode, so the copy-mode table is emptied down to the mouse, the badge is blanked,
+/// and `Any` (every key left unbound) leaves the mode and then forwards the key --
+/// `send-keys` with no arguments re-sends the key that triggered the binding. Typing or
+/// pasting while scrolled back therefore snaps to the bottom and lands in the shell.
+///
+/// The root drag binding is deliberately left alone: in a bare shell it enters copy-mode, and
 /// releasing copies the selection out through OSC 52, which the frontend now handles.
 const MOUSE_BINDINGS: &str = r##"bind-key -T root MouseDown3Pane if-shell -F -t = "#{||:#{pane_in_mode},#{mouse_any_flag}}" "select-pane -t = ; send-keys -M"
 bind-key -T root WheelUpPane if-shell -F -t = "#{||:#{pane_in_mode},#{mouse_any_flag}}" "send-keys -M" "if-shell -F -t = '#{alternate_on}' 'send-keys -t = -N 3 Up' 'copy-mode -e -t ='"
 bind-key -T root WheelDownPane if-shell -F -t = "#{||:#{pane_in_mode},#{mouse_any_flag}}" "send-keys -M" "if-shell -F -t = '#{alternate_on}' 'send-keys -t = -N 3 Down'"
+set -gw copy-mode-position-format ""
+unbind-key -a -T copy-mode
+bind-key -T copy-mode MouseDown1Pane select-pane
+bind-key -T copy-mode MouseDrag1Pane "select-pane ; send-keys -X begin-selection"
+bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel
+bind-key -T copy-mode WheelUpPane "select-pane ; send-keys -X -N 3 scroll-up"
+bind-key -T copy-mode WheelDownPane "select-pane ; send-keys -X -N 3 scroll-down"
+bind-key -T copy-mode Any "send-keys -X cancel ; send-keys"
 "##;
 
 fn conf_options(scrollback: u32) -> String {
@@ -493,8 +509,30 @@ mod tests {
             assert!(line.contains("#{alternate_on}"), "{line}");
             assert!(line.contains(&format!("-N 3 {arrow}")), "{line}");
         }
-        // The drag stays tmux's: copy-mode is how a bare agent pane selects.
-        assert!(!c.contains("MouseDrag1Pane"));
+        // The ROOT drag stays tmux's: copy-mode is how a bare agent pane selects.
+        assert!(!c.contains("-T root MouseDrag1Pane"));
+    }
+
+    #[test]
+    fn conf_makes_scrollback_behave_like_scrollback_not_a_mode() {
+        let c = conf_body(50_000);
+        assert!(c.contains("set -gw copy-mode-position-format \"\""));
+        // The table is emptied BEFORE its bindings are re-added; the other order would
+        // leave it empty, and a scrolled pane could never be scrolled back down.
+        let unbind = c
+            .find("unbind-key -a -T copy-mode")
+            .expect("the table is emptied");
+        let any = c.find("bind-key -T copy-mode Any").expect("an Any binding");
+        let wheel = c
+            .find("bind-key -T copy-mode WheelDownPane")
+            .expect("a wheel binding");
+        assert!(unbind < wheel && unbind < any);
+        // Any must leave the mode first and then forward the key (a bare `send-keys`).
+        let line = c.lines().find(|l| l.contains("copy-mode Any")).unwrap();
+        assert!(
+            line.ends_with("\"send-keys -X cancel ; send-keys\""),
+            "{line}"
+        );
     }
 
     #[test]

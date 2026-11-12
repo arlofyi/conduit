@@ -540,6 +540,11 @@ with `set -g mouse on`, which the WHEEL needs and the BUTTONS must not have.
   nothing unless the program asked for the mouse (no Split/Kill menu), and the wheel sends
   arrows to a full-screen program that did not. The drag stays tmux's copy-mode; releasing
   copies through OSC 52.
+- **Scrollback is tmux copy-mode, stripped of its mode.** The same `MOUSE_BINDINGS` empty
+  the `copy-mode` key table down to the mouse, blank `copy-mode-position-format` (the yellow
+  `[14/24]` badge) and bind `Any` to `send-keys -X cancel ; send-keys`, which leaves the mode
+  and re-sends the key. Without it a scrolled-back pane swallows typing and paste until `q`.
+  A key added to that table is a key that stops reaching the shell while scrolled.
 - **OSC 52 is handled by hand** (`parseOsc52` + `registerOscHandler(52)`), for every pane.
   xterm has no built-in handler, so `set-clipboard on` was copying into nothing. Writes only:
   a `?` read request is never answered. The write goes through Rust (`clipboard_write_text`)
