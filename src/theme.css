@@ -2573,16 +2573,42 @@ button {
   font-size: 11px;
   opacity: 0.7;
 }
-.diag-path {
-  font-family: var(--mono-font);
-  font-size: 11px;
+/* Settings -> About -> Diagnostics. A padded card of label/value pairs with its actions
+   in a footer. Labels size the first column and never wrap, so every row is one line. */
+.diag-card {
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: color-mix(in srgb, var(--sidebar-bg) 55%, transparent);
+}
+.about-facts {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  gap: 7px 24px; align-items: baseline;
+  margin: 0; font-size: 12px;
+}
+.about-facts dt { color: var(--text-dim); white-space: nowrap; }
+.about-facts dd {
+  margin: 0; min-width: 0; color: var(--text-bright);
+  font-variant-numeric: tabular-nums;
+  -webkit-user-select: text; user-select: text;
+}
+/* A sentence rather than a value: quieter, and it wraps. */
+.about-facts dd.about-prose { color: var(--text-mid); line-height: 1.5; }
+.about-facts dd.diag-path {
+  font-family: var(--mono-font); font-size: 11px; color: var(--text-mid);
   overflow-wrap: anywhere;
 }
+.diag-actions {
+  display: flex; flex-direction: column; gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+}
+.diag-note { margin: 0; font-size: 11.5px; line-height: 1.5; color: var(--text-dim); }
 .diag-recent summary {
   cursor: pointer;
   font-size: 12px;
   color: var(--text-mid);
-  margin: 8px 0 4px;
+  margin: 0 0 6px;
 }
 .diag-recent pre {
   max-height: 220px;
@@ -4079,34 +4105,6 @@ label.setting-row-title {
 .about-link:hover {
   text-decoration: underline;
 }
-.about-rows {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 4px;
-}
-.about-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 12px;
-}
-.about-key {
-  width: 64px;
-  flex-shrink: 0;
-  color: var(--text-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  font-size: 10px;
-}
-.about-val {
-  color: var(--text-mid);
-  font-variant-numeric: tabular-nums;
-}
-/* A sentence, not a value: it wraps, and its row aligns to the first line. */
-.about-row:has(.about-third-party) { align-items: baseline; }
-.about-third-party { line-height: 1.5; min-width: 0; }
-
 /* ---- Accounts manager ---- */
 .account-list {
   display: flex;
