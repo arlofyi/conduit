@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use base64::Engine;
 use dashmap::DashMap;
@@ -254,6 +255,18 @@ pub struct PtyManager {
     /// `set_keep_agents_in_project` like `persist`; read at spawn, so it applies to the
     /// next session started rather than to one already running.
     keep_in_project: AtomicBool,
+    /// What the person has typed into each session and not yet sent, so a machine write
+    /// (`write_machine`) can stay out of a half-written message. See `input_gate`.
+    gates: DashMap<String, Mutex<crate::input_gate::Gate>>,
+}
+
+/// What became of a machine write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MachineWrite {
+    /// It went in.
+    Sent,
+    /// The person was still typing when the limit passed. Nothing was written.
+    Held,
 }
 
 /// Why a session's processes are being ended. The two verbs kill the same things; they
@@ -293,6 +306,7 @@ impl PtyManager {
             lifecycle: Mutex::new(()),
             ide_host: std::sync::OnceLock::new(),
             keep_in_project: AtomicBool::new(true),
+            gates: DashMap::new(),
         }
     }
 
@@ -850,6 +864,132 @@ impl PtyManager {
         Ok(())
     }
 
+    /// Input from a PERSON: the desktop's `pty_write` and a phone's `input`. Written at
+    /// once, exactly like `write` -- keystroke order is the order of these calls -- and
+    /// also shown to the session's input gate so machine writers know someone is typing.
+    pub fn write_human(&self, session_id: &str, data: &str) -> Result<(), String> {
+        if let Ok(mut gate) = self.gates.entry(session_id.to_string()).or_default().lock() {
+            gate.human(data.as_bytes(), std::time::Instant::now());
+        }
+        self.write(session_id, data)
+    }
+
+    /// How much longer a machine write into this session should hold.
+    pub fn machine_wait(&self, session_id: &str) -> Duration {
+        self.machine_wait_with(
+            session_id,
+            crate::input_gate::quiet(),
+            crate::input_gate::draft_limit(),
+        )
+    }
+
+    fn machine_wait_with(&self, session_id: &str, quiet: Duration, draft: Duration) -> Duration {
+        self.gates
+            .get(session_id)
+            .and_then(|g| {
+                g.lock()
+                    .ok()
+                    .map(|g| g.wait(std::time::Instant::now(), quiet, draft))
+            })
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Input from a MACHINE that pastes and submits (`fleet_send`, worker news). Waits
+    /// until the person has stopped typing in this terminal, for at most `limit`, then
+    /// writes. `Held` means the limit passed first and nothing was written.
+    ///
+    /// Blocks the calling thread, so never call it from a sync Tauri command.
+    pub fn write_machine(
+        &self,
+        session_id: &str,
+        data: &str,
+        limit: Duration,
+    ) -> Result<MachineWrite, String> {
+        self.write_machine_with(
+            session_id,
+            data,
+            limit,
+            crate::input_gate::quiet(),
+            crate::input_gate::draft_limit(),
+        )
+    }
+
+    /// `write_machine` with the gate's two limits passed in, so tests need neither the
+    /// real seconds nor a process-wide environment variable.
+    fn write_machine_with(
+        &self,
+        session_id: &str,
+        data: &str,
+        limit: Duration,
+        quiet: Duration,
+        draft: Duration,
+    ) -> Result<MachineWrite, String> {
+        const POLL: Duration = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        loop {
+            if !self.has(session_id) {
+                return Err("no such session".to_string());
+            }
+            let wait = self.machine_wait_with(session_id, quiet, draft);
+            if wait.is_zero() {
+                self.write(session_id, data)?;
+                return Ok(MachineWrite::Sent);
+            }
+            if started.elapsed() >= limit {
+                return Ok(MachineWrite::Held);
+            }
+            thread::sleep(wait.min(POLL));
+        }
+    }
+
+    /// A session backed by a real PTY running `argv`, for tests that need bytes to arrive
+    /// somewhere. Returns everything the program writes back.
+    #[cfg(all(test, unix))]
+    pub(crate) fn insert_test_session(&self, session_id: &str, argv: &[&str]) -> Receiver<String> {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new(argv[0]);
+        cmd.args(&argv[1..]);
+        let child = pair.slave.spawn_command(cmd).expect("spawn");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let writer = pair.master.take_writer().expect("writer");
+        let (tx, rx) = sync_channel::<String>(1024);
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0
+                    || tx
+                        .send(String::from_utf8_lossy(&buf[..n]).into_owned())
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.sessions.insert(
+            session_id.to_string(),
+            Mutex::new(PtySession {
+                writer,
+                master: pair.master,
+                child,
+                sink: Arc::new(Mutex::new(None)),
+                subscribers: Arc::new(Mutex::new(Vec::new())),
+                next_sub_id: Arc::new(AtomicU64::new(0)),
+                size: Arc::new((AtomicU16::new(80), AtomicU16::new(24))),
+                output: Arc::new(RingBuffer::new(4096)),
+                suppress_remote: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+        rx
+    }
+
     /// Recent (ANSI-stripped) terminal output for a session, for `fleet_peek`.
     /// None if the session isn't running.
     pub fn recent_output(&self, session_id: &str, max_bytes: usize) -> Option<String> {
@@ -1035,6 +1175,7 @@ impl PtyManager {
         if how.keeps_snapshot() {
             self.save_scrollback_for(session_id);
         }
+        self.gates.remove(session_id);
         if let Some((_, m)) = self.sessions.remove(session_id) {
             if let Ok(mut session) = m.lock() {
                 // Windows: child.kill() is TerminateProcess on cmd.exe only, which orphans
@@ -2934,5 +3075,107 @@ mod tests {
             false,
         );
         assert!(!without_plugin.contains("--plugin-dir"), "{without_plugin}");
+    }
+    /// Everything the program has written back within `within`, joined.
+    #[cfg(unix)]
+    fn drain(rx: &Receiver<String>, within: Duration) -> String {
+        let deadline = std::time::Instant::now() + within;
+        let mut out = String::new();
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(chunk) => out.push_str(&chunk),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_machine_write_goes_in_at_once_when_nobody_is_typing() {
+        let pty = PtyManager::new();
+        let rx = pty.insert_test_session("s", &["cat"]);
+        let started = std::time::Instant::now();
+        let out = pty.write_machine_with("s", "hello-machine\r", MS(2000), MS(300), MS(1500));
+        assert_eq!(out, Ok(MachineWrite::Sent));
+        assert!(started.elapsed() < MS(200), "it waited with no one typing");
+        assert!(drain(&rx, MS(500)).contains("hello-machine"));
+        pty.kill("s");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_machine_write_waits_for_the_person_to_send_their_draft() {
+        let pty = Arc::new(PtyManager::new());
+        let rx = pty.insert_test_session("s", &["cat"]);
+        // The person is mid-sentence...
+        pty.write_human("s", "half a thou").unwrap();
+        let writer = pty.clone();
+        let machine = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let out = writer.write_machine_with("s", "MACHINE\r", MS(5000), MS(300), MS(4000));
+            (out, started.elapsed())
+        });
+        // ...and finishes 400 ms later.
+        thread::sleep(MS(400));
+        pty.write_human("s", "ght\r").unwrap();
+        let (out, took) = machine.join().unwrap();
+        assert_eq!(out, Ok(MachineWrite::Sent));
+        assert!(
+            took >= MS(400),
+            "it went in before the person pressed Enter ({took:?})"
+        );
+        assert!(
+            took < MS(2000),
+            "it kept waiting after the draft was sent ({took:?})"
+        );
+        let seen = drain(&rx, MS(500));
+        let human = seen
+            .find("half a thought")
+            .expect("the person's line arrived whole");
+        let machine = seen.find("MACHINE").expect("the machine's line arrived");
+        assert!(
+            human < machine,
+            "the machine's text landed inside the draft: {seen:?}"
+        );
+        pty.kill("s");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_machine_write_is_held_when_the_person_never_stops() {
+        let pty = PtyManager::new();
+        let rx = pty.insert_test_session("s", &["cat"]);
+        pty.write_human("s", "still typing").unwrap();
+        let out = pty.write_machine_with("s", "MACHINE\r", MS(300), MS(300), MS(60_000));
+        assert_eq!(out, Ok(MachineWrite::Held));
+        assert!(
+            !drain(&rx, MS(300)).contains("MACHINE"),
+            "a held write was written anyway"
+        );
+        pty.kill("s");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_machine_write_to_a_dead_session_is_an_error_not_a_wait() {
+        let pty = PtyManager::new();
+        assert!(pty
+            .write_machine_with("gone", "x", MS(5000), MS(300), MS(300))
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tearing_a_session_down_forgets_what_was_typed_into_it() {
+        let pty = PtyManager::new();
+        let _rx = pty.insert_test_session("s", &["cat"]);
+        pty.write_human("s", "draft").unwrap();
+        assert!(!pty.machine_wait("s").is_zero());
+        pty.kill("s");
+        assert!(pty.machine_wait("s").is_zero());
     }
 }

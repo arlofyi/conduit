@@ -1785,6 +1785,40 @@ worktree is deleted the server holds a dead inode and every pane it later forks 
 `shell-init: error retrieving current directory: getcwd`. An already-poisoned server keeps
 the bad cwd until it is killed — the fix only prevents new ones.
 
+## Where machine-typed input lives
+
+A session's PTY has one input stream and several writers. `input_gate.rs` (pure) decides
+when a MACHINE may type; design in
+`docs/superpowers/specs/2026-11-16-herdr-lessons-roadmap-design.md`.
+
+- **Three write paths on `PtyManager`, and picking the wrong one is the bug.**
+  `write_human` is a person (the desktop's `pty_write`, a phone's `input`): written at
+  once, and shown to the session's `Gate`. `write_machine` pastes and submits for an agent
+  (`fleet_send`): it waits until the person has sent or cleared their draft (60 s from
+  their last key), or 3 s of no keys, and answers `Held` without writing if they never
+  stop. Plain `write` is for keys that answer a menu already on screen (agy auto-approve,
+  the bridge's interrupt Esc) and must NOT wait. A new caller that pastes text must use
+  `write_machine`; `write_machine` blocks, so never call it from a sync Tauri command.
+- **`pty_write` also carries the terminal's own replies** (cursor reports, focus in/out,
+  mouse reports, OSC/DCS answers): xterm sends them through the same `onData`. The gate
+  parses and ignores them. Without that a pane merely gaining focus read as typing and
+  held every machine write for 3 s.
+- **Worker news is queued, never written on arrival** (`fleet_news.rs`). The old nudge was
+  dropped when the Conductor was mid-turn, and was typed into a Conductor on a permission
+  prompt (text plus Enter answers a menu). `decide` holds for `needsInput` and `running`;
+  the Conductor's own `stop`/`notification`/`sessionstart` and the stale sweep `kick` a
+  new pass. One pass per Conductor at a time (`begin`/`end`), and a pass re-reads the
+  status every loop because a dialog can open while it waits on typing.
+- **The note is `<conduit-fleet>…</conduit-fleet>`**, bracketed-pasted, and the persona
+  tells the Conductor it is data from Conduit, never its user. Session names are the
+  user's text: `clean` strips control bytes and `<`/`>` so a name cannot close the tag.
+- **`fleet_send` refuses a target at `needsInput`** unless `force: true` (`send_guard`).
+- **`fleet_wait` sleeps on `FleetState`'s change counter** (`fleet_wait.rs`). Read
+  `change_count` BEFORE the state you wait on. Anything a waiter could be waiting for must
+  call `notify_changed`: `record`, `set_running`, the stale sweep, and the `fleet_result`
+  arm do. A worker with a terminal that has never reported counts as `starting` for 30 s,
+  or a wait right after `fleet_spawn` would return at once.
+
 ## Where the fleet/Conductor orchestration lives
 
 A per-project **Conductor** (a Claude session flagged `role: Conductor`) observes and

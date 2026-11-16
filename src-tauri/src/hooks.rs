@@ -471,29 +471,9 @@ pub fn start(
                 }
             }
 
-            // SPEC-D: reactively wake the project's Conductor instead of making it poll
-            // fleet_list on a timer. Only for a wake-eligible event (worker stop /
-            // needsInput), only when the Conductor is not mid-turn, and debounced so a
-            // burst of near-simultaneous worker events collapses into one nudge.
-            if crate::fleet::is_wake_event(&event, &parsed) {
-                if let Some(snap) = store.fleet_snapshot(&session) {
-                    if let Some(conductor) = crate::fleet::resolve_wake_target(&snap, &session) {
-                        let status = fleet
-                            .snapshot()
-                            .get(&conductor.id)
-                            .map(|s| s.status.clone())
-                            .unwrap_or_default();
-                        if crate::fleet::conductor_wakeable(&status)
-                            && fleet.should_wake_now(&conductor.id)
-                        {
-                            let nudge = format!(
-                                "[Conduit] worker {session} reported \"{event}\" -- check fleet_list / fleet_results.\r"
-                            );
-                            let _ = pty.write(&conductor.id, &nudge);
-                        }
-                    }
-                }
-            }
+            // Worker news: tell the project's Conductor what happened instead of making it
+            // poll fleet_list. See `fleet_news`.
+            crate::fleet_news::on_hook_event(&store, &pty, &fleet, &session, &event, &parsed);
 
             // SPEC-A Tier 2 / SPEC-F (shared hook-channel infra): `result`/`note` are
             // HIGH-STAKES verbs -- data another session or the Conductor may act on --
