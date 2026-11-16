@@ -5438,6 +5438,24 @@ input[type="number"]:focus {
   font-family: var(--mono-font); font-size: 11.5px; line-height: 1.45; color: var(--text-mid);
   white-space: pre-wrap; word-break: break-word; user-select: text; -webkit-user-select: text;
 }
+/* ---- Settings -> Privacy: the statistics request, shown ---- */
+.telemetry-preview { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.telemetry-state { display: flex; align-items: baseline; gap: 8px; margin: 0 0 10px; font-size: 13px; color: var(--text-bright); }
+.telemetry-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; align-self: center; background: var(--text-dim); }
+.telemetry-state.on .telemetry-dot { background: var(--green); }
+.telemetry-reason { color: var(--text-dim); }
+.telemetry-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0 0 12px; font-size: 12px; }
+.telemetry-facts dt { color: var(--text-dim); }
+.telemetry-facts dd { margin: 0; color: var(--text-mid); min-width: 0; overflow-wrap: anywhere; }
+.telemetry-label { margin: 0 0 6px; font-size: 12px; color: var(--text-dim); }
+.telemetry-payload {
+  margin: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-bg); font-family: var(--mono-font); font-size: 11.5px; line-height: 1.5;
+  color: var(--text-mid); white-space: pre-wrap; overflow-wrap: anywhere;
+  user-select: text; -webkit-user-select: text;
+}
+.telemetry-note { margin: 8px 0 0; font-size: 11.5px; color: var(--text-dim); }
+.telemetry-preview code { font-family: var(--mono-font); font-size: 11.5px; }
 
 .modal.continuity-detail { width: min(640px, 90vw); }
 .continuity-prose {

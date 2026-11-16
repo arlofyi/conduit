@@ -37,6 +37,12 @@ All notable changes to Conduit are documented here. This project uses
 - **Added — A Jobs tab shows those commands.** It appears in the right column while a
   project has jobs: what is running, for how long, live output, and a Stop button.
 - **Changed — A session with a job still running is not stopped as idle.**
+- **Added — See exactly what usage statistics are sent.** Settings → Privacy now shows
+  whether this build is sending anything and why not, where it goes, how often, and the
+  whole request as it is built.
+- **Changed — Turning statistics off deletes the anonymous id.** A later opt-in starts
+  with a new random id instead of resuming the old one.
+- **Changed — `DO_NOT_TRACK` is honoured.** Setting it turns statistics off for that run.
 
 ## 0.51.2 — 2026-11-12
 

@@ -3914,6 +3914,8 @@ pub fn run() {
             mcp_apply,
             install_agent,
             telemetry::telemetry_ping,
+            telemetry::telemetry_preview,
+            telemetry::telemetry_forget,
             diag::diagnostics,
             diag::log_frontend_error,
             updates::update_should_notify,
