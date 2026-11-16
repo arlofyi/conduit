@@ -58,6 +58,18 @@ describe("a program reporting its own status", () => {
     mkdirSync(project, { recursive: true });
     // Two sessions: the second is the one in front, so the first can show a needs-you
     // badge (the app does not badge the session the user is already looking at).
+    // The project first, with no agent: opening is safe to wait on and proves the freshly
+    // booted app is taking CLI requests before a session is asked for.
+    execFileSync(shim, [project], { env });
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(() =>
+          Array.from(document.querySelectorAll(".project-block .name")).some(
+            (e) => (e.textContent ?? "").trim() === "report-project",
+          ),
+        )) as boolean,
+      { timeout: 30_000, timeoutMsg: "the project never appeared" },
+    );
     for (const name of ["reporter", "in-front"]) {
       execFileSync(shim, [project, "--agent", "claude", "--name", name], { env });
       await browser.waitUntil(async () => (await row(name)).found, {
