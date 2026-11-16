@@ -13,6 +13,8 @@ mod agy_usage;
 mod asks;
 mod board;
 mod bridge;
+#[cfg(test)]
+mod bridge_protocol;
 mod bridge_view;
 mod broker;
 mod claude_status;
