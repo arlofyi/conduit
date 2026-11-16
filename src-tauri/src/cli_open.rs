@@ -265,12 +265,9 @@ pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
-/// Authenticate and parse one `/open` request. Pure -- no IO, no Tauri.
-pub fn parse_open(
-    headers: &[(String, String)],
-    body: &str,
-    expected: &str,
-) -> Result<OpenRequest, Reject> {
+/// The two checks every route that ACTS must pass, shared so no route can skip one:
+/// `/open` here, and `/job` in `jobs.rs`. Pure -- no IO, no Tauri.
+pub fn authenticate(headers: &[(String, String)], expected: &str) -> Result<(), Reject> {
     // Origin FIRST: a page must not be able to use this route as a token oracle.
     if headers
         .iter()
@@ -287,6 +284,16 @@ pub fn parse_open(
     if expected.is_empty() || !secret_eq(supplied, expected) {
         return Err(Reject::BadToken);
     }
+    Ok(())
+}
+
+/// Authenticate and parse one `/open` request. Pure -- no IO, no Tauri.
+pub fn parse_open(
+    headers: &[(String, String)],
+    body: &str,
+    expected: &str,
+) -> Result<OpenRequest, Reject> {
+    authenticate(headers, expected)?;
     let req: OpenRequest = serde_json::from_str(body).map_err(|_| Reject::BadBody)?;
     if req.path.trim().is_empty() {
         return Err(Reject::BadBody);

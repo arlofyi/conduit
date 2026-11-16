@@ -1,0 +1,457 @@
+{
+  "about": "Frames a RELEASED phone app sends, and frame types it understands. Frozen: see bridge_protocol.rs. Add entries; never edit or delete one.",
+  "clientFrames": [
+    {
+      "frame": {
+        "type": "list"
+      },
+      "parsed": "List"
+    },
+    {
+      "frame": {
+        "session_id": "s-1",
+        "type": "attach"
+      },
+      "parsed": "Attach { session_id: \"s-1\" }"
+    },
+    {
+      "frame": {
+        "data": "ls\r",
+        "session_id": "s-1",
+        "type": "input"
+      },
+      "parsed": "Input { session_id: \"s-1\", data: \"ls\\r\" }"
+    },
+    {
+      "frame": {
+        "cols": 80,
+        "rows": 24,
+        "session_id": "s-1",
+        "type": "resize"
+      },
+      "parsed": "Resize { session_id: \"s-1\", cols: 80, rows: 24 }"
+    },
+    {
+      "frame": {
+        "action": "changes",
+        "session_id": "s-1",
+        "type": "git"
+      },
+      "parsed": "Git { session_id: \"s-1\", action: \"changes\", path: None }"
+    },
+    {
+      "frame": {
+        "action": "diff",
+        "path": "src/a.rs",
+        "session_id": "s-1",
+        "type": "git"
+      },
+      "parsed": "Git { session_id: \"s-1\", action: \"diff\", path: Some(\"src/a.rs\") }"
+    },
+    {
+      "frame": {
+        "session_id": "s-1",
+        "type": "kill"
+      },
+      "parsed": "Kill { session_id: \"s-1\" }"
+    },
+    {
+      "frame": {
+        "project_id": "p-1",
+        "type": "spawn"
+      },
+      "parsed": "Spawn { project_id: \"p-1\", prompt: \"\", agent: None, worktree: false, name: None, account: None }"
+    },
+    {
+      "frame": {
+        "account": "ref-1",
+        "agent": "claude",
+        "name": "Fix",
+        "project_id": "p-1",
+        "prompt": "fix it",
+        "type": "spawn",
+        "worktree": true
+      },
+      "parsed": "Spawn { project_id: \"p-1\", prompt: \"fix it\", agent: Some(\"claude\"), worktree: true, name: Some(\"Fix\"), account: Some(\"ref-1\") }"
+    },
+    {
+      "frame": {
+        "token": "t",
+        "type": "auth"
+      },
+      "parsed": "Auth { token: \"<redacted>\" }"
+    },
+    {
+      "frame": {
+        "deviceName": "Phone",
+        "nonce": "n",
+        "type": "pair"
+      },
+      "parsed": "Pair { secret: None, request: None, device_name: \"Phone\", nonce: \"<redacted>\" }"
+    },
+    {
+      "frame": {
+        "deviceName": "Phone",
+        "nonce": "n",
+        "request": true,
+        "secret": "s",
+        "type": "pair"
+      },
+      "parsed": "Pair { secret: Some(\"<redacted>\"), request: Some(true), device_name: \"Phone\", nonce: \"<redacted>\" }"
+    },
+    {
+      "frame": {
+        "type": "discover"
+      },
+      "parsed": "Discover"
+    },
+    {
+      "frame": {
+        "sessionId": "s-1",
+        "type": "interrupt"
+      },
+      "parsed": "Interrupt { session_id: \"s-1\" }"
+    },
+    {
+      "frame": {
+        "answers": {
+          "Which?": "One"
+        },
+        "askId": "a-1",
+        "type": "answer"
+      },
+      "parsed": "Answer { ask_id: \"a-1\", answers: 1 }"
+    },
+    {
+      "frame": {
+        "allow": true,
+        "id": "perm-1",
+        "type": "approve"
+      },
+      "parsed": "Approve { id: \"perm-1\", allow: true }"
+    },
+    {
+      "frame": {
+        "data": "AAAA",
+        "name": "a.png",
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "upload"
+      },
+      "parsed": "Upload { session_id: \"s-1\", request_id: \"r-1\", name: \"a.png\", data: 4, seq: None, done: None }"
+    },
+    {
+      "frame": {
+        "data": "AAAA",
+        "done": true,
+        "name": "a.png",
+        "requestId": "r-1",
+        "seq": 2,
+        "sessionId": "s-1",
+        "type": "upload"
+      },
+      "parsed": "Upload { session_id: \"s-1\", request_id: \"r-1\", name: \"a.png\", data: 4, seq: Some(2), done: Some(true) }"
+    },
+    {
+      "frame": {
+        "action": "stop",
+        "requestId": "r-1",
+        "sessionIds": [
+          "s-1"
+        ],
+        "type": "sessionaction"
+      },
+      "parsed": "SessionAction { request_id: \"r-1\", action: Stop, session_ids: [\"s-1\"] }"
+    },
+    {
+      "frame": {
+        "action": "delete",
+        "requestId": "r-1",
+        "sessionIds": [
+          "s-1",
+          "s-2"
+        ],
+        "type": "sessionaction"
+      },
+      "parsed": "SessionAction { request_id: \"r-1\", action: Delete, session_ids: [\"s-1\", \"s-2\"] }"
+    },
+    {
+      "frame": {
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "sessionoptions"
+      },
+      "parsed": "SessionOptions { session_id: \"s-1\", request_id: \"r-1\" }"
+    },
+    {
+      "frame": {
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "sessionset"
+      },
+      "parsed": "SessionSet { session_id: \"s-1\", request_id: \"r-1\", model: None, effort: None, name: None, keep_running: None, auto_approve: None, account: None }"
+    },
+    {
+      "frame": {
+        "account": "",
+        "autoApprove": false,
+        "effort": "high",
+        "keepRunning": true,
+        "model": "m",
+        "name": "N",
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "sessionset"
+      },
+      "parsed": "SessionSet { session_id: \"s-1\", request_id: \"r-1\", model: Some(\"m\"), effort: Some(\"high\"), name: Some(\"N\"), keep_running: Some(true), auto_approve: Some(false), account: Some(\"\") }"
+    },
+    {
+      "frame": {
+        "requestId": "r-1",
+        "type": "usage"
+      },
+      "parsed": "Usage { request_id: \"r-1\" }"
+    },
+    {
+      "frame": {
+        "type": "ports"
+      },
+      "parsed": "Ports"
+    },
+    {
+      "frame": {
+        "port": 3000,
+        "type": "tunnel"
+      },
+      "parsed": "Tunnel { token: None, port: 3000 }"
+    },
+    {
+      "frame": {
+        "port": 3000,
+        "token": "t",
+        "type": "tunnel"
+      },
+      "parsed": "Tunnel { token: Some(\"<redacted>\"), port: 3000 }"
+    },
+    {
+      "frame": {
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "fslist"
+      },
+      "parsed": "FsList { session_id: \"s-1\", request_id: \"r-1\", path: \"\" }"
+    },
+    {
+      "frame": {
+        "path": "src",
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "fslist"
+      },
+      "parsed": "FsList { session_id: \"s-1\", request_id: \"r-1\", path: \"src\" }"
+    },
+    {
+      "frame": {
+        "path": "a.txt",
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "fsread"
+      },
+      "parsed": "FsRead/FsDownload { session_id: \"s-1\", request_id: \"r-1\", path: \"a.txt\", confirm: false }"
+    },
+    {
+      "frame": {
+        "confirm": true,
+        "path": ".env",
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "fsread"
+      },
+      "parsed": "FsRead/FsDownload { session_id: \"s-1\", request_id: \"r-1\", path: \".env\", confirm: true }"
+    },
+    {
+      "frame": {
+        "baseMtimeMs": 1.5,
+        "baseSize": 3,
+        "content": "x",
+        "path": "a.txt",
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "fswrite"
+      },
+      "parsed": "FsWrite { session_id: \"s-1\", request_id: \"r-1\", path: \"a.txt\", content: 1 }"
+    },
+    {
+      "frame": {
+        "path": "a.bin",
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "fsdownload"
+      },
+      "parsed": "FsRead/FsDownload { session_id: \"s-1\", request_id: \"r-1\", path: \"a.bin\", confirm: false }"
+    },
+    {
+      "frame": {
+        "confirm": true,
+        "path": "a.bin",
+        "requestId": "r-1",
+        "sessionId": "s-1",
+        "type": "fsdownload"
+      },
+      "parsed": "FsRead/FsDownload { session_id: \"s-1\", request_id: \"r-1\", path: \"a.bin\", confirm: true }"
+    },
+    {
+      "frame": {
+        "requestId": "r-1",
+        "type": "fsack"
+      },
+      "parsed": "FsAck { request_id: \"r-1\" }"
+    },
+    {
+      "frame": {
+        "type": "rootchats"
+      },
+      "parsed": "RootChats"
+    },
+    {
+      "frame": {
+        "requestId": "r-1",
+        "type": "rootchatcreate"
+      },
+      "parsed": "RootChatCreate { request_id: \"r-1\", profile_id: None, scope: None, agent: None, model: None, effort: None, research: false, mcps: [] }"
+    },
+    {
+      "frame": {
+        "agent": "claude",
+        "effort": "high",
+        "mcps": [
+          "github"
+        ],
+        "model": "m",
+        "profileId": "pf",
+        "requestId": "r-1",
+        "research": true,
+        "scope": {
+          "allProfiles": false,
+          "profiles": [
+            null,
+            "pf"
+          ],
+          "projects": [
+            "p-1"
+          ]
+        },
+        "type": "rootchatcreate"
+      },
+      "parsed": "RootChatCreate { request_id: \"r-1\", profile_id: Some(\"pf\"), scope: Some(ChatScope { all_profiles: false, profiles: [None, Some(\"pf\")], projects: [\"p-1\"] }), agent: Some(\"claude\"), model: Some(\"m\"), effort: Some(\"high\"), research: true, mcps: [\"github\"] }"
+    },
+    {
+      "frame": {
+        "chatId": "c-1",
+        "requestId": "r-1",
+        "type": "rootchatsettings"
+      },
+      "parsed": "RootChatSettings { chat_id: \"c-1\", request_id: \"r-1\", model: None, effort: None, research: None, mcps: None }"
+    },
+    {
+      "frame": {
+        "chatId": "c-1",
+        "effort": "low",
+        "mcps": [],
+        "model": "m",
+        "requestId": "r-1",
+        "research": false,
+        "type": "rootchatsettings"
+      },
+      "parsed": "RootChatSettings { chat_id: \"c-1\", request_id: \"r-1\", model: Some(\"m\"), effort: Some(\"low\"), research: Some(false), mcps: Some([]) }"
+    },
+    {
+      "frame": {
+        "requestId": "r-1",
+        "type": "rootchatoptions"
+      },
+      "parsed": "RootChatOptions { request_id: \"r-1\" }"
+    },
+    {
+      "frame": {
+        "chatId": "c-1",
+        "type": "rootchathistory"
+      },
+      "parsed": "RootChat { chat_id: \"c-1\" }"
+    },
+    {
+      "frame": {
+        "chatId": "c-1",
+        "text": "hello",
+        "type": "rootchatsend"
+      },
+      "parsed": "RootChatSend { chat_id: \"c-1\", text: 5 }"
+    },
+    {
+      "frame": {
+        "chatId": "c-1",
+        "type": "rootchatstop"
+      },
+      "parsed": "RootChat { chat_id: \"c-1\" }"
+    },
+    {
+      "frame": {
+        "chatId": "c-1",
+        "type": "rootchatscope"
+      },
+      "parsed": "RootChatScope { chat_id: \"c-1\", scope: None }"
+    },
+    {
+      "frame": {
+        "chatId": "c-1",
+        "scope": {
+          "allProfiles": true
+        },
+        "type": "rootchatscope"
+      },
+      "parsed": "RootChatScope { chat_id: \"c-1\", scope: Some(ChatScope { all_profiles: true, profiles: [], projects: [] }) }"
+    }
+  ],
+  "serverFrameTypes": [
+    "answerResult",
+    "approveResult",
+    "authOk",
+    "chat",
+    "command",
+    "context",
+    "error",
+    "fsChunk",
+    "fsListResult",
+    "fsReadResult",
+    "fsWriteResult",
+    "gitresult",
+    "hello",
+    "history",
+    "image",
+    "killed",
+    "listed",
+    "macs",
+    "output",
+    "pairPending",
+    "pairResult",
+    "pending",
+    "pendingAdded",
+    "projects",
+    "resolved",
+    "rootChatCreated",
+    "rootChatEvent",
+    "rootChatHistory",
+    "rootChatOptions",
+    "rootChatScoped",
+    "rootChatSettings",
+    "rootChats",
+    "sessionActionResult",
+    "sessionOptions",
+    "sessionSetResult",
+    "spawned",
+    "status",
+    "tunnelOk",
+    "uploadProgress",
+    "uploadResult"
+  ]
+}

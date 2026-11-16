@@ -81,10 +81,24 @@ pub fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "fleet_send",
-            "description": "Type text into a worker session (submitted with Enter).",
+            "description": "Type text into a worker session (submitted with Enter). Waits while the user is typing in that terminal (answers `held` if they never stop; nothing was sent). Refuses a worker that is on a question or permission prompt, because the text would answer it; pass force: true only when that is what you mean.",
             "inputSchema": { "type": "object",
-                "properties": { "id": { "type": "string" }, "text": { "type": "string" } },
+                "properties": {
+                    "id": { "type": "string" },
+                    "text": { "type": "string" },
+                    "force": { "type": "boolean", "description": "Send even though the worker is waiting on a question or permission prompt." }
+                },
                 "required": ["id", "text"] }
+        }),
+        json!({
+            "name": "fleet_wait",
+            "description": "Block until workers stop running, instead of polling fleet_list or sleeping. mode \"all\" (default): returns when none of them is running. mode \"any\": returns on the first one to stop or post a fleet_result. Answers {reason, workers}; reason is settled | changed | timeout | no-workers. A timeout is a check-in, not a failure: call again.",
+            "inputSchema": { "type": "object",
+                "properties": {
+                    "ids": { "type": "array", "items": { "type": "string" }, "description": "Workers to wait on. Default: every worker in this project." },
+                    "mode": { "type": "string", "enum": ["all", "any"] },
+                    "timeoutSec": { "type": "integer", "description": "Default 50, maximum 600." }
+                } }
         }),
         json!({
             "name": "fleet_stop",
@@ -203,6 +217,22 @@ fn resolve_pair(
         .cloned()
         .ok_or("session-not-found")?;
     Ok((caller, target))
+}
+
+/// How long `fleet_send` waits for the user to stop typing in the target's terminal.
+const SEND_HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A worker on a question or a permission prompt must not be typed into: pasted text plus
+/// Enter answers the menu with whatever option is highlighted. `force` is the Conductor
+/// saying that answering is what it means.
+fn send_guard(target_status: &str, force: bool) -> Result<(), String> {
+    if target_status == "needsInput" && !force {
+        return Err(
+            "worker-awaiting-input: it is on a question or permission prompt, and your text would answer it. Look with fleet_peek; pass force: true only if answering is what you intend."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Tools a Worker-role caller may invoke -- the vertical/horizontal DATA tools, plus the
@@ -493,13 +523,37 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
             if ctx.store.is_private_mode() && !crate::store::can_inject(&caller, &target) {
                 return Err("access-denied: injection blocked by the sharing policy".into());
             }
+            let force = args.get("force").and_then(Value::as_bool) == Some(true);
+            send_guard(&ctx.fleet.status_of(id).unwrap_or_default(), force)?;
             // Bracketed paste + a trailing CR, so the TUI submits instead of leaving the
             // brief sitting in its composer for a human to press Enter on. See
-            // `pty::paste_and_submit` for why a bare `{text}\r` does not.
-            ctx.pty
-                .write(id, &crate::pty::paste_and_submit(text))
-                .map_err(|_| "worker-not-running".to_string())?;
-            Ok("sent".into())
+            // `pty::paste_and_submit` for why a bare `{text}\r` does not. Gated, so it
+            // never lands inside a message the user is typing into that terminal.
+            match ctx.pty.write_machine(
+                id,
+                &crate::pty::paste_and_submit(text),
+                SEND_HOLD_LIMIT,
+            ) {
+                Ok(crate::pty::MachineWrite::Sent) => Ok("sent".into()),
+                Ok(crate::pty::MachineWrite::Held) => Err(
+                    "held: the user is typing in that worker's terminal. Nothing was sent; try again shortly."
+                        .into(),
+                ),
+                Err(_) => Err("worker-not-running".into()),
+            }
+        }
+        "fleet_wait" => {
+            let parsed = crate::fleet_wait::parse_args(args)?;
+            crate::fleet_wait::wait(
+                &ctx.store,
+                &ctx.fleet,
+                &ctx.board,
+                &ctx.pty,
+                &ctx.conductor_id,
+                &parsed,
+                crate::fleet_wait::STARTUP_GRACE,
+            )
+            .map(|v| v.to_string())
         }
         "fleet_stop" => {
             let id = args
@@ -564,6 +618,8 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<String, String> 
                     "tokens": tokens,
                 }),
             ));
+            // A `fleet_wait` in mode "any" returns on a posted result.
+            ctx.fleet.notify_changed();
             Ok("recorded".into())
         }
         "fleet_results" => {
@@ -1055,6 +1111,7 @@ mod tests {
             "fleet_peek",
             "fleet_spawn",
             "fleet_send",
+            "fleet_wait",
             "fleet_stop",
             "fleet_result",
             "fleet_results",
@@ -1276,6 +1333,41 @@ mod tests {
                 "conductor should be allowed to call {tool}"
             );
         }
+    }
+
+    #[test]
+    fn a_worker_on_a_dialog_is_not_typed_into_unless_forced() {
+        let err = send_guard("needsInput", false).unwrap_err();
+        assert!(err.starts_with("worker-awaiting-input"), "{err}");
+        assert!(send_guard("needsInput", true).is_ok());
+        for status in ["idle", "running", "done", ""] {
+            assert!(send_guard(status, false).is_ok(), "{status}");
+        }
+    }
+
+    #[test]
+    fn only_a_conductor_may_wait_on_the_fleet() {
+        let (store, conductor, worker) = store_with_conductor_and_worker("authz_wait");
+        assert!(authorize(&store, &conductor.id, "fleet_wait").is_ok());
+        assert_eq!(
+            authorize(&store, &worker.id, "fleet_wait").unwrap_err(),
+            "worker-role-cannot-orchestrate"
+        );
+    }
+
+    #[test]
+    fn fleet_send_and_fleet_wait_advertise_their_new_arguments() {
+        let specs = tool_specs();
+        let spec = |name: &str| specs.iter().find(|t| t["name"] == name).cloned().unwrap();
+        assert!(spec("fleet_send")["inputSchema"]["properties"]["force"].is_object());
+        let wait = spec("fleet_wait");
+        let props = &wait["inputSchema"]["properties"];
+        assert!(
+            props["ids"].is_object()
+                && props["mode"].is_object()
+                && props["timeoutSec"].is_object()
+        );
+        assert!(wait["description"].as_str().unwrap().contains("check-in"));
     }
 
     // ---- SPEC-C: fleet_result / fleet_results plumbing (readable_by) ----

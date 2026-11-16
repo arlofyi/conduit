@@ -104,17 +104,131 @@ fn is_opted_out() -> bool {
     false
 }
 
-fn should_send(opt_out: bool) -> bool {
-    let suppressed = dev_suppressed(
+/// `DO_NOT_TRACK` as the convention reads it (consoledonottrack.com): set to anything but
+/// empty, `0` or `false` means "do not". Pure for tests.
+fn do_not_track(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+    })
+}
+
+/// Either environment switch that turns telemetry off for this run.
+fn env_disabled() -> bool {
+    std::env::var_os("CONDUIT_DISABLE_TELEMETRY").is_some()
+        || do_not_track(std::env::var("DO_NOT_TRACK").ok().as_deref())
+}
+
+fn suppressed_in_dev() -> bool {
+    dev_suppressed(
         cfg!(debug_assertions),
         std::env::var_os("CONDUIT_TELEMETRY_IN_DEV").is_some(),
-    );
+    )
+}
+
+fn should_send(opt_out: bool) -> bool {
     should_send_policy(
         opt_out,
-        suppressed,
-        std::env::var_os("CONDUIT_DISABLE_TELEMETRY").is_some(),
+        suppressed_in_dev(),
+        env_disabled(),
         creds_present(),
     )
+}
+
+/// Why nothing is being sent, in the user's words; `None` when it is. The SAME four inputs
+/// as `should_send_policy`, and a test holds the two to the same answer: a Settings page
+/// that says "sending" while the gate is shut (or the reverse) is worse than no page.
+fn not_sending_reason(
+    opt_out: bool,
+    is_debug: bool,
+    env_disabled: bool,
+    creds: bool,
+) -> Option<&'static str> {
+    if opt_out {
+        Some("You turned sharing off.")
+    } else if env_disabled {
+        Some("An environment variable turns it off for this run (DO_NOT_TRACK or CONDUIT_DISABLE_TELEMETRY).")
+    } else if is_debug {
+        Some("This is a development build, which never sends.")
+    } else if !creds {
+        Some("This build has no statistics endpoint configured.")
+    } else {
+        None
+    }
+}
+
+/// What Settings shows so the user can read exactly what leaves the machine.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryPreview {
+    /// Whether this build, with the user's current choice, sends anything at all.
+    pub sending: bool,
+    /// Why not, when it is not.
+    pub reason: Option<String>,
+    /// Where it goes.
+    pub endpoint: String,
+    /// One event, exactly as `build_payload` builds the real ones.
+    pub payload: serde_json::Value,
+    /// How often, in the user's words.
+    pub cadence: String,
+}
+
+/// The placeholder shown for the random id before one exists. Looking at the preview must
+/// not be what creates it.
+const NO_ID_YET: &str = "(a random id, created the first time something is sent)";
+
+fn preview(opt_out: bool, client_id: Option<String>, app_version: String) -> TelemetryPreview {
+    let reason = not_sending_reason(
+        opt_out,
+        suppressed_in_dev(),
+        env_disabled(),
+        creds_present(),
+    );
+    let body = build_payload(&PingInput {
+        client_id: client_id.unwrap_or_else(|| NO_ID_YET.to_string()),
+        event_name: "app_heartbeat".into(),
+        session_id: "(a random id for this sitting, new after 30 minutes away)".into(),
+        engagement_msec: 300_000,
+        app_version,
+        os: std::env::consts::OS.to_string(),
+    });
+    TelemetryPreview {
+        sending: reason.is_none(),
+        reason: reason.map(str::to_string),
+        endpoint: format!("{}{}", POSTHOG_HOST.trim_end_matches('/'), CAPTURE_PATH),
+        payload: serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+        cadence: "Once when the app opens, then every 5 minutes while its window is focused."
+            .into(),
+    }
+}
+
+fn existing_client_id_at(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Tauri command: what would be sent, and whether anything is. Read-only: it never sends
+/// and never creates the id.
+#[tauri::command]
+pub fn telemetry_preview(app: tauri::AppHandle, opted_out: bool) -> TelemetryPreview {
+    preview(
+        opted_out,
+        existing_client_id_at(&client_id_path()),
+        app.package_info().version.to_string(),
+    )
+}
+
+fn forget_client_id_at(path: &Path) -> bool {
+    std::fs::remove_file(path).is_ok()
+}
+
+/// Tauri command: delete the anonymous id. Called when the user turns sharing off, so
+/// "off" leaves nothing behind that could link a later opt-in to the earlier history.
+#[tauri::command]
+pub fn telemetry_forget() -> bool {
+    forget_client_id_at(&client_id_path())
 }
 
 /// Fire-and-forget POST. Mirrors claude_status.rs: `-s`, time-boxed, all output
@@ -236,6 +350,82 @@ mod tests {
         let second = read_or_create_client_id_at(&path);
         assert_eq!(first, second, "client_id must persist across calls");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_reason_shown_agrees_with_the_gate_for_every_combination() {
+        for bits in 0..16u8 {
+            let (opt_out, debug, env, creds) =
+                (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            let sends = should_send_policy(opt_out, debug, env, creds);
+            let reason = not_sending_reason(opt_out, debug, env, creds);
+            assert_eq!(
+                sends,
+                reason.is_none(),
+                "opt_out={opt_out} debug={debug} env={env} creds={creds}: gate says {sends}, page says {reason:?}"
+            );
+        }
+        // The user's own choice is named first, whatever else also applies.
+        assert_eq!(
+            not_sending_reason(true, true, true, false),
+            Some("You turned sharing off.")
+        );
+    }
+
+    #[test]
+    fn do_not_track_follows_the_convention() {
+        for on in ["1", "true", "yes", " 1 ", "TRUE"] {
+            assert!(do_not_track(Some(on)), "{on:?}");
+        }
+        for off in ["", "0", "false", "FALSE", "  "] {
+            assert!(!do_not_track(Some(off)), "{off:?}");
+        }
+        assert!(!do_not_track(None));
+    }
+
+    #[test]
+    fn the_preview_is_the_real_payload_and_names_no_more_fields() {
+        let p = preview(false, Some("uuid-123".into()), "1.2.3".into());
+        // Built by `build_payload`: the same four keys and five properties the real one has.
+        assert_eq!(p.payload.as_object().unwrap().len(), 4);
+        assert_eq!(p.payload["properties"].as_object().unwrap().len(), 5);
+        assert_eq!(p.payload["distinct_id"], "uuid-123");
+        assert_eq!(p.payload["properties"]["app_version"], "1.2.3");
+        assert_eq!(p.payload["properties"]["os"], std::env::consts::OS);
+        assert!(p.endpoint.starts_with("https://") && p.endpoint.ends_with(CAPTURE_PATH));
+        // Tests run as a debug build, which never sends, and the page must say so.
+        assert!(!p.sending);
+        assert!(p.reason.unwrap().contains("development build"));
+        let off = preview(true, None, "1.2.3".into());
+        assert_eq!(off.reason.as_deref(), Some("You turned sharing off."));
+    }
+
+    #[test]
+    fn looking_at_the_preview_never_creates_the_id() {
+        let dir = std::env::temp_dir().join(format!("conduit-tel-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("telemetry_client_id");
+        assert_eq!(existing_client_id_at(&path), None);
+        let p = preview(false, existing_client_id_at(&path), "1.2.3".into());
+        assert_eq!(p.payload["distinct_id"], NO_ID_YET);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn turning_sharing_off_deletes_the_id_and_a_later_opt_in_gets_a_new_one() {
+        let dir = std::env::temp_dir().join(format!("conduit-tel-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("telemetry_client_id");
+        let first = read_or_create_client_id_at(&path);
+        assert_eq!(
+            existing_client_id_at(&path).as_deref(),
+            Some(first.as_str())
+        );
+        assert!(forget_client_id_at(&path));
+        assert!(!path.exists());
+        // Nothing to delete is not an error worth reporting, just `false`.
+        assert!(!forget_client_id_at(&path));
+        let second = read_or_create_client_id_at(&path);
+        assert_ne!(first, second);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

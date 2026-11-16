@@ -13,6 +13,8 @@ mod agy_usage;
 mod asks;
 mod board;
 mod bridge;
+#[cfg(test)]
+mod bridge_protocol;
 mod bridge_view;
 mod broker;
 mod claude_status;
@@ -37,6 +39,8 @@ mod conversation_repair;
 mod diag;
 mod fleet;
 mod fleet_mcp;
+mod fleet_news;
+mod fleet_wait;
 mod format;
 mod fsops;
 mod git;
@@ -47,6 +51,8 @@ mod hookbus;
 mod hooks;
 mod hotexit;
 pub mod ide_host;
+mod input_gate;
+pub mod jobs;
 mod local_llm;
 mod local_ports;
 mod menu;
@@ -63,6 +69,7 @@ mod port_tunnel;
 mod project_new;
 mod proposals;
 mod pty;
+mod report;
 mod root_chat;
 mod root_chat_agy;
 mod root_chat_options;
@@ -776,7 +783,7 @@ fn ide_at_mention(
 
 #[tauri::command]
 fn pty_write(session_id: String, data: String, pty: State<Arc<PtyManager>>) -> Result<(), String> {
-    pty.write(&session_id, &data)
+    pty.write_human(&session_id, &data)
 }
 
 #[tauri::command]
@@ -865,21 +872,45 @@ fn busy_sessions(
     session_ids: Vec<String>,
     pty: State<Arc<PtyManager>>,
     store: State<Arc<store::Store>>,
+    jobs: State<Arc<jobs::Jobs>>,
 ) -> Vec<String> {
     if session_ids.is_empty() {
         return Vec::new();
     }
     let procs = crate::agent_activity::process_table();
+    // A job started with `conduit run` is a child of Conduit, not of the agent, so the
+    // process-tree check below cannot see it. It is the agent's work all the same.
+    let with_jobs = jobs.busy_owners();
     session_ids
         .into_iter()
         .filter(|id| {
-            pty.session_root_pid(id)
-                .is_some_and(|root| crate::agent_activity::has_background_work(&procs, root))
+            with_jobs.contains(id)
+                || pty
+                    .session_root_pid(id)
+                    .is_some_and(|root| crate::agent_activity::has_background_work(&procs, root))
                 || pty::session_projects_dir(&store, id).is_some_and(|projects| {
                     subagents::has_running_subagent(&projects, &store.claude_conversation_id(id))
                 })
         })
         .collect()
+}
+
+/// Every job (`conduit run`), running and recently finished, for the Jobs panel.
+#[tauri::command]
+fn jobs_list(jobs: State<Arc<jobs::Jobs>>) -> Vec<jobs::JobView> {
+    jobs.list()
+}
+
+/// The last `lines` lines a job wrote. Empty when the job is gone.
+#[tauri::command]
+fn job_output(id: String, lines: usize, jobs: State<Arc<jobs::Jobs>>) -> String {
+    jobs.read(&id, lines.clamp(1, 2000)).unwrap_or_default()
+}
+
+/// Stop a running job from the Jobs panel. `(async)`: ending a process tree runs `kill`.
+#[tauri::command(async)]
+fn job_kill(id: String, jobs: State<Arc<jobs::Jobs>>) {
+    let _ = jobs.kill(&id);
 }
 
 /// Settings -> Sessions "Remove stray NUL files": sweep every project folder for the
@@ -2516,7 +2547,11 @@ fn remove_session(
     session_id: String,
     store: State<Arc<Store>>,
     pty: State<Arc<PtyManager>>,
+    fleet: State<Arc<crate::fleet::FleetState>>,
+    jobs: State<Arc<jobs::Jobs>>,
 ) {
+    fleet.news.forget(&session_id);
+    jobs.kill_owned_by(&session_id);
     pty.kill(&session_id);
     pty.kill(&format!("{session_id}::term"));
     // A Hermes session owns a generated overlay directory under the data dir. Deleting the
@@ -3024,6 +3059,7 @@ fn set_dirty_count(window: tauri::Window, count: usize, dirty: State<DirtyGuard>
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle, pty: State<Arc<PtyManager>>) {
     pty.kill_all();
+    app.state::<Arc<jobs::Jobs>>().kill_all();
     app.state::<Arc<root_chat::RootChatState>>().kill_all();
     app.exit(0);
 }
@@ -3038,6 +3074,7 @@ fn prepare_for_update(app: tauri::AppHandle, pty: State<Arc<PtyManager>>) {
     // On Windows the installer exits the process without a RunEvent::Exit.
     diag::log_stats("before update");
     pty.kill_all();
+    app.state::<Arc<jobs::Jobs>>().kill_all();
     app.state::<Arc<root_chat::RootChatState>>().kill_all();
 }
 
@@ -3357,6 +3394,7 @@ pub fn run() {
         .manage(Arc::new(pairing::Pairing::default()))
         .manage(Arc::new(HookState::default()))
         .manage(Arc::new(crate::fleet::FleetState::default()))
+        .manage(Arc::new(crate::jobs::Jobs::default()))
         .manage(Arc::new(crate::board::BoardState::default()))
         .manage(Arc::new(TaskBoard::default()))
         .manage(Arc::new(claude_usage::ClaudeAuth::default()))
@@ -3485,6 +3523,14 @@ pub fn run() {
             let ask_gate = app.state::<Arc<asks::AskGate>>().inner().clone();
             // agy prompts as permission cards (agy fires no permission hook).
             agy_prompts::start(app.handle().clone());
+            {
+                // The Jobs panel refetches on this; a job starting or ending is the only
+                // thing that changes its list.
+                let app_for_jobs = app.handle().clone();
+                app.state::<Arc<jobs::Jobs>>().set_notifier(move || {
+                    let _ = app_for_jobs.emit("jobs-changed", ());
+                });
+            }
             hooks::start(
                 app.handle().clone(),
                 hook_state,
@@ -3632,9 +3678,20 @@ pub fn run() {
                 let fleet_for_sweep = fleet.clone();
                 let app_for_sweep = app.handle().clone();
                 let store_for_stale = store.clone();
+                let pty_for_sweep = app.state::<Arc<PtyManager>>().inner().clone();
                 std::thread::spawn(move || loop {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                     let swept = fleet_for_sweep.sweep_stale_working();
+                    // A session that just stopped reading as `running` may be a Conductor
+                    // with worker news held for the end of its turn. `kick` is a no-op for
+                    // anything with nothing queued.
+                    for id in &swept {
+                        crate::fleet_news::kick(
+                            pty_for_sweep.clone(),
+                            fleet_for_sweep.clone(),
+                            id.clone(),
+                        );
+                    }
                     // A stale "running" must not survive into state.json either, or the next
                     // launch would resume a session nothing was happening in.
                     for id in &swept {
@@ -3692,6 +3749,9 @@ pub fn run() {
             set_keep_agents_in_project,
             remove_stray_nul_files,
             busy_sessions,
+            jobs_list,
+            job_output,
+            job_kill,
             any_agent_running,
             load_projects,
             add_project,
@@ -3854,6 +3914,8 @@ pub fn run() {
             mcp_apply,
             install_agent,
             telemetry::telemetry_ping,
+            telemetry::telemetry_preview,
+            telemetry::telemetry_forget,
             diag::diagnostics,
             diag::log_frontend_error,
             updates::update_should_notify,
@@ -3871,6 +3933,7 @@ pub fn run() {
         .run(|app_handle, event| match event {
             tauri::RunEvent::ExitRequested { .. } => {
                 app_handle.state::<Arc<PtyManager>>().kill_all();
+                app_handle.state::<Arc<jobs::Jobs>>().kill_all();
                 app_handle
                     .state::<Arc<root_chat::RootChatState>>()
                     .kill_all();

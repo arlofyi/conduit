@@ -5,6 +5,49 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — A Conductor's message to a worker could land inside what you were typing.**
+  Text an agent sends into a session now waits until you have sent or cleared your own
+  half-written message there, and tells the agent it was held if you never stop.
+- **Fixed — Worker news could answer a Conductor's permission prompt.** The note that tells
+  a Conductor a worker finished is no longer typed while the Conductor is on a question or
+  a permission prompt.
+- **Fixed — A busy Conductor never heard that a worker finished.** News that arrives while
+  the Conductor is mid-turn is now kept and delivered when its turn ends, as one note
+  covering every worker that reported.
+- **Added — Conductors can wait for workers instead of polling.** A new `fleet_wait` tool
+  returns when the workers stop running, or when the first one stops or reports a result.
+- **Changed — A Conductor can no longer type into a worker that is asking a question.**
+  `fleet_send` refuses a worker waiting on a question or permission prompt unless the
+  Conductor says it means to answer it.
+- **Changed — The "finished" dot clears once you have looked.** A session that finished while
+  you were elsewhere keeps its dot until you open it; a few seconds after it is in front of
+  you it reads as idle, so the dots that remain are the ones you have not seen.
+- **Added — "Needs you" says what for.** A session waiting on a tool permission shows
+  "approve?", one waiting on a question shows "question", with the full reason on hover.
+- **Added — `conduit --skill` prints a manual for agents.** It teaches an agent to hand off
+  slow commands, report its status and start sessions, and Conductors and workers are
+  told it exists.
+
+- **Added — Any program can report its own status.** `conduit report --state
+  working|idle|blocked|error` (with an optional `--kind`, `--message` and `--seq`) moves a
+  session's dot the same way a hooked agent does, for wrapper scripts, custom agents and
+  agents whose own hooks are thin. Outside a Conduit session it does nothing.
+
+- **Added — Agents can hand slow commands to Conduit.** `conduit run --bg -- <command>`
+  starts a build, test run or install inside Conduit and returns at once; `conduit wait`,
+  `conduit read`, `conduit jobs` and `conduit kill` follow it. The agent stays free to work
+  and to be reached, and its own command rules still apply because it calls `conduit`
+  through its normal shell. macOS and Linux; reinstall the command from Settings to get it.
+- **Added — A Jobs tab shows those commands.** It appears in the right column while a
+  project has jobs: what is running, for how long, live output, and a Stop button.
+- **Changed — A session with a job still running is not stopped as idle.**
+- **Added — See exactly what usage statistics are sent.** Settings → Privacy now shows
+  whether this build is sending anything and why not, where it goes, how often, and the
+  whole request as it is built.
+- **Changed — Turning statistics off deletes the anonymous id.** A later opt-in starts
+  with a new random id instead of resuming the old one.
+- **Changed — `DO_NOT_TRACK` is honoured.** Setting it turns statistics off for that run.
+
 ## 0.51.2 — 2026-11-12
 
 - **Fixed — The wheel walked your command history in the side terminal.** Scrolling there now

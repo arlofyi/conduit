@@ -2514,7 +2514,9 @@ fn handle_conn(stream: TcpStream, peer: IpAddr, app: AppHandle, ctrl: Arc<Bridge
                         }
                     }
                     Some(ClientMsg::Input { session_id, data }) => {
-                        let _ = pty.write(&session_id, &data);
+                        // A phone message is a person typing: it goes in at once and
+                        // counts as typing for the session's input gate.
+                        let _ = pty.write_human(&session_id, &data);
                     }
                     Some(ClientMsg::Resize {
                         session_id,

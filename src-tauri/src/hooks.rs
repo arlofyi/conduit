@@ -98,6 +98,8 @@ pub fn start(
         // read one and not the other is a dead `conduit` until the next boot.
         let cli_token = Arc::new(crate::cli_open::write_token_file());
 
+        let report_seq = crate::report::SeqGate::default();
+
         for mut request in server.incoming_requests() {
             if request.method() != &Method::Post {
                 let _ = request.respond(Response::from_string("ok"));
@@ -110,6 +112,14 @@ pub fn start(
             // so it is authenticated (see cli_open::parse_open) rather than trusted.
             // Note that the non-POST early return above answers OPTIONS with a bare 200
             // and no CORS headers — which IS the preflight refusal the design relies on.
+            // `conduit run` and friends (`jobs.rs`). Also acts, so it passes the same two
+            // checks as `/open`. On its own thread: `wait` blocks for as long as asked.
+            if url.starts_with("/job") {
+                let token = cli_token.clone();
+                let jobs = app.state::<Arc<crate::jobs::Jobs>>().inner().clone();
+                std::thread::spawn(move || crate::jobs::handle_job(request, &token, &jobs));
+                continue;
+            }
             if url.starts_with("/open") {
                 let app = app.clone();
                 let token = cli_token.clone();
@@ -370,6 +380,23 @@ pub fn start(
 
             let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
 
+            // `conduit report`: a program saying what it is doing, for sessions whose
+            // agent has no hooks (or thin ones). Rewritten HERE, before anything reads the
+            // event, into the lifecycle event it stands for -- so every consumer below and
+            // in the frontend sees an ordinary `prompt` / `stop` / `notification`.
+            let (event, parsed, body) = if event == "report" {
+                if !report_seq.accepts(&session, crate::report::seq_of(&parsed)) {
+                    continue;
+                }
+                let Some((as_event, as_body)) = crate::report::translate(&parsed) else {
+                    continue;
+                };
+                let text = as_body.to_string();
+                (as_event.to_string(), as_body, text)
+            } else {
+                (event, parsed, body)
+            };
+
             // Mirror status into the fleet map so the Conductor can read it (fleet_list).
             fleet.record(&session, &event, &parsed);
             // Persist the resulting status so the next launch knows whether this agent
@@ -471,29 +498,9 @@ pub fn start(
                 }
             }
 
-            // SPEC-D: reactively wake the project's Conductor instead of making it poll
-            // fleet_list on a timer. Only for a wake-eligible event (worker stop /
-            // needsInput), only when the Conductor is not mid-turn, and debounced so a
-            // burst of near-simultaneous worker events collapses into one nudge.
-            if crate::fleet::is_wake_event(&event, &parsed) {
-                if let Some(snap) = store.fleet_snapshot(&session) {
-                    if let Some(conductor) = crate::fleet::resolve_wake_target(&snap, &session) {
-                        let status = fleet
-                            .snapshot()
-                            .get(&conductor.id)
-                            .map(|s| s.status.clone())
-                            .unwrap_or_default();
-                        if crate::fleet::conductor_wakeable(&status)
-                            && fleet.should_wake_now(&conductor.id)
-                        {
-                            let nudge = format!(
-                                "[Conduit] worker {session} reported \"{event}\" -- check fleet_list / fleet_results.\r"
-                            );
-                            let _ = pty.write(&conductor.id, &nudge);
-                        }
-                    }
-                }
-            }
+            // Worker news: tell the project's Conductor what happened instead of making it
+            // poll fleet_list. See `fleet_news`.
+            crate::fleet_news::on_hook_event(&store, &pty, &fleet, &session, &event, &parsed);
 
             // SPEC-A Tier 2 / SPEC-F (shared hook-channel infra): `result`/`note` are
             // HIGH-STAKES verbs -- data another session or the Conductor may act on --

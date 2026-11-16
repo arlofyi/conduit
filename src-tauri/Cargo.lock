@@ -637,6 +637,7 @@ dependencies = [
  "base64 0.22.1",
  "dashmap",
  "dirs 5.0.1",
+ "libc",
  "png 0.17.16",
  "portable-pty",
  "rusqlite",

@@ -590,6 +590,86 @@ plus install/remove/status), and one listener in `App.tsx`.
   `cli_shim.rs` pin all of it, including that `release.yml` passes no `--features`.
 - Design: `docs/superpowers/specs/2026-09-04-conduit-cli-launcher-design.md`.
 
+## Where jobs (`conduit run`) live
+
+`jobs.rs` (engine + the `/job` route), the job subcommands in `cli_shim.rs`'s POSIX shim,
+`src/jobs.ts` + `JobsPanel.tsx` + `hooks/useJobs.ts`. An agent hands a slow command to
+Conduit instead of holding its own shell tool: `conduit run --bg -- cargo build`, then
+`conduit wait <job>` / `read` / `jobs` / `kill`.
+
+- **A CLI, not an MCP tool, on purpose.** The agent calls `conduit` through its own shell
+  tool, so the user's allow and deny rules for commands still apply. One MCP tool that runs
+  commands would be a single switch that skips all of them. Do not add `fleet_run`.
+- **`/job` passes the same two checks as `/open`** (`cli_open::authenticate`: Origin
+  refused first, then the per-boot token). It is handled on its own thread because `wait`
+  blocks, and it answers PLAIN TEXT so a POSIX shell needs no JSON parser.
+- **The shim sends its own `PATH` and directory.** Conduit is a GUI app; its PATH has none
+  of the user's tools. The job runs `/bin/sh -c` with the caller's PATH in the caller's
+  directory. One argument is a shell command as written; several are quoted word by word
+  (`sh_quote`, which keeps an argument's trailing newline -- a printf format ends in one).
+- **A job never cold-starts Conduit**, unlike `conduit <path>`: with nothing running there
+  is nowhere for it to run.
+- **`close_inherited_fds` runs in every job before exec, and is not optional.** On macOS a
+  pipe or accepted socket is created first and marked close-on-exec second, so a fork in
+  between hands the child someone else's descriptor. A job lives for minutes, and whoever
+  reads that pipe waits for EOF until the job exits -- in the app that reader is a `git`
+  call. A test pins it with a pipe deliberately left inheritable.
+- **`tests/cli_jobs.rs` runs one test at a time** (`ONE_AT_A_TIME`). Its tests spawn
+  long-lived shim processes from the same process that forks jobs, which is that same race
+  in the harness: 1 failure in 12 runs, then 7 in 15, before it was serialized.
+- **A job is its own process group** (`process_group(0)`); `kill_tree` signals the group, so
+  a pipeline dies with its shell. Jobs are killed with their owning session
+  (`remove_session`), on quit, and before an update.
+- **`busy_sessions` counts `Jobs::busy_owners`.** A job is a child of Conduit, not of the
+  agent, so the process-tree check cannot see it; without this, idle auto-stop would stop
+  an agent that is waiting on its own build.
+- **Limits:** 16 running, 64 kept (oldest finished dropped first, a running job never),
+  256 KB of output per job (the tail), ids `j1, j2, …` never reused in a run.
+- **The Jobs tab exists only while the project has jobs** (`jobsForProject`): owner's
+  project first, then the directory, and a job that belongs to no project shows in every
+  project so it is never running unseen. The list is event-driven (`jobs-changed`); only a
+  RUNNING job's output is polled.
+- **Windows:** the engine compiles and is tested there, but `conduit.cmd` refuses the job
+  subcommands by name (falling through would try to open a folder called `run`).
+- The shim marker went to `conduit-cli-shim-v4`; an installed v3 reads as outdated.
+
+## Where the agent manual lives
+
+`cli_shim::SKILL`, printed by `conduit --skill`. It is the one place an agent learns the
+`conduit` command; both fleet briefs point at it.
+
+- **Three tests tie it to the shim**: every subcommand the shim dispatches on is taught,
+  every `conduit <word>` and flag the manual shows is one the shim parses, and every number
+  in it (16 jobs, 256 KB, 180 s, 64 KB) is compared with the constant that enforces it. An
+  agent follows a manual literally, so a manual that drifts is worse than none.
+- It is embedded in a QUOTED here-document; the shim test compares the printed text with
+  the constant byte for byte, because the manual contains `$CONDUIT_SESSION_ID`.
+- This is the small half of Herdr's "shape the app by asking your agent". The large half
+  (agents editing layouts and panels as plain files) needs the plugin system and belongs to
+  that spec, not here.
+
+## Where `conduit report` lives
+
+`report.rs` + the `report` subcommand in the POSIX shim. A program in a session says what
+it is doing, with no hook installer: wrappers, custom agents, agents with thin hooks.
+
+- **`translate` rewrites a report into the lifecycle event it stands for, in `hooks.rs`,
+  before anything reads the event.** `working` → `prompt`, `idle`/`done` → `stop`,
+  `blocked` → `notification` (with `--kind permission|question` mapped onto Claude's own
+  `notification_type` words), `error` → `stopfailure`. Nothing downstream, Rust or
+  frontend, has a "report" case, so a reported status and a hooked one cannot mean
+  different things. An unknown state moves nothing.
+- **It posts to `/hook`, not a token-gated route.** A report is display data like every
+  other hook event, and the provenance gate (`store.has_session`) applies to it unchanged.
+- **`SeqGate` drops late reports.** A reporter fires and forgets, so `working` can land
+  after the `idle` that followed it. With `--seq`, a report is taken only if its number is
+  higher than the last accepted for that session; without one it is always taken. This is
+  the principled version of the 3 s done-holdoff, which stays for agents that send no seq.
+- **The shim prefers the session's own `CONDUIT_HOOK_PORT`** over the published endpoint
+  file (the dev-build-inside-installed-app case, same as the hook relays), does nothing
+  without `CONDUIT_SESSION_ID`, and exits 0 whatever happens after argument checking: a
+  status report must never break the work it reports.
+
 ## Where the mobile bridge lives
 
 `bridge.rs` (WebSocket server + `BridgeController`), `tailscale.rs`, `mobile_devices.rs`,
@@ -778,6 +858,24 @@ plus install/remove/status), and one listener in `App.tsx`.
   sidebar click end in the same state, and a broadcast never runs a delete twice. A phone
   delete keeps the worktree -- the desktop asks before removing one; a remote tap cannot.
 
+### The bridge protocol is frozen against installed phones
+
+`bridge_protocol.rs` (tests only) + `bridge_protocol_released.json`. A phone updates on its
+own schedule, so the desktop must keep parsing every frame a released phone sends and keep
+sending every frame type it reads.
+
+- **ADD, never edit.** `clientFrames` records example frames with the value each must
+  still parse to (`Debug` text, secrets redacted). A new message or field gets NEW entries
+  with `"parsed": ""`, filled by `CONDUIT_BLESS_BRIDGE_PROTOCOL=1 cargo test
+  bridge_protocol`, which never rewrites an entry that already has a value.
+- **It records values, not just "it parsed"**, because the silent break is a renamed
+  OPTIONAL field: serde reads it as the default and the phone's setting is ignored.
+- **`wire_type` has no wildcard arm.** A new `ClientMsg` variant fails to compile there,
+  and `the_type_list_matches_the_enum` then demands a frozen frame for it.
+- `serverFrameTypes` is checked by scanning `src/*.rs` for `"type": "<word>"` literals,
+  since server frames are built with `json!` where they are sent. A frame type built any
+  other way would not be seen; keep building them as literals.
+
 ## Where the phone's files, Antigravity chats and general chat live
 
 Design: `docs/superpowers/specs/2026-10-31-phone-sessions-files-general-chat-design.md`.
@@ -928,6 +1026,23 @@ rule all keep working, which browsing to the computer's tailnet name breaks.
 - The tunnel's read wait adapts (10 ms for 1 s after traffic, then 50, then 200 ms): a fixed
   10 ms poll woke every idle browser keep-alive tunnel 100 times a second.
 - Design: `docs/superpowers/specs/2026-10-31-port-mirroring-design.md`.
+
+## Where the telemetry preview lives
+
+`telemetry.rs` (`telemetry_preview`, `telemetry_forget`) + `TelemetryPreview.tsx` under
+Settings → Privacy. The page shows the request itself, not a description of it.
+
+- **The preview is built by `build_payload`**, the function that builds the real request,
+  so the page cannot list fewer fields than are sent. A test pins the key counts.
+- **`not_sending_reason` takes the same four inputs as `should_send_policy`** and a test
+  walks all sixteen combinations: the page saying "sending" while the gate is shut (or the
+  reverse) is worse than no page. The user's own choice is named first.
+- **Looking never creates the id.** The preview reads `telemetry_client_id` if it exists
+  and shows a placeholder otherwise; only a real send creates it.
+- **Opting out deletes the id** (`store.setTelemetryOptOut` → `telemetry_forget`).
+- `DO_NOT_TRACK` (anything but empty, `0`, `false`) joins `CONDUIT_DISABLE_TELEMETRY`.
+- The opt-out itself still lives in the frontend (`useTelemetry` stops pinging); Rust's
+  `is_opted_out()` is the old belt-and-braces stub and the preview is told the choice.
 
 ## Where diagnostics live
 
@@ -1672,6 +1787,21 @@ agrees), the 3-second done-holdoff against out-of-order tool hooks, and the clas
 types are a no-op). Design:
 `docs/superpowers/specs/2026-08-10-nodeterm-lessons-round-2-design.md`.
 
+### `done` is "finished unseen", and only in the frontend
+
+`statusRules.doneSeenIn` + `hooks/useDoneSeen.ts` + `store.markSeen`. A `done` session that
+has been in front of the user (the same test `askShouldHandOff` uses, so a card and a dot
+cannot disagree about what is being watched) becomes `idle`.
+
+- **Never sooner than `DONE_HOLDOFF_MS`.** `holdsOffWorking` needs the status to still read
+  `done` while a late tool hook from the finished turn can arrive.
+- **`markSeen` keeps `updatedAt`**, unlike `setStatus`. Idle auto-stop counts from it, and
+  looking at a session must not restart that clock.
+- **Rust keeps `done`.** `fleet_list` answers "did the worker finish", not "did a person
+  glance at it". This is the one status rule that deliberately has no Rust twin.
+- `LiveState.needsKind` (`statusRules.needsKind`, from `notification_type`) says what a
+  `needsInput` session waits for; `setStatus` clears it, so it never outlives its block.
+
 ## Where the transcript readers live
 
 Four separate consumers read Claude's transcript store, and all of them resolve it per
@@ -1784,6 +1914,40 @@ worktree is deleted the server holds a dead inode and every pane it later forks 
 *in preference to `-c`* (tmux 3.7b), which is why new terminals greeted users with
 `shell-init: error retrieving current directory: getcwd`. An already-poisoned server keeps
 the bad cwd until it is killed — the fix only prevents new ones.
+
+## Where machine-typed input lives
+
+A session's PTY has one input stream and several writers. `input_gate.rs` (pure) decides
+when a MACHINE may type; design in
+`docs/superpowers/specs/2026-11-16-herdr-lessons-roadmap-design.md`.
+
+- **Three write paths on `PtyManager`, and picking the wrong one is the bug.**
+  `write_human` is a person (the desktop's `pty_write`, a phone's `input`): written at
+  once, and shown to the session's `Gate`. `write_machine` pastes and submits for an agent
+  (`fleet_send`): it waits until the person has sent or cleared their draft (60 s from
+  their last key), or 3 s of no keys, and answers `Held` without writing if they never
+  stop. Plain `write` is for keys that answer a menu already on screen (agy auto-approve,
+  the bridge's interrupt Esc) and must NOT wait. A new caller that pastes text must use
+  `write_machine`; `write_machine` blocks, so never call it from a sync Tauri command.
+- **`pty_write` also carries the terminal's own replies** (cursor reports, focus in/out,
+  mouse reports, OSC/DCS answers): xterm sends them through the same `onData`. The gate
+  parses and ignores them. Without that a pane merely gaining focus read as typing and
+  held every machine write for 3 s.
+- **Worker news is queued, never written on arrival** (`fleet_news.rs`). The old nudge was
+  dropped when the Conductor was mid-turn, and was typed into a Conductor on a permission
+  prompt (text plus Enter answers a menu). `decide` holds for `needsInput` and `running`;
+  the Conductor's own `stop`/`notification`/`sessionstart` and the stale sweep `kick` a
+  new pass. One pass per Conductor at a time (`begin`/`end`), and a pass re-reads the
+  status every loop because a dialog can open while it waits on typing.
+- **The note is `<conduit-fleet>…</conduit-fleet>`**, bracketed-pasted, and the persona
+  tells the Conductor it is data from Conduit, never its user. Session names are the
+  user's text: `clean` strips control bytes and `<`/`>` so a name cannot close the tag.
+- **`fleet_send` refuses a target at `needsInput`** unless `force: true` (`send_guard`).
+- **`fleet_wait` sleeps on `FleetState`'s change counter** (`fleet_wait.rs`). Read
+  `change_count` BEFORE the state you wait on. Anything a waiter could be waiting for must
+  call `notify_changed`: `record`, `set_running`, the stale sweep, and the `fleet_result`
+  arm do. A worker with a terminal that has never reported counts as `starting` for 30 s,
+  or a wait right after `fleet_spawn` would return at once.
 
 ## Where the fleet/Conductor orchestration lives
 

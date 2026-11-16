@@ -5398,6 +5398,65 @@ input[type="number"]:focus {
 .continuity-body { flex: 1; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .continuity-meta { flex: none; color: var(--text-dim); font-size: 11px; white-space: nowrap; }
 
+/* ---- Jobs (`conduit run`): a list over the selected job's output ---- */
+.jobs-panel { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.jobs-list { flex: none; max-height: 45%; overflow-y: auto; border-bottom: 1px solid var(--border); }
+.job-row {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-height: 26px;
+  padding: 4px 10px; border-bottom: 1px solid var(--border);
+  font-family: var(--ui-font); font-size: 12px; color: var(--text-mid); cursor: pointer;
+}
+.job-row:last-child { border-bottom: none; }
+.job-row:hover, .job-row.selected { background: var(--selection-bg); }
+.job-row:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.job-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--border); }
+/* A ring, not a filled dot: the accent and the failure red sit close together on the dark
+   themes, and two filled dots side by side read as the same state. */
+.job-dot.running {
+  background: transparent; box-shadow: inset 0 0 0 1.5px var(--accent);
+  animation: job-pulse 1.6s ease-in-out infinite;
+}
+.job-dot.ok { background: var(--green); }
+.job-dot.failed { background: var(--red); }
+.job-dot.stopped { background: var(--text-dim); }
+@keyframes job-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .job-dot.running { animation: none; } }
+.job-id { flex: none; font-family: var(--mono-font); font-size: 11px; color: var(--text-dim); }
+.job-name { flex: none; max-width: 30%; color: var(--text-bright); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.job-command {
+  flex: 1; min-width: 0; font-family: var(--mono-font); font-size: 11px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.job-meta { flex: none; font-size: 11px; color: var(--text-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.job-stop {
+  flex: none; padding: 1px 8px; border: 1px solid var(--border); border-radius: 4px;
+  background: none; font-family: var(--ui-font); font-size: 11px; color: var(--text-mid); cursor: pointer;
+}
+.job-stop:hover { color: var(--red); border-color: var(--red); }
+.job-output {
+  flex: 1; min-height: 0; margin: 0; padding: 8px 10px; overflow: auto;
+  font-family: var(--mono-font); font-size: 11.5px; line-height: 1.45; color: var(--text-mid);
+  white-space: pre-wrap; word-break: break-word; user-select: text; -webkit-user-select: text;
+}
+/* ---- Settings -> Privacy: the statistics request, shown ---- */
+.telemetry-preview { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.telemetry-state { display: flex; align-items: baseline; gap: 8px; margin: 0 0 10px; font-size: 13px; color: var(--text-bright); }
+.telemetry-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; align-self: center; background: var(--text-dim); }
+.telemetry-state.on .telemetry-dot { background: var(--green); }
+.telemetry-reason { color: var(--text-dim); }
+.telemetry-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0 0 12px; font-size: 12px; }
+.telemetry-facts dt { color: var(--text-dim); }
+.telemetry-facts dd { margin: 0; color: var(--text-mid); min-width: 0; overflow-wrap: anywhere; }
+.telemetry-label { margin: 0 0 6px; font-size: 12px; color: var(--text-dim); }
+.telemetry-payload {
+  margin: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-bg); font-family: var(--mono-font); font-size: 11.5px; line-height: 1.5;
+  color: var(--text-mid); white-space: pre-wrap; overflow-wrap: anywhere;
+  user-select: text; -webkit-user-select: text;
+}
+.telemetry-note { margin: 8px 0 0; font-size: 11.5px; color: var(--text-dim); }
+.telemetry-preview code { font-family: var(--mono-font); font-size: 11.5px; }
+
 .modal.continuity-detail { width: min(640px, 90vw); }
 .continuity-prose {
   margin: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;

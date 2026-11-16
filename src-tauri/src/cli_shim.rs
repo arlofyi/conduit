@@ -14,17 +14,98 @@ use serde::Serialize;
 /// Present in every generated shim. `remove` refuses to delete a file without it (or a
 /// legacy marker), so it can never destroy an unrelated `conduit` the user put on PATH
 /// themselves.
-pub const SHIM_MARKER: &str = "conduit-cli-shim-v3";
+pub const SHIM_MARKER: &str = "conduit-cli-shim-v4";
 
 /// Markers of shims earlier Conduit versions wrote. Still ours: `install` replaces them
 /// and `remove` deletes them; `status` reports them as installed but outdated.
 /// v2: the Windows shim did not report its codepage, and broke on a `)` in a path.
-pub const LEGACY_MARKERS: &[&str] = &["conduit-cli-shim-v1", "conduit-cli-shim-v2"];
+/// v3: no `run` / `wait` / `read` / `jobs` / `kill` subcommands.
+pub const LEGACY_MARKERS: &[&str] = &[
+    "conduit-cli-shim-v1",
+    "conduit-cli-shim-v2",
+    "conduit-cli-shim-v3",
+];
 
 /// Whether a file's text is a shim some Conduit version wrote.
 fn is_ours(text: &str) -> bool {
     text.contains(SHIM_MARKER) || LEGACY_MARKERS.iter().any(|m| text.contains(m))
 }
+
+/// What `conduit --skill` prints: the manual an AGENT reads to use this command.
+///
+/// Kept beside the shim that implements it, and a test checks every subcommand the shim
+/// accepts is taught here and nothing is taught that it does not accept. A manual that
+/// drifts from the tool is worse than none: an agent follows it exactly.
+///
+/// Plain text on purpose (it is embedded in a shell here-document and a batch file is
+/// never asked for it), and written for a reader that will do literally what it says.
+pub const SKILL: &str = r#"# conduit: the command line of the Conduit app
+
+You are running inside Conduit, a desktop app that runs coding agents side by side.
+`$CONDUIT_SESSION_ID` is set when you are in one of its sessions. This command talks to
+the running app. It never needs a password; it works only on this computer.
+
+## Do not block yourself on slow commands
+
+Your own shell tool holds you until its command ends: no messages reach you, and a long
+build can outlive the tool's time limit. Hand slow commands (builds, test suites,
+installs, CI watches, dev servers) to Conduit instead.
+
+    conduit run --bg --name build -- cargo build --release
+    conduit wait j1                 # blocks until it ends; exits with ITS exit code
+    conduit read j1 --lines 80      # the end of its output
+
+- `conduit run --bg ...` prints a job id such as `j1` and returns at once.
+- Several words after `--` are a program and its arguments, each kept as one word.
+  A single quoted string is a shell command as written:
+  `conduit run --bg "cd app && pnpm test"`.
+- Without `--bg`, `conduit run` waits, prints the output, and exits with the command's
+  exit code. After `--timeout <seconds>` (default 180) it exits 124 and says
+  `still running as j1`. The command KEEPS RUNNING: wait for it, do not start it again.
+- `conduit wait <job> --timeout <seconds>` exits 124 when the job is still running. That
+  is a check-in, not a failure: wait again, or do other work first.
+- `conduit jobs` lists every job: id, state, exit code, name, command.
+- `conduit kill <job>` stops one and everything it started.
+- Never `sleep` to wait for a job. Use `conduit wait`.
+- The person sees your jobs in Conduit's Jobs tab and can stop them.
+- A job runs in the directory you called `conduit run` from, with your PATH.
+- Output is kept to the last 256 KB per job. For more, redirect to a file in the command.
+
+## Say what you are doing
+
+If your status in Conduit's sidebar is wrong or missing, report it:
+
+    conduit report --state working
+    conduit report --state blocked --kind permission --message "Allow the deploy?"
+    conduit report --state idle
+
+- States: `working` (a turn started), `idle` (ready for input), `blocked` (you need the
+  person; `--kind permission` or `--kind question` says what for), `error` (the turn
+  failed; `--kind` is a short reason such as `rate_limit`).
+- `--seq <n>` with a number that only goes up (a timestamp works) lets Conduit drop a
+  report that arrives late. Use it if you report from the background.
+- Outside a Conduit session this does nothing and succeeds, so it is safe in any script.
+- Most agents never need this: Conduit already follows the usual ones through their hooks.
+
+## Open a project or start another session
+
+    conduit .                                   # open this folder as a project
+    conduit . --agent claude --name review      # and start one new session in it
+    conduit . --agent claude --worktree fix-auth --prompt-file /abs/path/brief.md
+
+- `--agent <id>` starts ONE new session. Start one only when the person asked for it.
+- `--worktree <slug>` gives that session its own git worktree and branch (lowercase
+  letters, digits, single hyphens).
+- `--prompt-file <absolute path>` is the session's first message (UTF-8, at most 64 KB).
+- `--provider`, `--model`, `--effort` choose what the new session runs on.
+
+## Limits to respect
+
+- At most 16 jobs run at once. Kill jobs you no longer need.
+- Jobs belong to the session that started them and end when that session is deleted.
+- On Windows only `conduit <path>` works; `run`, `wait`, `read`, `jobs`, `kill` and
+  `report` are refused there.
+"#;
 
 pub fn shim_file_name() -> &'static str {
     if cfg!(windows) {
@@ -54,6 +135,13 @@ set -eu
 
 usage() {{
   echo "usage: conduit <path> [--agent <id>] [--worktree <slug>] [--name <text>] [--prompt-file <file>] [--provider <p>] [--model <m>] [--effort <e>]" >&2
+  echo "       conduit run [--bg] [--name <text>] [--timeout <seconds>] [--] <command>..." >&2
+  echo "       conduit wait <job> [--timeout <seconds>]" >&2
+  echo "       conduit read <job> [--lines <n>]" >&2
+  echo "       conduit jobs" >&2
+  echo "       conduit kill <job>" >&2
+  echo "       conduit report --state <working|idle|blocked|error> [--kind <text>] [--message <text>] [--seq <n>]" >&2
+  echo "       conduit --skill        (the manual for an agent using this command)" >&2
   exit 2
 }}
 
@@ -72,6 +160,223 @@ json_esc() {{
       for (i = 1; i <= n; i++) {{ c = substr($0, i, 1); printf "%s", ((c in m) ? m[c] : c) }}
     }}'
 }}
+
+# ---- jobs: slow commands handed to Conduit instead of run in the caller's own shell ----
+#
+# `conduit run --bg -- cargo build` starts the command in Conduit and prints its job id;
+# `conduit wait` blocks on it, `conduit read` prints its output. A job never cold-starts
+# Conduit: with nothing running there is nowhere for it to run.
+
+data_dir() {{
+  name="${{CONDUIT_DATA_DIR_NAME:-ConduitTauri}}"
+  case "$(uname -s)" in
+    Darwin) base="$HOME/Library/Application Support" ;;
+    *) base="${{XDG_DATA_HOME:-$HOME/.local/share}}" ;;
+  esac
+  dir="$base/$name"
+}}
+
+# One argument as a single shell word, so `conduit run -- grep "a b" f` reaches the job's
+# shell with its quoting intact.
+sh_quote() {{
+  # The trailing x keeps the argument's own final newlines: command substitution strips
+  # them, and an argument like a printf format ends in one.
+  quoted=$(printf '%sx' "$1" | sed "s/'/'\\\\''/g")
+  printf "'%s'" "${{quoted%x}}"
+}}
+
+is_number() {{
+  case "$1" in ''|*[!0123456789]*) return 1 ;; *) return 0 ;; esac
+}}
+
+# POSTs $1 to /job, waiting at most $2 seconds. Sets `code` (HTTP status, 000 when nothing
+# answered) and leaves the reply in $reply_file.
+job_post() {{
+  code=000
+  [ -f "$dir/hook-endpoint.sh" ] && [ -f "$dir/cli-token" ] || return 0
+  . "$dir/hook-endpoint.sh"
+  [ -n "${{CONDUIT_HOOK_PORT:-}}" ] || return 0
+  token=$(cat "$dir/cli-token")
+  code=$(curl -s -o "$reply_file" -w '%{{http_code}}' -m "$2" -X POST \
+    -H "Content-Type: application/json" \
+    -H "X-Conduit-Token: $token" \
+    --data "$1" \
+    "http://127.0.0.1:$CONDUIT_HOOK_PORT/job" 2>/dev/null) || true
+  [ -n "$code" ] || code=000
+}}
+
+# Exits unless the last job_post was answered 2xx.
+job_ok() {{
+  case "$code" in
+    2??) return 0 ;;
+    000) echo "conduit: Conduit is not running (jobs run inside it)." >&2; exit 1 ;;
+    403) echo "conduit: Conduit refused the CLI token; restart Conduit, or check CONDUIT_DATA_DIR_NAME names the running instance." >&2; exit 1 ;;
+    404) echo "conduit: no such job." >&2; exit 1 ;;
+    *) echo "conduit: $(cat "$reply_file" 2>/dev/null || echo "Conduit answered HTTP $code")" >&2; exit 1 ;;
+  esac
+}}
+
+# Waits for job $1 for at most $2 seconds. Sets `job_state` to "exited <code>" or "running".
+# Asked in slices so one HTTP request never outlives its own timeout.
+job_wait() {{
+  left="$2"
+  job_state="running"
+  while [ "$left" -gt 0 ]; do
+    slice="$left"; [ "$slice" -le 50 ] || slice=50
+    job_post "{{\"op\":\"wait\",\"id\":\"$(json_esc "$1")\",\"timeout\":$slice}}" $((slice + 10))
+    job_ok
+    job_state=$(cat "$reply_file")
+    [ "$job_state" = "running" ] || return 0
+    left=$((left - slice))
+  done
+}}
+
+job_read() {{
+  job_post "{{\"op\":\"read\",\"id\":\"$(json_esc "$1")\",\"lines\":$2}}" 15
+  job_ok
+  cat "$reply_file"
+}}
+
+job_main() {{
+  sub="$1"; shift
+  data_dir
+  reply_file=$(mktemp "${{TMPDIR:-/tmp}}/conduit-job.XXXXXX")
+  trap 'rm -f "$reply_file"' EXIT
+  case "$sub" in
+    run)
+      bg=""; job_name=""; timeout=180
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --bg) bg=1; shift ;;
+          --name) [ $# -ge 2 ] || usage; job_name="$2"; shift 2 ;;
+          --timeout) [ $# -ge 2 ] || usage; timeout="$2"; shift 2 ;;
+          --) shift; break ;;
+          -*) echo "conduit: unknown option $1" >&2; usage ;;
+          *) break ;;
+        esac
+      done
+      [ $# -gt 0 ] || usage
+      is_number "$timeout" || {{ echo "conduit: --timeout takes whole seconds" >&2; exit 2; }}
+      # One argument is a shell command as written; several are a program and its
+      # arguments, each kept as one word.
+      if [ $# -eq 1 ]; then
+        command="$1"
+      else
+        command=""
+        for word in "$@"; do command="$command $(sh_quote "$word")"; done
+        command="${{command# }}"
+      fi
+      body="\"op\":\"run\",\"command\":\"$(json_esc "$command")\",\"cwd\":\"$(json_esc "$(pwd -P)")\",\"path\":\"$(json_esc "$PATH")\""
+      [ -z "$job_name" ] || body="$body,\"name\":\"$(json_esc "$job_name")\""
+      [ -z "${{CONDUIT_SESSION_ID:-}}" ] || body="$body,\"session\":\"$(json_esc "$CONDUIT_SESSION_ID")\""
+      job_post "{{$body}}" 15
+      job_ok
+      id=$(cat "$reply_file")
+      if [ -n "$bg" ]; then
+        echo "$id"
+        exit 0
+      fi
+      job_wait "$id" "$timeout"
+      job_read "$id" 2000
+      case "$job_state" in
+        "exited "*) exit "${{job_state#exited }}" ;;
+        *) echo "[conduit] still running as $id; wait with: conduit wait $id" >&2
+           exit 124 ;;
+      esac ;;
+    wait)
+      [ $# -ge 1 ] || usage
+      id="$1"; shift
+      timeout=180
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --timeout) [ $# -ge 2 ] || usage; timeout="$2"; shift 2 ;;
+          *) usage ;;
+        esac
+      done
+      is_number "$timeout" || {{ echo "conduit: --timeout takes whole seconds" >&2; exit 2; }}
+      job_wait "$id" "$timeout"
+      case "$job_state" in
+        "exited "*) code="${{job_state#exited }}"; echo "$id exited $code"; exit "$code" ;;
+        *) echo "$id still running" ; exit 124 ;;
+      esac ;;
+    read)
+      [ $# -ge 1 ] || usage
+      id="$1"; shift
+      lines=200
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --lines) [ $# -ge 2 ] || usage; lines="$2"; shift 2 ;;
+          *) usage ;;
+        esac
+      done
+      is_number "$lines" || {{ echo "conduit: --lines takes a whole number" >&2; exit 2; }}
+      job_read "$id" "$lines"
+      exit 0 ;;
+    jobs)
+      job_post '{{"op":"list"}}' 15
+      job_ok
+      cat "$reply_file"
+      exit 0 ;;
+    kill)
+      [ $# -eq 1 ] || usage
+      job_post "{{\"op\":\"kill\",\"id\":\"$(json_esc "$1")\"}}" 15
+      job_ok
+      exit 0 ;;
+  esac
+}}
+
+# ---- report: a program in a Conduit session says what it is doing ----
+#
+# For wrappers, custom agents, and agents whose own hooks are thin. Outside a Conduit
+# session this does nothing and succeeds, so the same script runs anywhere. It never
+# fails the caller either: a status report must not be able to break the work it reports.
+report_main() {{
+  state=""; kind=""; message=""; seq=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --state) [ $# -ge 2 ] || usage; state="$2"; shift 2 ;;
+      --kind) [ $# -ge 2 ] || usage; kind="$2"; shift 2 ;;
+      --message) [ $# -ge 2 ] || usage; message="$2"; shift 2 ;;
+      --seq) [ $# -ge 2 ] || usage; seq="$2"; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  case "$state" in
+    working|idle|done|blocked|error) ;;
+    *) echo "conduit: --state must be working, idle, blocked or error" >&2; exit 2 ;;
+  esac
+  [ -z "$seq" ] || is_number "$seq" || {{ echo "conduit: --seq takes a whole number" >&2; exit 2; }}
+  [ -n "${{CONDUIT_SESSION_ID:-}}" ] || exit 0
+  data_dir
+  # The session's own port when it has one: a dev build started from inside the installed
+  # app must reach itself, exactly as the hook relays do.
+  port="${{CONDUIT_HOOK_PORT:-}}"
+  if [ -z "$port" ] && [ -f "$dir/hook-endpoint.sh" ]; then
+    . "$dir/hook-endpoint.sh"
+    port="${{CONDUIT_HOOK_PORT:-}}"
+  fi
+  [ -n "$port" ] || exit 0
+  body="\"state\":\"$state\""
+  [ -z "$kind" ] || body="$body,\"kind\":\"$(json_esc "$kind")\""
+  [ -z "$message" ] || body="$body,\"message\":\"$(json_esc "$message")\""
+  [ -z "$seq" ] || body="$body,\"seq\":$seq"
+  curl -s -o /dev/null -m 2 -X POST -H "Content-Type: application/json" \
+    --data "{{$body}}" \
+    "http://127.0.0.1:$port/hook?session=$CONDUIT_SESSION_ID&event=report" 2>/dev/null || true
+  exit 0
+}}
+
+# A subcommand is the FIRST word. A directory with one of these names is still openable
+# as `conduit ./run`.
+case "${{1:-}}" in
+  run|wait|read|jobs|kill) job_main "$@" ;;
+  report) shift; report_main "$@" ;;
+  --skill)
+    # Quoted delimiter: nothing in the manual is expanded.
+    cat <<'CONDUIT_SKILL_END'
+{SKILL}CONDUIT_SKILL_END
+    exit 0 ;;
+esac
 
 target=""
 agent=""
@@ -226,6 +531,15 @@ pub fn shim_cmd() -> String {
 rem {SHIM_MARKER} — generated by Conduit. Do not edit; reinstall from Settings.
 setlocal disabledelayedexpansion
 
+rem Jobs are not in the Windows shim yet. Refuse by name: falling through would try to
+rem open a folder called "run".
+if /i "%~1"=="run" goto no_jobs
+if /i "%~1"=="wait" goto no_jobs
+if /i "%~1"=="read" goto no_jobs
+if /i "%~1"=="jobs" goto no_jobs
+if /i "%~1"=="kill" goto no_jobs
+if /i "%~1"=="report" goto no_jobs
+
 set "target="
 set "agent="
 set "worktree="
@@ -252,6 +566,9 @@ shift
 goto parse
 :usage
 echo usage: conduit ^<path^> [--agent ^<id^>] [--worktree ^<slug^>] [--name ^<text^>] [--prompt-file ^<file^>] [--provider ^<p^>] [--model ^<m^>] [--effort ^<e^>] 1>&2
+exit /b 2
+:no_jobs
+echo conduit: run, wait, read, jobs, kill and report are not available in conduit.cmd yet 1>&2
 exit /b 2
 :bad_name
 echo conduit: in conduit.cmd --name cannot contain double quotes, percent signs or exclamation marks 1>&2
@@ -744,11 +1061,106 @@ mod tests {
         assert!(sh.trim_end().ends_with("answered || cold_start"));
     }
 
+    /// Every `conduit <subcommand>` the POSIX shim dispatches on, read from its own
+    /// `case` line -- so adding a subcommand without teaching it fails here.
+    fn dispatched_subcommands() -> Vec<String> {
+        let sh = shim_sh();
+        let mut found = Vec::new();
+        for line in sh.lines().map(str::trim) {
+            if let Some(names) = line.strip_suffix(") job_main \"$@\" ;;") {
+                found.extend(names.split('|').map(str::to_string));
+            } else if line.starts_with("report) shift; report_main") {
+                found.push("report".into());
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_skill_teaches_every_subcommand_the_shim_accepts() {
+        let subs = dispatched_subcommands();
+        assert_eq!(subs, ["run", "wait", "read", "jobs", "kill", "report"]);
+        for sub in &subs {
+            assert!(
+                SKILL.contains(&format!("conduit {sub}")),
+                "`conduit {sub}` works but the manual never mentions it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_skill_teaches_nothing_the_shim_does_not_accept() {
+        let subs = dispatched_subcommands();
+        let sh = shim_sh();
+        // Every `conduit <word>` in the manual is a subcommand, a path, or a flag.
+        for line in SKILL.lines() {
+            let mut rest = line;
+            while let Some(at) = rest.find("conduit ") {
+                rest = &rest[at + 8..];
+                let word: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
+                    .collect();
+                let ok =
+                    word.is_empty() || word == "." || word.starts_with('-') || subs.contains(&word);
+                assert!(
+                    ok,
+                    "the manual shows `conduit {word}`, which the shim would treat as a path"
+                );
+            }
+        }
+        // And every flag it names is one the shim parses.
+        for flag in [
+            "--bg",
+            "--name",
+            "--timeout",
+            "--lines",
+            "--state",
+            "--kind",
+            "--message",
+            "--seq",
+            "--agent",
+            "--worktree",
+            "--prompt-file",
+            "--provider",
+            "--model",
+            "--effort",
+        ] {
+            assert!(SKILL.contains(flag), "{flag} is not in the manual");
+            assert!(
+                sh.contains(&format!("{flag})")),
+                "{flag} is taught but not parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_skill_states_the_limits_the_engine_enforces() {
+        // Numbers an agent will act on: they must be the real ones.
+        assert!(SKILL.contains("At most 16 jobs"));
+        assert_eq!(crate::jobs::MAX_RUNNING, 16);
+        assert!(SKILL.contains("256 KB"));
+        assert_eq!(crate::jobs::OUTPUT_CAP, 256 * 1024);
+        assert!(SKILL.contains("default 180"));
+        assert!(shim_sh().contains("timeout=180"));
+        assert!(SKILL.contains("at most 64 KB"));
+        assert_eq!(crate::cli_open::MAX_PROMPT_BYTES, 65_536);
+    }
+
+    #[test]
+    fn the_skill_survives_being_embedded_in_the_shim() {
+        // It sits in a quoted here-document: the end marker must not appear inside it, and
+        // it must end with a newline so the marker starts its own line.
+        assert!(!SKILL.contains("CONDUIT_SKILL_END"));
+        assert!(SKILL.ends_with('\n'));
+        assert!(shim_sh().contains(SKILL));
+    }
+
     #[test]
     fn shims_carry_the_current_marker_and_new_flags() {
         for t in [shim_sh(), shim_cmd()] {
             assert!(t.contains(SHIM_MARKER));
-            assert!(t.contains("conduit-cli-shim-v3"));
+            assert!(t.contains("conduit-cli-shim-v4"));
             for f in ["--worktree", "--name", "--prompt-file"] {
                 assert!(t.contains(f), "{f}");
             }
