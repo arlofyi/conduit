@@ -83,3 +83,59 @@ export function notificationStatus(
 export function awaitsUser(toolName: string | undefined): boolean {
   return toolName === "AskUserQuestion" || toolName === "ExitPlanMode";
 }
+
+/**
+ * `done` means "finished while you were not looking". Once the session has been in front
+ * of the user it is just idle -- a done dot that never clears is wallpaper, and the
+ * sidebar stops telling you which sessions have something new.
+ *
+ * Returns how many ms from `now` the session should be marked seen, or undefined when the
+ * rule does not apply. Never sooner than the done-holdoff: `holdsOffWorking` needs the
+ * status to still read `done` while a late tool hook from the finished turn can arrive,
+ * and flipping to idle inside that window would let the hook resurrect the turn.
+ *
+ * Frontend only, on purpose. Rust's mirror keeps `done`: what a Conductor reads through
+ * `fleet_list` is whether the worker finished, not whether a person glanced at it.
+ */
+export function doneSeenIn(
+  status: SessionStatus | undefined,
+  updatedAt: number | undefined,
+  now: number,
+  inFront: boolean,
+): number | undefined {
+  if (status !== "done" || !inFront) return undefined;
+  if (updatedAt === undefined) return 0;
+  return Math.max(0, DONE_HOLDOFF_MS - Math.max(0, now - updatedAt));
+}
+
+/** What a session at `needsInput` is waiting for. */
+export type NeedsKind = "permission" | "question" | "input";
+
+/**
+ * The kind of block behind a `notification` that asks for the user, from the same
+ * `notification_type` `notificationStatus` reads. `idle_prompt` only asks for the user
+ * when the turn is parked on a question tool (`awaitingUser`), so that is what it is.
+ */
+export function needsKind(notificationType: string | undefined): NeedsKind {
+  switch (notificationType) {
+    case "permission_prompt":
+      return "permission";
+    case "elicitation_dialog":
+    case "idle_prompt":
+      return "question";
+    default:
+      return "input";
+  }
+}
+
+/** The sidebar pill for a session that needs the user: short text, full sentence on hover. */
+export function needsLabel(kind: NeedsKind | undefined): { text: string; title: string } {
+  switch (kind) {
+    case "permission":
+      return { text: "approve?", title: "Waiting for you to allow or deny a tool" };
+    case "question":
+      return { text: "question", title: "Waiting for your answer to a question" };
+    default:
+      return { text: "needs you", title: "Waiting for your input" };
+  }
+}

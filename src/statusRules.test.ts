@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   DONE_HOLDOFF_MS,
+  doneSeenIn,
+  needsKind,
+  needsLabel,
   WORKING_STALE_MS,
   holdsOffWorking,
   isStaleWorking,
@@ -83,5 +86,50 @@ describe("notificationStatus", () => {
   it("keeps the legacy badge when the payload carries no type at all", () => {
     expect(notificationStatus(undefined, "running")).toBe("needsInput");
     expect(notificationStatus(undefined, "done")).toBe("needsInput");
+  });
+});
+
+describe("done means finished unseen", () => {
+  const t0 = 1_000_000;
+
+  it("applies only to a done session that is in front of the user", () => {
+    expect(doneSeenIn("done", t0, t0 + 10_000, false)).toBeUndefined();
+    for (const status of ["idle", "running", "needsInput"] as const) {
+      expect(doneSeenIn(status, t0, t0 + 10_000, true)).toBeUndefined();
+    }
+    expect(doneSeenIn(undefined, t0, t0, true)).toBeUndefined();
+  });
+
+  it("never marks seen inside the done-holdoff", () => {
+    expect(doneSeenIn("done", t0, t0, true)).toBe(DONE_HOLDOFF_MS);
+    expect(doneSeenIn("done", t0, t0 + 1_000, true)).toBe(DONE_HOLDOFF_MS - 1_000);
+    expect(doneSeenIn("done", t0, t0 + DONE_HOLDOFF_MS, true)).toBe(0);
+    expect(doneSeenIn("done", t0, t0 + 60_000, true)).toBe(0);
+  });
+
+  it("treats an entry with no timestamp as long finished, and a clock that went back as fresh", () => {
+    expect(doneSeenIn("done", undefined, t0, true)).toBe(0);
+    expect(doneSeenIn("done", t0, t0 - 5_000, true)).toBe(DONE_HOLDOFF_MS);
+  });
+});
+
+describe("what a session needs you for", () => {
+  it("reads the kind from the notification type", () => {
+    expect(needsKind("permission_prompt")).toBe("permission");
+    expect(needsKind("elicitation_dialog")).toBe("question");
+    expect(needsKind("idle_prompt")).toBe("question");
+    expect(needsKind("agent_needs_input")).toBe("input");
+    expect(needsKind(undefined)).toBe("input");
+    expect(needsKind("something_new")).toBe("input");
+  });
+
+  it("labels each kind, and an unknown one as the plain pill", () => {
+    expect(needsLabel("permission").text).toBe("approve?");
+    expect(needsLabel("question").text).toBe("question");
+    expect(needsLabel("input").text).toBe("needs you");
+    expect(needsLabel(undefined).text).toBe("needs you");
+    for (const k of ["permission", "question", "input", undefined] as const) {
+      expect(needsLabel(k).title.length).toBeGreaterThan(10);
+    }
   });
 });

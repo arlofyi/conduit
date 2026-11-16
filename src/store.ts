@@ -434,6 +434,8 @@ export interface LiveState {
    * the clock rather than trusting the event order.
    */
   updatedAt?: number;
+  /** What a `needsInput` session is waiting for. Only meaningful at that status. */
+  needsKind?: import("./statusRules").NeedsKind;
 }
 
 const EMPTY_LIVE: LiveState = { status: "idle", todos: [] };
@@ -1873,6 +1875,12 @@ interface AppState {
   startProjectRename: (projectId: string) => void;
   cancelProjectRename: () => void;
   setStatus: (id: string, status: SessionStatus) => void;
+  /** Mark a `needsInput` session with what it is waiting for (statusRules `needsKind`). */
+  setNeedsKind: (id: string, kind: import("./statusRules").NeedsKind) => void;
+  /** The user has looked at a finished session: `done` becomes `idle` (statusRules
+   *  `doneSeenIn`). Keeps `updatedAt`, so looking at a session never restarts the clock
+   *  idle auto-stop counts from. */
+  markSeen: (id: string) => void;
   /** Apply the Rust stale-working sweep's verdict to the frontend's own `live` map. */
   markStale: (ids: string[]) => void;
   setTodos: (id: string, todos: TodoItem[]) => void;
@@ -4077,9 +4085,23 @@ export const useStore = create<AppState>((set, get) => {
       set((s) => ({
         live: {
           ...s.live,
-          [id]: { ...(s.live[id] ?? EMPTY_LIVE), status, updatedAt: Date.now() },
+          // The kind belongs to ONE block: any new status ends it.
+          [id]: { ...(s.live[id] ?? EMPTY_LIVE), status, updatedAt: Date.now(), needsKind: undefined },
         },
       })),
+    setNeedsKind: (id, kind) =>
+      set((s) => {
+        const cur = s.live[id];
+        if (cur?.status !== "needsInput" || cur.needsKind === kind) return {};
+        return { live: { ...s.live, [id]: { ...cur, needsKind: kind } } };
+      }),
+    markSeen: (id) =>
+      set((s) => {
+        const cur = s.live[id];
+        // Guarded: a new turn may have started between the timer being set and firing.
+        if (cur?.status !== "done") return {};
+        return { live: { ...s.live, [id]: { ...cur, status: "idle" } } };
+      }),
     markStale: (ids) =>
       set((s) => {
         // The Rust watchdog swept these; mirror its answer so the sidebar and `fleet_list`

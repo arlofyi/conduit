@@ -1672,6 +1672,21 @@ agrees), the 3-second done-holdoff against out-of-order tool hooks, and the clas
 types are a no-op). Design:
 `docs/superpowers/specs/2026-08-10-nodeterm-lessons-round-2-design.md`.
 
+### `done` is "finished unseen", and only in the frontend
+
+`statusRules.doneSeenIn` + `hooks/useDoneSeen.ts` + `store.markSeen`. A `done` session that
+has been in front of the user (the same test `askShouldHandOff` uses, so a card and a dot
+cannot disagree about what is being watched) becomes `idle`.
+
+- **Never sooner than `DONE_HOLDOFF_MS`.** `holdsOffWorking` needs the status to still read
+  `done` while a late tool hook from the finished turn can arrive.
+- **`markSeen` keeps `updatedAt`**, unlike `setStatus`. Idle auto-stop counts from it, and
+  looking at a session must not restart that clock.
+- **Rust keeps `done`.** `fleet_list` answers "did the worker finish", not "did a person
+  glance at it". This is the one status rule that deliberately has no Rust twin.
+- `LiveState.needsKind` (`statusRules.needsKind`, from `notification_type`) says what a
+  `needsInput` session waits for; `setStatus` clears it, so it never outlives its block.
+
 ## Where the transcript readers live
 
 Four separate consumers read Claude's transcript store, and all of them resolve it per
