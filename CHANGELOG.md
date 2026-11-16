@@ -5,6 +5,12 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Changed — The "finished" dot clears once you have looked.** A session that finished while
+  you were elsewhere keeps its dot until you open it; a few seconds after it is in front of
+  you it reads as idle, so the dots that remain are the ones you have not seen.
+- **Added — "Needs you" says what for.** A session waiting on a tool permission shows
+  "approve?", one waiting on a question shows "question", with the full reason on hover.
+
 ## 0.51.2 — 2026-11-12
 
 - **Fixed — The wheel walked your command history in the side terminal.** Scrolling there now

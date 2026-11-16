@@ -35,6 +35,7 @@ import { ThemeSwitcher } from "./ThemeSwitcher";
 import { ClaudeStatusPill } from "./ClaudeStatusPill";
 import { UsagePanel } from "./UsagePanel";
 import { ClaudeStatusWarning } from "./ClaudeStatusWarning";
+import { needsLabel, type NeedsKind } from "../statusRules";
 
 // Collapsed projects persist as a list of project ids in localStorage — a pure
 // sidebar UI preference, mirroring conduit.sidebarWidth / conduit.topH (no backend
@@ -451,6 +452,7 @@ function SessionRow({
   const status = useStore((s) => liveState(s.live, session.id).status);
   const activity = useStore((s) => liveState(s.live, session.id).activity);
   const compacting = useStore((s) => liveState(s.live, session.id).compacting);
+  const needsKind = useStore((s) => liveState(s.live, session.id).needsKind);
   // A `live` entry exists only once the session has emitted a hook, so its presence IS
   // "this session has started this run" — see glyphStateFor.
   const loaded = useStore((s) => s.live[session.id] !== undefined);
@@ -606,7 +608,12 @@ function SessionRow({
           ⏻
         </span>
       ) : (
-        <StatusAccessory status={status} activity={activity} compacting={compacting} />
+        <StatusAccessory
+          status={status}
+          activity={activity}
+          compacting={compacting}
+          needsKind={needsKind}
+        />
       )}
     </div>
     </div>
@@ -813,12 +820,21 @@ function StatusAccessory({
   status,
   activity,
   compacting,
+  needsKind,
 }: {
   status: string;
   activity?: string;
   compacting?: boolean;
+  needsKind?: NeedsKind;
 }) {
-  if (status === "needsInput") return <span className="pill-needs">needs you</span>;
+  if (status === "needsInput") {
+    const label = needsLabel(needsKind);
+    return (
+      <span className="pill-needs" title={label.title}>
+        {label.text}
+      </span>
+    );
+  }
   if (compacting) return <span className="pill-compacting">compacting</span>;
   if (status === "running")
     return activity ? (

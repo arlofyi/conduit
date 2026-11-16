@@ -31,9 +31,10 @@ import {
 
 import { type ChatItem } from "./rootChat";
 import { type PendingDecision } from "./rootProposals";
-import { awaitsUser, holdsOffWorking, notificationStatus } from "./statusRules";
+import { awaitsUser, holdsOffWorking, needsKind, notificationStatus } from "./statusRules";
 import { type ThemePref } from "./themes";
 import { useClaudeAmbient } from "./hooks/useClaudeAmbient";
+import { useDoneSeen } from "./hooks/useDoneSeen";
 import { useAutoStopIdle } from "./hooks/useAutoStopIdle";
 import { useSessionDirs } from "./hooks/useSessionDirs";
 import { useSessionContext } from "./hooks/useSessionContext";
@@ -122,6 +123,7 @@ export default function App() {
   // sidebar-hosted poller).
   useClaudeAmbient();
   useAutoStopIdle();
+  useDoneSeen();
   useSessionDirs();
   useSessionContext();
   const projects = useStore((s) => s.projects);
@@ -430,6 +432,7 @@ export default function App() {
             globalSelectedSessionId(st) === session && document.hasFocus();
           if (!active) {
             st.setStatus(session, next);
+            st.setNeedsKind(session, needsKind(body?.notification_type));
             doNotify(session, body?.message ?? "needs your input");
           }
           break;
