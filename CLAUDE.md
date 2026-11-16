@@ -778,6 +778,24 @@ plus install/remove/status), and one listener in `App.tsx`.
   sidebar click end in the same state, and a broadcast never runs a delete twice. A phone
   delete keeps the worktree -- the desktop asks before removing one; a remote tap cannot.
 
+### The bridge protocol is frozen against installed phones
+
+`bridge_protocol.rs` (tests only) + `bridge_protocol_released.json`. A phone updates on its
+own schedule, so the desktop must keep parsing every frame a released phone sends and keep
+sending every frame type it reads.
+
+- **ADD, never edit.** `clientFrames` records example frames with the value each must
+  still parse to (`Debug` text, secrets redacted). A new message or field gets NEW entries
+  with `"parsed": ""`, filled by `CONDUIT_BLESS_BRIDGE_PROTOCOL=1 cargo test
+  bridge_protocol`, which never rewrites an entry that already has a value.
+- **It records values, not just "it parsed"**, because the silent break is a renamed
+  OPTIONAL field: serde reads it as the default and the phone's setting is ignored.
+- **`wire_type` has no wildcard arm.** A new `ClientMsg` variant fails to compile there,
+  and `the_type_list_matches_the_enum` then demands a frozen frame for it.
+- `serverFrameTypes` is checked by scanning `src/*.rs` for `"type": "<word>"` literals,
+  since server frames are built with `json!` where they are sent. A frame type built any
+  other way would not be seen; keep building them as literals.
+
 ## Where the phone's files, Antigravity chats and general chat live
 
 Design: `docs/superpowers/specs/2026-10-31-phone-sessions-files-general-chat-design.md`.
