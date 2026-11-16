@@ -5,6 +5,9 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — About names the third-party screen rules.** Settings → About credits Herdr
+  for the rule files used to read agent dialogs, with their license.
+
 - **Added — Antigravity, Gemini and OpenCode sessions show when they are waiting on you.**
   Conduit reads the agent's own screen for a permission, question or folder-trust prompt
   and marks the session "needs you", for dialogs those agents' hooks never report. macOS

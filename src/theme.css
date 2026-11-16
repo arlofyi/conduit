@@ -4103,6 +4103,9 @@ label.setting-row-title {
   color: var(--text-mid);
   font-variant-numeric: tabular-nums;
 }
+/* A sentence, not a value: it wraps, and its row aligns to the first line. */
+.about-row:has(.about-third-party) { align-items: baseline; }
+.about-third-party { line-height: 1.5; min-width: 0; }
 
 /* ---- Accounts manager ---- */
 .account-list {

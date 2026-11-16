@@ -98,6 +98,16 @@ export function AboutPanel() {
           <span className="about-key">License</span>
           <span className="about-val">MIT</span>
         </div>
+        <div className="about-row">
+          <span className="about-key">Includes</span>
+          <span className="about-val about-third-party">
+            Screen rules for Antigravity, Gemini and OpenCode from{" "}
+            {link("https://github.com/herdrdev/herdr", "Herdr")}, used unmodified
+            under the{" "}
+            {link("https://www.apache.org/licenses/LICENSE-2.0", "Apache License 2.0")}.
+            Copyright the Herdr authors.
+          </span>
+        </div>
       </div>
       <DiagnosticsSection />
     </div>
