@@ -75,6 +75,11 @@ mod root_chat_agy;
 mod root_chat_options;
 mod root_mcp;
 mod routing;
+// tmux is the only source of a rendered screen, and tmux is not a Windows thing.
+#[cfg(not(windows))]
+mod screen_rules;
+#[cfg(not(windows))]
+mod screen_watch;
 mod scrollback;
 mod search;
 #[cfg_attr(windows, allow(dead_code))]
@@ -3523,6 +3528,9 @@ pub fn run() {
             let ask_gate = app.state::<Arc<asks::AskGate>>().inner().clone();
             // agy prompts as permission cards (agy fires no permission hook).
             agy_prompts::start(app.handle().clone());
+            // Dialogs read off the screen, for agents whose hooks cannot report them.
+            #[cfg(not(windows))]
+            screen_watch::start(app.handle().clone());
             {
                 // The Jobs panel refetches on this; a job starting or ending is the only
                 // thing that changes its list.

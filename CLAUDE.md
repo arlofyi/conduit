@@ -648,6 +648,38 @@ Conduit instead of holding its own shell tool: `conduit run --bg -- cargo build`
   (agents editing layouts and panels as plain files) needs the plugin system and belongs to
   that spec, not here.
 
+## Where screen rules live
+
+`screen_rules/` (engine + vendored rule files) and `screen_watch.rs` (the poller). An
+agent sitting on a dialog its hooks cannot report -- Antigravity fires none, and a
+folder-trust prompt runs before any exist -- is read off its own screen.
+
+- **The rule files are Herdr's, copied UNMODIFIED** (`manifests/antigravity.toml`,
+  `gemini.toml`, `opencode.toml`; Apache-2.0; `NOTICE.md` + `LICENSE-APACHE-2.0` beside
+  them; commit `ee5bfb5`). Their authors measured the patterns against live agents, which
+  is the reason to adopt rather than write our own. A test pins each file's bytes and
+  `.gitattributes` marks them `-text`, so "unmodified" stays true on a Windows checkout.
+  Editing one means recording the change in `NOTICE.md` (the license requires it).
+- **The engine is ours and implements only what those files use**: regions `whole_recent`
+  and `bottom_non_empty_lines(N)`. A file naming any other region (Herdr has `osc_title`,
+  prompt-marker regions...) fails to load WHOLE. To adopt another agent's file, add its
+  regions first; never map an unknown region onto the whole screen.
+- **Only Antigravity, Gemini and OpenCode get rules.** Claude, Codex, Command Code and
+  Hermes report through hooks Conduit installs and measured itself; a second opinion from
+  the screen would only be a way for the two to disagree.
+- **No match means no opinion, never idle.** Herdr falls back to idle for an unknown
+  screen, and its own docs list that as the hole that lets automation type into a dialog.
+- **The watcher fills ONE gap**: it reports `blocked` once when a dialog appears and the
+  hooks have not said so, then hands the session back (`working` if the screen shows work,
+  `idle` after two empty looks in a row). It never raises over a status hooks set and lets
+  go as soon as hooks move the session on (`Tracker`).
+- **It reports through `report.rs`'s door** (a `report` event POSTed to our own hook
+  server, `source: "screen"`), so no consumer has a "screen" case. `seq_key` gives each
+  reporter its own counter per session: the watcher uses the clock, a script counts 1, 2, 3.
+- **The screen is `tmux capture-pane`, never the PTY ring.** The ring is a history of
+  repaints; an "esc to cancel" from a turn that ended a minute ago is still in it. So no
+  tmux means no screen status, and both modules are `#[cfg(not(windows))]`.
+
 ## Where `conduit report` lives
 
 `report.rs` + the `report` subcommand in the POSIX shim. A program in a session says what

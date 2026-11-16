@@ -1,0 +1,2 @@
+# Herdr rule files are pinned byte for byte (screen_rules); no line-ending conversion.
+src-tauri/src/screen_rules/manifests/* -text

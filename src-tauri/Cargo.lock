@@ -640,6 +640,7 @@ dependencies = [
  "libc",
  "png 0.17.16",
  "portable-pty",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
@@ -656,6 +657,7 @@ dependencies = [
  "tauri-plugin-wdio-webdriver",
  "tauri-plugin-window-state",
  "tiny_http",
+ "toml 0.8.2",
  "tungstenite",
  "uuid",
 ]
