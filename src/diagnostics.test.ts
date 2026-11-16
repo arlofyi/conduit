@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createDedupe, detailsText, formatUptime, toReport } from "./diagnostics";
+import { createDedupe, detailsText, displayPath, formatUptime, toReport } from "./diagnostics";
 
 describe("toReport", () => {
   it("normalizes an Error with its stack and the component stack", () => {
@@ -59,5 +59,25 @@ describe("formatting", () => {
     const t = detailsText(toReport("render", new Error("bad"), "board"), "0.50.0");
     expect(t.split("\n")[0]).toBe("Conduit 0.50.0 — render in board");
     expect(t).toContain("Error: bad");
+  });
+});
+
+describe("displayPath", () => {
+  it("shows the home folder as ~ on every OS", () => {
+    expect(displayPath("/Users/sam/Library/Application Support/ConduitTauri/logs")).toBe(
+      "~/Library/Application Support/ConduitTauri/logs",
+    );
+    expect(displayPath("/home/sam/.local/share/ConduitTauri/logs")).toBe("~/.local/share/ConduitTauri/logs");
+    expect(displayPath("C:\\Users\\sam\\AppData\\Roaming\\ConduitTauri\\logs")).toBe(
+      "~\\AppData\\Roaming\\ConduitTauri\\logs",
+    );
+    expect(displayPath("/Users/sam")).toBe("~");
+  });
+
+  it("leaves a path outside any home folder alone", () => {
+    expect(displayPath("/var/log/conduit")).toBe("/var/log/conduit");
+    expect(displayPath("/Usersx/sam/logs")).toBe("/Usersx/sam/logs");
+    expect(displayPath("D:\\data\\logs")).toBe("D:\\data\\logs");
+    expect(displayPath("")).toBe("");
   });
 });

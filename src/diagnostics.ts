@@ -114,3 +114,18 @@ export const COUNTER_LABELS: Record<string, string> = {
   frontend_errors: "UI errors",
   frontend_dropped: "UI errors not logged (rate limit)",
 };
+
+/**
+ * A path as shown on screen: the home folder as `~`. The full path is a long line whose
+ * first third is the same on every row of every machine, and it also puts the account
+ * name on screen in a panel people screenshot when asking for help. The real path stays
+ * in the tooltip, and "Copy diagnostics" redacts it separately in Rust.
+ */
+export function displayPath(path: string): string {
+  // macOS `/Users/<name>/…`, Linux `/home/<name>/…`, Windows `C:\Users\<name>\…`.
+  const unix = /^\/(?:Users|home)\/[^/]+(\/|$)/.exec(path);
+  if (unix) return `~${unix[1]}${path.slice(unix[0].length)}`;
+  const win = /^[A-Za-z]:\\Users\\[^\\]+(\\|$)/.exec(path);
+  if (win) return `~${win[1]}${path.slice(win[0].length)}`;
+  return path;
+}

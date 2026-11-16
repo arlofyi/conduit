@@ -5,6 +5,10 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Changed — Settings → About is tidier.** Version, updates, source and the diagnostics
+  figures share one aligned layout, labels no longer wrap, the log folder shows your home
+  folder as `~`, and the buttons have room.
+
 - **Added — About names the third-party screen rules.** Settings → About credits Herdr
   for the rule files used to read agent dialogs, with their license.
 

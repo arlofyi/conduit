@@ -1,9 +1,9 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { useStore } from "../store";
 import { Button, ButtonRow, SettingsSection } from "./ui";
-import { COUNTER_LABELS, formatUptime } from "../diagnostics";
+import { COUNTER_LABELS, displayPath, formatUptime } from "../diagnostics";
 
 /** `diag::diagnostics` (diag.rs). Everything here is local; `report` is pre-redacted. */
 interface DiagnosticsView {
@@ -71,44 +71,33 @@ export function AboutPanel() {
         Built with love by Uzair Hayat, Fahed Yasin, and Usman Kaisser at{" "}
         {link(SITE_URL, "Arlo")}.
       </p>
-      <div className="about-rows">
-        <div className="about-row">
-          <span className="about-key">Version</span>
-          <span className="about-val">{version || "..."}</span>
-        </div>
-        <div className="about-row">
-          <span className="about-key">Updates</span>
-          <span className="about-val about-updates">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => void check({ manual: true })}
-              disabled={phase === "checking" || phase === "downloading"}
-            >
-              Check for updates
-            </Button>
-            <span className="about-update-status">{status()}</span>
-          </span>
-        </div>
-        <div className="about-row">
-          <span className="about-key">Source</span>
-          {link(REPO_URL, "github.com/uziiuzair/conduit")}
-        </div>
-        <div className="about-row">
-          <span className="about-key">License</span>
-          <span className="about-val">MIT</span>
-        </div>
-        <div className="about-row">
-          <span className="about-key">Includes</span>
-          <span className="about-val about-third-party">
-            Screen rules for Antigravity, Gemini and OpenCode from{" "}
-            {link("https://github.com/herdrdev/herdr", "Herdr")}, used unmodified
-            under the{" "}
-            {link("https://www.apache.org/licenses/LICENSE-2.0", "Apache License 2.0")}.
-            Copyright the Herdr authors.
-          </span>
-        </div>
-      </div>
+      <dl className="about-facts">
+        <dt>Version</dt>
+        <dd>{version || "..."}</dd>
+        <dt>Updates</dt>
+        <dd className="about-updates">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => void check({ manual: true })}
+            disabled={phase === "checking" || phase === "downloading"}
+          >
+            Check for updates
+          </Button>
+          <span className="about-update-status">{status()}</span>
+        </dd>
+        <dt>Source</dt>
+        <dd>{link(REPO_URL, "github.com/uziiuzair/conduit")}</dd>
+        <dt>License</dt>
+        <dd>MIT</dd>
+        <dt>Includes</dt>
+        <dd className="about-prose">
+          Screen rules for Antigravity, Gemini and OpenCode from{" "}
+          {link("https://github.com/herdrdev/herdr", "Herdr")}, used unmodified under the{" "}
+          {link("https://www.apache.org/licenses/LICENSE-2.0", "Apache License 2.0")}. Copyright the Herdr
+          authors.
+        </dd>
+      </dl>
       <DiagnosticsSection />
     </div>
   );
@@ -158,40 +147,44 @@ function DiagnosticsSection() {
           Refresh
         </Button>
       }
+      flush
     >
-      <div className="about-rows">
-        <div className="about-row">
-          <span className="about-key">This run</span>
-          <span className="about-val">{view ? `up ${formatUptime(view.uptimeSecs)}` : "..."}</span>
-        </div>
-        {shown?.map((c) => (
-          <div className="about-row" key={c.key}>
-            <span className="about-key">{COUNTER_LABELS[c.key] ?? c.key}</span>
-            <span className="about-val">{c.value}</span>
-          </div>
-        ))}
-        <div className="about-row">
-          <span className="about-key">Log folder</span>
-          <span className="about-val diag-path" title={view?.logDir}>
-            {view?.logDir ?? "..."}
-          </span>
+      {/* Its own card, not the section's default body: that one is a 2px-padded shell
+          built for full-width setting rows, and anything else sits flush against its
+          border. */}
+      <div className="diag-card">
+        <dl className="about-facts">
+          <dt>This run</dt>
+          <dd>{view ? `up ${formatUptime(view.uptimeSecs)}` : "..."}</dd>
+          {shown?.map((c) => (
+            <Fragment key={c.key}>
+              <dt>{COUNTER_LABELS[c.key] ?? c.key}</dt>
+              <dd>{c.value}</dd>
+            </Fragment>
+          ))}
+          <dt>Log folder</dt>
+          <dd className="diag-path" title={view?.logDir}>
+            {view ? displayPath(view.logDir) : "..."}
+          </dd>
+        </dl>
+        {view && view.recent.length > 0 && (
+          <details className="diag-recent">
+            <summary>Recent errors and warnings ({view.recent.length})</summary>
+            <pre>{view.recent.map((l) => l.trimEnd()).join(String.fromCharCode(10))}</pre>
+          </details>
+        )}
+        <div className="diag-actions">
+          <ButtonRow align="start">
+            <Button variant="secondary" size="sm" onClick={openLogs} disabled={!view}>
+              Open logs folder
+            </Button>
+            <Button variant="secondary" size="sm" onClick={copy}>
+              Copy diagnostics
+            </Button>
+          </ButtonRow>
+          {note && <p className="diag-note">{note}</p>}
         </div>
       </div>
-      {view && view.recent.length > 0 && (
-        <details className="diag-recent">
-          <summary>Recent errors and warnings ({view.recent.length})</summary>
-          <pre>{view.recent.map((l) => l.trimEnd()).join(String.fromCharCode(10))}</pre>
-        </details>
-      )}
-      <ButtonRow align="start">
-        <Button variant="secondary" size="sm" onClick={openLogs} disabled={!view}>
-          Open logs folder
-        </Button>
-        <Button variant="secondary" size="sm" onClick={copy}>
-          Copy diagnostics
-        </Button>
-      </ButtonRow>
-      {note && <p className="about-update-status">{note}</p>}
     </SettingsSection>
   );
 }
