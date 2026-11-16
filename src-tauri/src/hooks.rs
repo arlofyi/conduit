@@ -110,6 +110,14 @@ pub fn start(
             // so it is authenticated (see cli_open::parse_open) rather than trusted.
             // Note that the non-POST early return above answers OPTIONS with a bare 200
             // and no CORS headers — which IS the preflight refusal the design relies on.
+            // `conduit run` and friends (`jobs.rs`). Also acts, so it passes the same two
+            // checks as `/open`. On its own thread: `wait` blocks for as long as asked.
+            if url.starts_with("/job") {
+                let token = cli_token.clone();
+                let jobs = app.state::<Arc<crate::jobs::Jobs>>().inner().clone();
+                std::thread::spawn(move || crate::jobs::handle_job(request, &token, &jobs));
+                continue;
+            }
             if url.starts_with("/open") {
                 let app = app.clone();
                 let token = cli_token.clone();

@@ -449,7 +449,7 @@ export interface ContextMenuState {
 }
 
 export type TopTab = "files" | "changes" | "todos" | "subagents";
-export type BottomTab = "terminal" | "git" | "model" | "agent" | "decisions" | "messages";
+export type BottomTab = "terminal" | "git" | "model" | "agent" | "decisions" | "messages" | "jobs";
 
 // ---- Claude ambient (status + usage) — mirror Rust serde camelCase ----
 export interface StatusComponent { name: string; status: string; }

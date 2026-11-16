@@ -5,6 +5,15 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Agents can hand slow commands to Conduit.** `conduit run --bg -- <command>`
+  starts a build, test run or install inside Conduit and returns at once; `conduit wait`,
+  `conduit read`, `conduit jobs` and `conduit kill` follow it. The agent stays free to work
+  and to be reached, and its own command rules still apply because it calls `conduit`
+  through its normal shell. macOS and Linux; reinstall the command from Settings to get it.
+- **Added — A Jobs tab shows those commands.** It appears in the right column while a
+  project has jobs: what is running, for how long, live output, and a Stop button.
+- **Changed — A session with a job still running is not stopped as idle.**
+
 ## 0.51.2 — 2026-11-12
 
 - **Fixed — The wheel walked your command history in the side terminal.** Scrolling there now

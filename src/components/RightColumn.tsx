@@ -25,6 +25,9 @@ import {
   type ContinuityRow,
 } from "./ContinuityPanels";
 import { supersededMap } from "../continuityFeed";
+import { JobsPanel } from "./JobsPanel";
+import { useJobs } from "../hooks/useJobs";
+import { jobsForProject, jobsTabLabel } from "../jobs";
 import { useContinuityFeed } from "../hooks/useContinuityFeed";
 import {
   RefreshIcon,
@@ -87,6 +90,21 @@ export function RightColumn({
       setBottomTab("terminal");
     }
   }, [feedAvailable, bottomTab, setBottomTab]);
+
+  // Jobs (`conduit run`). Like the feed tabs, this one does not exist until there is
+  // something in it: most projects never start a job, and an always-empty tab is noise.
+  const allJobs = useJobs();
+  const jobs = useMemo(
+    () => (projectId ? jobsForProject(allJobs, projectId, projects) : []),
+    [allJobs, projectId, projects],
+  );
+  const sessionNames = useMemo(
+    () => Object.fromEntries(projects.flatMap((p) => p.sessions.map((s) => [s.id, s.name]))),
+    [projects],
+  );
+  useEffect(() => {
+    if (jobs.length === 0 && bottomTab === "jobs") setBottomTab("terminal");
+  }, [jobs.length, bottomTab, setBottomTab]);
 
   const layout = useStore((s) => (projectId ? s.layouts[projectId] : undefined));
   const sessionDirs = useStore((s) => s.sessionDirs);
@@ -309,6 +327,13 @@ export function RightColumn({
           <PanelTab label="Git" active={bottomTab === "git"} onClick={() => setBottomTab("git")} />
           <PanelTab label="Model" active={bottomTab === "model"} onClick={() => setBottomTab("model")} />
           <PanelTab label="Agent" active={bottomTab === "agent"} onClick={() => setBottomTab("agent")} />
+          {jobs.length > 0 && (
+            <PanelTab
+              label={jobsTabLabel(jobs)}
+              active={bottomTab === "jobs"}
+              onClick={() => setBottomTab("jobs")}
+            />
+          )}
           {feedAvailable && (
             <>
               <PanelTab
@@ -352,6 +377,7 @@ export function RightColumn({
               <AgentPanel sessionId={activeSessionId} />
             </div>
           )}
+          {bottomTab === "jobs" && <JobsPanel jobs={jobs} sessionNames={sessionNames} />}
           {bottomTab === "decisions" && projectId && (
             <DecisionsPanel
               projectId={projectId}

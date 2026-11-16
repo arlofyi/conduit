@@ -57,6 +57,11 @@ dirs = "5"
 sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Already in the tree through portable-pty and tauri; named here for one call in
+# `jobs.rs` (closing inherited file descriptors in a job before it execs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 # The GUI end-to-end harness. Never enable this for a release build.
