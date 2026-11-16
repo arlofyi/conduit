@@ -385,7 +385,10 @@ pub fn start(
             // event, into the lifecycle event it stands for -- so every consumer below and
             // in the frontend sees an ordinary `prompt` / `stop` / `notification`.
             let (event, parsed, body) = if event == "report" {
-                if !report_seq.accepts(&session, crate::report::seq_of(&parsed)) {
+                if !report_seq.accepts(
+                    &crate::report::seq_key(&session, &parsed),
+                    crate::report::seq_of(&parsed),
+                ) {
                     continue;
                 }
                 let Some((as_event, as_body)) = crate::report::translate(&parsed) else {

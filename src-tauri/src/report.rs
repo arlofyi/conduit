@@ -86,6 +86,16 @@ impl SeqGate {
     }
 }
 
+/// The counter a report's `seq` is compared against: the session, and the reporter's
+/// `source` when it names one. Two reporters on one session (a script counting 1, 2, 3 and
+/// Conduit's own screen watcher using the clock) must not drop each other's reports.
+pub fn seq_key(session: &str, body: &Value) -> String {
+    match body.get("source").and_then(Value::as_str) {
+        Some(source) if !source.is_empty() => format!("{session}\u{1f}{source}"),
+        _ => session.to_string(),
+    }
+}
+
 /// The `seq` a report carries, when it is a whole number.
 pub fn seq_of(body: &Value) -> Option<u64> {
     body.get("seq").and_then(Value::as_u64)
@@ -187,6 +197,19 @@ mod tests {
         assert!(gate.accepts("s", Some(12)));
         // Sessions do not share a counter.
         assert!(gate.accepts("other", Some(1)));
+    }
+
+    #[test]
+    fn two_reporters_on_one_session_keep_separate_counters() {
+        let gate = SeqGate::default();
+        let script = json!({"state": "working", "seq": 3});
+        let watcher = json!({"state": "blocked", "seq": 1_731_800_000_000u64, "source": "screen"});
+        assert!(gate.accepts(&seq_key("s", &watcher), seq_of(&watcher)));
+        // The script's small counter is not behind the watcher's clock.
+        assert!(gate.accepts(&seq_key("s", &script), seq_of(&script)));
+        assert!(!gate.accepts(&seq_key("s", &script), seq_of(&script)));
+        assert_ne!(seq_key("s", &script), seq_key("s", &watcher));
+        assert_eq!(seq_key("s", &json!({"source": ""})), "s");
     }
 
     #[test]

@@ -5,6 +5,11 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Antigravity, Gemini and OpenCode sessions show when they are waiting on you.**
+  Conduit reads the agent's own screen for a permission, question or folder-trust prompt
+  and marks the session "needs you", for dialogs those agents' hooks never report. macOS
+  and Linux, sessions running under tmux. The screen patterns are Herdr's (Apache-2.0).
+
 - **Fixed — A Conductor's message to a worker could land inside what you were typing.**
   Text an agent sends into a session now waits until you have sent or cleared your own
   half-written message there, and tells the agent it was held if you never stop.
