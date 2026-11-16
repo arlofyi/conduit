@@ -98,6 +98,8 @@ pub fn start(
         // read one and not the other is a dead `conduit` until the next boot.
         let cli_token = Arc::new(crate::cli_open::write_token_file());
 
+        let report_seq = crate::report::SeqGate::default();
+
         for mut request in server.incoming_requests() {
             if request.method() != &Method::Post {
                 let _ = request.respond(Response::from_string("ok"));
@@ -377,6 +379,23 @@ pub fn start(
             }
 
             let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+
+            // `conduit report`: a program saying what it is doing, for sessions whose
+            // agent has no hooks (or thin ones). Rewritten HERE, before anything reads the
+            // event, into the lifecycle event it stands for -- so every consumer below and
+            // in the frontend sees an ordinary `prompt` / `stop` / `notification`.
+            let (event, parsed, body) = if event == "report" {
+                if !report_seq.accepts(&session, crate::report::seq_of(&parsed)) {
+                    continue;
+                }
+                let Some((as_event, as_body)) = crate::report::translate(&parsed) else {
+                    continue;
+                };
+                let text = as_body.to_string();
+                (as_event.to_string(), as_body, text)
+            } else {
+                (event, parsed, body)
+            };
 
             // Mirror status into the fleet map so the Conductor can read it (fleet_list).
             fleet.record(&session, &event, &parsed);

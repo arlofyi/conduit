@@ -69,6 +69,7 @@ mod port_tunnel;
 mod project_new;
 mod proposals;
 mod pty;
+mod report;
 mod root_chat;
 mod root_chat_agy;
 mod root_chat_options;
