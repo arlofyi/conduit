@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+## 0.52.0 — 2026-11-17
+
 - **Changed — Settings → About is tidier.** Version, updates, source and the diagnostics
   figures share one aligned layout, labels no longer wrap, the log folder shows your home
   folder as `~`, and the buttons have room.
