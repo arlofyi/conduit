@@ -262,17 +262,21 @@ pub fn message_path(file: &str) -> String {
 /// True when `p` is a symlink, or on Windows any reparse point (a junction is not a
 /// symlink to `is_symlink`, but it redirects all the same).
 pub(crate) fn is_link(meta: &std::fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return true;
-        }
-    }
+    meta.file_type().is_symlink() || is_reparse_point(meta)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Only Windows has reparse points. Split out (rather than a `#[cfg]` block inside
+/// `is_link`) because with that block compiled away the function read as `if x { true }
+/// else { false }`, which clippy 1.100 rejects on every other platform.
+#[cfg(not(windows))]
+fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
     false
 }
 

@@ -689,6 +689,8 @@ mod tests {
         }
     }
 
+    // Only the tests that actually run a command wait on one, and those are Unix-only.
+    #[cfg(unix)]
     const LONG: Duration = Duration::from_secs(20);
 
     #[test]
