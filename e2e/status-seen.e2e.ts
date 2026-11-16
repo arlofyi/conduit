@@ -83,6 +83,18 @@ describe("session status in the sidebar", () => {
     if (!status?.path) throw new Error("install_cli_shim did not report a path");
     const project = join(mkdtempSync(join(tmpdir(), "conduit-e2e-seen-")), "seen-project");
     mkdirSync(project, { recursive: true });
+    // The project first, with no agent: opening is safe to wait on and proves the freshly
+    // booted app is taking CLI requests before a session is asked for.
+    execFileSync(status.path, [project], { env });
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(() =>
+          Array.from(document.querySelectorAll(".project-block .name")).some(
+            (e) => (e.textContent ?? "").trim() === "seen-project",
+          ),
+        )) as boolean,
+      { timeout: 30_000, timeoutMsg: "the project never appeared" },
+    );
     for (const name of ["seen-alpha", "seen-beta"]) {
       execFileSync(status.path, [project, "--agent", "claude", "--name", name], { env });
       await browser.waitUntil(async () => (await row(name)).found, {
@@ -114,6 +126,9 @@ describe("session status in the sidebar", () => {
   it("clears it once the session has been in front of the user", async () => {
     await clickRow("seen-alpha");
     await browser.waitUntil(async () => (await row("seen-alpha")).selected, { timeout: 10_000 });
+    // Stated, not assumed: the real window may have lost OS focus to whatever else is
+    // happening on this machine, and a scripted click does not bring it back.
+    await setFocused(true);
     await browser.waitUntil(async () => !(await row("seen-alpha")).done, {
       timeout: 10_000,
       timeoutMsg: "the dot never cleared after the session was looked at",
