@@ -5,6 +5,21 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — A Conductor's message to a worker could land inside what you were typing.**
+  Text an agent sends into a session now waits until you have sent or cleared your own
+  half-written message there, and tells the agent it was held if you never stop.
+- **Fixed — Worker news could answer a Conductor's permission prompt.** The note that tells
+  a Conductor a worker finished is no longer typed while the Conductor is on a question or
+  a permission prompt.
+- **Fixed — A busy Conductor never heard that a worker finished.** News that arrives while
+  the Conductor is mid-turn is now kept and delivered when its turn ends, as one note
+  covering every worker that reported.
+- **Added — Conductors can wait for workers instead of polling.** A new `fleet_wait` tool
+  returns when the workers stop running, or when the first one stops or reports a result.
+- **Changed — A Conductor can no longer type into a worker that is asking a question.**
+  `fleet_send` refuses a worker waiting on a question or permission prompt unless the
+  Conductor says it means to answer it.
+
 ## 0.51.2 — 2026-11-12
 
 - **Fixed — The wheel walked your command history in the side terminal.** Scrolling there now

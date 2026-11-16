@@ -37,6 +37,8 @@ mod conversation_repair;
 mod diag;
 mod fleet;
 mod fleet_mcp;
+mod fleet_news;
+mod fleet_wait;
 mod format;
 mod fsops;
 mod git;
@@ -47,6 +49,7 @@ mod hookbus;
 mod hooks;
 mod hotexit;
 pub mod ide_host;
+mod input_gate;
 mod local_llm;
 mod local_ports;
 mod menu;
@@ -776,7 +779,7 @@ fn ide_at_mention(
 
 #[tauri::command]
 fn pty_write(session_id: String, data: String, pty: State<Arc<PtyManager>>) -> Result<(), String> {
-    pty.write(&session_id, &data)
+    pty.write_human(&session_id, &data)
 }
 
 #[tauri::command]
@@ -2516,7 +2519,9 @@ fn remove_session(
     session_id: String,
     store: State<Arc<Store>>,
     pty: State<Arc<PtyManager>>,
+    fleet: State<Arc<crate::fleet::FleetState>>,
 ) {
+    fleet.news.forget(&session_id);
     pty.kill(&session_id);
     pty.kill(&format!("{session_id}::term"));
     // A Hermes session owns a generated overlay directory under the data dir. Deleting the
@@ -3632,9 +3637,20 @@ pub fn run() {
                 let fleet_for_sweep = fleet.clone();
                 let app_for_sweep = app.handle().clone();
                 let store_for_stale = store.clone();
+                let pty_for_sweep = app.state::<Arc<PtyManager>>().inner().clone();
                 std::thread::spawn(move || loop {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                     let swept = fleet_for_sweep.sweep_stale_working();
+                    // A session that just stopped reading as `running` may be a Conductor
+                    // with worker news held for the end of its turn. `kick` is a no-op for
+                    // anything with nothing queued.
+                    for id in &swept {
+                        crate::fleet_news::kick(
+                            pty_for_sweep.clone(),
+                            fleet_for_sweep.clone(),
+                            id.clone(),
+                        );
+                    }
                     // A stale "running" must not survive into state.json either, or the next
                     // launch would resume a session nothing was happening in.
                     for id in &swept {
