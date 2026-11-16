@@ -64,6 +64,7 @@ usage() {{
   echo "       conduit read <job> [--lines <n>]" >&2
   echo "       conduit jobs" >&2
   echo "       conduit kill <job>" >&2
+  echo "       conduit report --state <working|idle|blocked|error> [--kind <text>] [--message <text>] [--seq <n>]" >&2
   exit 2
 }}
 
@@ -247,10 +248,52 @@ job_main() {{
   esac
 }}
 
+# ---- report: a program in a Conduit session says what it is doing ----
+#
+# For wrappers, custom agents, and agents whose own hooks are thin. Outside a Conduit
+# session this does nothing and succeeds, so the same script runs anywhere. It never
+# fails the caller either: a status report must not be able to break the work it reports.
+report_main() {{
+  state=""; kind=""; message=""; seq=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --state) [ $# -ge 2 ] || usage; state="$2"; shift 2 ;;
+      --kind) [ $# -ge 2 ] || usage; kind="$2"; shift 2 ;;
+      --message) [ $# -ge 2 ] || usage; message="$2"; shift 2 ;;
+      --seq) [ $# -ge 2 ] || usage; seq="$2"; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  case "$state" in
+    working|idle|done|blocked|error) ;;
+    *) echo "conduit: --state must be working, idle, blocked or error" >&2; exit 2 ;;
+  esac
+  [ -z "$seq" ] || is_number "$seq" || {{ echo "conduit: --seq takes a whole number" >&2; exit 2; }}
+  [ -n "${{CONDUIT_SESSION_ID:-}}" ] || exit 0
+  data_dir
+  # The session's own port when it has one: a dev build started from inside the installed
+  # app must reach itself, exactly as the hook relays do.
+  port="${{CONDUIT_HOOK_PORT:-}}"
+  if [ -z "$port" ] && [ -f "$dir/hook-endpoint.sh" ]; then
+    . "$dir/hook-endpoint.sh"
+    port="${{CONDUIT_HOOK_PORT:-}}"
+  fi
+  [ -n "$port" ] || exit 0
+  body="\"state\":\"$state\""
+  [ -z "$kind" ] || body="$body,\"kind\":\"$(json_esc "$kind")\""
+  [ -z "$message" ] || body="$body,\"message\":\"$(json_esc "$message")\""
+  [ -z "$seq" ] || body="$body,\"seq\":$seq"
+  curl -s -o /dev/null -m 2 -X POST -H "Content-Type: application/json" \
+    --data "{{$body}}" \
+    "http://127.0.0.1:$port/hook?session=$CONDUIT_SESSION_ID&event=report" 2>/dev/null || true
+  exit 0
+}}
+
 # A subcommand is the FIRST word. A directory with one of these names is still openable
 # as `conduit ./run`.
 case "${{1:-}}" in
   run|wait|read|jobs|kill) job_main "$@" ;;
+  report) shift; report_main "$@" ;;
 esac
 
 target=""
@@ -413,6 +456,7 @@ if /i "%~1"=="wait" goto no_jobs
 if /i "%~1"=="read" goto no_jobs
 if /i "%~1"=="jobs" goto no_jobs
 if /i "%~1"=="kill" goto no_jobs
+if /i "%~1"=="report" goto no_jobs
 
 set "target="
 set "agent="
@@ -442,7 +486,7 @@ goto parse
 echo usage: conduit ^<path^> [--agent ^<id^>] [--worktree ^<slug^>] [--name ^<text^>] [--prompt-file ^<file^>] [--provider ^<p^>] [--model ^<m^>] [--effort ^<e^>] 1>&2
 exit /b 2
 :no_jobs
-echo conduit: run, wait, read, jobs and kill are not available in conduit.cmd yet 1>&2
+echo conduit: run, wait, read, jobs, kill and report are not available in conduit.cmd yet 1>&2
 exit /b 2
 :bad_name
 echo conduit: in conduit.cmd --name cannot contain double quotes, percent signs or exclamation marks 1>&2

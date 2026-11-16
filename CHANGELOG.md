@@ -5,6 +5,11 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Any program can report its own status.** `conduit report --state
+  working|idle|blocked|error` (with an optional `--kind`, `--message` and `--seq`) moves a
+  session's dot the same way a hooked agent does, for wrapper scripts, custom agents and
+  agents whose own hooks are thin. Outside a Conduit session it does nothing.
+
 - **Added — Agents can hand slow commands to Conduit.** `conduit run --bg -- <command>`
   starts a build, test run or install inside Conduit and returns at once; `conduit wait`,
   `conduit read`, `conduit jobs` and `conduit kill` follow it. The agent stays free to work

@@ -104,7 +104,10 @@ mod tests {
         assert_eq!(event(json!({"state": "working"})).unwrap().0, "prompt");
         assert_eq!(event(json!({"state": "idle"})).unwrap().0, "stop");
         assert_eq!(event(json!({"state": "done"})).unwrap().0, "stop");
-        assert_eq!(event(json!({"state": "blocked"})).unwrap().0, "notification");
+        assert_eq!(
+            event(json!({"state": "blocked"})).unwrap().0,
+            "notification"
+        );
         assert_eq!(event(json!({"state": "error"})).unwrap().0, "stopfailure");
     }
 
@@ -118,14 +121,20 @@ mod tests {
 
     #[test]
     fn blocked_says_what_for_in_the_words_status_rules_already_reads() {
-        let kind = |k: Value| event(json!({"state": "blocked", "kind": k})).unwrap().1["notification_type"].clone();
+        let kind = |k: Value| {
+            event(json!({"state": "blocked", "kind": k})).unwrap().1["notification_type"].clone()
+        };
         assert_eq!(kind(json!("permission")), "permission_prompt");
         assert_eq!(kind(json!("question")), "elicitation_dialog");
         assert_eq!(kind(json!("something")), "agent_needs_input");
         let (_, body) = event(json!({"state": "blocked"})).unwrap();
         assert_eq!(body["notification_type"], "agent_needs_input");
         // Every one of them reads as needsInput to the status rules.
-        for nt in ["permission_prompt", "elicitation_dialog", "agent_needs_input"] {
+        for nt in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "agent_needs_input",
+        ] {
             assert_eq!(
                 crate::status_rules::notification_status(Some(nt), "running", false),
                 Some("needsInput")
@@ -136,7 +145,11 @@ mod tests {
     #[test]
     fn a_reported_status_drives_the_fleet_mirror_like_a_hooked_one() {
         let mut s = crate::fleet::FleetStatus::default();
-        for (state, want) in [("working", "running"), ("idle", "done"), ("working", "running")] {
+        for (state, want) in [
+            ("working", "running"),
+            ("idle", "done"),
+            ("working", "running"),
+        ] {
             let (ev, body) = event(json!({ "state": state })).unwrap();
             crate::fleet::apply_event(&mut s, ev, &body);
             assert_eq!(s.status, want, "after reporting {state}");
@@ -152,7 +165,8 @@ mod tests {
 
     #[test]
     fn a_message_is_one_bounded_line() {
-        let (_, body) = event(json!({"state": "blocked", "message": "  allow\nrm -rf?\u{1b}[31m  "})).unwrap();
+        let (_, body) =
+            event(json!({"state": "blocked", "message": "  allow\nrm -rf?\u{1b}[31m  "})).unwrap();
         assert_eq!(body["message"], "allow rm -rf? [31m");
         let long = "x".repeat(500);
         let (_, body) = event(json!({"state": "blocked", "message": long})).unwrap();

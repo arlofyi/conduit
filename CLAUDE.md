@@ -633,6 +633,28 @@ Conduit instead of holding its own shell tool: `conduit run --bg -- cargo build`
   subcommands by name (falling through would try to open a folder called `run`).
 - The shim marker went to `conduit-cli-shim-v4`; an installed v3 reads as outdated.
 
+## Where `conduit report` lives
+
+`report.rs` + the `report` subcommand in the POSIX shim. A program in a session says what
+it is doing, with no hook installer: wrappers, custom agents, agents with thin hooks.
+
+- **`translate` rewrites a report into the lifecycle event it stands for, in `hooks.rs`,
+  before anything reads the event.** `working` → `prompt`, `idle`/`done` → `stop`,
+  `blocked` → `notification` (with `--kind permission|question` mapped onto Claude's own
+  `notification_type` words), `error` → `stopfailure`. Nothing downstream, Rust or
+  frontend, has a "report" case, so a reported status and a hooked one cannot mean
+  different things. An unknown state moves nothing.
+- **It posts to `/hook`, not a token-gated route.** A report is display data like every
+  other hook event, and the provenance gate (`store.has_session`) applies to it unchanged.
+- **`SeqGate` drops late reports.** A reporter fires and forgets, so `working` can land
+  after the `idle` that followed it. With `--seq`, a report is taken only if its number is
+  higher than the last accepted for that session; without one it is always taken. This is
+  the principled version of the 3 s done-holdoff, which stays for agents that send no seq.
+- **The shim prefers the session's own `CONDUIT_HOOK_PORT`** over the published endpoint
+  file (the dev-build-inside-installed-app case, same as the hook relays), does nothing
+  without `CONDUIT_SESSION_ID`, and exits 0 whatever happens after argument checking: a
+  status report must never break the work it reports.
+
 ## Where the mobile bridge lives
 
 `bridge.rs` (WebSocket server + `BridgeController`), `tailscale.rs`, `mobile_devices.rs`,
