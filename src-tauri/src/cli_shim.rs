@@ -14,12 +14,17 @@ use serde::Serialize;
 /// Present in every generated shim. `remove` refuses to delete a file without it (or a
 /// legacy marker), so it can never destroy an unrelated `conduit` the user put on PATH
 /// themselves.
-pub const SHIM_MARKER: &str = "conduit-cli-shim-v3";
+pub const SHIM_MARKER: &str = "conduit-cli-shim-v4";
 
 /// Markers of shims earlier Conduit versions wrote. Still ours: `install` replaces them
 /// and `remove` deletes them; `status` reports them as installed but outdated.
 /// v2: the Windows shim did not report its codepage, and broke on a `)` in a path.
-pub const LEGACY_MARKERS: &[&str] = &["conduit-cli-shim-v1", "conduit-cli-shim-v2"];
+/// v3: no `run` / `wait` / `read` / `jobs` / `kill` subcommands.
+pub const LEGACY_MARKERS: &[&str] = &[
+    "conduit-cli-shim-v1",
+    "conduit-cli-shim-v2",
+    "conduit-cli-shim-v3",
+];
 
 /// Whether a file's text is a shim some Conduit version wrote.
 fn is_ours(text: &str) -> bool {
@@ -54,6 +59,11 @@ set -eu
 
 usage() {{
   echo "usage: conduit <path> [--agent <id>] [--worktree <slug>] [--name <text>] [--prompt-file <file>] [--provider <p>] [--model <m>] [--effort <e>]" >&2
+  echo "       conduit run [--bg] [--name <text>] [--timeout <seconds>] [--] <command>..." >&2
+  echo "       conduit wait <job> [--timeout <seconds>]" >&2
+  echo "       conduit read <job> [--lines <n>]" >&2
+  echo "       conduit jobs" >&2
+  echo "       conduit kill <job>" >&2
   exit 2
 }}
 
@@ -72,6 +82,176 @@ json_esc() {{
       for (i = 1; i <= n; i++) {{ c = substr($0, i, 1); printf "%s", ((c in m) ? m[c] : c) }}
     }}'
 }}
+
+# ---- jobs: slow commands handed to Conduit instead of run in the caller's own shell ----
+#
+# `conduit run --bg -- cargo build` starts the command in Conduit and prints its job id;
+# `conduit wait` blocks on it, `conduit read` prints its output. A job never cold-starts
+# Conduit: with nothing running there is nowhere for it to run.
+
+data_dir() {{
+  name="${{CONDUIT_DATA_DIR_NAME:-ConduitTauri}}"
+  case "$(uname -s)" in
+    Darwin) base="$HOME/Library/Application Support" ;;
+    *) base="${{XDG_DATA_HOME:-$HOME/.local/share}}" ;;
+  esac
+  dir="$base/$name"
+}}
+
+# One argument as a single shell word, so `conduit run -- grep "a b" f` reaches the job's
+# shell with its quoting intact.
+sh_quote() {{
+  # The trailing x keeps the argument's own final newlines: command substitution strips
+  # them, and an argument like a printf format ends in one.
+  quoted=$(printf '%sx' "$1" | sed "s/'/'\\\\''/g")
+  printf "'%s'" "${{quoted%x}}"
+}}
+
+is_number() {{
+  case "$1" in ''|*[!0123456789]*) return 1 ;; *) return 0 ;; esac
+}}
+
+# POSTs $1 to /job, waiting at most $2 seconds. Sets `code` (HTTP status, 000 when nothing
+# answered) and leaves the reply in $reply_file.
+job_post() {{
+  code=000
+  [ -f "$dir/hook-endpoint.sh" ] && [ -f "$dir/cli-token" ] || return 0
+  . "$dir/hook-endpoint.sh"
+  [ -n "${{CONDUIT_HOOK_PORT:-}}" ] || return 0
+  token=$(cat "$dir/cli-token")
+  code=$(curl -s -o "$reply_file" -w '%{{http_code}}' -m "$2" -X POST \
+    -H "Content-Type: application/json" \
+    -H "X-Conduit-Token: $token" \
+    --data "$1" \
+    "http://127.0.0.1:$CONDUIT_HOOK_PORT/job" 2>/dev/null) || true
+  [ -n "$code" ] || code=000
+}}
+
+# Exits unless the last job_post was answered 2xx.
+job_ok() {{
+  case "$code" in
+    2??) return 0 ;;
+    000) echo "conduit: Conduit is not running (jobs run inside it)." >&2; exit 1 ;;
+    403) echo "conduit: Conduit refused the CLI token; restart Conduit, or check CONDUIT_DATA_DIR_NAME names the running instance." >&2; exit 1 ;;
+    404) echo "conduit: no such job." >&2; exit 1 ;;
+    *) echo "conduit: $(cat "$reply_file" 2>/dev/null || echo "Conduit answered HTTP $code")" >&2; exit 1 ;;
+  esac
+}}
+
+# Waits for job $1 for at most $2 seconds. Sets `job_state` to "exited <code>" or "running".
+# Asked in slices so one HTTP request never outlives its own timeout.
+job_wait() {{
+  left="$2"
+  job_state="running"
+  while [ "$left" -gt 0 ]; do
+    slice="$left"; [ "$slice" -le 50 ] || slice=50
+    job_post "{{\"op\":\"wait\",\"id\":\"$(json_esc "$1")\",\"timeout\":$slice}}" $((slice + 10))
+    job_ok
+    job_state=$(cat "$reply_file")
+    [ "$job_state" = "running" ] || return 0
+    left=$((left - slice))
+  done
+}}
+
+job_read() {{
+  job_post "{{\"op\":\"read\",\"id\":\"$(json_esc "$1")\",\"lines\":$2}}" 15
+  job_ok
+  cat "$reply_file"
+}}
+
+job_main() {{
+  sub="$1"; shift
+  data_dir
+  reply_file=$(mktemp "${{TMPDIR:-/tmp}}/conduit-job.XXXXXX")
+  trap 'rm -f "$reply_file"' EXIT
+  case "$sub" in
+    run)
+      bg=""; job_name=""; timeout=180
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --bg) bg=1; shift ;;
+          --name) [ $# -ge 2 ] || usage; job_name="$2"; shift 2 ;;
+          --timeout) [ $# -ge 2 ] || usage; timeout="$2"; shift 2 ;;
+          --) shift; break ;;
+          -*) echo "conduit: unknown option $1" >&2; usage ;;
+          *) break ;;
+        esac
+      done
+      [ $# -gt 0 ] || usage
+      is_number "$timeout" || {{ echo "conduit: --timeout takes whole seconds" >&2; exit 2; }}
+      # One argument is a shell command as written; several are a program and its
+      # arguments, each kept as one word.
+      if [ $# -eq 1 ]; then
+        command="$1"
+      else
+        command=""
+        for word in "$@"; do command="$command $(sh_quote "$word")"; done
+        command="${{command# }}"
+      fi
+      body="\"op\":\"run\",\"command\":\"$(json_esc "$command")\",\"cwd\":\"$(json_esc "$(pwd -P)")\",\"path\":\"$(json_esc "$PATH")\""
+      [ -z "$job_name" ] || body="$body,\"name\":\"$(json_esc "$job_name")\""
+      [ -z "${{CONDUIT_SESSION_ID:-}}" ] || body="$body,\"session\":\"$(json_esc "$CONDUIT_SESSION_ID")\""
+      job_post "{{$body}}" 15
+      job_ok
+      id=$(cat "$reply_file")
+      if [ -n "$bg" ]; then
+        echo "$id"
+        exit 0
+      fi
+      job_wait "$id" "$timeout"
+      job_read "$id" 2000
+      case "$job_state" in
+        "exited "*) exit "${{job_state#exited }}" ;;
+        *) echo "[conduit] still running as $id; wait with: conduit wait $id" >&2
+           exit 124 ;;
+      esac ;;
+    wait)
+      [ $# -ge 1 ] || usage
+      id="$1"; shift
+      timeout=180
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --timeout) [ $# -ge 2 ] || usage; timeout="$2"; shift 2 ;;
+          *) usage ;;
+        esac
+      done
+      is_number "$timeout" || {{ echo "conduit: --timeout takes whole seconds" >&2; exit 2; }}
+      job_wait "$id" "$timeout"
+      case "$job_state" in
+        "exited "*) code="${{job_state#exited }}"; echo "$id exited $code"; exit "$code" ;;
+        *) echo "$id still running" ; exit 124 ;;
+      esac ;;
+    read)
+      [ $# -ge 1 ] || usage
+      id="$1"; shift
+      lines=200
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --lines) [ $# -ge 2 ] || usage; lines="$2"; shift 2 ;;
+          *) usage ;;
+        esac
+      done
+      is_number "$lines" || {{ echo "conduit: --lines takes a whole number" >&2; exit 2; }}
+      job_read "$id" "$lines"
+      exit 0 ;;
+    jobs)
+      job_post '{{"op":"list"}}' 15
+      job_ok
+      cat "$reply_file"
+      exit 0 ;;
+    kill)
+      [ $# -eq 1 ] || usage
+      job_post "{{\"op\":\"kill\",\"id\":\"$(json_esc "$1")\"}}" 15
+      job_ok
+      exit 0 ;;
+  esac
+}}
+
+# A subcommand is the FIRST word. A directory with one of these names is still openable
+# as `conduit ./run`.
+case "${{1:-}}" in
+  run|wait|read|jobs|kill) job_main "$@" ;;
+esac
 
 target=""
 agent=""
@@ -226,6 +406,14 @@ pub fn shim_cmd() -> String {
 rem {SHIM_MARKER} — generated by Conduit. Do not edit; reinstall from Settings.
 setlocal disabledelayedexpansion
 
+rem Jobs are not in the Windows shim yet. Refuse by name: falling through would try to
+rem open a folder called "run".
+if /i "%~1"=="run" goto no_jobs
+if /i "%~1"=="wait" goto no_jobs
+if /i "%~1"=="read" goto no_jobs
+if /i "%~1"=="jobs" goto no_jobs
+if /i "%~1"=="kill" goto no_jobs
+
 set "target="
 set "agent="
 set "worktree="
@@ -252,6 +440,9 @@ shift
 goto parse
 :usage
 echo usage: conduit ^<path^> [--agent ^<id^>] [--worktree ^<slug^>] [--name ^<text^>] [--prompt-file ^<file^>] [--provider ^<p^>] [--model ^<m^>] [--effort ^<e^>] 1>&2
+exit /b 2
+:no_jobs
+echo conduit: run, wait, read, jobs and kill are not available in conduit.cmd yet 1>&2
 exit /b 2
 :bad_name
 echo conduit: in conduit.cmd --name cannot contain double quotes, percent signs or exclamation marks 1>&2
@@ -748,7 +939,7 @@ mod tests {
     fn shims_carry_the_current_marker_and_new_flags() {
         for t in [shim_sh(), shim_cmd()] {
             assert!(t.contains(SHIM_MARKER));
-            assert!(t.contains("conduit-cli-shim-v3"));
+            assert!(t.contains("conduit-cli-shim-v4"));
             for f in ["--worktree", "--name", "--prompt-file"] {
                 assert!(t.contains(f), "{f}");
             }

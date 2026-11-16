@@ -590,6 +590,49 @@ plus install/remove/status), and one listener in `App.tsx`.
   `cli_shim.rs` pin all of it, including that `release.yml` passes no `--features`.
 - Design: `docs/superpowers/specs/2026-09-04-conduit-cli-launcher-design.md`.
 
+## Where jobs (`conduit run`) live
+
+`jobs.rs` (engine + the `/job` route), the job subcommands in `cli_shim.rs`'s POSIX shim,
+`src/jobs.ts` + `JobsPanel.tsx` + `hooks/useJobs.ts`. An agent hands a slow command to
+Conduit instead of holding its own shell tool: `conduit run --bg -- cargo build`, then
+`conduit wait <job>` / `read` / `jobs` / `kill`.
+
+- **A CLI, not an MCP tool, on purpose.** The agent calls `conduit` through its own shell
+  tool, so the user's allow and deny rules for commands still apply. One MCP tool that runs
+  commands would be a single switch that skips all of them. Do not add `fleet_run`.
+- **`/job` passes the same two checks as `/open`** (`cli_open::authenticate`: Origin
+  refused first, then the per-boot token). It is handled on its own thread because `wait`
+  blocks, and it answers PLAIN TEXT so a POSIX shell needs no JSON parser.
+- **The shim sends its own `PATH` and directory.** Conduit is a GUI app; its PATH has none
+  of the user's tools. The job runs `/bin/sh -c` with the caller's PATH in the caller's
+  directory. One argument is a shell command as written; several are quoted word by word
+  (`sh_quote`, which keeps an argument's trailing newline -- a printf format ends in one).
+- **A job never cold-starts Conduit**, unlike `conduit <path>`: with nothing running there
+  is nowhere for it to run.
+- **`close_inherited_fds` runs in every job before exec, and is not optional.** On macOS a
+  pipe or accepted socket is created first and marked close-on-exec second, so a fork in
+  between hands the child someone else's descriptor. A job lives for minutes, and whoever
+  reads that pipe waits for EOF until the job exits -- in the app that reader is a `git`
+  call. A test pins it with a pipe deliberately left inheritable.
+- **`tests/cli_jobs.rs` runs one test at a time** (`ONE_AT_A_TIME`). Its tests spawn
+  long-lived shim processes from the same process that forks jobs, which is that same race
+  in the harness: 1 failure in 12 runs, then 7 in 15, before it was serialized.
+- **A job is its own process group** (`process_group(0)`); `kill_tree` signals the group, so
+  a pipeline dies with its shell. Jobs are killed with their owning session
+  (`remove_session`), on quit, and before an update.
+- **`busy_sessions` counts `Jobs::busy_owners`.** A job is a child of Conduit, not of the
+  agent, so the process-tree check cannot see it; without this, idle auto-stop would stop
+  an agent that is waiting on its own build.
+- **Limits:** 16 running, 64 kept (oldest finished dropped first, a running job never),
+  256 KB of output per job (the tail), ids `j1, j2, …` never reused in a run.
+- **The Jobs tab exists only while the project has jobs** (`jobsForProject`): owner's
+  project first, then the directory, and a job that belongs to no project shows in every
+  project so it is never running unseen. The list is event-driven (`jobs-changed`); only a
+  RUNNING job's output is polled.
+- **Windows:** the engine compiles and is tested there, but `conduit.cmd` refuses the job
+  subcommands by name (falling through would try to open a folder called `run`).
+- The shim marker went to `conduit-cli-shim-v4`; an installed v3 reads as outdated.
+
 ## Where the mobile bridge lives
 
 `bridge.rs` (WebSocket server + `BridgeController`), `tailscale.rs`, `mobile_devices.rs`,
