@@ -111,19 +111,29 @@ describe("session status in the sidebar", () => {
     expect((await row("seen-alpha")).done).toBe(true);
   });
 
-  it("keeps it while the window is not focused, even once selected", async () => {
-    await setFocused(false);
+  it("clears it once the session has been in front of the user", async () => {
     await clickRow("seen-alpha");
     await browser.waitUntil(async () => (await row("seen-alpha")).selected, { timeout: 10_000 });
-    await browser.pause(PAST_HOLDOFF_MS);
-    expect((await row("seen-alpha")).done).toBe(true);
-  });
-
-  it("clears it once the session has been in front of the user", async () => {
-    await setFocused(true);
     await browser.waitUntil(async () => !(await row("seen-alpha")).done, {
       timeout: 10_000,
       timeoutMsg: "the dot never cleared after the session was looked at",
+    });
+  });
+
+  it("keeps it on the selected session while the window is not focused", async () => {
+    // The blur comes with nothing clicked after it: a click in a real window brings a real
+    // focus event with it, which would undo this.
+    await setFocused(false);
+    await hook(a.id, "prompt");
+    await hook(a.id, "stop");
+    await browser.waitUntil(async () => (await row("seen-alpha")).done, { timeout: 10_000 });
+    await browser.pause(PAST_HOLDOFF_MS);
+    expect((await row("seen-alpha")).done).toBe(true);
+    // The user comes back to the window: now it has been seen.
+    await setFocused(true);
+    await browser.waitUntil(async () => !(await row("seen-alpha")).done, {
+      timeout: 10_000,
+      timeoutMsg: "the dot never cleared after the window regained focus",
     });
   });
 
