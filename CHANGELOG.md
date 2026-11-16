@@ -24,6 +24,10 @@ All notable changes to Conduit are documented here. This project uses
   you it reads as idle, so the dots that remain are the ones you have not seen.
 - **Added — "Needs you" says what for.** A session waiting on a tool permission shows
   "approve?", one waiting on a question shows "question", with the full reason on hover.
+- **Added — `conduit --skill` prints a manual for agents.** It teaches an agent to hand off
+  slow commands, report its status and start sessions, and Conductors and workers are
+  told it exists.
+
 - **Added — Any program can report its own status.** `conduit report --state
   working|idle|blocked|error` (with an optional `--kind`, `--message` and `--seq`) moves a
   session's dot the same way a hooked agent does, for wrapper scripts, custom agents and

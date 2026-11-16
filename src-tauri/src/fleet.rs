@@ -286,7 +286,7 @@ Slow commands (builds, test suites, installs, CI watches): if `conduit` is on yo
 start them with `conduit run --bg --name <name> -- <command>` and collect them with \
 `conduit wait <job>` and `conduit read <job>`, instead of holding your own shell tool until \
 they end. You stay free to work and to be reached, the job shows in Conduit's Jobs tab, and \
-it keeps this session from being stopped as idle.";
+it keeps this session from being stopped as idle. `conduit --skill` prints the full manual.";
 
 /// Appended (via `--append-system-prompt`) to a Claude WORKER with fleet MCP access --
 /// either spawned via `fleet_spawn`, or a manual/custom session that opted into the
@@ -306,7 +306,7 @@ Slow commands (builds, test suites, installs, CI watches): if `conduit` is on yo
 start them with `conduit run --bg --name <name> -- <command>` and collect them with \
 `conduit wait <job>` and `conduit read <job>`, instead of holding your own shell tool until \
 they end. You stay free to work and to be reached, the job shows in Conduit's Jobs tab, and \
-it keeps this session from being stopped as idle.";
+it keeps this session from being stopped as idle. `conduit --skill` prints the full manual.";
 
 /// The `--mcp-config` JSON pointing the Conductor at the in-app fleet MCP server.
 /// The `conductor` query param scopes every tool call to this session's project.
@@ -1022,6 +1022,7 @@ mod tests {
             assert!(text.contains("conduit wait <job>"));
             // Hedged on purpose: the shim is installed from Settings and may not be there.
             assert!(text.contains("if `conduit` is on your PATH"));
+            assert!(text.contains("conduit --skill"));
         }
     }
 

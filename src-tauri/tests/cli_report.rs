@@ -204,3 +204,17 @@ fn a_report_never_fails_the_caller_when_conduit_is_gone() {
 fn the_windows_shim_refuses_report_by_name() {
     assert!(cli_shim::shim_cmd().contains("if /i \"%~1\"==\"report\" goto no_jobs"));
 }
+
+#[test]
+fn skill_prints_the_manual_verbatim_and_needs_no_running_conduit() {
+    let f = fixture();
+    // Nothing is published and nothing is listening: the manual must still print.
+    std::fs::remove_dir_all(f.home.join("Library")).ok();
+    std::fs::remove_dir_all(f.home.join(".local")).ok();
+    let o = f.command().arg("--skill").output().unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    // Byte for byte: a `$VAR` or a backtick in the manual must not be expanded by the
+    // shell that prints it.
+    assert_eq!(String::from_utf8_lossy(&o.stdout), cli_shim::SKILL);
+    f.nothing_arrived();
+}
