@@ -2728,6 +2728,9 @@ export const useStore = create<AppState>((set, get) => {
     setTelemetryOptOut: (v) => {
       localStorage.setItem(TELEMETRY_OPTOUT_KEY, v ? "1" : "0");
       set({ telemetryOptOut: v });
+      // Off leaves nothing behind: the random id goes too, so a later opt-in is a new
+      // stranger rather than the same one resuming.
+      if (v) void invoke("telemetry_forget").catch(() => {});
     },
 
     // Detect installed agent binaries ONCE at startup and cache the result, so the

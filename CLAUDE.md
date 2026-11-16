@@ -929,6 +929,23 @@ rule all keep working, which browsing to the computer's tailnet name breaks.
   10 ms poll woke every idle browser keep-alive tunnel 100 times a second.
 - Design: `docs/superpowers/specs/2026-10-31-port-mirroring-design.md`.
 
+## Where the telemetry preview lives
+
+`telemetry.rs` (`telemetry_preview`, `telemetry_forget`) + `TelemetryPreview.tsx` under
+Settings → Privacy. The page shows the request itself, not a description of it.
+
+- **The preview is built by `build_payload`**, the function that builds the real request,
+  so the page cannot list fewer fields than are sent. A test pins the key counts.
+- **`not_sending_reason` takes the same four inputs as `should_send_policy`** and a test
+  walks all sixteen combinations: the page saying "sending" while the gate is shut (or the
+  reverse) is worse than no page. The user's own choice is named first.
+- **Looking never creates the id.** The preview reads `telemetry_client_id` if it exists
+  and shows a placeholder otherwise; only a real send creates it.
+- **Opting out deletes the id** (`store.setTelemetryOptOut` → `telemetry_forget`).
+- `DO_NOT_TRACK` (anything but empty, `0`, `false`) joins `CONDUIT_DISABLE_TELEMETRY`.
+- The opt-out itself still lives in the frontend (`useTelemetry` stops pinging); Rust's
+  `is_opted_out()` is the old belt-and-braces stub and the preview is told the choice.
+
 ## Where diagnostics live
 
 Local only -- `diag.rs` shares nothing with the opt-out PostHog ping in `telemetry.rs`, and

@@ -3,6 +3,7 @@ import { ErrorBoundary } from "./ErrorBoundary";
 import { AgentList } from "./AgentList";
 import { McpMatrix } from "./McpMatrix";
 import { TelemetryToggle } from "./TelemetryToggle";
+import { TelemetryPreview } from "./TelemetryPreview";
 import { AboutPanel } from "./AboutPanel";
 import { AccountList } from "./AccountList";
 import { UsagePrefsPanel } from "./UsagePrefsPanel";
@@ -217,6 +218,7 @@ export function Settings({
                     file paths, project names, or personal data are ever sent.
                   </p>
                   <TelemetryToggle />
+                  <TelemetryPreview />
                 </>
               )}
               {tab === "plugins" && (
