@@ -633,6 +633,21 @@ Conduit instead of holding its own shell tool: `conduit run --bg -- cargo build`
   subcommands by name (falling through would try to open a folder called `run`).
 - The shim marker went to `conduit-cli-shim-v4`; an installed v3 reads as outdated.
 
+## Where the agent manual lives
+
+`cli_shim::SKILL`, printed by `conduit --skill`. It is the one place an agent learns the
+`conduit` command; both fleet briefs point at it.
+
+- **Three tests tie it to the shim**: every subcommand the shim dispatches on is taught,
+  every `conduit <word>` and flag the manual shows is one the shim parses, and every number
+  in it (16 jobs, 256 KB, 180 s, 64 KB) is compared with the constant that enforces it. An
+  agent follows a manual literally, so a manual that drifts is worse than none.
+- It is embedded in a QUOTED here-document; the shim test compares the printed text with
+  the constant byte for byte, because the manual contains `$CONDUIT_SESSION_ID`.
+- This is the small half of Herdr's "shape the app by asking your agent". The large half
+  (agents editing layouts and panels as plain files) needs the plugin system and belongs to
+  that spec, not here.
+
 ## Where `conduit report` lives
 
 `report.rs` + the `report` subcommand in the POSIX shim. A program in a session says what
