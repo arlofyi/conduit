@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { homedir, platform, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -57,9 +57,28 @@ export function e2eDataDir(): string {
   return join(base, E2E_DATA_DIR);
 }
 
+/**
+ * Every spec, listed from the directory rather than matched by a glob.
+ *
+ * The recursive glob this used (every `.e2e.ts` under `e2e/`) matched nothing in two places: in CI (the `e2e` workflow
+ * exited "No specs found to run" on every push, so it had been testing nothing), and in
+ * any checkout whose path has a dot-directory in it, such as a worktree under
+ * `.claude/worktrees/`. An explicit list of files has no pattern to go wrong, and a
+ * directory that cannot be read fails loudly here instead of reporting zero specs.
+ */
+function specFiles(): string[] {
+  const dir = resolve("e2e");
+  const files = readdirSync(dir)
+    .filter((f) => f.endsWith(".e2e.ts"))
+    .sort()
+    .map((f) => join(dir, f));
+  if (files.length === 0) throw new Error(`no *.e2e.ts specs in ${dir}`);
+  return files;
+}
+
 export const config: WebdriverIO.Config = {
   runner: "local",
-  specs: ["./e2e/**/*.e2e.ts"],
+  specs: specFiles(),
   // One app instance: the specs share the app's state deliberately (the second spec
   // asserts the FIRST one's project was not added twice).
   maxInstances: 1,
