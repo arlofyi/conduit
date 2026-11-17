@@ -100,6 +100,8 @@ export interface LifecycleSession {
   /** Last persisted agent activity: running | needsInput | done | idle. */
   agentState?: string | null;
   role?: string;
+  /** An Agent Teams lead (Claude). */
+  agentTeams?: boolean;
 }
 
 /** The sessions that start by themselves when Conduit launches. */
@@ -142,7 +144,9 @@ export interface IdleStopInput {
  * which is also how we know it has a running process), its agent has finished (`done` or
  * `idle`; `needsInput` only when opted in), and that status is at least the configured
  * minutes old. A `running` agent is never stopped. Conductors are exempt: they sit idle
- * between worker results by design, and a stopped one cannot be woken.
+ * between worker results by design, and a stopped one cannot be woken. An Agent Teams lead
+ * is exempt for a harder reason: its teammates run INSIDE its process, its own turn ends
+ * while they are still working, and they cannot be brought back once it is stopped.
  */
 export function idleStopTargets(input: IdleStopInput): { projectId: string; sessionId: string }[] {
   const { now, sessions, live, visible, prefs, pinned } = input;
@@ -150,7 +154,7 @@ export function idleStopTargets(input: IdleStopInput): { projectId: string; sess
   const quietMs = clampMinutes(prefs.autoStopMinutes) * 60_000;
   const out: { projectId: string; sessionId: string }[] = [];
   for (const s of sessions) {
-    if (s.stopped || s.role === "conductor") continue;
+    if (s.stopped || s.role === "conductor" || s.agentTeams === true) continue;
     if (pinned?.has(s.id)) continue;
     if (!prefs.autoStopVisible && visible.has(s.id)) continue;
     const l = live[s.id];

@@ -126,6 +126,8 @@ export interface Session {
   keepRunning?: boolean;
   /** Conduit answers this session's permission prompts with Allow (agy only). */
   autoApprove?: boolean;
+  /** Starts with Claude Code's agent teams on, so it can lead a team (Claude only). */
+  agentTeams?: boolean;
 }
 
 /** A registered agent account (mirrors the Rust serde struct, camelCase). */
@@ -1718,7 +1720,7 @@ interface AppState {
 
   addProject: (path: string) => Promise<void>;
   removeProject: (id: string) => Promise<void>;
-  addSession: (projectId: string, opts?: { name?: string; useWorktree?: boolean; worktreeSlug?: string | null; prompt?: string | null; agent?: AgentId; role?: SessionRole; account?: string | null; mcpServers?: string[] | null; model?: string | null; provider?: string | null }) => Promise<void>;
+  addSession: (projectId: string, opts?: { name?: string; useWorktree?: boolean; worktreeSlug?: string | null; prompt?: string | null; agent?: AgentId; role?: SessionRole; account?: string | null; mcpServers?: string[] | null; agentTeams?: boolean; model?: string | null; provider?: string | null }) => Promise<void>;
   renameSession: (projectId: string, sessionId: string, name: string) => Promise<void>;
   /** Rename a project's display label only (not the directory on disk). */
   renameProject: (projectId: string, name: string) => Promise<void>;
@@ -2901,7 +2903,10 @@ export const useStore = create<AppState>((set, get) => {
       // `provider` names the endpoint the new session runs on. It rides the CREATE call for
       // the same reason `model` does: set afterwards, the terminal has already spawned.
       const provider = opts?.provider ?? null;
-      const session = await invoke<Session | null>("add_session", { projectId, name, useWorktree, worktreeSlug, agent, role, mcpServers, model, provider });
+      // Rides the CREATE call like `model`: the first spawn reads it. Rust keeps it only
+      // for a Claude session.
+      const agentTeams = opts?.agentTeams === true;
+      const session = await invoke<Session | null>("add_session", { projectId, name, useWorktree, worktreeSlug, agent, role, mcpServers, agentTeams, model, provider });
       if (!session) return;
       // Pin an explicitly-chosen account (blank = inherit the project/global default).
       if (opts?.account) {

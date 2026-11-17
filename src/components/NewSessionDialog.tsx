@@ -25,6 +25,8 @@ export function NewSessionDialog({
     account?: string | null;
     /** MCP servers this session may load. null = inherit every configured server. */
     mcpServers?: string[] | null;
+    /** Start as an Agent Teams lead (Claude only). */
+    agentTeams?: boolean;
     model?: string | null;
   }) => void;
 }) {
@@ -57,6 +59,9 @@ export function NewSessionDialog({
   const [account, setAccount] = useState<string>("");
   // A Conductor is a Claude session in the project root that orchestrates the fleet.
   const [conductor, setConductor] = useState(false);
+  // Agent Teams: Claude Code's own experimental teams, switched on for this one session.
+  // Independent of the Conductor box -- a Conductor may lead a team too.
+  const [agentTeams, setAgentTeams] = useState(false);
   // Detection is loaded once at startup (store.loadAgents) and cached, so opening
   // this dialog is instant — no per-open login-shell PATH scan.
   const detected = useStore((s) => s.agents);
@@ -148,7 +153,7 @@ export function NewSessionDialog({
         ? null
         : mcpCandidates.filter((s) => !mcpOff.includes(s.name)).map((s) => s.name);
     if (conductor) {
-      onCreate({ name: name.trim() || undefined, useWorktree: false, agent: "claude", role: "conductor", account: acct, mcpServers: mcp });
+      onCreate({ name: name.trim() || undefined, useWorktree: false, agent: "claude", role: "conductor", account: acct, mcpServers: mcp, agentTeams });
       return;
     }
     if (!isReady(agent)) return;
@@ -159,6 +164,8 @@ export function NewSessionDialog({
       role: "worker",
       account: acct,
       mcpServers: mcp,
+      // The box forces the agent to Claude when ticked; picking another agent unticks it.
+      agentTeams: agentTeams && agent === "claude",
       // Only send a model the route actually picked FOR this agent. Picking a different
       // agent by hand clears it (below), so a Claude model can never reach Codex.
       model: routedModel,
@@ -189,6 +196,24 @@ export function NewSessionDialog({
             }}
           />
           <span>Conductor (orchestrates this project)</span>
+        </label>
+
+        <label
+          className={`dialog-toggle ${isReady("claude") ? "" : "disabled"}`}
+          title="Starts Claude with its experimental agent teams on. Ask it for teammates and it leads them: they share a task list and message each other. Teammates run inside this session's terminal and share its folder; they are not separate Conduit sessions, and they do not come back if the session is stopped."
+        >
+          <input
+            type="checkbox"
+            // Picking another agent unticks it: the switch means nothing outside Claude.
+            checked={agentTeams && agent === "claude"}
+            disabled={!isReady("claude")}
+            onChange={(e) => {
+              const on = e.target.checked;
+              setAgentTeams(on);
+              if (on) setAgent("claude");
+            }}
+          />
+          <span>Agent Teams (Claude only)</span>
         </label>
 
         {taskKinds.length > 0 && !conductor && (

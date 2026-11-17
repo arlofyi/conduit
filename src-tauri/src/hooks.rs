@@ -1712,6 +1712,46 @@ pub fn write_settings_file(port: u16) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
+/// The settings that make a Claude session an Agent Teams lead.
+///
+/// Both keys travel in a `--settings` file rather than the spawn environment or a flag:
+/// a settings file crosses the tmux server boundary (which `cmd.env` does not) and needs
+/// no Windows arm, and `--settings` outranks the user's own settings.json.
+///
+/// `teammateMode` is pinned to `in-process` on purpose. Conduit runs every session inside
+/// tmux, and Claude's `auto` mode answers "am I in tmux?" by splitting teammates into
+/// panes of THAT tmux session -- inside one Conduit terminal, under Conduit's own mouse
+/// bindings, sized for one program. A user whose settings.json says `auto` would get
+/// exactly that without this key.
+fn agent_teams_settings() -> Value {
+    json!({
+        "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" },
+        "teammateMode": "in-process",
+    })
+}
+
+/// Write the `--settings` file for an Agent Teams session and return its path.
+/// `with_hooks` = the session would otherwise have been handed `write_settings_file`'s
+/// hooks file (a worktree session): `--settings` takes ONE file, so this one must carry
+/// those hooks too or the session goes silent. The two variants have fixed contents, so
+/// they are two fixed files, not one per session.
+pub fn write_agent_teams_settings_file(port: u16, with_hooks: bool) -> Option<String> {
+    let (name, mut value) = if with_hooks {
+        #[cfg(windows)]
+        write_hook_relays();
+        ("conduit-hooks-teams.json", settings_value(port))
+    } else {
+        ("conduit-teams.json", json!({}))
+    };
+    if let (Some(dst), Value::Object(src)) = (value.as_object_mut(), agent_teams_settings()) {
+        dst.extend(src);
+    }
+    let path = crate::store::data_dir().join(name);
+    let data = serde_json::to_vec_pretty(&value).ok()?;
+    fs::write(&path, data).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
 /// A command hook that pipes the event JSON (stdin) to Conduit's server, tagged
 /// with this session via env vars resolved at run time.
 fn command(event: &str, port: u16) -> Value {
@@ -3012,6 +3052,17 @@ mod tests {
             !saved.contains("CONDUIT_SESSION_ID"),
             "backup must be the pre-Conduit file, not a post-install one"
         );
+    }
+
+    #[test]
+    fn agent_teams_settings_enable_teams_and_keep_teammates_out_of_tmux_panes() {
+        let v = agent_teams_settings();
+        assert_eq!(v["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1");
+        // Anything but in-process lets Claude split panes inside Conduit's own tmux session.
+        assert_eq!(v["teammateMode"], "in-process");
+        // It is merged over the hooks file for worktree sessions: it must never carry a
+        // `hooks` key of its own, or the merge would replace Conduit's hooks.
+        assert!(v.get("hooks").is_none());
     }
 
     #[test]

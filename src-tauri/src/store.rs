@@ -217,6 +217,12 @@ pub struct Session {
     /// Skipped when false so older state.json files stay byte-identical.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_approve: bool,
+    /// Agent Teams (Claude only): the session starts with Claude Code's experimental agent
+    /// teams switched on, so it can lead a team of teammates (see
+    /// `hooks::agent_teams_settings`). Set at creation, read at every spawn. Skipped when
+    /// false so older state.json files stay byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_teams: bool,
 }
 
 /// Directed READ policy: may `caller` read `target`'s output? The single source of truth for
@@ -2286,6 +2292,34 @@ impl Store {
         true
     }
 
+    /// Mark a session as an Agent Teams lead (see `Session::agent_teams`). Saves only on a
+    /// change. False when the session is unknown.
+    pub fn set_session_agent_teams(&self, session_id: &str, on: bool) -> bool {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = projects
+            .iter_mut()
+            .flat_map(|p| &mut p.sessions)
+            .find(|s| s.id == session_id)
+        else {
+            return false;
+        };
+        if s.agent_teams != on {
+            s.agent_teams = on;
+            self.save(&projects);
+        }
+        true
+    }
+
+    /// Whether the session starts with agent teams on.
+    pub fn session_agent_teams(&self, session_id: &str) -> bool {
+        self.projects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|p| &p.sessions)
+            .any(|s| s.id == session_id && s.agent_teams)
+    }
+
     /// Whether the session auto-approves its permission prompts.
     pub fn session_auto_approve(&self, session_id: &str) -> bool {
         self.projects
@@ -3918,6 +3952,25 @@ mod tests {
         let old: Session =
             serde_json::from_value(serde_json::json!({"id": "x", "name": "x"})).unwrap();
         assert_eq!(old.agent_state, None);
+    }
+
+    #[test]
+    fn agent_teams_is_absent_when_false_and_round_trips() {
+        let mut s: Session = serde_json::from_value(serde_json::json!({
+            "id": "s", "name": "n", "createdAt": 1
+        }))
+        .unwrap();
+        assert!(
+            !s.agent_teams,
+            "a session written before the feature leads no team"
+        );
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("agentTeams").is_none(), "{v}");
+        s.agent_teams = true;
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["agentTeams"], true);
+        let back: Session = serde_json::from_value(v).unwrap();
+        assert!(back.agent_teams);
     }
 
     #[test]

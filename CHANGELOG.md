@@ -5,6 +5,13 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Agent Teams for Claude sessions.** The new-session dialog has an "Agent Teams
+  (Claude only)" box next to Conductor. A session created with it starts Claude with its
+  experimental agent teams on: ask it for teammates and it leads them, with a shared task
+  list and direct messages between them. Teammates run inside that session's terminal and
+  share its folder. A team lead is never stopped automatically, because its teammates
+  cannot be brought back.
+
 ## 0.52.0 — 2026-11-17
 
 - **Changed — Settings → About is tidier.** Version, updates, source and the diagnostics
