@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { open } from "@tauri-apps/plugin-dialog";
+import { confirmDialog } from "../confirmDialog";
 import { invoke } from "@tauri-apps/api/core";
 import {
   useStore,
@@ -105,7 +106,7 @@ export async function deleteSession(
   const prompt = running
     ? `Session "${session.name}" is still working. Delete and stop it?\n\nIts conversation history is kept.`
     : `Delete session "${session.name}"?`;
-  if (!confirm(prompt)) return;
+  if (!(await confirmDialog(prompt))) return;
 
   if (session.useWorktree && session.worktreePath) {
     // Kill the live processes BEFORE asking anything about the worktree. The agent writes
@@ -120,7 +121,7 @@ export async function deleteSession(
     const msg = dirty
       ? `Also remove its git worktree (${session.branch})?\n\nIt has uncommitted changes that will be permanently lost.`
       : `Also remove its git worktree (${session.branch})?\n\nThe branch is kept; only the working copy is removed.`;
-    if (confirm(msg)) {
+    if (await confirmDialog(msg)) {
       try {
         await worktreeRemove(found.project.path, session.worktreePath, dirty);
       } catch (e) {
@@ -921,14 +922,16 @@ function SessionContextMenu() {
         <button onClick={() => startRootChatRename(chatId)}>Rename</button>
         <button
           className="danger"
-          onClick={() => {
+          onClick={async () => {
+            // Close first: the menu must not sit open behind the dialog, and everything
+            // the answer needs is already captured.
+            closeMenu();
             if (
-              confirm(
+              await confirmDialog(
                 `Delete chat "${chat.title}"?\n\nIts conversation transcript stays on disk and remains searchable.`,
               )
             )
               void removeRootChat(chatId);
-            closeMenu();
           }}
         >
           Delete Chat
@@ -1010,15 +1013,16 @@ function SessionContextMenu() {
         </button>
         <button
           className="danger"
-          onClick={() => {
+          onClick={async () => {
+            const projectId = menu.projectId;
+            closeMenu();
             if (
               project &&
-              confirm(
+              (await confirmDialog(
                 `Remove project "${project.name}" from Conduit?\n\nThis closes its sessions. Your files are not deleted.`,
-              )
+              ))
             )
-              void removeProject(menu.projectId);
-            closeMenu();
+              void removeProject(projectId);
           }}
         >
           Remove Project
@@ -1131,23 +1135,23 @@ function SessionContextMenu() {
         </button>
       )}
       <button
-        onClick={() => {
+        onClick={async () => {
           if (!menuSession) return;
+          const projectId = menu.projectId;
+          closeMenu();
           if (menuSession.stopped) {
-            void startSession(menu.projectId, sid);
+            void startSession(projectId, sid);
           } else {
             if (
               live[sid]?.status === "running" &&
-              !confirm(
+              !(await confirmDialog(
                 `"${menuSession.name}" is still working. Stop it?\n\nIts conversation is kept — starting it again resumes where it left off.`,
-              )
+              ))
             ) {
-              closeMenu();
               return;
             }
-            void stopSession(menu.projectId, sid);
+            void stopSession(projectId, sid);
           }
-          closeMenu();
         }}
         title={
           menuSession?.stopped
@@ -1170,20 +1174,19 @@ function SessionContextMenu() {
       )}
       {menuSession?.agent === "antigravity" && (
         <button
-          onClick={() => {
+          onClick={async () => {
             // Turning it ON hands every command and file edit a blanket yes, so it asks first;
             // turning it off only restores the prompts and needs no confirmation.
+            closeMenu();
             if (
               !menuSession.autoApprove &&
-              !confirm(
+              !(await confirmDialog(
                 `Auto-approve every request from "${menuSession.name}"?\n\nConduit will answer Allow to each command and file edit this Antigravity session asks for, without showing you the request.`,
-              )
+              ))
             ) {
-              closeMenu();
               return;
             }
             toggleAutoApprove(menuSession.id);
-            closeMenu();
           }}
           title="Conduit answers every permission request from this Antigravity session with Allow, commands and file edits included. Antigravity's own auto mode still asks, so Conduit answers for it."
         >

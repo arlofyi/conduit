@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { invoke } from "@tauri-apps/api/core";
 import { ask, open } from "@tauri-apps/plugin-dialog";
+import { confirmDialog } from "./confirmDialog";
 import {
   useStore,
   findSession,
@@ -966,11 +967,12 @@ export default function App() {
       const msg = payload.dirty
         ? `The Conductor wants to stop "${payload.name}"${where}.\n\nIt has uncommitted changes — those stay on disk, but its running process will be terminated. Allow?`
         : `The Conductor wants to stop "${payload.name}"${where}. Its running process will be terminated. Allow?`;
-      const approved = window.confirm(msg);
-      void invoke("conductor_confirm_response", {
-        requestId: payload.requestId,
-        approved,
-      }).catch(() => {});
+      void confirmDialog(msg).then((approved) =>
+        invoke("conductor_confirm_response", {
+          requestId: payload.requestId,
+          approved,
+        }).catch(() => {}),
+      );
     });
     return () => {
       void unSpawn.then((f) => f());

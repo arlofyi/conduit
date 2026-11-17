@@ -5,6 +5,12 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Fixed — confirmations are waited for.** Deleting a session, deleting a chat, removing a
+  project, stopping a working session and turning on auto-approve all asked "are you sure?"
+  and then went ahead without waiting for the answer, so Cancel did nothing. Each now waits.
+- **Fixed — the Conductor's request to stop a worker can be approved.** The prompt appeared,
+  but the answer never reached the Conductor and the stop was refused after a minute.
+
 ## 0.52.0 — 2026-11-17
 
 - **Changed — Settings → About is tidier.** Version, updates, source and the diagnostics
