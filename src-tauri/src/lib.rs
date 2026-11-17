@@ -626,6 +626,19 @@ fn pty_spawn(
         (working_directory.clone(), None, None)
     };
 
+    // Agent Teams: the switch and the pinned teammate mode ride a `--settings` file (see
+    // `hooks::agent_teams_settings` for why not the environment). `--settings` takes one
+    // file, so a worktree session's hooks file is replaced by one carrying both. If the
+    // write fails the session starts as a plain one rather than not at all.
+    let settings_path = if !shell_only
+        && agent == crate::agent::AgentId::Claude
+        && store.session_agent_teams(&session_id)
+    {
+        hooks::write_agent_teams_settings_file(port, settings_path.is_some()).or(settings_path)
+    } else {
+        settings_path
+    };
+
     // Resume token: the agent's own captured conversation id. agy resumes via
     // `--conversation=<id>` and Command Code via `--session <id>`; Claude resumes it in
     // place of its pinned session id once a `/clear` (or similar) has moved it on. None for
@@ -1991,6 +2004,9 @@ fn add_session(
     // Feature C: MCP registry names this session may load. None = inherit everything
     // (today's behavior). See `Session::mcp_servers` for why None != Some(<everything>).
     mcp_servers: Option<Vec<String>>,
+    // Start the session as an Agent Teams lead. Optional so a caller written before the
+    // feature still creates a plain session. Honoured for Claude only.
+    agent_teams: Option<bool>,
     model: Option<String>,
     // `conduit open --worktree <slug>`: use this slug instead of the one derived from the
     // name. Ignored without `use_worktree`; an invalid slug is dropped (derived one stays).
@@ -2019,6 +2035,13 @@ fn add_session(
     if model.is_some() {
         store.set_session_model(&session.id, model.clone());
         session.model = model;
+    }
+    // Claude only, decided here rather than trusted from the caller: the setting is a
+    // Claude Code switch, and a flag stored on another agent's session would be a lie the
+    // UI later reads back.
+    if agent_teams == Some(true) && agent == crate::agent::AgentId::Claude {
+        store.set_session_agent_teams(&session.id, true);
+        session.agent_teams = true;
     }
     if use_worktree {
         if let Some(slug) = worktree_slug.filter(|s| crate::worktree::valid_slug(s)) {
