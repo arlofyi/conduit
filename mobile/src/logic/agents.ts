@@ -24,6 +24,7 @@ export const AGENTS: readonly AgentInfo[] = [
   { id: "antigravity", label: "Antigravity", letter: "A", tint: "#a78bfa" },
   { id: "commandcode", label: "Command Code", letter: "c", tint: "#e0b341" },
   { id: "hermes", label: "Hermes Agent", letter: "H", tint: "#b58cff" },
+  { id: "conduitcode", label: "Conduit Code", letter: "C", tint: "#4fb3bf" },
 ];
 
 const UNKNOWN: AgentInfo = { id: "", label: "Agent", letter: "?", tint: "#968d86" };

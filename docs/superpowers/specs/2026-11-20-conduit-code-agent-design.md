@@ -46,7 +46,9 @@ fresh on every launch and shows no status ring; nothing errors.
   test, `src/agents.ts`, `mobile/src/logic/agents.ts`, and `default_profile_dir`
   (`.conduit`).
 - `ConduitCodeAdapter`: binary `conduit-code`; install command
-  `npm install -g @conduitcode/cli`; `supports_worktree` true; `supports_model_flags` true
+  `npm install -g @conduitcode/cli`; `supports_worktree` false (that flag means "takes
+  Claude's `--worktree`", which this CLI rejects; the dialog's worktree box stays
+  Claude-only, and a fleet worker still gets a Conduit-made worktree); `supports_model_flags` true
   with the default `--model` / `--effort`; `model_switch_command` is `/model <id>`.
 - `build_invocation`: with a resume token,
   `conduit-code<flags> --resume <id> || conduit-code<flags>`; without one, a single bare

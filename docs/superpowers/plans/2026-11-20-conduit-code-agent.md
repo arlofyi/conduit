@@ -67,7 +67,7 @@ fn conduit_code_never_puts_a_prompt_or_trust_on_the_command_line() {
 #[test]
 fn conduit_code_flags_and_seams() {
     let a = ConduitCodeAdapter;
-    assert!(a.supports_worktree() && a.supports_model_flags());
+    assert!(!a.supports_worktree() && a.supports_model_flags());
     assert_eq!((a.model_flag(), a.effort_flag()), ("--model", "--effort"));
     assert_eq!(a.model_switch_command("m", None, None).as_deref(), Some("/model m"));
     assert!(a.hooks_profile().is_none() && a.plugin_profile().is_none());
@@ -107,14 +107,14 @@ fn only_agents_that_choose_their_own_id_have_it_captured_from_sessionstart() {
 
 **Interfaces:**
 - Consumes: wire id `conduitcode` from Task 1.
-- Produces: `AGENTS` entry `{ id: "conduitcode", label: "Conduit Code", … }` — letter `"C"` (Claude draws a brand mark, so the monogram is free), tint `"#4fb3bf"`, `supportsWorktree: true`, `supportsMcp: false`, `supportsModelFlags: true`, `effortLevels: CLAUDE_EFFORT`, no `supportsEndpoint`, no `models`.
+- Produces: `AGENTS` entry `{ id: "conduitcode", label: "Conduit Code", … }` — letter `"C"` (Claude draws a brand mark, so the monogram is free), tint `"#4fb3bf"`, `supportsWorktree: false`, `supportsMcp: false`, `supportsModelFlags: true`, `effortLevels: CLAUDE_EFFORT`, no `supportsEndpoint`, no `models`.
 
 - [ ] **Step 1: Failing test** in `src/agents.test.ts`:
 
 ```ts
 it("lists Conduit Code with the flags its CLI really takes", () => {
   const a = agentMeta("conduitcode");
-  expect(a).toMatchObject({ label: "Conduit Code", supportsWorktree: true, supportsMcp: false, supportsModelFlags: true });
+  expect(a).toMatchObject({ label: "Conduit Code", supportsWorktree: false, supportsMcp: false, supportsModelFlags: true });
   expect(a.effortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
   expect(a.supportsEndpoint).toBeFalsy();
 });

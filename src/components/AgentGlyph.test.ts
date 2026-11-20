@@ -53,7 +53,7 @@ describe("glyphStateFor", () => {
  * until Nous Research ships one. Add an agent here only when the same is true of it, and
  * remove it the moment a real mark exists.
  */
-const NO_BRAND_MARK: ReadonlySet<string> = new Set(["hermes"]);
+const NO_BRAND_MARK: ReadonlySet<string> = new Set(["hermes", "conduitcode"]);
 
 describe("AGENT_MARKS", () => {
   it("has a mark for every agent Conduit can spawn", () => {
