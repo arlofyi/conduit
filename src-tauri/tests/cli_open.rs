@@ -132,13 +132,24 @@ fn opens_the_current_directory() {
 
 #[test]
 fn a_bare_invocation_defaults_to_the_current_directory() {
+    // Only where Conduit Code is not installed: with it, no argument is ITS command (see
+    // `shared_name` below). The PATH here is the system's own, so a `conduit-code` the
+    // developer installed is not found.
     let f = fixture();
     let (port, rx) = serve(f.token.clone());
     f.publish_port(port);
 
     let project = f.home.join("bare");
     std::fs::create_dir_all(&project).unwrap();
-    let out = f.command().current_dir(&project).output().unwrap();
+    let mut cmd = f.command();
+    if cfg!(unix) {
+        cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    }
+    let out = cmd
+        .env_remove("CONDUIT_BIN_HANDOFF")
+        .current_dir(&project)
+        .output()
+        .unwrap();
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(Path::new(&recv(&rx).path).ends_with("bare"));
 }
@@ -571,4 +582,156 @@ fn a_non_ascii_name_and_path_survive_an_oem_console_codepage() {
     let got = recv(&rx);
     assert!(got.path.ends_with("Café projekt"), "got {}", got.path);
     assert_eq!(got.name.as_deref(), Some("Crème brûlée"));
+}
+
+// ---- one name, two products: the first argument decides who answers ----
+//
+// Conduit Code (npm `@conduitcode/cli`) installs a `conduit` too. These run the real shim
+// with a stand-in `conduit-code` on PATH that records what it was handed.
+
+#[cfg(unix)]
+mod shared_name {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A PATH with the system tools the shim needs and nothing of the developer's own
+    /// (a real `conduit-code` is installed on some machines that run these).
+    const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+    /// Puts a fake `conduit-code` in `<home>/code-bin` that writes its arguments (one per
+    /// line) and whether the hand-off mark was set, then exits 7.
+    fn fake_code(f: &Fixture) -> (String, PathBuf) {
+        let dir = f.home.join("code-bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = f.home.join("code.log");
+        let bin = dir.join("conduit-code");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n{{ echo \"handoff=${{CONDUIT_BIN_HANDOFF:-}}\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > '{}'\nexit 7\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (format!("{}:{SYSTEM_PATH}", dir.display()), log)
+    }
+
+    fn run_with(f: &Fixture, path: &str, cwd: &Path, args: &[&str]) -> Output {
+        f.command()
+            .env("PATH", path)
+            .env_remove("CONDUIT_BIN_HANDOFF")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn conduit_code_commands_are_handed_over_with_their_arguments_and_exit_code() {
+        let f = fixture();
+        let (port, rx) = serve(f.token.clone());
+        f.publish_port(port);
+        let (path, log) = fake_code(&f);
+
+        for (args, expect) in [
+            (vec![], "handoff=1\n"),
+            (vec!["login"], "handoff=1\narg=login\n"),
+            (
+                vec!["--model", "zai/glm 5", "--resume", "abc"],
+                "handoff=1\narg=--model\narg=zai/glm 5\narg=--resume\narg=abc\n",
+            ),
+            (vec!["-h"], "handoff=1\narg=-h\n"),
+            // Not a verb, not a path, not a directory here: Conduit Code reports it.
+            (vec!["frobnicate"], "handoff=1\narg=frobnicate\n"),
+        ] {
+            let _ = std::fs::remove_file(&log);
+            let out = run_with(&f, &path, &f.home, &args);
+            assert_eq!(out.status.code(), Some(7), "{args:?}: {}", stderr(&out));
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), expect, "{args:?}");
+        }
+        silent(&rx);
+    }
+
+    #[test]
+    fn the_apps_own_commands_never_reach_conduit_code() {
+        let f = fixture();
+        let (port, rx) = serve(f.token.clone());
+        f.publish_port(port);
+        let (path, log) = fake_code(&f);
+        let project = f.home.join("proj");
+        std::fs::create_dir_all(project.join("run")).unwrap();
+
+        // A path in every agreed spelling, a bare directory name, and flags-first.
+        for args in [
+            vec!["."],
+            vec!["./run"],
+            vec!["run/.."],
+            vec![project.to_str().unwrap()],
+            vec!["--agent", "claude", "."],
+        ] {
+            let out = run_with(&f, &path, &project, &args);
+            assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+            let _ = recv(&rx);
+        }
+        // The manual, and a verb that is also a folder name here (the verb wins).
+        let out = run_with(&f, &path, &project, &["--skill"]);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("conduit run --bg"));
+        // (`report` with a bad state is refused before anything is sent.)
+        let out = run_with(&f, &path, &project, &["report", "--state", "bogus"]);
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert!(!log.exists(), "an app command was handed to Conduit Code");
+    }
+
+    #[test]
+    fn without_conduit_code_nothing_is_handed_over() {
+        let f = fixture();
+        let (port, rx) = serve(f.token.clone());
+        f.publish_port(port);
+        let project = f.home.join("solo");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // No argument opens this folder, as the command always did.
+        let out = run_with(&f, SYSTEM_PATH, &project, &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(recv(&rx).path.ends_with("solo"));
+
+        let out = run_with(&f, SYSTEM_PATH, &project, &["login"]);
+        assert_eq!(out.status.code(), Some(127));
+        assert!(
+            stderr(&out).contains("npm i -g @conduitcode/cli"),
+            "{}",
+            stderr(&out)
+        );
+
+        let out = run_with(&f, SYSTEM_PATH, &project, &["--help"]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(
+            stderr(&out).contains("usage: conduit <path>"),
+            "{}",
+            stderr(&out)
+        );
+        silent(&rx);
+    }
+
+    #[test]
+    fn a_call_that_was_handed_to_us_is_answered_here_and_never_handed_back() {
+        let f = fixture();
+        let (port, rx) = serve(f.token.clone());
+        f.publish_port(port);
+        let (path, log) = fake_code(&f);
+
+        let out = f
+            .command()
+            .env("PATH", &path)
+            .env("CONDUIT_BIN_HANDOFF", "1")
+            .current_dir(&f.home)
+            .args(["login"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(stderr(&out).contains("not a directory"), "{}", stderr(&out));
+        assert!(!log.exists(), "the call went round again");
+        silent(&rx);
+    }
 }

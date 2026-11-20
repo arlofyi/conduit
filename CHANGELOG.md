@@ -5,6 +5,16 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Changed — `conduit` shares its name with Conduit Code.** If you also have Conduit Code
+  (`npm install -g @conduitcode/cli`), `conduit` now does the same thing whichever of the
+  two your terminal finds first: `conduit .`, `conduit <folder>`, `conduit run` and the
+  other job commands go to this app, and everything else — `conduit` by itself,
+  `conduit login`, `conduit --model …` — opens Conduit Code. Without Conduit Code
+  installed nothing changes. Reinstall the command from Settings to get this.
+- **Fixed — installing the `conduit` command where another one already sits in
+  `/usr/local/bin`.** Conduit now installs its command in `~/.local/bin` instead of
+  refusing.
+
 ## 0.53.0 — 2026-11-17
 
 - **Added — Agent Teams for Claude sessions.** The new-session dialog has an "Agent Teams
