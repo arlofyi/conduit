@@ -429,8 +429,12 @@ pub fn start(
             // baseline, no filesystem scan, no ambiguity when two sessions share a home.
             // Resist the pull to reuse the agy path just because the constraint looks the
             // same -- that path exists only because agy fires no lifecycle hooks at all.
+            //
+            // Conduit Code is the same case by a different transport: it has no hook
+            // config at all and POSTs its own `sessionstart` here when it finds
+            // `CONDUIT_SESSION_ID` in its environment, with the same two fields.
             if event == "sessionstart"
-                && store.session_agent(&session) == crate::agent::AgentId::CommandCode
+                && captures_conversation_from_sessionstart(store.session_agent(&session))
             {
                 if let Some(cid) = parsed
                     .get("session_id")
@@ -1508,6 +1512,22 @@ pub fn claude_profile() -> HooksProfile {
                 verb: "sessionend",
             },
         ],
+    }
+}
+
+/// Agents that choose their own conversation id and announce it in a `sessionstart` body,
+/// so the next spawn can resume it. Claude is not here: its id is followed by
+/// `claude_conversation_update`, which also has a pinned first id to reason about.
+pub fn captures_conversation_from_sessionstart(agent: crate::agent::AgentId) -> bool {
+    use crate::agent::AgentId;
+    match agent {
+        AgentId::CommandCode | AgentId::ConduitCode => true,
+        AgentId::Claude
+        | AgentId::Codex
+        | AgentId::Gemini
+        | AgentId::OpenCode
+        | AgentId::Antigravity
+        | AgentId::Hermes => false,
     }
 }
 
@@ -3369,6 +3389,17 @@ mod tests {
             1,
             "re-install must overwrite, not duplicate the plugin body"
         );
+    }
+
+    #[test]
+    fn only_agents_that_choose_their_own_id_have_it_captured_from_sessionstart() {
+        use crate::agent::AgentId::*;
+        for a in [CommandCode, ConduitCode] {
+            assert!(captures_conversation_from_sessionstart(a), "{a:?}");
+        }
+        for a in [Claude, Codex, Gemini, OpenCode, Antigravity, Hermes] {
+            assert!(!captures_conversation_from_sessionstart(a), "{a:?}");
+        }
     }
 
     #[test]

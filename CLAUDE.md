@@ -1461,6 +1461,39 @@ installed CLI (`hermes --help`, `hermes chat --help`) and its own source, not fr
   `structuredResult`/`mailbox` stay false rather than lying to the router.
 - Design: `docs/superpowers/specs/2026-09-19-hermes-agent-and-provider-routing-design.md`.
 
+## Where Conduit Code lives
+
+An eighth adapter (`npm install -g @conduitcode/cli`, binary `conduit-code`), and the first
+agent that reports to Conduit by itself instead of through a hook file Conduit installs.
+Flags were read from `conduit-code --help` and its argument parser (0.1.1), which is
+STRICT: an unknown flag or a stray positional makes it exit.
+
+- **Conduit writes no file for it.** No `hooks_profile`, no `plugin_profile`, nothing under
+  `~/.conduit` (machine-wide, and the CLI never reads `~/.claude`). The CLI finds the hook
+  server from the env every session already gets (`CONDUIT_SESSION_ID`, `CONDUIT_HOOK_PORT`,
+  `CONDUIT_HOOK_ENDPOINT`) and POSTs the lifecycle verbs to `/hook` itself.
+- **Resume is CAPTURED, like Command Code.** There is no `--session-id`; the id arrives in
+  the CLI's own `sessionstart` body and lands in `Session.agent_conversation_id`.
+  `hooks::captures_conversation_from_sessionstart` is the one predicate for both agents.
+  The id is the PROVIDER's session id, announced only once the first turn is under way,
+  so a session quit before its first prompt has nothing to resume; and `--resume` continues
+  Claude-backed sessions only (another target warns and starts fresh).
+  There is deliberately NO scan of `~/.conduit/sessions`: a CLI too old to report starts
+  fresh every launch and shows no status ring, and nothing errors.
+- **`supports_worktree` is false and must stay false.** That flag means "takes Claude's
+  `--worktree`", which `pty.rs` then appends; the strict parser rejects it. A fleet worker
+  still gets a Conduit-made worktree as its cwd.
+- **No prompt reaches it at spawn.** The CLI takes no prompt argument, so `build_invocation`
+  drops `prompt_arg`. A dispatched brief has to be sent afterwards; the capability card
+  says so, and that is one reason it is Tier 2.
+- **`--trust` is never passed.** Trusting a repository is the user's call. Until they do,
+  the CLI ignores the repo's `.mcp.json`, which is the other reason for Tier 2.
+- **The npm package also installs a bin named `conduit`**, which is the name of Conduit's
+  own CLI shim (`cli_shim.rs`). Where npm's bin directory comes first on `PATH`, `conduit
+  run` / `conduit report` / `conduit .` start the TUI instead. Unresolved; the fix belongs
+  in the package. The adapter only ever names `conduit-code`.
+- Design: `docs/superpowers/specs/2026-11-20-conduit-code-agent-design.md`.
+
 ## Where per-agent model endpoints live
 
 One agent, one endpoint: `ProviderSettings` (`store.rs`), stored as

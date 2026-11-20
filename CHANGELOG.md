@@ -5,6 +5,11 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Conduit Code as an agent.** Start Conduit Code (`npm install -g @conduitcode/cli`)
+  sessions from the new-session dialog, with a model and a reasoning effort. A session picks its own conversation back up after a restart,
+  and shows whether it is working or waiting for you, once the installed `conduit-code` is
+  a version that reports its session to Conduit; an older one simply starts fresh each time.
+
 ## 0.53.0 — 2026-11-17
 
 - **Added — Agent Teams for Claude sessions.** The new-session dialog has an "Agent Teams

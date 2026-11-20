@@ -5,7 +5,8 @@ export type AgentId =
   | "opencode"
   | "antigravity"
   | "commandcode"
-  | "hermes";
+  | "hermes"
+  | "conduitcode";
 
 export interface AgentMeta {
   id: AgentId;
@@ -60,6 +61,15 @@ export const AGENTS: AgentMeta[] = [
   // pointed at (any OpenRouter model, or whatever a local server serves), so a fixed list
   // would be wrong the moment the endpoint changed.
   { id: "hermes", label: "Hermes Agent", letter: "H", tint: "#b58cff", supportsWorktree: false, supportsMcp: true, supportsModelFlags: true, supportsEndpoint: true, effortLevels: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
+  // Conduit Code (`conduit-code`, npm `@conduitcode/cli`). `--model` and `--effort` are
+  // spelled as Claude spells them. supportsMcp stays off: it has no `mcp add` subcommand
+  // (servers live in ~/.conduit/mcp.json, a file Conduit does not write). No endpoint
+  // seam either -- it manages its own providers and accounts. Models are free text:
+  // `<provider>/<model>` or `auto`, whatever its own accounts can reach. No brand mark is
+  // shipped, so AgentGlyph falls back to the letter; Claude draws a mark, so "C" is free.
+  // supportsWorktree is off like every non-Claude agent: the dialog's worktree box is
+  // wired to Claude's own `--worktree` flag, which this CLI does not have.
+  { id: "conduitcode", label: "Conduit Code", letter: "C", tint: "#4fb3bf", supportsWorktree: false, supportsMcp: false, supportsModelFlags: true, effortLevels: CLAUDE_EFFORT },
 ];
 
 export const DEFAULT_AGENT: AgentId = "claude";
