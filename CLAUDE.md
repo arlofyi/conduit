@@ -1475,6 +1475,9 @@ STRICT: an unknown flag or a stray positional makes it exit.
 - **Resume is CAPTURED, like Command Code.** There is no `--session-id`; the id arrives in
   the CLI's own `sessionstart` body and lands in `Session.agent_conversation_id`.
   `hooks::captures_conversation_from_sessionstart` is the one predicate for both agents.
+  The id is the PROVIDER's session id, announced only once the first turn is under way,
+  so a session quit before its first prompt has nothing to resume; and `--resume` continues
+  Claude-backed sessions only (another target warns and starts fresh).
   There is deliberately NO scan of `~/.conduit/sessions`: a CLI too old to report starts
   fresh every launch and shows no status ring, and nothing errors.
 - **`supports_worktree` is false and must stay false.** That flag means "takes Claude's

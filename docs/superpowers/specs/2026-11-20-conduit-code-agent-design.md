@@ -13,6 +13,10 @@ session dialog, resumed on restart, with a working status dot.
 
 - `--resume <session-id>` continues a session. There is no `--session-id`, so Conduit
   cannot pin its own id; the id is the CLI's.
+- The id `--resume` takes is the PROVIDER's session id (the `init` event's `sessionId`),
+  not the name of the CLI's own record folder under `~/.conduit/sessions/`. `--resume`
+  continues Claude-backed sessions only; another target warns and starts fresh. The
+  provider announces the id only once the first turn is under way.
 - `--model <id>` and `--effort low|medium|high|xhigh|max`, spelled as Claude spells them.
   `/model` switches mid-session.
 - No positional prompt and no prompt flag.
@@ -84,6 +88,18 @@ file `CONDUIT_HOOK_ENDPOINT` names when readable, else `CONDUIT_HOOK_PORT`.
 | `turn_result`, ok | `stop` | `{}` |
 | `turn_result`, not ok | `stopfailure` | `{error: <subtype>}` |
 | the app exits | `sessionend` | `{}` |
+
+As built (CLI branch `feat/conduit-app-report`, `src/conduit-app/report.ts`), with three
+additions to the table: `prompt` carries the first 500 characters of the prompt (Conduit
+names the session from it), each tool start sends `pretool` `{tool_name}`, and a
+`sessionstart` that lands mid-turn is followed by a repeated `prompt`, because Conduit
+reads a session start as "not working". `source` is `resume` only when the announced id
+equals the `--resume` value. A secret prompt sends `notification`
+`{notification_type: "elicitation_dialog"}`.
+
+Measured 2026-11-20 against a local listener, one haiku turn then a resumed one:
+`prompt`, `sessionstart` (`startup`), `prompt`, `stop`, `sessionend`; resumed run identical
+with `source: "resume"` and the same id.
 
 Fire and forget, 2 s timeout, every failure swallowed: a status report must never break
 the work it reports. No token is involved; `/hook` is display data behind the provenance
