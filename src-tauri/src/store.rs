@@ -5152,6 +5152,8 @@ mod tests {
             AgentId::OpenCode,
             AgentId::Antigravity,
             AgentId::CommandCode,
+            AgentId::Hermes,
+            AgentId::ConduitCode,
         ]);
     }
 

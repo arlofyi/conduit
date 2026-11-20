@@ -69,7 +69,7 @@ export interface ProfileEntry {
   needs: number;
 }
 
-/** Two-letter fallback per desktop agent id (src/agents.ts lists the seven). */
+/** Two-letter fallback per desktop agent id (src/agents.ts lists the eight). */
 const AGENT_INITIALS: Record<string, string> = {
   claude: "CL",
   codex: "CX",
@@ -78,6 +78,7 @@ const AGENT_INITIALS: Record<string, string> = {
   antigravity: "AG",
   commandcode: "CC",
   hermes: "HE",
+  conduitcode: "CO",
 };
 
 export function agentInitials(agent: string): string {

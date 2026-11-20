@@ -5,6 +5,10 @@ All notable changes to Conduit are documented here. This project uses
 
 ## Unreleased
 
+- **Added — Conduit Code as an agent.** Start Conduit Code (`npm install -g @conduitcode/cli`)
+  sessions from the new-session dialog, with a model and a reasoning effort. A session picks its own conversation back up after a restart,
+  and shows whether it is working or waiting for you, once the installed `conduit-code` is
+  a version that reports its session to Conduit; an older one simply starts fresh each time.
 - **Changed — `conduit` shares its name with Conduit Code.** If you also have Conduit Code
   (`npm install -g @conduitcode/cli`), `conduit` now does the same thing whichever of the
   two your terminal finds first: `conduit .`, `conduit <folder>`, `conduit run` and the

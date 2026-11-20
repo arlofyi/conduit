@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 /// Which coding-agent CLI a session runs. Persisted on each Session; serializes as a
-/// lowercase string ("claude"/"codex"/"gemini"/"opencode"/"antigravity"/"commandcode"/"hermes").
+/// lowercase string ("claude"/"codex"/"gemini"/"opencode"/"antigravity"/"commandcode"/"hermes"/"conduitcode").
 /// Unknown/absent → Claude, and that back-compat promise is now KEPT rather than merely
 /// documented: see `store::PersistedEnum` for what one unreadable value used to cost.
 /// `Hash`/`Eq` let it key the per-agent default-account maps (serde emits it as a JSON string
@@ -19,6 +19,7 @@ pub enum AgentId {
     Antigravity,
     CommandCode,
     Hermes,
+    ConduitCode,
 }
 
 impl crate::store::PersistedEnum for AgentId {
@@ -31,6 +32,7 @@ impl crate::store::PersistedEnum for AgentId {
             "antigravity" => Some(AgentId::Antigravity),
             "commandcode" => Some(AgentId::CommandCode),
             "hermes" => Some(AgentId::Hermes),
+            "conduitcode" => Some(AgentId::ConduitCode),
             _ => None,
         }
     }
@@ -280,6 +282,7 @@ pub fn default_profile_dir(agent: AgentId) -> Option<&'static str> {
         AgentId::Claude | AgentId::Antigravity => Some(".claude"),
         AgentId::CommandCode => Some(".commandcode"),
         AgentId::Hermes => Some(".hermes"),
+        AgentId::ConduitCode => Some(".conduit"),
         AgentId::Codex | AgentId::Gemini | AgentId::OpenCode => None,
     }
 }
@@ -1445,6 +1448,17 @@ pub fn capability_card(agent: AgentId) -> serde_json::Value {
             "whenToUse": "Spreading load across ~58 models from one subscription -- Anthropic, OpenAI, Google, xAI and a large open-source set -- when the point is to NOT spend a Claude or Codex quota. Per-session model and reasoning effort are selectable (`--model`, `--effort`): pass `model` to fleet_spawn to pin any one of them exactly (`claude-opus-5`, `google/gemini-3.7-flash`, `deepseek/deepseek-v4-flash`), or `modelTier` for the coarse cheap/standard/hard mapping. A cheap open model can take mechanical work while the expensive quotas stay for work that needs them.",
             "whenNotToUse": "Conducting: the Conductor persona and its orchestration tools are Claude-only. Work that must run on one specific vendor's own subscription rather than through Command Code's."
         }),
+        AgentId::ConduitCode => serde_json::json!({
+            "agent": "conduitcode",
+            // Tier 2 on arrival. It reads `<repo>/.mcp.json`, but only once the repo is
+            // trusted, and nothing has verified a Conduit Code worker against the fleet
+            // MCP server -- so both flags stay false rather than lying to the router.
+            "tier": 2,
+            "structuredResult": false,
+            "mailbox": false,
+            "whenToUse": "Work that should pick its own model per job: Conduit Code routes between Claude, GLM, local (Ollama) and OpenRouter models from one session, cheap first and a stronger model when its check keeps failing. Pass `model` to pin one (`zai/glm-5.3-flash`, `ollama/<id>`, `openrouter/<id>`, or `auto`).",
+            "whenNotToUse": "Anything needing a fleet_result or the mailbox -- there is no verified result channel yet. Anything that must start from a brief: Conduit Code takes no prompt on its command line, so a dispatched task is not delivered and has to be sent afterwards with fleet_send."
+        }),
         AgentId::Hermes => serde_json::json!({
             "agent": "hermes",
             // Tier 2, not 1, and the distinction is the design doc's invariant 9: Hermes
@@ -1675,6 +1689,73 @@ impl ProviderAdapter for HermesAdapter {
     }
 }
 
+pub struct ConduitCodeAdapter;
+
+/// Conduit Code (`npm install -g @conduitcode/cli`), the TUI harness from the same house.
+///
+/// Every flag here was read from `conduit-code --help` and the CLI's own argument parser
+/// (0.1.1), which is `strict`: an unknown flag makes it exit, so nothing is guessed.
+impl ProviderAdapter for ConduitCodeAdapter {
+    fn id(&self) -> AgentId {
+        AgentId::ConduitCode
+    }
+    /// `conduit-code`, never the package's second bin `conduit`: that name is Conduit's
+    /// own CLI shim, and which of the two a bare `conduit` reaches depends on PATH order.
+    fn binary(&self) -> &'static str {
+        "conduit-code"
+    }
+    fn install_command(&self) -> Option<String> {
+        Some("npm install -g @conduitcode/cli".into())
+    }
+    // `supports_worktree` stays at its default (false): it means "takes Claude's
+    // `--worktree` flag", which pty.rs would then append, and this CLI's strict parser
+    // rejects it. A fleet worker still gets a Conduit-made worktree (the non-flag arm in
+    // `pty_spawn`) and runs with that directory as its cwd.
+    //
+    // `--model <id>` and `--effort low|medium|high|xhigh|max`, spelled as Claude spells
+    // them, so the trait defaults for both flags are right.
+    fn supports_model_flags(&self) -> bool {
+        true
+    }
+    /// `/model` switches mid-session and takes the id as its argument.
+    fn model_switch_command(
+        &self,
+        model: &str,
+        _provider: Option<&str>,
+        _effort: Option<&str>,
+    ) -> Option<String> {
+        Some(format!("/model {model}"))
+    }
+    /// Resume by the id Conduit Code chose for itself.
+    ///
+    /// There is no `--session-id` to pin Conduit's id, so `resume_token` is the id the CLI
+    /// reported in its own `sessionstart` (see `hooks::captures_conversation_from_sessionstart`).
+    /// An older CLI reports nothing, the token stays absent, and every launch is a fresh
+    /// session -- there is deliberately no scan of `~/.conduit/sessions` to guess one.
+    ///
+    /// `prompt_arg` is ignored on purpose: the CLI takes no prompt on its command line, and
+    /// its parser rejects a stray positional. `--trust` is never passed -- trusting a
+    /// repository is the user's call, as it is with Claude.
+    ///
+    /// `|| <bare>` guards only the resume branch, for a session deleted from disk.
+    fn build_invocation(
+        &self,
+        _session_id: &str,
+        _projects_dir: Option<&Path>,
+        flags: &str,
+        _prompt_arg: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> String {
+        match resume_token {
+            Some(tok) => {
+                let id = crate::pty::quote_arg(tok);
+                format!("conduit-code{flags} --resume {id} || conduit-code{flags}")
+            }
+            None => format!("conduit-code{flags}"),
+        }
+    }
+}
+
 /// Resolve the adapter for an agent id.
 pub fn adapter_for(agent: AgentId) -> Box<dyn ProviderAdapter> {
     match agent {
@@ -1685,6 +1766,7 @@ pub fn adapter_for(agent: AgentId) -> Box<dyn ProviderAdapter> {
         AgentId::Antigravity => Box::new(AntigravityAdapter),
         AgentId::CommandCode => Box::new(CommandCodeAdapter),
         AgentId::Hermes => Box::new(HermesAdapter),
+        AgentId::ConduitCode => Box::new(ConduitCodeAdapter),
     }
 }
 
@@ -1732,6 +1814,7 @@ pub fn all_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(AntigravityAdapter),
         Box::new(CommandCodeAdapter),
         Box::new(HermesAdapter),
+        Box::new(ConduitCodeAdapter),
     ]
 }
 
@@ -1744,6 +1827,7 @@ fn label_for(id: AgentId) -> &'static str {
         AgentId::Antigravity => "Antigravity (agy)",
         AgentId::CommandCode => "Command Code",
         AgentId::Hermes => "Hermes Agent",
+        AgentId::ConduitCode => "Conduit Code",
     }
 }
 
@@ -3379,6 +3463,58 @@ mod tests {
     }
 
     #[test]
+    fn conduit_code_resumes_by_the_id_it_reported_and_falls_back_bare() {
+        let a = ConduitCodeAdapter;
+        assert_eq!(a.binary(), "conduit-code");
+        assert_eq!(
+            a.install_command().as_deref(),
+            Some("npm install -g @conduitcode/cli")
+        );
+        assert_eq!(
+            a.build_invocation("s", None, "", None, None),
+            "conduit-code"
+        );
+        let id = crate::pty::quote_arg("abc-1");
+        assert_eq!(
+            a.build_invocation("s", None, " --model x", None, Some("abc-1")),
+            format!("conduit-code --model x --resume {id} || conduit-code --model x")
+        );
+    }
+
+    #[test]
+    fn conduit_code_never_puts_a_prompt_or_trust_on_the_command_line() {
+        let cmd = ConduitCodeAdapter.build_invocation("s", None, "", Some("'do it'"), Some("id"));
+        assert!(!cmd.contains("do it") && !cmd.contains("--trust"), "{cmd}");
+        let fresh = ConduitCodeAdapter.build_invocation("s", None, "", Some("'do it'"), None);
+        assert_eq!(fresh, "conduit-code");
+    }
+
+    #[test]
+    fn conduit_code_flags_and_seams() {
+        let a = ConduitCodeAdapter;
+        // `supports_worktree` means "has its own `--worktree` flag" (pty.rs appends it), and
+        // this CLI's strict parser has none. Conduit-driven worktrees still apply to it.
+        assert!(!a.supports_worktree() && a.supports_model_flags());
+        assert_eq!((a.model_flag(), a.effort_flag()), ("--model", "--effort"));
+        assert_eq!(
+            a.model_switch_command("m", None, None).as_deref(),
+            Some("/model m")
+        );
+        // Conduit writes no file for this agent: the CLI reports itself from the env.
+        assert!(a.hooks_profile().is_none() && a.plugin_profile().is_none());
+        assert!(a.project_mcp_config_rel_path().is_none());
+        use crate::store::PersistedEnum;
+        assert_eq!(
+            AgentId::from_wire("conduitcode"),
+            Some(AgentId::ConduitCode)
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentId::ConduitCode).unwrap(),
+            r#""conduitcode""#
+        );
+    }
+
+    #[test]
     fn capability_cards_are_tier_labeled_and_complete() {
         let cards = capability_cards();
         // Derived from the registry, not a literal: a hardcoded count only ever fails the
@@ -3393,6 +3529,7 @@ mod tests {
             (AgentId::CommandCode, 1),
             (AgentId::Antigravity, 3),
             (AgentId::Hermes, 2),
+            (AgentId::ConduitCode, 2),
         ];
         assert_eq!(
             expected_tiers.len(),

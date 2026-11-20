@@ -1,12 +1,12 @@
 # Conduit
 
-**Run multiple _real_ coding-agent terminals across your projects — Claude Code, Codex, Gemini, Antigravity, OpenCode, Command Code, and Hermes Agent, each a live CLI session — side by side in one window.**
+**Run multiple _real_ coding-agent terminals across your projects — Claude Code, Codex, Gemini, Antigravity, OpenCode, Command Code, Hermes Agent, and Conduit Code, each a live CLI session — side by side in one window.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%20v2-24C8DB.svg)](https://tauri.app)
 
 Not a chat UI. Not a TUI. Conduit embeds genuine agent CLIs — Claude Code, Codex,
-Gemini, Antigravity, OpenCode, Command Code, and Hermes Agent — in a real PTY per session, and
+Gemini, Antigravity, OpenCode, Command Code, Hermes Agent, and Conduit Code — in a real PTY per session, and
 lets you arrange those sessions (and real editor tabs) into side-by-side editor groups — with a
 file tree, a Monaco editor, a branch-lane git graph, per-session to-dos driven by agent hooks,
 a Conductor that can orchestrate the whole fleet, and a phone app to keep an eye on all of it.
@@ -256,7 +256,7 @@ pnpm tauri dev
 **Requirements:** [Rust](https://rustup.rs) + [Node](https://nodejs.org) (with
 [pnpm](https://pnpm.io)) + at least one supported agent CLI on your `PATH` —
 [`claude`](https://docs.claude.com/en/docs/claude-code), `codex`, `gemini`, `agy`,
-`opencode`, Command Code (`cmd`, or `cmdc` on Windows) or `hermes` (the onboarding wizard
+`opencode`, Command Code (`cmd`, or `cmdc` on Windows), `hermes` or `conduit-code` (the onboarding wizard
 detects which are installed) — plus `git` and
 `curl`. On macOS you'll also need the Xcode Command Line Tools; on Windows, the MSVC
 toolchain (`rustup` `stable-x86_64-pc-windows-msvc` plus the Visual Studio C++ Build

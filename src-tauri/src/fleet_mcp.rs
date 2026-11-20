@@ -68,7 +68,7 @@ pub fn tool_specs() -> Vec<Value> {
                 "properties": {
                     "task": { "type": "string" },
                     "name": { "type": "string" },
-                    "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "opencode", "antigravity", "commandcode", "hermes"], "description": "Defaults to \"claude\". See fleet_capabilities for what each agent is good at and its tier (structured-result support)." },
+                    "agent": { "type": "string", "enum": ["claude", "codex", "gemini", "opencode", "antigravity", "commandcode", "hermes", "conduitcode"], "description": "Defaults to \"claude\". See fleet_capabilities for what each agent is good at and its tier (structured-result support)." },
                     "objective": { "type": "string", "description": "The mandate, if different/more precise than `task`." },
                     "outputShape": { "type": "string", "description": "What a done result should look like." },
                     "boundaries": { "type": "string", "description": "What the worker must NOT do." },
