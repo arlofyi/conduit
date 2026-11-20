@@ -633,6 +633,40 @@ Conduit instead of holding its own shell tool: `conduit run --bg -- cargo build`
   subcommands by name (falling through would try to open a folder called `run`).
 - The shim marker went to `conduit-cli-shim-v4`; an installed v3 reads as outdated.
 
+## Where the shared `conduit` name lives
+
+Conduit Code (npm `@conduitcode/cli`) installs a command called `conduit` too. Both keep
+the name, so both follow ONE rule and the answer cannot depend on `PATH` order: the FIRST
+argument decides who answers. The contract text is in the conduit-code repo
+(`docs/conduit-bin-contract.md`, version 1); this side pins it in `cli_shim.rs`
+(`BIN_CONTRACT_VERSION`, `APP_FIRST_FLAGS`, `CODE_BIN`, `HANDOFF_ENV`).
+
+- **Ours:** the six verbs, `--skill`, the open form's own leading flags (`-a`, `--agent`,
+  `--worktree`, `--name`, `--prompt-file`, `--provider`), and a path (`.`, `..`, `~`,
+  anything starting `/`, `./`, `../`, `~/`, or the name of an existing directory). A verb
+  wins over a folder of the same name. **Everything else is Conduit Code's**, including
+  no argument at all, `-h`/`--help`, and `--model`/`--effort` when they LEAD a call (both
+  products have those two, so the open form must start with the path or `--agent`).
+- **The hand-off is `exec conduit-code "$@"`**, never `conduit`: that is the name being
+  shared, and `conduit-code` never hands anything back. `CONDUIT_BIN_HANDOFF=1` marks a
+  call that was already handed over; a shim that sees it answers the call itself, so two
+  `conduit`s cannot pass one call back and forth.
+- **Without Conduit Code installed the old behaviour stands:** no argument opens the
+  current folder and `-h` prints the app's usage. Any other Conduit Code command exits
+  127 with one line naming the npm package. A user with only the app sees no change.
+- **`install_dir` skips `/usr/local/bin` when the `conduit` there is not ours**
+  (`use_shared_dir`). npm's global bin directory is `/usr/local/bin` on some machines,
+  and `install` rightly refuses to replace a file Conduit did not write -- which used to
+  leave no way to install the command at all. `~/.local/bin` is where Conduit Code looks.
+- The verbs in the rule are read from the shim's own dispatch by a test, so a new
+  subcommand cannot ship without being claimed from Conduit Code; adding one (or a
+  leading flag) bumps the contract version in BOTH repos.
+- `tests/cli_open.rs`'s `shared_name` module runs the real shim against a stand-in
+  `conduit-code`. Tests that need "not installed" set `PATH` to the system's own
+  directories, because a developer machine may really have `conduit-code`.
+- The Windows half (`conduit.cmd`) follows the same rule but has only been compiled and
+  text-checked, never run. The marker went to `conduit-cli-shim-v5`.
+
 ## Where the agent manual lives
 
 `cli_shim::SKILL`, printed by `conduit --skill`. It is the one place an agent learns the
@@ -1488,10 +1522,9 @@ STRICT: an unknown flag or a stray positional makes it exit.
   says so, and that is one reason it is Tier 2.
 - **`--trust` is never passed.** Trusting a repository is the user's call. Until they do,
   the CLI ignores the repo's `.mcp.json`, which is the other reason for Tier 2.
-- **The npm package also installs a bin named `conduit`**, which is the name of Conduit's
-  own CLI shim (`cli_shim.rs`). Where npm's bin directory comes first on `PATH`, `conduit
-  run` / `conduit report` / `conduit .` start the TUI instead. Unresolved; the fix belongs
-  in the package. The adapter only ever names `conduit-code`.
+- **The npm package also installs a bin named `conduit`**, the name of Conduit's own CLI
+  shim. Both keep it and route by first argument; see "Where the shared `conduit` name
+  lives". The adapter only ever names `conduit-code`, which never hands a call on.
 - Design: `docs/superpowers/specs/2026-11-20-conduit-code-agent-design.md`.
 
 ## Where per-agent model endpoints live

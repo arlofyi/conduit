@@ -9,6 +9,15 @@ All notable changes to Conduit are documented here. This project uses
   sessions from the new-session dialog, with a model and a reasoning effort. A session picks its own conversation back up after a restart,
   and shows whether it is working or waiting for you, once the installed `conduit-code` is
   a version that reports its session to Conduit; an older one simply starts fresh each time.
+- **Changed — `conduit` shares its name with Conduit Code.** If you also have Conduit Code
+  (`npm install -g @conduitcode/cli`), `conduit` now does the same thing whichever of the
+  two your terminal finds first: `conduit .`, `conduit <folder>`, `conduit run` and the
+  other job commands go to this app, and everything else — `conduit` by itself,
+  `conduit login`, `conduit --model …` — opens Conduit Code. Without Conduit Code
+  installed nothing changes. Reinstall the command from Settings to get this.
+- **Fixed — installing the `conduit` command where another one already sits in
+  `/usr/local/bin`.** Conduit now installs its command in `~/.local/bin` instead of
+  refusing.
 
 ## 0.53.0 — 2026-11-17
 
